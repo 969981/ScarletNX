@@ -57,6 +57,9 @@ endif()
 if(SNX_BUILD_AGB AND NOT (SNX_TOOLS_ONLY AND SNX_BUILD_NX))
     snx_multicall_driver(AGB snx_agb_program scarletnx-agb AGB_RUNTIME)
 endif()
+if(SNX_BUILD_ANDROID AND NOT SNX_TOOLS_ONLY)
+    snx_multicall_driver(ANDROID snx_android_program scarletnx-android "")
+endif()
 
 if(WIN32)
     # Prefer static toolchain/SDL libraries. LLVM may still use a DLL import library, resolved by cmake/llvm.cmake and
