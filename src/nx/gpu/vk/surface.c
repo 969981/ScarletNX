@@ -7,6 +7,7 @@
    come back. Textures and render targets are each in a list from the least recently used to the most, which the
    caches' eviction takes from (vk_surf_reclaim): idle ones, and more when device memory nears its budget
    (vk_mem_trim, with the budget from gpu/vk/memory.c). */
+#include "nx/runtime/platform/wtx.h"
 #include "common/utilities/bits.h"
 #include <stdlib.h>
 #include <string.h>
@@ -583,8 +584,10 @@ static void run_cool(void* user, u64 at, u8* host, u64 n) {
 static void mem_baseline(Surf* s) {
     u64 size = rt_bytes(s);
     int tracked = 0;
+    if (WTX_ENV("WTX_COOL_FIRST") && !(s->gva >> 63) && size) /* mutant: cooled before the take-in */
+        span_runs(s->gva, size, run_cool, NULL);
     if (!(s->gva >> 63) && size) span_runs(s->gva, size, run_take, &tracked);
-    if (tracked) span_runs(s->gva, size, run_cool, NULL);
+    if (tracked && !WTX_ENV("WTX_COOL_FIRST")) span_runs(s->gva, size, run_cool, NULL);
     s->mem_wseen = tracked ? vk_ww_now() : 0;
 }
 static void rt_loaded(Surf* s) {
@@ -820,8 +823,9 @@ static void flush_rebase(Surf* s, u64 size, int kept, u64 gw0) {
         return;
     }
     s->gw = gpu_mem_generation();
+    if (WTX_ENV("WTX_COOL_FIRST")) span_runs(s->gva, size, run_cool, NULL); /* mutant */
     span_runs(s->gva, size, run_take, &tracked);
-    if (tracked) span_runs(s->gva, size, run_cool, NULL);
+    if (tracked && !WTX_ENV("WTX_COOL_FIRST")) span_runs(s->gva, size, run_cool, NULL);
     if (s->draw_wseen && tracked) s->draw_wseen = vk_ww_now();
     s->mem_wseen = tracked ? vk_ww_now() : 0;
 }
@@ -1565,9 +1569,10 @@ void vk_rt_drawn(Surf* s) {
            took most of the GPU thread (FreeBSD, Linux before 6.7) */
         /* Dirty metadata needs the mapping's address, without acquiring pixels
            that can still be GPU-owned. The hash fallback acquires its own data. */
+        if (WTX_ENV("WTX_COOL_FIRST") && !(s->gva >> 63) && size) span_runs(s->gva, size, run_cool, NULL); /* mutant */
         s->draw_has_hash = vk_written_since(gmem_host(s->gva, size), size, 0) < 0 && s->feeds_tex;
         if (s->draw_has_hash) s->draw_hash = rt_mem_hash(s);
-        if (!(s->gva >> 63) && size) span_runs(s->gva, size, run_cool, NULL);
+        if (!WTX_ENV("WTX_COOL_FIRST") && !(s->gva >> 63) && size) span_runs(s->gva, size, run_cool, NULL);
         s->draw_wseen = vk_ww_now();
         s->draw_gw = gpu_mem_generation();
     }

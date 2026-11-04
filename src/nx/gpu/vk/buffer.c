@@ -6,6 +6,8 @@
    change replaces, so nothing waits for the GPU. A big range's own buffer instead takes the pages written since it
    last matched memory, copied on the GPU in order with the draws (patch_own). Big ranges that have been stable for
    long are checked less often. */
+#include "nx/runtime/platform/wtx.h"
+#include <sys/resource.h>
 #include <stdlib.h>
 #include <string.h>
 #include "nx/gpu/gpu.h"
@@ -843,7 +845,12 @@ static int out_copyable(const GfxOut* o, u64 lo, u64 hi) {
     if (vk_written_since(host, hi - lo, o->wseen) == 0) return 1;
     if (o->initial) return 0; /* the baseline is still being produced by the GPU */
     host = gmem_ptr_untracked(lo, hi - lo);
-    return host && !memcmp(host, o->org + (lo - o->addr), hi - lo);
+    if (!host) return 0;
+    u64 t0 = wtx_ns();
+    int same = !memcmp(host, o->org + (lo - o->addr), hi - lo);
+    wtx_add(WTX_CMP_NS, wtx_ns() - t0);
+    wtx_add(WTX_CMP_BYTES, hi - lo);
+    return same;
 }
 /* the same for each run of o's bytes in [gva, gva + len), through whichever GPU address maps them (out_spans) */
 typedef struct {
@@ -868,7 +875,14 @@ static void copyable_span(void* user, u64 at, u64 from, u64 n) {
         return;
     }
     host = gmem_ptr_untracked(c->gva + at, n);
-    if (!host || memcmp(host, c->o->org + from, n)) c->ok = 0;
+    if (!host) {
+        c->ok = 0;
+        return;
+    }
+    u64 t0 = wtx_ns();
+    if (memcmp(host, c->o->org + from, n)) c->ok = 0;
+    wtx_add(WTX_CMP_NS, wtx_ns() - t0);
+    wtx_add(WTX_CMP_BYTES, n);
 }
 /* A composition takes each byte from the newest pending result over it: that result was made over the ones before it
    (composed, or over guest memory they hadn't touched) and its draw ran after theirs, so its buffer holds the byte as
@@ -1232,6 +1246,7 @@ static void ww_mark_range(u64 o, u64 e) {
         else if (g_wpeer.n < WW_PEER_N)
             g_wpeer.r[g_wpeer.n++] = (WwRange){o, e};
         else {
+            wtx_add(WTX_FULL, 1);
             WwRange* r = &g_wpeer.r[WW_PEER_N - 1];
             if (o < r->a) r->a = o;
             if (e > r->e) r->e = e;
@@ -1315,12 +1330,15 @@ static void ww_note(u8* p, u64 n) {
     WwStage* st = t_buffer.wstage;
     u64 a = (u64)(p - g_mem);
     if (a >= AS_SIZE || !n) return;
+    wtx_add(WTX_SCAN_PAGES, n >> 12);
     if (st->n && st->r[st->n - 1].e == a)
         st->r[st->n - 1].e = a + n;
     else if (st->n < WW_RES_N)
         st->r[st->n++] = (WwRange){a, a + n};
-    else
+    else {
         st->r[WW_RES_N - 1].e = a + n;
+        wtx_add(WTX_FULL, 1);
+    }
 }
 static int ww_claim(u64 l) {
     u8 free = 0;
@@ -1329,11 +1347,19 @@ static int ww_claim(u64 l) {
 /* guest memory [a, e) scanned, but for the pages an import of unified memory holds: the driver takes them again at
    each submission, writable, which a scan would report as the CPU's writes, and after a scan protected them it faults
    every one of them in again (uma.c). vk_written_since can't tell there */
+static _Thread_local int t_wtx_in_check; /* the thread is in vk_written_since (wtx) */
 static int ww_scan_free(u64 a, u64 e) {
     int r = 0;
     while (a < e && !r) {
         u64 hi, lo = vk_uma_import_in(a, e, &hi);
-        if (lo > a) r = plat_ww_scan(GP(a), lo - a, ww_note);
+        if (lo > a) {
+            u64 t0 = wtx_ns();
+            r = plat_ww_scan(GP(a), lo - a, ww_note);
+            u64 d = wtx_ns() - t0;
+            wtx_add(WTX_SCAN_NS, d);
+            wtx_add(WTX_SCANS, 1);
+            if (t_wtx_in_check) wtx_add(WTX_CHECK_SCAN_NS, d);
+        }
         a = hi;
     }
     return r;
@@ -1347,6 +1373,7 @@ static void ww_publish(WwStage* st) {
             g_wres[n++] = st->r[i];
         else { /* full: the last range covers this one too */
             WwRange* w = &g_wres[WW_RES_N - 1];
+            wtx_add(WTX_FULL, 1);
             if (st->r[i].a < w->a) w->a = st->r[i].a;
             if (st->r[i].e > w->e) w->e = st->r[i].e;
         }
@@ -1499,6 +1526,7 @@ static void ww_scanner(void* arg) {
 }
 void vk_ww_new_epoch(void) {
     u32 e = __atomic_add_fetch(&g_ww_epoch, 1, __ATOMIC_RELEASE);
+    wtx_add(WTX_EPOCHS, 1);
     if (t_buffer.ww_streaming)
         t_buffer.ww_stream = e; /* a wait of the running job ended: what the CPU wrote before is its to see */
     if (__atomic_load_n(&g_wscan_on, __ATOMIC_ACQUIRE)) {
@@ -1582,7 +1610,17 @@ static void ww_take_peers(void) {
     for (int i = 0; i < n; i++) mem_alias_peers(g_wpeer.r[i].a, g_wpeer.r[i].e - g_wpeer.r[i].a, ww_peer_mark, NULL);
 }
 
+static int vk_written_since_(const u8* host, u64 len, u32 since);
 int vk_written_since(const u8* host, u64 len, u32 since) {
+    u64 t0 = wtx_ns();
+    t_wtx_in_check = 1;
+    int r = vk_written_since_(host, len, since);
+    t_wtx_in_check = 0;
+    wtx_add(WTX_CHECK_NS, wtx_ns() - t0);
+    wtx_add(WTX_CHECKS, 1);
+    return r;
+}
+static int vk_written_since_(const u8* host, u64 len, u32 since) {
     if (!g_ww || !host || !len) return -1;
     if (g_ww < 0) {
         g_ww = mem_ww_probe(ww_mark) == 0;
@@ -1649,23 +1687,34 @@ static int ww_cool_range(u64 a, u64 e) {
         while (!ww_claim(l)) plat_yield();
     t_buffer.wstage = &g_wstage_check;
     plat_ww_cool(GP(a), e - a, ww_note);
+    for (int i = 0; i < g_wstage_check.n; i++)
+        wtx_add(WTX_COOL_PAGES, (g_wstage_check.r[i].e - g_wstage_check.r[i].a) >> 12);
     ww_publish(&g_wstage_check);
     for (u64 l = lo; l <= hi; l++) __atomic_store_n(&g_wleaf_busy[l], 0, __ATOMIC_RELEASE);
     return 1;
 }
+static void vk_ww_cool_(const u8* host, u64 len);
 void vk_ww_cool(const u8* host, u64 len) {
+    u64 t0 = wtx_ns();
+    vk_ww_cool_(host, len);
+    wtx_add(WTX_COOL_NS, wtx_ns() - t0);
+    wtx_add(WTX_COOLS, 1);
+}
+static void vk_ww_cool_(const u8* host, u64 len) {
+    if (WTX_ENV("WTX_NOCOOL")) return; /* mutant: no cool step */
     if (g_ww <= 0 || !host || !len) return;
     u64 o = (u64)(host - g_mem);
     if (o >= AS_SIZE) return;
     if (len > AS_SIZE - o) len = AS_SIZE - o;
     int cooled = ww_cool_range(o, o + len);
-    if (mem_alias_any()) { /* a write through another address of the pages reads as one at these (ww_take_peers) */
+    if (mem_alias_any() && !WTX_ENV("WTX_COOL_NOPEERS")) { /* mutant: the target's own addresses only */ /* a write through another address of the pages reads as one at these (ww_take_peers) */
         WwPeers at;
         at.n = at.over = 0;
         mem_alias_peers(o, len, ww_peer_note, &at);
         for (int i = 0; i < at.n; i++) cooled |= ww_cool_range(at.r[i].a, at.r[i].e);
     }
     if (!cooled) return;
+    wtx_add(WTX_COOLED, 1);
     ww_take_scanned(); /* newer than every baseline before, and no newer than the one the caller takes next */
     ww_take_peers();
 }
@@ -2696,7 +2745,75 @@ void vk_buf_stats(u32* count, u64* bytes) {
 }
 
 /* buffers not read for twenty seconds, and in 120 presents, go */
+/* the wtx: line every 600 presents: each bucket's sum since the last line, the seconds it covers, the process's
+   getrusage, and the frame times of those presents (the time between two calls of vk_buf_frame) */
+#define WTX_FT_BINS 400 /* 0.5 ms each, to 200 ms; the last holds the rest */
+static struct {
+    u64 last[WTX_N], last_ns, frame_ns, ft_max;
+    u32 ft[WTX_FT_BINS], frames;
+    u64 ut, st, minflt, nivcsw;
+} g_wtxr;
+static double wtx_ft_pct(double q) {
+    u32 want = (u32)(q * g_wtxr.frames), seen = 0;
+    for (u32 b = 0; b < WTX_FT_BINS; b++)
+        if ((seen += g_wtxr.ft[b]) > want) return (b + 0.5) * 0.5;
+    return WTX_FT_BINS * 0.5;
+}
+static void wtx_report(void) {
+    static const char* const name[WTX_N] = {
+        "scan_ns", "scans", "scan_pages", "check_ns", "checks", "check_scan_ns", "hash_ns", "hash_bytes", "shash_ns",
+        "shash_bytes", "cmp_ns", "cmp_bytes", "upload_ns", "uploads", "upload_bytes", "trap_ns", "traps", "hot_pages",
+        "epochs", "stage_bytes", "stages", "fault_ns", "faults", "protect_ns", "protects", "cool_ns", "cools", "cooled",
+        "cool_pages", "unheld", "full"};
+    char line[2048];
+    int at = 0;
+    u64 now = wtx_ns();
+    if (g_wtxr.last_ns) {
+        u32 over33 = 0, over50 = 0;
+        for (u32 b = 67; b < WTX_FT_BINS; b++) over33 += g_wtxr.ft[b];
+        for (u32 b = 100; b < WTX_FT_BINS; b++) over50 += g_wtxr.ft[b];
+        at += snprintf(line, sizeof line, "secs=%.3f frames=%u ft_p50=%.2f ft_p90=%.2f ft_p99=%.2f ft_max=%.2f "
+                       "ft_over33=%u ft_over50=%u", (double)(now - g_wtxr.last_ns) / 1e9, g_wtxr.frames,
+                       wtx_ft_pct(0.5), wtx_ft_pct(0.9), wtx_ft_pct(0.99), (double)g_wtxr.ft_max / 1e6, over33, over50);
+        for (int k = 0; k < WTX_N && at < (int)sizeof line; k++) {
+            u64 v = __atomic_load_n(&g_wtx[k], __ATOMIC_RELAXED);
+            at += snprintf(line + at, sizeof line - (size_t)at, " %s=%llu", name[k],
+                           (unsigned long long)(v - g_wtxr.last[k]));
+        }
+        struct rusage ru;
+        if (!getrusage(RUSAGE_SELF, &ru) && at < (int)sizeof line) {
+            u64 ut = (u64)ru.ru_utime.tv_sec * 1000000 + (u64)ru.ru_utime.tv_usec,
+                st = (u64)ru.ru_stime.tv_sec * 1000000 + (u64)ru.ru_stime.tv_usec;
+            at += snprintf(line + at, sizeof line - (size_t)at, " utime_us=%llu stime_us=%llu minflt=%llu nivcsw=%llu",
+                           (unsigned long long)(ut - g_wtxr.ut), (unsigned long long)(st - g_wtxr.st),
+                           (unsigned long long)((u64)ru.ru_minflt - g_wtxr.minflt),
+                           (unsigned long long)((u64)ru.ru_nivcsw - g_wtxr.nivcsw));
+        }
+        LOG("wtx: %s\n", line);
+    }
+    struct rusage ru;
+    if (!getrusage(RUSAGE_SELF, &ru)) {
+        g_wtxr.ut = (u64)ru.ru_utime.tv_sec * 1000000 + (u64)ru.ru_utime.tv_usec;
+        g_wtxr.st = (u64)ru.ru_stime.tv_sec * 1000000 + (u64)ru.ru_stime.tv_usec;
+        g_wtxr.minflt = (u64)ru.ru_minflt;
+        g_wtxr.nivcsw = (u64)ru.ru_nivcsw;
+    }
+    for (int k = 0; k < WTX_N; k++) g_wtxr.last[k] = __atomic_load_n(&g_wtx[k], __ATOMIC_RELAXED);
+    g_wtxr.last_ns = now;
+    memset(g_wtxr.ft, 0, sizeof g_wtxr.ft);
+    g_wtxr.frames = 0;
+    g_wtxr.ft_max = 0;
+}
 void vk_buf_frame(void) {
+    u64 now = wtx_ns();
+    if (g_wtxr.frame_ns) {
+        u64 d = now - g_wtxr.frame_ns, b = d / 500000;
+        g_wtxr.ft[b < WTX_FT_BINS ? b : WTX_FT_BINS - 1]++;
+        g_wtxr.frames++;
+        if (d > g_wtxr.ft_max) g_wtxr.ft_max = d;
+    }
+    g_wtxr.frame_ns = now;
+    if (g_vk_present % 600 == 0) wtx_report();
     vk_uma_frame();
     if (g_vk_present % 4) return;
     if (copy_stats_on() && g_vk_present % 600 == 0) {

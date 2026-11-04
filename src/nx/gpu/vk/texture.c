@@ -5,6 +5,7 @@
    is smaller). Others are loaded from guest memory, staged as they are and deswizzled and converted on the GPU
    (vk/blocklinear.c, vk/texconv.c, vk/astc.c), and checked for changes now and then: often at first, rarely once
    they have stayed the same. */
+#include "nx/runtime/platform/wtx.h"
 #include "common/utilities/bits.h"
 #include "nx/gpu/texture/descriptor.h"
 #include <stdlib.h>
@@ -459,7 +460,11 @@ static int tex_upload_(Surf* t);
 /* a texture's upload as a profiler zone (SNX_TRACY builds) */
 static int tex_upload(Surf* t) {
     SNX_ZONE_V(z, "texture upload", t->size);
+    u64 t0 = wtx_ns();
     int r = tex_upload_(t);
+    wtx_add(WTX_UPLOAD_NS, wtx_ns() - t0);
+    wtx_add(WTX_UPLOADS, 1);
+    wtx_add(WTX_UPLOAD_BYTES, t->size);
     SNX_ZONE_END(z);
     return r;
 }
@@ -526,7 +531,14 @@ static int tex_upload_(Surf* t) {
 /* change checks: a hash of the whole texture, 4 KiB at a time, the same whichever way its bytes are reached (the
    sampled check for big long-stable textures is vk_sample_hash) */
 #define MEM_HASH_PIECE 4096u
+static u64 mem_hash_(u64 gva, u64 size);
 static u64 mem_hash(u64 gva, u64 size) {
+    u64 t0 = wtx_ns(), h = mem_hash_(gva, size);
+    wtx_add(WTX_HASH_NS, wtx_ns() - t0);
+    wtx_add(WTX_HASH_BYTES, size);
+    return h;
+}
+static u64 mem_hash_(u64 gva, u64 size) {
     u64 piece[MEM_HASH_PIECE / 8];
     u64 h = 1469598103934665603ull;
     /* bytes the GPU holds are trapped: they hash as their owner (vk_guest_peek), so the texture is read in pieces.

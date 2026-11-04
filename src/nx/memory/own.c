@@ -16,6 +16,7 @@
    lock wait for it (own_begin, every mapping change), so mem.c lands what it touches first (own_acquire). Nor may one
    holding the producer's lock, on an owned page (its landing needs the lock): own_fault ends the process with the
    address, as that is a bug in the runtime. Its fault on a page no entry is on any more goes on */
+#include "nx/runtime/platform/wtx.h"
 #include "common/utilities/bits.h"
 #include <stdlib.h>
 #include <string.h>
@@ -309,7 +310,14 @@ static void report_owned_fault(u64 a, int write, u32 tid, int fault_state) {
     plat_dump_fault_thread(tid);
 }
 
+static void own_fault_(u8* p, int write, u32 tid);
 static void own_fault(u8* p, int write, u32 tid) {
+    u64 t0 = wtx_ns();
+    own_fault_(p, write, tid);
+    wtx_add(WTX_TRAP_NS, wtx_ns() - t0);
+    wtx_add(WTX_TRAPS, 1);
+}
+static void own_fault_(u8* p, int write, u32 tid) {
     u64 a = (u64)(p - g_mem), page = a & ~(g_page - 1);
     if (p < g_mem || a >= AS_SIZE) { /* not the guest's memory: nothing of ours, let it go */
         plat_trap_continue(p, g_page);

@@ -6,6 +6,7 @@
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE /* REG_RIP, pipe2 */
 #endif
+#include "nx/runtime/platform/wtx.h"
 #include "nx/runtime/platform/plat.h"
 #include "nx/runtime/main.h"
 #include "nx/runtime/nce/nce.h"
@@ -870,7 +871,17 @@ static void* trap_signal_thread(void* arg) {
    goes again too. Only when it faults again at the same address with no page opened since is it not the
    tracking's (a page whose state is wrong, which must end the process rather than spin). A page that isn't mapped
    is never the tracking's */
+static int wp_fault_(void* a, int write);
 static int wp_fault(void* a, int write) {
+    u64 t0 = wtx_ns();
+    int r = wp_fault_(a, write);
+    if (r == 2) {
+        wtx_add(WTX_FAULT_NS, wtx_ns() - t0);
+        wtx_add(WTX_FAULTS, 1);
+    }
+    return r != 0;
+}
+static int wp_fault_(void* a, int write) {
     u8* w = __atomic_load_n(&g_wp, __ATOMIC_ACQUIRE);
     u64 i, page = (u64)1 << g_wp_shift;
     u8 s;
@@ -904,7 +915,7 @@ static int wp_fault(void* a, int write) {
     __atomic_fetch_sub(&g_wp_held, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_wp_opened, 1, __ATOMIC_SEQ_CST);
     wp_unlock(i, (u8)((s & WP_ARMED) | WP_MAPPED)); /* written, and writable */
-    return 1;
+    return 2; /* the tracking's fault (wtx) */
 }
 /* the locked written pages [i, i + n): reported, and held read only when the budget allows */
 static void wp_protect(u64 i, u64 n, void (*cb)(u8* p, u64 size)) {
@@ -914,14 +925,22 @@ static void wp_protect(u64 i, u64 n, void (*cb)(u8* p, u64 size)) {
     int shed = 0;
     for (k = i; k < i + n; k++)
         if (!(__atomic_load_n(&g_wp[k], __ATOMIC_RELAXED) & WP_PROT)) add++;
-    if (!wp_reserve(add))
+    u64 t0 = wtx_ns();
+    int bad = 0;
+    if (!wp_reserve(add)) {
         to = 0; /* left writable, and written: reported again by the next scan */
-    else if (mprotect(a, (size_t)len, PROT_READ | g_vm_exec)) {
+        wtx_add(WTX_UNHELD, n);
+    } else if ((bad = mprotect(a, (size_t)len, PROT_READ | g_vm_exec)) != 0) {
         /* it may have changed part of the run: held, but written, so a fault opens it and the next scan tries again */
         to = WP_MAPPED | WP_PROT;
         shed = errno == ENOMEM;
     } else
         to = WP_MAPPED | WP_PROT | WP_CLEAN;
+    if (to) {
+        wtx_add(WTX_PROTECT_NS, wtx_ns() - t0);
+        wtx_add(WTX_PROTECTS, 1);
+    }
+    (void)bad;
     for (k = i; k < i + n; k++) wp_unlock(k, to ? to : (u8)(__atomic_load_n(&g_wp[k], __ATOMIC_RELAXED) & ~WP_LOCK));
     cb(a, len);
     if (shed) wp_shed();
@@ -943,6 +962,7 @@ static int wp_scan(u8* p, u64 size, void (*cb)(u8* p, u64 size)) {
                 if (n) wp_protect(run, n, cb);
                 n = 0;
                 wp_unlock(i, s); /* hot: written, and left writable */
+                wtx_add(WTX_HOT_PAGES, 1);
                 cb(g_wp_base + (i << g_wp_shift), page);
                 continue;
             }

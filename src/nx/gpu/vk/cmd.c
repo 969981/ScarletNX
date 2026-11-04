@@ -6,6 +6,7 @@
    buffers), a ring its storage results are copied back into for the CPU, descriptor pools, and the resources to
    destroy once its work is done; none of them is reused before its last submission has finished. Ending a frame at a
    submit would reset them mid-draw, and wait for the GPU at every submit. */
+#include "nx/runtime/platform/wtx.h"
 #include <stdlib.h>
 #include <string.h>
 #include "nx/runtime/platform/log.h"
@@ -109,7 +110,14 @@ u64 vk_hash_copy(void* dst, const void* src, u64 size) {
     return h;
 }
 
+static u64 vk_sample_hash_(u64 gva, u64 len);
 u64 vk_sample_hash(u64 gva, u64 len) {
+    u64 t0 = wtx_ns(), h = vk_sample_hash_(gva, len);
+    wtx_add(WTX_SHASH_NS, wtx_ns() - t0);
+    wtx_add(WTX_SHASH_BYTES, len);
+    return h;
+}
+static u64 vk_sample_hash_(u64 gva, u64 len) {
     u8 tmp[2048 + 128];
     if (len <= sizeof tmp) {
         vk_guest_peek(gva, tmp, len);
@@ -498,6 +506,8 @@ u8* vk_stage(u64 size, u64 align, VkBuffer* buf, u64* off)
  * snapshots in host memory; stable buffers get their own device-local copies. */
 u8* vk_stage_upload(u64 size, u64 align, VkBuffer* buf, u64* off)
 {
+	wtx_add(WTX_STAGE_BYTES, size);
+	wtx_add(WTX_STAGES, 1);
 	return stage_alloc(size, align, buf, off, NULL, 0);
 }
 
