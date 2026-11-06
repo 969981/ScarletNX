@@ -1,0 +1,63 @@
+name: Sync ScarletNX upstream
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: scarletnx-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == '969981/ScarletNX'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout local main with history
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Merge upstream changes into main
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/scarletnx/ScarletNX.git
+          git fetch --no-tags upstream main
+          upstream_sha=$(git rev-parse upstream/main)
+          new_commits=$(git rev-list --count HEAD..upstream/main)
+          echo "Upstream: $upstream_sha, unseen commits: $new_commits"
+          if [ "$new_commits" -eq 0 ]; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo 'No new upstream commits.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Keep this repo's workflows and other custom commits. Never force-push.
+          # Conflicts intentionally fail the job rather than overwriting custom files.
+          git merge --no-ff -m "chore(sync): upstream $upstream_sha" upstream/main
+          git push origin HEAD:main
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch the existing upstream build matrix
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A push made using GITHUB_TOKEN does not start a new push workflow.
+          # Explicit workflow_dispatch runs Build and its full existing platform matrix.
+          gh workflow run build.yml --repo "$GITHUB_REPOSITORY" --ref main
+          echo 'Build dispatched; the separate publish workflow waits for its successful completion.'

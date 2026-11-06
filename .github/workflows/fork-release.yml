@@ -1,0 +1,74 @@
+name: Release successful upstream sync
+
+on:
+  workflow_run:
+    workflows: [Build]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: scarletnx-sync-release-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      github.repository == '969981/ScarletNX' &&
+      github.event.workflow_run.event == 'workflow_dispatch' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exactly the successfully built commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 1
+
+      - name: Verify sync provenance and deduplicate releases
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          subject=$(git log -1 --format=%s)
+          if [[ ! "$subject" =~ ^chore\(sync\):\ upstream\ ([0-9a-f]{40})$ ]]; then
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+            echo "Not a sync commit: $subject"
+            exit 0
+          fi
+          upstream_sha="${BASH_REMATCH[1]}"
+          tag="upstream-${upstream_sha:0:12}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+            echo "Already published $tag"
+            exit 0
+          fi
+          echo 'publish=true' >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Download, package and publish successful build artifacts
+        if: steps.plan.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_SHA: ${{ github.event.workflow_run.head_sha }}
+          BUILD_RUN: ${{ github.event.workflow_run.id }}
+          RELEASE_TAG: ${{ steps.plan.outputs.tag }}
+          UPSTREAM_SHA: ${{ steps.plan.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/fork-release.py --repo "$GITHUB_REPOSITORY" --run "$BUILD_RUN" --sha "$BUILD_SHA" --out release
+          notes=$(printf 'Automatically synchronized and built from [scarletnx/ScarletNX](https://github.com/scarletnx/ScarletNX).\n\n- Upstream commit: `%s`\n- Built commit: `%s`\n- [Build and test run](https://github.com/%s/actions/runs/%s)\n- Release assets include SHA256SUMS.txt for integrity checks.\n' "$UPSTREAM_SHA" "$BUILD_SHA" "$GITHUB_REPOSITORY" "$BUILD_RUN")
+          gh release create "$RELEASE_TAG" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$BUILD_SHA" \
+            --title "ScarletNX upstream ${UPSTREAM_SHA:0:12}" \
+            --notes "$notes" \
+            --prerelease
