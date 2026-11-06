@@ -40,6 +40,11 @@ static void usage(FILE* out) {
         "  -x, --extract   Extract only\n"
         "  -r, --recompile Recompile without playing\n"
         "  --model old|new The console to model (default old)\n"
+        "  --update FILE   An update of the game (a CIA of its update title, or a bare update NCCH) to play it with: the\n"
+        "                  update's code, ExHeader and RomFS are the game's, as an installed update's are. It is kept\n"
+        "                  in the game's .ini (update=) for its own copy of the runtime; a launch without it plays without one\n"
+        "  --dlc FILE      A DLC of the game (a CIA of its add-on title), given again for each one (at most 16): the game's\n"
+        "                  NCCH archive and am:app serve its contents. Kept in the game's .ini (dlc1=, dlc2=, ...)\n"
         "  --keys FILE     The 3DS AES keys, in Azahar's aes_keys.txt format, to decrypt an encrypted game\n"
         "                  with (default ~/.3ds/aes_keys.txt)\n"
         "  --repo DIR      The data folder (default: a portable copy's folder, else the user's data\n"
@@ -370,9 +375,56 @@ static bool read_game_ini(const char* folder, char** source, SnxCtrModel* model)
     free(path);
     return read;
 }
+#define MAX_DLC 16
+/* the DLC files (dlc1= to dlc16=) the game's .ini names, each the caller's; the count */
+static unsigned read_dlc_ini(const char* folder, char* dlc[MAX_DLC]) {
+    char *path = snx_ctr_game_file(folder, ".ini"), *key, *value;
+    size_t size;
+    char* text = path ? (char*)snx_read_file(path, &size) : NULL;
+    unsigned count = 0;
+    SnxIni ini;
+    if (text) snx_ini_start(&ini, text);
+    for (unsigned n = 1; n <= MAX_DLC && text; ++n) {
+        char name[8];
+        snprintf(name, sizeof name, "dlc%u", n);
+        snx_ini_start(&ini, text);
+        while (snx_ini_next(&ini, &key, &value))
+            if (!strcmp(key, name) && *value && count < MAX_DLC) dlc[count++] = snx_strdup(value);
+    }
+    free(text);
+    free(path);
+    return count;
+}
+static void free_dlc(char* dlc[MAX_DLC], unsigned count) {
+    for (unsigned i = 0; i < count; ++i) free(dlc[i]);
+}
+/* the DLC files laid beside the game, each named in the list; the first failure's result */
+static SnxCtrExtractResult add_dlc(SnxCtrSource* source, char* const dlc[MAX_DLC], unsigned count, char* error,
+                                   size_t error_size) {
+    SnxCtrExtractResult result = SNX_CTR_EXTRACT_OK;
+    for (unsigned i = 0; i < count && result == SNX_CTR_EXTRACT_OK; ++i)
+        result = snx_ctr_source_add_dlc(source, dlc[i], error, error_size);
+    return result;
+}
+/* the update (update=) the game's .ini names, the caller's; NULL without one */
+static char* read_update_ini(const char* folder) {
+    char *path = snx_ctr_game_file(folder, ".ini"), *key, *value, *update = NULL;
+    size_t size;
+    char* text = path ? (char*)snx_read_file(path, &size) : NULL;
+    SnxIni ini;
+    if (text) snx_ini_start(&ini, text);
+    while (text && snx_ini_next(&ini, &key, &value))
+        if (!strcmp(key, "update") && *value) {
+            free(update);
+            update = snx_strdup(value);
+        }
+    free(text);
+    free(path);
+    return update;
+}
 /* whether a line of the game's .ini sets one of the keys this file writes, which the new values replace */
 static bool game_ini_own_line(const char* line, size_t n) {
-    static const char* const keys[] = {"source", "model", "system"};
+    static const char* const keys[] = {"source", "model", "system", "update"};
     size_t i;
     while (n && (*line == ' ' || *line == '\t')) line++, n--;
     for (i = 0; i < sizeof keys / sizeof keys[0]; ++i) {
@@ -381,16 +433,40 @@ static bool game_ini_own_line(const char* line, size_t n) {
         for (at = k; at < n && (line[at] == ' ' || line[at] == '\t'); ++at) continue;
         if (at < n && line[at] == '=') return true;
     }
+    /* dlc1= to dlc16= */
+    if (n > 3 && !strncmp(line, "dlc", 3)) {
+        size_t at = 3;
+        while (at < n && line[at] >= '0' && line[at] <= '9') ++at;
+        while (at < n && (line[at] == ' ' || line[at] == '	')) ++at;
+        if (at > 3 && at < n && line[at] == '=') return true;
+    }
     return false;
+}
+/* text with the line key=value added; the old text is freed, NULL when the new one cannot be made */
+static char* ini_append(char* text, const char* key, const char* value) {
+    char* more = snx_format("%s%s=%s\n", text, key, value);
+    free(text);
+    return more;
 }
 /* The keys this file writes, as they are now. The game's .ini's other lines stay, so a setting a player added by hand is
    not lost when a game is played again */
-static bool write_game_ini(const char* folder, const char* source, SnxCtrModel model) {
+static bool write_game_ini(const char* folder, const char* source, const char* update, char* const dlc[MAX_DLC],
+                           unsigned dlc_count, SnxCtrModel model) {
     char *path = snx_ctr_game_file(folder, ".ini"), *full = snx_absolute(source);
     size_t size = 0, n = 0, tail_n = 0;
     char* old = path && full ? (char*)snx_read_file(path, &size) : NULL;
-    char* tail =
-        full ? snx_format("source=%s\nmodel=%s\nsystem=3ds\n", full, model == SNX_CTR_OLD ? "old" : "new") : NULL;
+    char* patch = update ? snx_absolute(update) : NULL;
+    char* tail = full && (!update || patch)
+                     ? snx_format("source=%s\nmodel=%s\nsystem=3ds\n", full, model == SNX_CTR_OLD ? "old" : "new")
+                     : NULL;
+    /* the update and each DLC follow the fixed keys, one line each */
+    if (tail && patch) tail = ini_append(tail, "update", patch);
+    for (unsigned i = 0; tail && i < dlc_count; ++i) {
+        char *abs = snx_absolute(dlc[i]), name[8];
+        snprintf(name, sizeof name, "dlc%u", i + 1);
+        tail = abs ? ini_append(tail, name, abs) : (free(tail), NULL);
+        free(abs);
+    }
     bool read = full && (!path || old || !snx_path_exists(path));
     char* text = read && tail ? (char*)snx_alloc(size + strlen(tail) + 2) : NULL;
     if (tail) tail_n = strlen(tail);
@@ -417,6 +493,7 @@ static bool write_game_ini(const char* folder, const char* source, SnxCtrModel m
     free(tail);
     free(text);
     free(old);
+    free(patch);
     free(full);
     free(path);
     return written;
@@ -461,7 +538,9 @@ int snx_ctr_main(int argc, char** argv) {
     SnxCtrModel model = SNX_CTR_OLD;
     const char *input = NULL, *output = NULL, *outdir = NULL, *repo = NULL, *keys = NULL, *game = NULL;
     bool info = false, positional = false, extract_only = false, recompile = false, budget_set = false;
-    bool extract_container = false, model_set = false;
+    bool extract_container = false, model_set = false, update_set = false;
+    const char *update = NULL, *dlc_given[MAX_DLC];
+    unsigned dlc_given_count = 0;
     uint64_t max_blocks = 0; /* no budget */
     double seconds = 0;      /* no time limit */
     uint32_t ipc_stubs = 0;  /* with ctr_auto_stub_ipc off, every unknown service command stops the run */
@@ -528,6 +607,21 @@ int snx_ctr_main(int argc, char** argv) {
                       stderr);
                 return 2;
             }
+        } else if (!positional && (!strcmp(arg, "--update") || !strncmp(arg, "--update=", 9))) {
+            update = arg[8] ? arg + 9 : ++i < argc ? argv[i] : NULL;
+            if (!update) {
+                fputs("scarletnx-3ds: --update requires a file\n", stderr);
+                return 2;
+            }
+            update_set = true;
+            if (!*update) update = NULL;
+        } else if (!positional && (!strcmp(arg, "--dlc") || !strncmp(arg, "--dlc=", 6))) {
+            const char* file = arg[5] ? arg + 6 : ++i < argc ? argv[i] : NULL;
+            if (!file || !*file || dlc_given_count == MAX_DLC) {
+                fprintf(stderr, "scarletnx-3ds: --dlc requires a file, at most %d times\n", MAX_DLC);
+                return 2;
+            }
+            dlc_given[dlc_given_count++] = file;
         } else if (!positional && !strcmp(arg, "--model")) {
             if (++i == argc || (strcmp(argv[i], "old") && strcmp(argv[i], "new"))) {
                 fputs("scarletnx-3ds: --model requires old or new\n", stderr);
@@ -570,7 +664,8 @@ int snx_ctr_main(int argc, char** argv) {
     /* the game's own copy of the runtime plays it, or --game= names it */
     char* folder = game ? snx_strdup(game) : input || info ? NULL : own_game(argv[0]);
     /* --ipc-stubs only changes a run: with an option that does not run the game it is a mistake to report */
-    if ((!input && !info && !folder) || (folder && (input || output || outdir || keys)) ||
+    if ((!input && !info && !folder) || (folder && (input || output || outdir || keys || update_set || dlc_given_count)) ||
+        ((update_set || dlc_given_count) && (info || extract_only || extract_container)) ||
         (info && (input || extract_only || extract_container || recompile || output || outdir || budget_set)) ||
         (extract_only && (budget_set || recompile)) || (recompile && budget_set) ||
         (ipc_stubs && (info || extract_only || recompile))) {
@@ -641,7 +736,17 @@ int snx_ctr_main(int argc, char** argv) {
                 }
                 named = readable;
             }
-            SnxCtrExtractResult opened = snx_ctr_source_open(named, &source, error, sizeof error);
+            char *patch = read_update_ini(folder), *dlc[MAX_DLC];
+            unsigned dlc_count = read_dlc_ini(folder, dlc);
+            SnxCtrExtractResult opened = patch ? snx_ctr_source_open_update(named, patch, &source, error, sizeof error)
+                                               : snx_ctr_source_open(named, &source, error, sizeof error);
+            if (opened == SNX_CTR_EXTRACT_OK) opened = add_dlc(source, dlc, dlc_count, error, sizeof error);
+            if (opened != SNX_CTR_EXTRACT_OK) {
+                snx_ctr_source_close(source);
+                source = NULL;
+            }
+            free_dlc(dlc, dlc_count);
+            free(patch);
             if (opened != SNX_CTR_EXTRACT_OK) {
                 fprintf(stderr, "scarletnx-3ds: %s\n", error);
                 free(runtime);
@@ -691,9 +796,45 @@ int snx_ctr_main(int argc, char** argv) {
         return decrypted;
     }
     printf("Reading %s\n", readable);
-    SnxCtrExtractResult opened = snx_ctr_source_open(readable, &source, error, sizeof error);
+    char* patch = NULL;
+    if (update) { /* its decrypted copy lies beside the game's, under a name of its own */
+        char* kept = snx_format("%s.update", output ? output : old);
+        int made = kept ? readable_game(update, kept, keys, &patch) : 1;
+        free(kept);
+        if (made) {
+            free(readable);
+            free(old);
+            free(runtime);
+            return made;
+        }
+        printf("Reading the update %s\n", patch);
+    }
+    char* dlc[MAX_DLC];
+    unsigned dlc_count = 0;
+    SnxCtrExtractResult opened = SNX_CTR_EXTRACT_OK;
+    for (unsigned i = 0; i < dlc_given_count && opened == SNX_CTR_EXTRACT_OK; ++i) {
+        /* each DLC's decrypted copy lies beside the game's, under a name of its own */
+        char* kept = snx_format("%s.dlc%u", output ? output : old, i + 1);
+        int made = kept ? readable_game(dlc_given[i], kept, keys, &dlc[dlc_count]) : 1;
+        free(kept);
+        if (made) { /* readable_game said why */
+            free_dlc(dlc, dlc_count);
+            free(patch);
+            free(readable);
+            free(old);
+            free(runtime);
+            return made;
+        }
+        printf("Reading the DLC %s\n", dlc[dlc_count++]);
+    }
+    opened = patch ? snx_ctr_source_open_update(readable, patch, &source, error, sizeof error)
+                   : snx_ctr_source_open(readable, &source, error, sizeof error);
+    if (opened == SNX_CTR_EXTRACT_OK) opened = add_dlc(source, dlc, dlc_count, error, sizeof error);
     if (opened != SNX_CTR_EXTRACT_OK) {
+        snx_ctr_source_close(source);
+        free_dlc(dlc, dlc_count);
         fprintf(stderr, "scarletnx-3ds: %s\n", error);
+        free(patch);
         free(readable);
         free(old);
         free(runtime);
@@ -722,15 +863,19 @@ int snx_ctr_main(int argc, char** argv) {
     bool made = folder && !extract_only && !snx_is_link(folder) && !snx_mkdirs(folder);
     /* the folder names the game the player picked, not the decrypted copy an encrypted one leaves in the cache: a
        launcher asks whether it already made a game from that dump, and the cache's path matches none */
-    if (!folder || (made && !write_game_ini(folder, input, model))) {
+    if (!folder || (made && !write_game_ini(folder, input, patch, dlc, dlc_count, model))) {
         snx_ctr_source_close(source);
+        free_dlc(dlc, dlc_count);
         free(folder);
+        free(patch);
         free(readable);
         free(runtime);
         return 1;
     }
     status = play(readable, source, folder, model, max_blocks, seconds, recompile, extract_only, extract_container,
                   ipc_stubs, runtime);
+    free_dlc(dlc, dlc_count);
+    free(patch);
     free(readable);
     free(runtime);
     return status;
