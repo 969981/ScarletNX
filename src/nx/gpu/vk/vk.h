@@ -46,6 +46,9 @@
 #define VK_FRAMES          2  /* frames in flight */
 #define VK_FRAME_RING_CAPS 4  /* a frame ends once it has written this many allocations to its rings (vk_frame_check) */
 #define VK_SC_MAX          16 /* swapchain images */
+/* a transfer bigger than one allocation (g_vk.alloc_cap) goes in parts of at most this share of it: the rows a band
+   or a readback part needs on both sides and in scratch fit the cap together (vk_band, surface.c) */
+#define VK_PART_SHARE      4
 
 typedef struct {
     VkInstance instance;
@@ -201,12 +204,15 @@ void vk_image_destroy(VkImage img, VmaAllocation mem);
    texels of the blocks the device binds 3D images of format f in, 0 when it can't. vk_image_create_resident: such an
    image of one level and one layer, in those blocks (block, which it is refused without), with none bound; destroyed
    with vk_image_destroy. vk_image_resident binds memory to its blocks whose want[] is set and releases it from the
-   others (n: all of them, x first, then y, then z), after the work recorded before, which it submits; *bytes gets the
-   memory bound. 0 when memory ran out or the bind failed: the blocks that got memory are bound, the others as they
-   were */
+   others (n: all of them, x first, then y, then z), after the work recorded before, which it submits; the commands
+   recorded after it see the new bindings, and the memory released goes once the GPU is done with it. *bytes gets the
+   memory bound. 0 when memory ran out: the blocks that got memory are bound, the others as they were */
 int vk_resident_block(VkFormat f, VkImageUsageFlags usage, VkExtent3D* block);
 int vk_image_create_resident(const VkImageCreateInfo* ii, const VkExtent3D* block, VkImage* img);
 int vk_image_resident(VkImage img, const u8* want, u32 n, u64* bytes);
+/* the sparse binds made since the last submission, to the graphics queue in one batch before it (cmd.c's submit). 1
+   when the submission has to wait for one, which *wait then holds */
+int vk_sparse_flush(VkSemaphoreSubmitInfo* wait);
 /* Tracy memory events for VMA allocations. */
 #if defined(SNX_TRACY)
 void vk_mem_track(VmaAllocation a);
@@ -311,6 +317,9 @@ void vk_stage_report(void);
    Either semaphore may be VK_NULL_HANDLE */
 void vk_submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSemaphore signal);
 void vk_submit_for_readback(void);
+/* the commands recorded since the last submission submitted, when a command buffer is begun: what a change of an
+   image's sparse binding has to follow (memory.c) */
+void vk_submit_recorded(void);
 /* the next submission waits for a timeline semaphore of someone else's (FFmpeg's picture's) at one value and signals
    it at another: whichever submit comes next takes them, so commands recorded from now on never run before the wait */
 void vk_submit_after(VkSemaphore sem, u64 wait, u64 signal);
@@ -414,10 +423,13 @@ void vk_rec_sync(void);       /* until everything queued is recorded and submitt
    once (vk_rec_sync), so fn would run after it: the caller is another thread */
 void vk_rec_run(void (*fn)(void*), void* arg);
 void vk_rec_queue(VkQueue q); /* before submitting to or presenting on q outside the ring (vk_lock) */
+/* fn with a copy of size bytes of arg (a quarter of the ring at most), on the recording thread in order with the
+   commands, submissions and presents queued around it (vk_lock); at once without that thread */
+void vk_rec_call(void (*fn)(const void* arg), const void* arg, u64 size);
 /* Around every call on the graphics or the compute queue: a submit, a sparse bind, a present, a device wait. Vulkan
    requires a queue's calls to be externally synchronized, and they come from more than one thread: the recording
-   thread submits and presents the frames (record.c) without vk_lock, which the GPU thread holds while it binds an
-   image's pieces (memory.c) or submits compute. A leaf lock: taken with vk_lock held or not, never the other way */
+   thread submits and presents the frames and binds sparse memory (record.c, memory.c) without vk_lock, which the GPU
+   thread holds while it submits compute. A leaf lock: taken with vk_lock held or not, never the other way */
 void vk_queue_lock(VkQueue q);
 void vk_queue_unlock(VkQueue q);
 /* presents image idx of sc once wait is signaled, in order after the submissions queued before it (vk_lock). The
@@ -967,7 +979,8 @@ void vk_astc_stats(u64* levels, u64* bytes, u64* rgba8_bytes);
 u64 vk_astc_rgba8_bytes(void);
 
 /* vic.c: the VIC composition as a compute shader, recorded in the frame's command buffer, its output planes
-   published (vk_own_publish): 1 when composed, 0 when the job exceeds the device (it is skipped). Takes vk_lock */
+   published (vk_own_publish): 1 when composed, 0 when rows of it could not be (said, with the bytes they lacked). A
+   job bigger than one buffer goes in bands of rows. Takes vk_lock */
 int vk_vic_compose(const VicJob* j);
 /* nvdec.c: an NVDEC picture into its surfaces on the GPU (gpu.h's NvdecPic): staged rows (chroma interleaved there)
    or a Vulkan Video picture's planes copied out of its image, both planes swizzled there, the surfaces published
@@ -975,14 +988,32 @@ int vk_vic_compose(const VicJob* j);
 int vk_nvdec_write(const NvdecPic* p);
 void* vk_nvdec_hw_device(void);
 /* dma.c: a launch of the DMA copy engine on the GPU (gpu.h's GpuDmaOp), its destination published: 1 when done, 0
-   past the device's limits (skipped). Takes vk_lock */
+   when it could not be (said, with the bytes it lacked). A launch bigger than one allocation goes in bands of lines.
+   Takes vk_lock. vk_dma_stats: the launches so far, the bands the big ones took, the bytes they read and wrote */
 int vk_dma_copy(const GpuDmaOp* o);
+void vk_dma_stats(u64* copies, u64* bands, u64* bytes);
+/* A transfer that may be more than one buffer can hold (cap: g_vk.alloc_cap, or less), taken in bands of lines: the
+   DMA's copies, the 2D engine's blits (blit.c), VIC's jobs (vic.c). need(user, y, n): the most bytes one of the
+   buffers of lines [y, y + n) takes. A band ends where its end, counted from base, is a multiple of unit (a block
+   linear side's rows of blocks) */
+typedef struct {
+    u64 cap;
+    u32 unit, base;
+    u64 (*need)(const void* user, u32 y, u32 n);
+    const void* user;
+} VkBands;
+/* the lines from y on (left of them) the next band takes: all of them when they are the first and fit the cap, else
+   as many as fit VK_PART_SHARE of it, at least a unit. *most: the bytes the band needs, more than the cap when even a
+   unit is */
+u32 vk_band(const VkBands* b, u32 y, u32 left, u64* most);
 /* memory for the DMA engine's copies of sources at submission, which the copy reads in place (Renderer.snap_alloc and
    snap_free, from any thread), and the bytes it holds */
 u8* vk_snap_alloc(u64 len, u64* id);
 void vk_snap_free(u64 id);
 u64 vk_snap_bytes(void);
-/* blit.c: a 2D blit from memory on the GPU (gpu.h's GpuBlit), its destination published: 1 when done. Takes vk_lock */
+/* blit.c: a 2D blit from memory on the GPU (gpu.h's GpuBlit), its destination published: 1 when done, 0 when rows of
+   it could not be (said, with the bytes they lacked). A blit bigger than one allocation goes in bands of rows. Takes
+   vk_lock */
 int vk_blit_mem(const GpuBlit* b);
 /* msaa.c: a multisampled surface's samples moved between its image and the guest's layout of them (sample i of pixel
    (x, y) at texel (x X + i % X, y Y + i / X) of a surface X by Y times its size, DS_MSAA_), through a single-sampled
@@ -1346,6 +1377,9 @@ void vk_pipeline_stats(u64* pipes, u64* hits, u64* make_ms, u64* wait_ms, u64* s
 void vk_tex_stats(u64* uploads, u64* bytes); /* texture uploads from guest memory so far, and their bytes */
 u64 vk_rt_made(void);                        /* render targets made so far */
 VkPipelineCache vk_pipeline_cache(void);     /* for pipelines made elsewhere (compute) */
+/* of vk_tex_stats' uploads, the ones of some blocks alone (texture.c tex_patch): the blocks of the pages that changed
+   since the last check, or that a texture with holes in its mapping has mapped */
+void vk_tex_partial_stats(u64* loads, u64* bytes);
 void vk_pipeline_save(int at_exit);
 VkShaderModule vk_module_spv(const u32* words, size_t count);
 VkShaderModule vk_module_spv_location(const u32* words, size_t count, u32 location);
