@@ -447,7 +447,7 @@ setting Controls scale
 setting Controls opacity
     key controls_opacity
     int 0 100
-    default 100
+    default 50
     label Opacity
     words #%
     step 10
@@ -455,11 +455,12 @@ setting Controls opacity
 setting Controls skin
     key controls_skin
     text 512
-    default
+    default line
     label Skin
     set vpad_skin_choose
-    help Their look: empty for the built-in one, yorha for ScarletNX's own, or the path of a RetroArch overlay's .cfg
-    help (the first of its pages not named portrait). The game's menu goes round the built-in look and ScarletNX's own
+    help Their look: line (white lines) or yorha, ScarletNX's own; empty for the built-in one; or the path of a RetroArch
+    help overlay's .cfg (of its pages not named portrait, the one with the most controls). The game's menu goes round the
+    help built-in look and ScarletNX's own
 setting Relative stick center
     key controls_rel_center
     int 0 1
@@ -1453,6 +1454,11 @@ setting Extract game container
     default off
     words on=On
     help Extract a dump's ExeFS and RomFS into its game's folder. Off, the game reads them from the dump
+setting Java home
+    key java_home
+    text 192
+    help The JDK, 21 or later, that Android apps run on: the folder that holds its lib/server (bin/server on Windows).
+    help Empty = the one the build found. Set, the launcher gives it to scarletnx-android as --java-home
 # SNX_TRACY_BEGIN
 setting Tracy capture
     key tracy_capture

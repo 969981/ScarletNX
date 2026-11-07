@@ -8,6 +8,7 @@ Generated modules include runtime ABI code. Game assets, keys and firmware are e
 | Component | License |
 | --- | --- |
 | FFmpeg | LGPL-2.1-or-later |
+| zlib 1.3.2 (in FFmpeg's PNG decoder and encoder, `cmake/dependencies.cmake`) | zlib |
 | libvpx's VP9 test vectors (the WebM project's test data, downloaded for the `nvdec_vp9_*` tests, not shipped) | BSD-3-Clause |
 | jsmolka's gba-tests (test ROMs, downloaded for the `agb_gba_*` tests, not shipped) | MIT |
 | hactool / ConvertUTF (`src/nx/runtime/driver/hactool`, with ScarletNX's changes) | ISC / Unicode license |
@@ -35,9 +36,13 @@ Generated modules include runtime ABI code. Game assets, keys and firmware are e
 | Tracy (the profiler client, built only with `SNX_TRACY`) | BSD-3-Clause |
 | ENet / zstd (an Eden room's connection and its datagrams, `src/common/network/net_room.c`) | MIT / BSD-3-Clause |
 | miniz 3.1.2 (the zip around the launcher's Share Log, `src/gui/logzip.c`) | MIT |
-| libdeflate 1.26 (every deflate: Share Log's, the Vita driver's VPKs and eboot segments) | MIT |
+| libdeflate 1.26 (every deflate: Share Log's, the Vita driver's VPKs and eboot segments, the Android driver's APKs) | MIT |
+| HarfBuzz 15.0.0 (the Android driver's text shaping, `src/android/hwui/text.c`) | MIT ("Old MIT") |
+| SQLite 3.54.1 (the Android driver's `android.database.sqlite`, `src/android/db/sqlite_jni.c`) | Public domain |
+| OpenJDK (the JVM that the Android driver loads at run time from the installed JDK, not shipped) | GPL-2.0 with the Classpath Exception |
 | libadrenotools / liblinkernsbypass (the GPU drivers a player adds on Android arm64, `cmake/adrenotools.cmake`) | BSD-2-Clause |
 | lunasvg / plutovg (the splash's SVGs and the user's picture) | MIT / MIT, with FreeType's rasterizer and stroker (FreeType License) and stb (MIT or public domain) |
+| The on-screen controls' line skin (`dist/controls/skins/line`), drawn for ScarletNX by `scripts/build-skins.py` after the look of libretro common-overlays' flat retropad (CC-BY-4.0; none of its files are used) | GPL-3.0-or-later |
 | The on-screen controls' yorha skin (`dist/controls/skins/yorha`), drawn for ScarletNX by `scripts/build-skins.py` in the launcher's `yorha` theme's colours and lines, with the menus' font (SeaBIOS `vgafont16`, below) | GPL-3.0-or-later |
 | GUI menu icons (`src/gui/icons.hex`), drawn after Lucide 1.61.0's (some derived from Feather) | GPL-3.0-or-later, after Lucide's ISC and Feather's MIT (in `src/gui/FONT-NOTICE.txt`) |
 | GUI VGA BIOS font (SeaBIOS `vgafont16`, originally Joseph Gil's font collection) | Public domain |
@@ -99,6 +104,8 @@ a source keep that source's copyright lines and license, most with the revision 
 | `tests/ipc_message.c` (the HIPC, CMIF and TIPC request builders) | libnx | ISC |
 | `src/common/utilities/gpu_driver.c`, `src/gui/gpu_driver.c`, `src/gui/gpu_driver_fetch.c` and `src/nx/runtime/platform/gpu_driver_load.c` (GPU driver packages: meta.json's fields and size, the zip checked before it is unpacked, the devices that load one, libadrenotools' call; Freedreno Settings' presets; Download Driver's repositories, their releases and the recommendation by Adreno model) | Eden and yuzu (`src/android/app/src/main/java/org/yuzu/yuzu_emu/utils/GpuDriverHelper.kt`, `GpuDriverMetadata.kt`, `NativeFreedrenoConfig.kt`, `fragments/DriverFetcherFragment.kt`, `jni/native.cpp`'s `InitializeGpuDriver` and `SupportsCustomDriver`), the model only | GPL-3.0-or-later, GPL-2.0-or-later |
 | `src/gui/i18n.c` (`snx_mo_lookup`, the reader of the menu's catalogs; notice in [`src/gui/MUSL-NOTICE.txt`](../src/gui/MUSL-NOTICE.txt)) | musl (`src/locale/__mo_lookup.c`) | MIT |
+| The files of `src/android/framework/` whose header names the Android Open Source Project (exception messages, and parts of method bodies) | The Android Open Source Project's source of the same classes, as the Android SDK's sources for API level 36 carry it | Apache 2.0 ([text](../dist/licenses/AOSP/LICENSE.txt), [notice](../dist/licenses/AOSP/NOTICE.txt)) |
+| `src/android/framework/org/xmlpull/v1/XmlPullParserException.java` (the message its constructor makes) | XmlPull's API (Stefan Haustein and Aleksander Slominski), as the Android Open Source Project carries it | Public domain |
 | `dist/controls/*.xml`, and `controls.png` made from them | yuzu's Android overlay, as Eden and rEden carry it | GPL-3.0-or-later |
 
 Dynarmic (0BSD) and its GPL-3.0-or-later fork were consulted for the recompiler's instruction semantics. No code was

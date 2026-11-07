@@ -2117,6 +2117,10 @@ msgid "Runs a GBA ROM on the emulated AGB board"
 msgstr ""
 
 #: src/gui/main.c
+msgid "Runs an Android app's .apk, .xapk or .apks"
+msgstr ""
+
+#: src/gui/main.c
 msgid "Installs prod.keys, which games are extracted with"
 msgstr "Instala o prod.keys, com o qual os jogos são extraídos"
 
@@ -2173,6 +2177,10 @@ msgstr ""
 
 #: src/gui/main.c
 msgid "GBA ROM, played with scarletnx-agb"
+msgstr ""
+
+#: src/gui/main.c
+msgid "Android app, run with scarletnx-android"
 msgstr ""
 
 #: src/gui/main.c
@@ -4209,6 +4217,10 @@ msgid "R recompiles games: a Linux program runs as it is."
 msgstr ""
 
 #: src/gui/main.c
+msgid "R recompiles games: an Android app runs as it is."
+msgstr ""
+
+#: src/gui/main.c
 msgid "No game in focus to play."
 msgstr "Nenhum jogo em foco para jogar."
 
@@ -5197,6 +5209,10 @@ msgid "Load GBA ROM"
 msgstr ""
 
 #: src/gui/ui.txt
+msgid "Load Android APK/XAPK"
+msgstr ""
+
+#: src/gui/ui.txt
 msgid "Install Keys"
 msgstr ""
 
@@ -5443,6 +5459,14 @@ msgstr ""
 #: src/nx/runtime/settings.txt
 msgid "Extract a dump's ExeFS and RomFS into its game's folder. Off, the game reads them from the dump"
 msgstr "Extrai a ExeFS e a RomFS de um dump para a pasta do jogo. Desligado, o jogo as lê do dump"
+
+#: src/nx/runtime/settings.txt
+msgid "Java home"
+msgstr ""
+
+#: src/nx/runtime/settings.txt
+msgid "The JDK, 21 or later, that Android apps run on: the folder that holds its lib/server (bin/server on Windows). Empty = the one the build found. Set, the launcher gives it to scarletnx-android as --java-home"
+msgstr ""
 
 #: src/nx/runtime/settings.txt
 msgid "Tracy capture"

@@ -17,6 +17,7 @@
 #include "common/utilities/state_header.h"
 #include "common/utilities/demangle.h"
 #include "common/utilities/logscan.h"
+#include "common/utilities/run_mark.h"
 #include "gui/aot.h"
 #include "gui/browser.h"
 #include "gui/editor.h"
@@ -349,6 +350,7 @@ typedef struct App {
     bool recent_unsaved;        /* the list could not be written the last time it changed: the message says so */
     Uint64 clock;               /* fixed time for tests; 0 is the real clock */
     Uint64 fade_ms, leaving_ms; /* a screen fading in from black since; the run fading out since */
+    Uint64 run_started_ms;      /* the menu's run started, for its end's line in the log (run_said) */
     Uint64 entering_ms;         /* the menu fading out since, before a run fades in */
     char* self;    /* the program that runs Switch inputs: the runtime the menu is part of, NULL to look for one */
     char* drivers; /* the folder the other drivers are looked for in first */
@@ -767,6 +769,7 @@ typedef char gui_entries_in_order[GUI_ENTRY(GUI_LINUX) == UI_MENU_ENTRIES_LOAD_L
                                           GUI_ENTRY(GUI_3DS) == UI_MENU_ENTRIES_LOAD_3DS_GAME &&
                                           GUI_ENTRY(GUI_VITA) == UI_MENU_ENTRIES_LOAD_VITA_VPK &&
                                           GUI_ENTRY(GUI_GBA) == UI_MENU_ENTRIES_LOAD_GBA_ROM &&
+                                          GUI_ENTRY(GUI_ANDROID) == UI_MENU_ENTRIES_LOAD_ANDROID_APK_XAPK &&
                                           GUI_ENTRY(GUI_KEYS) == UI_MENU_ENTRIES_INSTALL_KEYS &&
                                           GUI_ENTRY(GUI_SETTINGS) == UI_MENU_ENTRIES_SETTINGS &&
                                           GUI_ENTRY(GUI_LOG) == UI_MENU_ENTRIES_SHARE_LOG &&
@@ -1734,9 +1737,12 @@ static void recent_note(App* app) {
         memmove(at, at + cut, strlen(at + cut) + 1);
     }
 }
-/* a recent game Games shows: a game made, or a Linux program, which runs as it is. A dump not made yet stays in the
-   list, so that its game takes its place once made (recent_as_games), but is not shown: opening it would recompile it */
-static bool recent_game(const GuiRecentGame* r) { return r->prepared || r->driver == GUI_LINUX; }
+/* a load whose file runs as it is, with no game made of it: a Linux program, an Android app */
+static bool runs_as_is(int driver) { return driver == GUI_LINUX || driver == GUI_ANDROID; }
+/* a recent game Games shows: a game made, or a Linux program or an Android app, which runs as it is. A dump not made
+   yet stays in the list, so that its game takes its place once made (recent_as_games), but is not shown: opening it
+   would recompile it */
+static bool recent_game(const GuiRecentGame* r) { return r->prepared || runs_as_is(r->driver); }
 static int recent_games(const App* app) {
     int n = 0;
     for (int i = 0; i < app->recent.count; ++i) n += recent_game(&app->recent.game[i]);
@@ -3527,6 +3533,80 @@ static void settings_text(const App* app, const char* key, char* out, size_t out
     value = gui_settings_value(&app->settings, key);
     snprintf(out, out_size, "%s", value ? value : "");
 }
+/* Debug's Log level at 2: the launcher logs more of what the system does to the app too, as a phone's runs have no
+   console to watch: each run's start and end (run_said); thermal and power changes on iOS, macOS and Android; the
+   document picker's steps and the app's lifecycle on the Apple apps */
+static int debug_log(const App* app) {
+    char level[16];
+    settings_text(app, "log", level, sizeof level);
+    return SDL_atoi(level) >= 2;
+}
+/* the data folder's disk, no path: "N MiB free of M MiB", or why that is unknown */
+static void disk_room(const App* app, char* out, size_t size) {
+    SnxU64 room = 0, all = 0;
+    char why[256];
+    if (!app->data_dir)
+        snprintf(out, size, "unknown, with no data folder");
+    else if (snx_disk_room(app->data_dir, &room, &all))
+        snprintf(out, size, "unknown, %s", snx_os_error(why, sizeof why));
+    else
+        snprintf(out, size, "%llu MiB free of %llu MiB", (unsigned long long)(room >> 20),
+                 (unsigned long long)(all >> 20));
+}
+/* a run's or a recompile's line in the launcher log (debug_log): what happened to it, its time once it ended
+   (started_ms, 0 for a start), and the data folder's disk then, which a recompile uses up */
+static void run_said(const App* app, const char* kind, const char* what, Uint64 started_ms) {
+    char ended[64] = {0}, disk[128];
+    if (started_ms) snprintf(ended, sizeof ended, ", after %.1f s", (double)(now_ms(app) - started_ms) / 1000);
+    disk_room(app, disk, sizeof disk);
+    gui_log("%s: %s%s; disk: %s", kind, what, ended, disk);
+#ifdef SDL_PLATFORM_IOS
+    char stats[512];
+    gui_apple_stats(stats, sizeof stats); /* the app's memory then: a recompile runs in its process */
+    gui_log("%s: %s", kind, stats);
+#endif
+}
+/* an end's what for run_said, with its status */
+static const char* run_ended(char* out, size_t size, bool aborted, int status) {
+    snprintf(out, size, "%s, status %d", aborted ? "aborted" : "ended", status);
+    return out;
+}
+#ifdef SDL_PLATFORM_APPLE
+/* the data folder's dumps/, keys/ and recompiled/ in the launcher log (debug_log): what the app finds there, its names
+   and sizes. A key file's name and size only, never what it holds */
+static void data_folders_log(const App* app) {
+    static const char* const names[] = {"dumps", "keys", "recompiled"};
+    for (size_t f = 0; app->data_dir && f < SDL_arraysize(names); ++f) {
+        char* dir = snx_path_join(app->data_dir, names[f]);
+        char** list = NULL;
+        size_t n = 0;
+        if (!dir || snx_list_dir(dir, &list, &n)) {
+            gui_log("folders: %s/ cannot be listed", names[f]);
+            free(dir);
+            continue;
+        }
+        char shown[SNX_PATH_SIZE];
+        snx_home_short(dir, shown, sizeof shown);
+        gui_log("folders: %s holds %zu", shown, n);
+        for (size_t i = 0; i < n && i < 64; ++i) { /* shortcut: 64 entries a folder, raise it when a log needs more */
+            char* path = snx_path_join(dir, list[i]);
+            if (path && snx_is_dir(path))
+                gui_log("  %s/", list[i]);
+            else
+                gui_log("  %s, %llu MiB", list[i], path ? (unsigned long long)(snx_file_size(path) >> 20) : 0ull);
+            free(path);
+        }
+        if (n > 64) gui_log("  and %zu more", n - 64);
+        snx_free_strings(list, n);
+        free(dir);
+    }
+    for (int i = 0; i < app->folder_count; ++i) {
+        char shown[SNX_PATH_SIZE];
+        snx_home_short(app->folders[i], shown, sizeof shown);
+        gui_log("folders: also listed %s", shown);
+    }
+}
+#endif
 /* Settings' user, by its uid (user_uid), as users.ini lists them: its number, 0 for a uid no user has; without one
    the deprecated user's number, else 1 */
 static int settings_user(const App* app) {
@@ -5189,7 +5269,8 @@ static void addons_pick(App* app, int row) {
     else
         SDL_ShowOpenFileDialog(folder_picked, &app->addon_picked, app->window, &app->cheats_filter, 1, NULL, false);
 #elif defined(SDL_PLATFORM_IOS) /* nor any picker there: the document picker (dist/apple), which takes no filter */
-    opened = gui_apple_pick(app->window, folder, folder_picked, &app->addon_picked, why, sizeof why) != 0;
+    opened =
+        gui_apple_pick(app->window, folder, folder_picked, &app->addon_picked, debug_log(app), why, sizeof why) != 0;
 #else
     /* its answer comes as an event even when it cannot open, which says why */
     if (folder)
@@ -6266,8 +6347,9 @@ static const char* item_about(const App* app, int item) {
                                         SNX_TR_NOOP("Runs a Linux ARM program, 64 or 32-bit"),
                                         SNX_TR_NOOP("Recompiles a 3DS game, then runs it"),
                                         SNX_TR_NOOP("Recompiles a PS Vita homebrew .vpk, then runs it"),
-                                        SNX_TR_NOOP("Runs a GBA ROM on the emulated AGB board")};
-    if (item >= GUI_SWITCH && item <= GUI_GBA) return snx_tr(loads[item - GUI_SWITCH]);
+                                        SNX_TR_NOOP("Runs a GBA ROM on the emulated AGB board"),
+                                        SNX_TR_NOOP("Runs an Android app's .apk, .xapk or .apks")};
+    if (item >= GUI_SWITCH && item <= GUI_ANDROID) return snx_tr(loads[item - GUI_SWITCH]);
     if (item == GUI_KEYS) return snx_tr("Installs prod.keys, which games are extracted with");
     if (item == GUI_EXIT) return snx_tr("Closes ScarletNX");
     {
@@ -6327,7 +6409,7 @@ unsigned ui_menu_entries_attr_cb(App* app, size_t row) {
         free(in_use);
     }
     if (row == GUI_LOG && app->log_due) attr |= UI_ATTR_FAILURE | UI_ATTR_BLINK;
-    if (row <= GUI_GBA && (loads_off(app) >> row & 1u)) attr |= UI_ATTR_OFF;
+    if (row <= GUI_ANDROID && (loads_off(app) >> row & 1u)) attr |= UI_ATTR_OFF;
     return attr;
 }
 static void draw_menu(App* app) {
@@ -6709,8 +6791,10 @@ void ui_games_grid_tiles_row_action_cb(App* app, size_t row, uint32_t hit) {
 /* the focused row of Games: what it is, about it, and a line more for a recent game's or a game's kind */
 static bool game_was_old(const App* app, const char* path);
 static int row_driver(const GuiGames* games, size_t i);
-/* a 3DS game, a Vita VPK or a GBA ROM: a console's package its driver makes a game of */
-static bool package(const char* name) { return gui_is_cia(name) || gui_is_vpk(name) || gui_is_gba(name); }
+/* a 3DS game, a Vita VPK, a GBA ROM or an Android app: a package its driver makes a game of, or runs as it is */
+static bool package(const char* name) {
+    return gui_is_cia(name) || gui_is_vpk(name) || gui_is_gba(name) || gui_is_apk(name);
+}
 /* a made game's kind, by the console its folder says */
 static const char* ready_kind(int driver) {
     return driver == GUI_3DS    ? snx_tr("3DS game, ready to run")
@@ -6737,6 +6821,7 @@ static void game_kind(const App* app, const GuiGames* games, size_t i, char* kin
                  gui_is_cia(name)    ? snx_tr("3DS game, opened with scarletnx-3ds")
                  : gui_is_vpk(name)  ? snx_tr("Vita VPK, opened with scarletnx-vita")
                  : gui_is_gba(name)  ? snx_tr("GBA ROM, played with scarletnx-agb")
+                 : gui_is_apk(name)  ? snx_tr("Android app, run with scarletnx-android")
                  : gui_is_dump(name) ? snx_tr("A dump, prepared when it runs")
                                      /* Games' own rows by what list_games read, another list's from its folder */
                                      : ready_kind(games == &app->games ? app->games_drivers[i] : row_driver(games, i)));
@@ -6755,9 +6840,11 @@ static void recent_kind(const App* app, const GuiRecentGame* r, char* kind, size
             game_kind(app, &app->games, i, kind, size);
             return;
         }
-    /* shown, it is a game made or a Linux program (recent_game) */
+    /* shown, it is a game made, a Linux program or an Android app (recent_game) */
     snprintf(kind, size, "%s",
-             r->driver == GUI_LINUX ? snx_tr("Linux ARM ELF, run with scarletnx-gnuabi") : ready_kind(r->driver));
+             r->driver == GUI_LINUX     ? snx_tr("Linux ARM ELF, run with scarletnx-gnuabi")
+             : r->driver == GUI_ANDROID ? snx_tr("Android app, run with scarletnx-android")
+                                        : ready_kind(r->driver));
 }
 static const char* games_focus(App* app, const GuiGamesBoxes* g, const char** about, char* kind, size_t size) {
     size_t selected = app->browser.selected, head = app->browser.head;
@@ -7284,7 +7371,7 @@ static unsigned drivers_held(void) {
     return gui_drivers_held(SNX_GUI_PROGRAM_DRIVERS);
 #else
     unsigned held = 0;
-    for (int item = GUI_SWITCH; item <= GUI_GBA; ++item)
+    for (int item = GUI_SWITCH; item <= GUI_ANDROID; ++item)
         if (snx_menu_has_driver && snx_menu_has_driver(gui_driver_name(item))) held |= 1u << item;
     return held;
 #endif
@@ -7345,7 +7432,7 @@ static unsigned loads_off(App* app) {
     Uint64 now = SDL_GetTicks();
     if (app->loads_at && key == app->loads_key && now - app->loads_at < 1000) return app->loads_off;
     app->loads_off = 0;
-    for (int item = GUI_SWITCH; item <= GUI_GBA; ++item)
+    for (int item = GUI_SWITCH; item <= GUI_ANDROID; ++item)
         if (!driver_there(app, item)) app->loads_off |= 1u << item;
     app->loads_key = key;
     app->loads_at = SDL_max(now, 1);
@@ -7971,7 +8058,7 @@ static void folder_answer(App* app, bool taken, bool deep) {
         snprintf(app->editor.note, sizeof app->editor.note, "%s", snx_tr("Not added"));
     free(path);
 }
-/* the system's folder picker answers on its own thread, as the file picker */
+/* a system picker answers on its own thread: its choice comes back to event() as an event of the type at userdata */
 static void SDLCALL folder_picked(void* userdata, const char* const* files, int filter) {
     SDL_Event e;
     (void)filter;
@@ -8228,19 +8315,20 @@ static int folder_entry_row(const App* app, int e, int* group) {
 /* the key Folders' focused row takes, in parts, when it does something there: a place picks another, and one picked
    goes back to its default; an Extra is taken off; Add a folder adds one; Reset to Defaults resets a place picked.
    How many (0 or 1, 2 for a place picked) */
-/* Games' focused row a game's of any console (a recent run's or a listed one's; a heading none, a Linux program none),
-   which R recompiles; *mods when it is a made Switch game, whose mods M opens */
+/* Games' focused row a game's of any console (a recent run's or a listed one's; a heading none, a Linux program or an
+   Android app none), which R recompiles; *mods when it is a made Switch game, whose mods M opens */
 static bool games_game_focus(const App* app, bool* mods) {
     size_t row = app->browser.selected, head = app->browser.head;
     size_t index = app->browser.page * app->browser.page_size + row - head;
     *mods = false;
     if (row < head && (int)row < recent_shown(app)) {
         const GuiRecentGame* r = &app->recent.game[recent_index(app, (int)row)];
-        if (r->driver == GUI_LINUX) return false;
+        if (runs_as_is(r->driver)) return false;
         *mods = r->driver == GUI_SWITCH && !gui_is_dump(r->path);
         return true;
     }
     if (row < head || index >= app->games.count || gui_games_heading(&app->games, index)) return false;
+    if (gui_is_apk(app->games.names[index])) return false;
     *mods = !gui_is_dump(app->games.names[index]) && app->games_drivers[index] == GUI_SWITCH;
     return true;
 }
@@ -8381,6 +8469,51 @@ static int places_keep(App* app, char* const* before, char* note, size_t size) {
              app->app_file);
     return 1;
 }
+/* the launcher log's folder, where its start's mark is too (run_mark.h): logs/ of iOS's Documents, which the Files app
+   shows (gui_apple_start made it), else the state folder (Folders' Logs). Owned; NULL when there is none */
+static char* log_folder(const App* app) {
+#ifdef SDL_PLATFORM_IOS
+    char *documents = SDL_GetCurrentDirectory(), *logs = documents ? snx_path_join(documents, "logs") : NULL;
+    (void)app;
+    SDL_free(documents);
+    return logs;
+#else
+    return menu_folder(app, SNX_USER_STATE, true);
+#endif
+}
+/* a start of the launcher that did not end with an exit (run_mark.h), in its log, with what the system says of it */
+static void mark_said(void* data, const SnxRunMark* mark) {
+#ifdef SDL_PLATFORM_ANDROID
+    char* cause = gui_android_exit_reason(mark->pid, mark->started);
+#elif defined(SDL_PLATFORM_IOS)
+    const char* cause = "the system ended it: a crash, its memory limit (jetsam), or a close from the app switcher";
+#else
+    const char* cause = "a crash, a kill (by the system for its memory, or by the user) or a power loss, which the "
+                        "system does not name";
+#endif
+    *(bool*)data = true;
+    if (!mark->text)
+        gui_log("last start: pid %lld, unknown whether it ended with an exit: %s", mark->pid, mark->left);
+    else
+        gui_log("last start: %s did not end with an exit: %s", mark->text[0] ? mark->text : "a mark with no text",
+                cause);
+    if (mark->text && mark->left) gui_log("last start: %s, so the next start says it again", mark->left);
+#ifdef SDL_PLATFORM_ANDROID
+    free(cause);
+#endif
+}
+/* this launcher's start's mark (run_mark.h) in its log's folder, after each start that left its own there unended is
+   said; moving it, from the folder Logs was before */
+static void mark_start(const App* app, bool moving) {
+    char *folder = log_folder(app), why[1024];
+    bool any = false;
+    snx_run_mark_end();
+    if (!folder || snx_run_mark_start(folder, mark_said, &any, why, sizeof why) < 0)
+        gui_log("start mark: %s: the next start cannot tell whether this one ended with an exit",
+                folder ? why : "no log folder");
+    if (!any && !moving) gui_log("last start: ended with an exit, or none before");
+    free(folder);
+}
 #define GUI_RUN_LOGS 8 /* launchers open at once on one Logs folder, each with run logs of its own */
 /* the run logs of the Logs folder in use, made as the menu opens it (open_files) and as Folders' Logs changes: the
    first pair no other launcher holds, last-run.log and last-recompile.log, else last-run-2.log and last-recompile-2.log
@@ -8391,6 +8524,7 @@ static void run_log_follow(App* app) {
     if (!state) return;
 #ifndef SDL_PLATFORM_IOS /* there in Documents' logs/, which the Files app shows (initialize) */
     if (!app->look_only) gui_log_folder(state);
+    if (!app->look_only && snx_run_mark_held()) mark_start(app, true); /* Logs changed: the mark goes with the log */
 #endif
     if (app->run_locked) snx_unlock_file(app->run_lock);
     app->run_locked = false;
@@ -8742,7 +8876,7 @@ static void recent_as_games(App* app) {
     for (i = app->recent.count - 1; i >= 0; --i) { /* from the oldest: an entry dropped moves none still to look at */
         const GuiRecentGame* r = &app->recent.game[i];
         char* own = r->driver == GUI_SWITCH && r->prepared ? addon_game(r->path) : NULL;
-        const char* program = own ? own : r->driver != GUI_LINUX && !r->prepared ? made_program(&made, r->path) : NULL;
+        const char* program = own ? own : !runs_as_is(r->driver) && !r->prepared ? made_program(&made, r->path) : NULL;
         if (!program && r->driver == GUI_SWITCH && !r->prepared) { /* the games' add-ons read once, when one is asked */
             if (!addons_read) made_list(app, &addons, true);
             addons_read = true;
@@ -8820,7 +8954,7 @@ static void open_folder_picker(App* app) {
 #elif defined(SDL_PLATFORM_IOS)
     { /* nor there: the document picker (dist/apple) */
         char message[sizeof app->editor.note - 40];
-        if (gui_apple_pick(app->window, 1, folder_picked, &app->picked_folder, message, sizeof message))
+        if (gui_apple_pick(app->window, 1, folder_picked, &app->picked_folder, debug_log(app), message, sizeof message))
             ;
         else if (app->editing) {
             snprintf(app->editor.note, sizeof app->editor.note, snx_tr("The folder picker could not open: %s"),
@@ -9283,7 +9417,7 @@ static void driver_pick(App* app) {
         return;
     }
 #ifdef SDL_PLATFORM_IOS
-    opened = gui_apple_pick(app->window, 0, folder_picked, &app->driver_picked, why, sizeof why) != 0;
+    opened = gui_apple_pick(app->window, 0, folder_picked, &app->driver_picked, debug_log(app), why, sizeof why) != 0;
 #else
     SDL_ShowOpenFileDialog(folder_picked, &app->driver_picked, app->window, &app->driver_filter, 1, NULL, false);
 #endif
@@ -12981,6 +13115,9 @@ static int play_as(App* app, const char* asked, bool next) {
     SDL_GetCurrentTime(&app->played_at);
     ok = gui_android_play(argv, app->message, sizeof(app->message));
     if (ok) app->playing = true; /* the queue's recompile goes gently until the menu shows again */
+    app->run_started_ms = SDL_max(now_ms(app), 1);
+    if (debug_log(app))
+        run_said(app, "run", ok ? "starts in the game's activity, a process of its own" : app->message, 0);
     if (ok) {
         free(app->played_game);
         app->played_game = snx_strdup(game);
@@ -13048,6 +13185,11 @@ static void game_end(App* app) {
         snprintf(what, sizeof what, snx_tr("the game wrote no log since it started; the newest is %s"), log);
     else
         end = gui_log_game_end(log, what, sizeof what, lines, sizeof lines);
+    if (debug_log(app)) { /* its status is the game's process's, which this one is not the parent of */
+        char said[sizeof what + 32];
+        snprintf(said, sizeof said, "ended, %s: %s", end >= 0 ? "its log says" : "its log unread", what);
+        run_said(app, "run", said, app->run_started_ms);
+    }
     if (end == SNX_LOG_NONE) {
         free(log);
         return;
@@ -13123,6 +13265,7 @@ static int play(App* app, const char* asked) {
     if (driver) argv[n++] = driver;
     if (freedreno) argv[n++] = freedreno;
     argv[n] = NULL;
+    if (debug_log(app)) run_said(app, "run", "starts in this process once the menu closes", 0);
     gui_apple_play(argv);
     free(driver);
     free(freedreno);
@@ -13638,6 +13781,10 @@ static void pump(App* app) {
         int status;
         if (gui_process_finished(app->process, &status)) {
             app->menu.running = false;
+            if (debug_log(app)) {
+                char what[64];
+                run_said(app, "run", run_ended(what, sizeof what, app->aborting, status), app->run_started_ms);
+            }
             /* Normal exits wait for acknowledgement. ESC already acknowledged
                an abort, so return straight to the menu after nonblocking reaping. */
             app->finished = !app->aborting;
@@ -14197,7 +14344,7 @@ static void launch(App* app, char* absolute, bool prepared) {
 #endif
     /* a dump, package or ROM a game was made from already: played or recompiled, as the player answers (made_answer;
        DraVee, 2026-10-24) */
-    if (!app->recompile && !app->made_ok && !prepared && app->menu.selected != GUI_LINUX && made_from(app, absolute)) {
+    if (!app->recompile && !app->made_ok && !prepared && !runs_as_is(app->menu.selected) && made_from(app, absolute)) {
         made_ask(app, absolute);
         return;
     }
@@ -14205,7 +14352,7 @@ static void launch(App* app, char* absolute, bool prepared) {
        does: the Compile tab shows it, and it plays once it ended if the tab still shows it (job_play). So does a Switch
        game another build made, which its driver would recompile on the run's screen: its program opened (the one it
        plays, run_program), or its dump with Play answered */
-    bool compile = !app->recompile && !prepared && app->menu.selected != GUI_LINUX && !made_from(app, absolute);
+    bool compile = !app->recompile && !prepared && !runs_as_is(app->menu.selected) && !made_from(app, absolute);
 #ifndef SDL_PLATFORM_IOS /* the games there are packs the app loads, with no stamp */
     if (!compile && !app->recompile && !app->compiled && prepared && app->menu.selected == GUI_SWITCH &&
         gui_game_folder(absolute)) {
@@ -14322,6 +14469,7 @@ static void launch(App* app, char* absolute, bool prepared) {
     }
     if (make) argv[n++] = "-r";
     if (!direct) argv[n++] = game_option ? game_option : run ? run : absolute;
+    if (app->menu.selected == GUI_ANDROID) n += gui_settings_java_home(s, argv + n);
     /* Switch options only, never guest argv for the CPU-only Linux driver or the 3DS one; R's recompile takes no
        option of a run but the game's settings it recompiles with (NCE). The drivers work in the menu's data folder,
        so they list the same games */
@@ -14402,6 +14550,8 @@ static void launch(App* app, char* absolute, bool prepared) {
     icons_wait(app); /* the one driver thread, a dump's icon's first */
 #endif
     bool started = gui_process_start(app->process, argv, app->message, sizeof(app->message));
+    app->run_started_ms = SDL_max(now_ms(app), 1);
+    if (debug_log(app)) run_said(app, "run", started ? "starts" : app->message, 0);
     if (started && app->run_log) {
         size_t k;
         if (app->run_out) fclose(app->run_out);
@@ -14535,7 +14685,9 @@ static void job_start(App* app) {
 #ifdef SDL_PLATFORM_IOS
         icons_wait(app); /* the one driver thread, a dump's icon's first */
 #endif
-        if (!gui_process_start(app->job_process, argv, why, sizeof why)) {
+        bool started = gui_process_start(app->job_process, argv, why, sizeof why);
+        if (debug_log(app)) run_said(app, "recompile", started ? "starts" : why, 0);
+        if (!started) {
             job->state = GUI_JOB_FAILED;
             job->status = -1;
             job->ended_ms = SDL_max(now_ms(app), 1);
@@ -14670,6 +14822,10 @@ static void job_ended(App* app, int i, int status) {
     char took[64];
     Uint64 now = SDL_max(now_ms(app), 1);
     gui_steps_finish(&app->job_steps, !failed);
+    if (debug_log(app)) {
+        char what[64];
+        run_said(app, "recompile", run_ended(what, sizeof what, aborted, status), job->started_ms);
+    }
     if (app->job_out) {
         fprintf(app->job_out, "\n[%s, status %d]\n", aborted ? "aborted" : "ended", status);
         fclose(app->job_out);
@@ -14936,6 +15092,7 @@ static int named_driver(const char* name) {
     return gui_is_cia(name)    ? GUI_3DS
            : gui_is_vpk(name)  ? GUI_VITA
            : gui_is_gba(name)  ? GUI_GBA
+           : gui_is_apk(name)  ? GUI_ANDROID
            : gui_is_dump(name) ? GUI_SWITCH
                                : -1;
 }
@@ -14984,6 +15141,9 @@ static void recompile_focus(App* app) {
         snprintf(app->message, sizeof app->message, "%s", snx_tr("No game in focus to recompile."));
     else if (recent && app->recent.game[recent_index(app, (int)row)].driver == GUI_LINUX)
         snprintf(app->message, sizeof app->message, "%s", snx_tr("R recompiles games: a Linux program runs as it is."));
+    else if ((recent && app->recent.game[recent_index(app, (int)row)].driver == GUI_ANDROID) ||
+             (game && gui_is_apk(app->games.names[index])))
+        snprintf(app->message, sizeof app->message, "%s", snx_tr("R recompiles games: an Android app runs as it is."));
     else {
         app->recompile = true;
         if (recent)
@@ -15057,7 +15217,8 @@ static int aot_focus_game(App* app, AotFocus* f) {
         path = app->recent.game[recent_index(app, (int)row)].path;
     } else if (game) {
         if (gui_games_heading(&app->games, index) || gui_is_cia(app->games.names[index]) ||
-            gui_is_vpk(app->games.names[index]) || gui_is_gba(app->games.names[index]))
+            gui_is_vpk(app->games.names[index]) || gui_is_gba(app->games.names[index]) ||
+            gui_is_apk(app->games.names[index]))
             return 0; /* no path */
         path = app->games.paths[index];
     } else {
@@ -15373,23 +15534,15 @@ static void drop(App* app, const char* value, bool text_drop) {
             free(absolute);
     }
 }
-/* the system's file picker answers on its own thread: the choice comes back to event() as an app->picked event */
-static void SDLCALL picker_done(void* userdata, const char* const* files, int filter) {
-    SDL_Event e;
-    (void)filter;
-    SDL_zero(e);
-    e.type = *(const Uint32*)userdata;
-    e.user.data1 = files && files[0] ? SDL_strdup(files[0]) : NULL;
-    SDL_PushEvent(&e);
-}
 static void picked(App* app, const char* uri);
 static void open_picker(App* app) {
     app->keys_done = 0; /* another try: the last one's outcome no longer stands */
     if (!app->picked) app->picked = SDL_RegisterEvents(1);
 #ifdef SDL_PLATFORM_IOS /* SDL has no file dialog there: the document picker (dist/apple) */
-    if (app->picked) gui_apple_pick(app->window, 0, picker_done, &app->picked, app->message, sizeof(app->message));
+    if (app->picked)
+        gui_apple_pick(app->window, 0, folder_picked, &app->picked, debug_log(app), app->message, sizeof(app->message));
 #else
-    if (app->picked) SDL_ShowOpenFileDialog(picker_done, &app->picked, app->window, NULL, 0, NULL, false);
+    if (app->picked) SDL_ShowOpenFileDialog(folder_picked, &app->picked, app->window, NULL, 0, NULL, false);
 #endif
 }
 /* the last max bytes of a file from the first line that starts in them, as text, or "". A home folder cut in two is no
@@ -16185,7 +16338,8 @@ static void menu_key(App* app, GuiKey key) {
     }
     if (pick_screen(app) && key != GUI_SELECT && key != GUI_CANCEL) return; /* nothing there to move to */
     /* a load whose driver is not there opens no screen: it says which driver, looked for again now (#640) */
-    if (key == GUI_SELECT && app->menu.view == GUI_LOAD_NONE && !app->menu.running && app->menu.selected <= GUI_GBA) {
+    if (key == GUI_SELECT && app->menu.view == GUI_LOAD_NONE && !app->menu.running &&
+        app->menu.selected <= GUI_ANDROID) {
         app->loads_at = 0;
         if (loads_off(app) >> app->menu.selected & 1u) {
             driver_missing(app, app->menu.selected, app->message, sizeof app->message);
@@ -16413,6 +16567,7 @@ void ui_menu_entries_load_linux_arm_elf_action_cb(App* app, uint32_t hit) { menu
 void ui_menu_entries_load_3ds_game_action_cb(App* app, uint32_t hit) { menu_entry(app, GUI_3DS, hit); }
 void ui_menu_entries_load_vita_vpk_action_cb(App* app, uint32_t hit) { menu_entry(app, GUI_VITA, hit); }
 void ui_menu_entries_load_gba_rom_action_cb(App* app, uint32_t hit) { menu_entry(app, GUI_GBA, hit); }
+void ui_menu_entries_load_android_apk_xapk_action_cb(App* app, uint32_t hit) { menu_entry(app, GUI_ANDROID, hit); }
 void ui_menu_entries_install_keys_action_cb(App* app, uint32_t hit) { menu_entry(app, GUI_KEYS, hit); }
 void ui_menu_entries_settings_action_cb(App* app, uint32_t hit) { menu_entry(app, GUI_SETTINGS, hit); }
 void ui_menu_entries_share_log_action_cb(App* app, uint32_t hit) { menu_entry(app, GUI_LOG, hit); }
@@ -17224,6 +17379,18 @@ static void event_take(App* app, const SDL_Event* e) {
         drop(app, e->drop.data, e->type == SDL_EVENT_DROP_TEXT);
         return; /* SDL3 owns the event's data, unlike SDL2. */
     }
+#ifdef SDL_PLATFORM_APPLE
+    /* a picker's answer, any of the four, in the launcher log (debug_log): what came back, or SDL's error */
+    if (e->type >= SDL_EVENT_USER &&
+        ((app->addon_picked && e->type == app->addon_picked) || (app->driver_picked && e->type == app->driver_picked) ||
+         (app->picked_folder && e->type == app->picked_folder) || (app->picked && e->type == app->picked)) &&
+        debug_log(app)) {
+        char shown[SNX_PATH_SIZE];
+        snx_home_short(e->user.data1 ? (const char*)e->user.data1 : "none", shown, sizeof shown);
+        gui_log("dialog: the answer %s%s%s", shown, e->user.code ? ", an error: " : "",
+                e->user.code && e->user.data2 ? (const char*)e->user.data2 : "");
+    }
+#endif
     /* Add Mod's or Add Cheats' picker's answer: a folder or a file, none, or why it could not open */
     if (app->addon_picked && e->type == app->addon_picked) {
         addons_picked(app, (const char*)e->user.data1, (const char*)e->user.data2, e->user.code != 0);
@@ -17275,6 +17442,7 @@ static void event_take(App* app, const SDL_Event* e) {
     if (app->picked && e->type == app->picked) {
         picked(app, e->user.data1);
         SDL_free(e->user.data1);
+        SDL_free(e->user.data2);
         return;
     }
     if (e->type == SDL_EVENT_FINGER_DOWN && !app->finger) {
@@ -17544,10 +17712,9 @@ static bool initialize(App* app, const char* self) {
 #ifdef SDL_PLATFORM_IOS
     gui_apple_start();
     { /* the log in Documents' logs/, which gui_apple_start made and the Files app shows */
-        char *documents = SDL_GetCurrentDirectory(), *logs = documents ? snx_path_join(documents, "logs") : NULL;
+        char* logs = log_folder(app);
         gui_log_folder(logs);
         free(logs);
-        SDL_free(documents);
     }
 #endif
     if (!SDL_Init(SDL_INIT_VIDEO)) return false;
@@ -17720,6 +17887,24 @@ static void open_files(App* app) {
     drivers_load(app);
     if (!app->look_only)
         gui_log("%s starts, its data folder %s", snx_build_log_line(), app->data_dir ? app->data_dir : "(none)");
+#ifndef SDL_PLATFORM_IOS /* there the banner says it, with the space iOS keeps for the app (apple.m) */
+    if (!app->look_only) {
+        char disk[128];
+        disk_room(app, disk, sizeof disk);
+        gui_log("disk: %s", disk);
+    }
+#endif
+#ifdef SDL_PLATFORM_APPLE
+    if (!app->look_only && debug_log(app)) { /* the level at the start: a later change starts neither */
+        gui_apple_state_watch();
+        data_folders_log(app);
+    }
+#elif defined(SDL_PLATFORM_ANDROID)
+    if (!app->look_only && debug_log(app)) { /* the level at the start: a later change starts it not */
+        char why[512];
+        if (!gui_android_state_watch(why, sizeof why)) gui_log("state: not watched: %s", why);
+    }
+#endif
     if (prefs) run_log_follow(app);  /* in the Logs folder app.ini picked */
     if (prefs) recent_as_games(app); /* by the recompiled/ app.ini picked */
     app->users_dir = snx_users_dir(app->home_dir ? app->home_dir : app->data_dir);
@@ -17813,6 +17998,7 @@ int snx_gui_main(const char* self) {
         return 1;
     }
     open_files(&app); /* here, not in initialize(), so the tests keep their own */
+    mark_start(&app, false);
     setup_start(&app);
     app.games_fresh = true;
     watch_start(&app);
@@ -17838,6 +18024,11 @@ int snx_gui_main(const char* self) {
         SDL_Delay(16);
     }
     cleanup(&app);
+#ifdef SDL_PLATFORM_IOS
+    int played = 0;
+    if (gui_apple_played(&played)) return 0; /* the game picked runs in this process next, under this mark */
+#endif
+    snx_run_mark_end();
     return 0;
 }
 #ifndef SNX_GUI_NO_MAIN /* the menu alone: Android's activity runs it, and a build without the Switch runtime */

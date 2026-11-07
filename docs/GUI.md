@@ -78,8 +78,8 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   focus again. A tap on a finished run returns to the menu, and one on a
   running run's ESC line aborts it. Android's back button is ESC. On a screen packed with
   pixels (a phone) the text takes the display's own scale, as far as the menu still fits.
-- **Load Switch NSP/XCI/NRO**, **Load Linux ARM ELF**, **Load 3DS game**, **Load Vita VPK** and
-  **Load GBA ROM** open a screen as the keys': a click on its blinking **[ Pick or drop a file ]**, or Enter, opens the system's file
+- **Load Switch NSP/XCI/NRO**, **Load Linux ARM ELF**, **Load 3DS game**, **Load Vita VPK**, **Load GBA ROM** and
+  **Load Android APK/XAPK** open a screen as the keys': a click on its blinking **[ Pick or drop a file ]**, or Enter, opens the system's file
   picker (on Linux the desktop's, else zenity's). Dropping a file on the window and Ctrl+V with
   a path work too. ESC returns to the menu. On Android the picker opens at once. A dump is read where it lies
   and takes no room, unless *Extract dump* is on. Then one not extracted yet takes about its size, a Switch
@@ -105,6 +105,10 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
 - **Load GBA ROM** uses `scarletnx-agb`, the AGB board runtime, with the menu's data folder as its `--data`: it makes
   the game's folder of `recompiled/` (named after the ROM's file), its module and its copy of the runtime, and plays
   it in a window. See [AGB board](AGB.md).
+- **Load Android APK/XAPK** uses `scarletnx-android` on an `.apk`, `.xapk` or `.apks` file, with no other argument.
+  The driver installs a bundle of split APKs itself. The app runs as it is, as a Linux program does: nothing is
+  compiled first, and its recent row shows at once. An APK in a games or dumps folder shows in Games, and Enter runs
+  it the same way. R on it says that it runs as it is. See [Android apps](android/README.md).
 - **Install Keys**, immediately after the five load entries, blinks red (the theme's `failure` colour, at its
   `blink_ms`) while no keys are in use, the Switch's or the 3DS's. It prompts you to
   pick a keys file (a click on the blinking **[ Pick or drop a keys file ]** in the middle of
@@ -358,7 +362,18 @@ two; left out, none) and `language` (`auto`, `en` or a
   to them. Launchers open at once on one Logs folder each keep their runs' output apart: the first `last-run.log` and
   `last-recompile.log`, the next `last-run-2.log` and `last-recompile-2.log`, and on to 8, each held while its
   launcher is open (a lock on the file, which leaves it to be read); the log says which a launcher took, and Share Log
-  sends its own.
+  sends its own. Each start says how the last ended: `last start: ended with an exit, or none before`, or for each
+  start that left its mark, `last start: pid 4242, started 2026-11-07 10:01:02 did not end with an exit:` and what the
+  system says of it (on Android 11 and later the reason it keeps for that process, [ANDROID](ANDROID.md); elsewhere
+  the system names none). The mark is `.running-<pid>` beside the log, made at the start, held while the launcher
+  runs and deleted at its exit, Logs moving it; a game keeps its own beside its log, which the game's next start says
+  the same way. The start also gives the data folder's disk, `disk: 51200 MiB free of 953344 MiB` (on iOS the
+  banner's, [APPLE](APPLE.md)). Debug's Log level at 2 adds a line at each start and end of a run and of a recompile,
+  with its status, its time and the disk then (`run: ended, status 7, after 12.3 s; disk: ...`); and on Android and
+  the Apple apps each change of the thermal state and of the low power mode (Android's Battery Saver), `state: thermal
+  severe, low power mode on`: Android's seven thermal statuses by Android's names (`none`, `light`, `moderate`,
+  `severe`, `critical`, `emergency`, `shutdown`), as they do not match Apple's four (`nominal`, `fair`, `serious`,
+  `critical`) one to one, and `thermal not reported` below Android 10, which gives none.
 - **Exit** closes the launcher, once asked (ESC on the menu asks too, and while a recompile of the queue runs or waits
   the question names it), a screen saying for half a second which of its
   files it keeps for the next start (Settings, the picks of Settings > App, the libraries' folders, the recent games), a second
@@ -498,7 +513,7 @@ cannot be read is named and the others still listed.
   at a time behind the screens: with none running it starts at once, the Compile tab showing it; else the tips say
   where it waits. A game of the queue says it on its row (`42%`, `next`, `3rd in queue`) and in the side box; Enter
   on it, or R again, shows it on the Compile tab, and it plays once its compile ended. On a Linux
-  program, or another row, R says why it does nothing. **B** builds the focused game's AOT pack from its JIT cache
+  program, an Android app, or another row, R says why it does nothing. **B** builds the focused game's AOT pack from its JIT cache
   ([AOT packs](AOT_PACKS.md)) through the same queue.
 - **M** (on Android a tap on *Mods* at the foot) opens the box of the recompiled Switch game in focus, recent or on
   the page, that Enter opens for a game with updates, DLCs, mods, cheats or other programs beside it, and for a game

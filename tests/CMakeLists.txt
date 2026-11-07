@@ -39,9 +39,9 @@ endfunction()
 if(SNX_TEST_SANITIZERS)
     cmake_language(DEFER DIRECTORY "${PROJECT_SOURCE_DIR}" CALL snx_test_sanitize
         # the common code: network, filesystems, LZ4 and xxHash, the Vulkan setup the frontends share, the launcher's
-        # HTTPS and the roots it carries
+        # HTTPS and the roots it carries, the zip reader of VPKs and APKs
         scarletnx-common scarletnx-net scarletnx-ldn scarletnx-filesystem snx_demangle snx_lz4
-        snx_xxhash snx_vk_common snx_https snx_cacert
+        snx_xxhash snx_vk_common snx_https snx_cacert snx_zip
         snx-logscan
         # the recompiler and its backends
         snx_llvm snx_arm_llvm snx_arm_decode scarletnx-recompiler scarletnx-recompiler-shared
@@ -50,8 +50,10 @@ if(SNX_TEST_SANITIZERS)
         snx-test-build-info
         # the Switch runtime: its components, the shader translator and the Vulkan backend
         scarletnx snx_core snx_kernel snx_hle snx_video snx_gpu snx_platform snx_shader snx_vk
-        # the GNU ABI runtime
-        scarletnx-gnuabi
+        # the GNU ABI runtime and its kernel
+        scarletnx-gnuabi scarletnx-gnuabi-kernel
+        # the Android app driver: its DEX translator, its program and the native bridge
+        snx_android_dex snx_android_program snx_android_bridge
         # the 3DS runtime
         scarletnx-3ds snx_ctr_program snx_ctr_board snx_ctr_memory snx_ctr_loader snx_ctr_cpu snx_ctr_process snx_ctr_native
         snx_ctr_audio snx_ctr_gpu snx_ctr_gpu_reference
@@ -1492,7 +1494,8 @@ add_executable(snx-test-ini-deprecated ini_deprecated.c "${PROJECT_SOURCE_DIR}/s
 snx_test_target(snx-test-ini-deprecated 11)
 add_test(NAME ini_deprecated COMMAND snx-test-ini-deprecated)
 
-# options.c's TV mode Auto over a faked host power source, and a key its .ini gives twice; the rest of the runtime stubbed
+# options.c's TV mode Auto over a faked host power source, a key its .ini gives twice, and controls_skin's default as a
+# .ini opens; the rest of the runtime stubbed
 add_executable(snx-test-options-tv-mode options_tv_mode.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/options.c")
 snx_test_target(snx-test-options-tv-mode 23)
 target_link_libraries(snx-test-options-tv-mode PRIVATE scarletnx-common)
@@ -1529,6 +1532,10 @@ add_test(NAME fatal_screen COMMAND snx-test-fatal-screen)
 add_executable(snx-test-ini ini.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c")
 snx_test_target(snx-test-ini 11)
 add_test(NAME ini COMMAND snx-test-ini)
+# the Linux AArch64 signal frame the GNU ABI runtime and the Android bridge share
+add_executable(snx-test-linux-signal linux_signal.c "${PROJECT_SOURCE_DIR}/src/common/runtime/linux_signal.c")
+snx_test_target(snx-test-linux-signal 11)
+add_test(NAME linux_signal COMMAND snx-test-linux-signal)
 add_executable(snx-test-ini-lines ini_lines.c "${PROJECT_SOURCE_DIR}/src/common/utilities/ini_lines.c")
 snx_test_target(snx-test-ini-lines 99)
 add_test(NAME ini_lines COMMAND snx-test-ini-lines)
@@ -1647,6 +1654,9 @@ if(EXISTS /usr/bin/clang)
     add_test(NAME host_cc COMMAND "${CMAKE_COMMAND}" "-DSRC=${PROJECT_SOURCE_DIR}"
              "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/host-cc-test" -P "${CMAKE_CURRENT_SOURCE_DIR}/host_cc_test.cmake")
 endif()
+# the JDK cmake/android_jdk.cmake takes for the Android app driver, and the reason it gives when it takes none
+add_test(NAME android_jdk COMMAND "${CMAKE_COMMAND}" "-DSRC=${PROJECT_SOURCE_DIR}"
+         "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/android-jdk-test" -P "${CMAKE_CURRENT_SOURCE_DIR}/android_jdk_test.cmake")
 # every SNX_ variable a preset of CMakePresets.json sets is one the build reads
 add_test(NAME preset_variables COMMAND "${CMAKE_COMMAND}" "-DSRC=${PROJECT_SOURCE_DIR}" -P
          "${CMAKE_CURRENT_SOURCE_DIR}/preset_variables_test.cmake")
@@ -1708,6 +1718,12 @@ add_executable(snx-test-collection-programs collection_programs.c)
 snx_test_target(snx-test-collection-programs 99)
 target_link_libraries(snx-test-collection-programs PRIVATE scarletnx-common)
 add_test(NAME collection_programs COMMAND snx-test-collection-programs)
+
+# a start's mark (common/utilities/run_mark.c): made, ended, said by the next start, a held one left, a long folder
+add_executable(snx-test-run-mark run_mark.c)
+snx_test_target(snx-test-run-mark 99)
+target_link_libraries(snx-test-run-mark PRIVATE scarletnx-common)
+add_test(NAME run_mark COMMAND snx-test-run-mark)
 
 # the console a game's folder plays and its copy of the runtime (common/utilities/game_ini.c), which the launcher reads
 add_executable(snx-test-game-system game_system.c)
@@ -1868,6 +1884,16 @@ if(NOT SNX_TOOLS_ONLY)
     target_compile_definitions(snx-test-nvdec-decode PRIVATE SNX_TEST_REAL_FFMPEG)
     target_link_libraries(snx-test-nvdec-decode PRIVATE FFmpeg::avcodec)
     add_test(NAME nvdec_decode COMMAND snx-test-nvdec-decode)
+endif()
+# FFmpeg's image codecs, libswscale and zlib come with the Android driver alone (cmake/ffmpeg.cmake)
+if(TARGET FFmpeg::avcodec AND Python3_Interpreter_FOUND)
+    if(snx_ffmpeg_images)
+        set(snx_ffmpeg_images_want 1)
+    else()
+        set(snx_ffmpeg_images_want 0)
+    endif()
+    add_test(NAME ffmpeg_images COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg_images.py"
+                                        "${snx_ffmpeg_prefix}/private" ${snx_ffmpeg_images_want})
 endif()
 if(SNX_TEST_VP9_VECTORS)
     # nvdec.c's VP9 jobs on libvpx's test vectors, each image against the MD5 libvpx lists for it, at its own job's

@@ -8,6 +8,7 @@
 #endif
 #include "nx/runtime/platform/plat.h"
 #include "common/utilities/bits.h"
+#include "common/utilities/run_mark.h"
 #include "nx/runtime/main.h"
 #include "nx/runtime/nce/nce.h"
 #include "nx/runtime/platform/log.h"
@@ -527,6 +528,7 @@ void plat_system_info(char* out, size_t cap) {
 void plat_yield(void) { sched_yield(); }
 void plat_exit_now(int code) {
     fflush(NULL);
+    snx_run_mark_end(); /* an exit: _exit runs no atexit handler */
     _exit(code);
 }
 

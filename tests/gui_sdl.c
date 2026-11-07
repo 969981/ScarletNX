@@ -3863,7 +3863,8 @@ int main(int argc, char** argv) {
     char* self = snx_executable(argv[0]);
     char* input = snx_path_join(temporary, "game with spaces;literal.nro");
     assert(!snx_write_file(input, "0", 1));
-    const char* names[] = {"runtime", "scarletnx-gnuabi", "scarletnx-3ds", "scarletnx-vita", "scarletnx-agb"};
+    const char* names[] = {"runtime", "scarletnx-gnuabi", "scarletnx-3ds", "scarletnx-vita", "scarletnx-agb",
+                           "scarletnx-android"};
     for (size_t i = 0; i < sizeof names / sizeof *names; ++i) {
 #ifdef _WIN32
         char* filename = snx_format("%s.exe", names[i]);
@@ -3996,6 +3997,10 @@ int main(int argc, char** argv) {
     assert(app.menu.selected == GUI_GBA);
     render(&app);
     shows(&app, "- " ICON_GAMEPAD " Load GBA ROM", yellow);
+    key(&app, SDLK_RIGHT);
+    assert(app.menu.selected == GUI_ANDROID);
+    render(&app);
+    shows(&app, "- " ICON_PACKAGE_PLUS " Load Android APK/XAPK", yellow);
     /* a load whose driver is neither beside the menu nor on PATH (on iOS the four the app leaves out) is greyed, still
        there, as soon as the folder or PATH it is looked for in changes, and Enter on it says which driver rather than
        opening its screen; put back, Enter looks again and opens it; gone again, the row greys within a second (#640) */
@@ -4036,7 +4041,7 @@ int main(int argc, char** argv) {
         free(vita);
         app.menu.activated = false;
         app.menu.active = GUI_SWITCH;
-        app.menu.selected = GUI_GBA;
+        app.menu.selected = GUI_ANDROID;
         app.message[0] = 0;
     }
     key(&app, SDLK_RIGHT);
@@ -4368,12 +4373,12 @@ int main(int argc, char** argv) {
     assert(app.form == GUI_FORM_SETTINGS);
     key(&app, SDLK_RETURN);
     /* a group's settings on the right, a row each with its help in the tips; the group named over them */
-    /* gdbstub, Extract to tmpfs, Extract dump, Optimization level, LLVM batch, AOT threads, Unit size, Unit cache
-       limit, the LLVM Internals page and Tracy capture, whose row a launcher without SNX_TRACY does not list */
+    /* gdbstub, Extract to tmpfs, Extract dump, Java home, Optimization level, LLVM batch, AOT threads, Unit size, Unit
+       cache limit, the LLVM Internals page and Tracy capture, whose row a launcher without SNX_TRACY does not list */
     int tracy = 0;
     for (int i = 0; i < app.settings.own; i++)
         if (!strcmp(app.settings.values[i].key, "tracy_capture")) tracy = 1;
-    assert(app.form == GUI_FORM_GROUP && app.group == 1 && app.editor.count == 9 + tracy);
+    assert(app.form == GUI_FORM_GROUP && app.group == 1 && app.editor.count == 10 + tracy);
     render(&app);
     shows(&app, "Launch", normal);
     shows_half(&app, "Enables gdbstub", normal); /* in the tips */
@@ -6835,6 +6840,7 @@ int main(int argc, char** argv) {
     key(&app, SDLK_LEFT);
     key(&app, SDLK_LEFT);
     key(&app, SDLK_LEFT);
+    key(&app, SDLK_LEFT);
     /* a load opens the screen its file is picked on at once: games/ is Games' now, not an option under it */
     assert(app.menu.selected == GUI_SWITCH);
     pump(&app);
@@ -6964,12 +6970,44 @@ int main(int argc, char** argv) {
     char* program = snx_path_join(temporary, "game with spaces;literal");
     assert(!snx_write_file(program, "1", 1));
     char* quoted = snx_format("\"%s\"", program);
+    /* Debug's Log level at 2: the run's start and its end, with its status and time, and the data folder's disk, in
+       the launcher log */
+    char* run_logs = snx_path_join(temporary, "run lines");
+    char* run_lines = console_in(run_logs);
+    char* data_was = app.data_dir; /* a file here: its disk unknown */
+    app.data_dir = snx_strdup(temporary);
+    snx_menu_settings = debug_settings; /* a runtime's list that has the log's level */
+    settings_forget(&app);
+    assert(!snx_mkdirs(run_logs) && gui_settings_set(settings_of(&app), "log", "2"));
+    gui_log_folder(run_logs);
     e.type = SDL_EVENT_DROP_TEXT;
     e.drop.data = quoted;
     event(&app, &e);
     free(quoted);
     assert(app.menu.running);
     finish(&app, 7);
+    {
+        size_t said_size = 0;
+        char *said = (char*)snx_read_file(run_lines, &said_size), *end;
+        unsigned long long room = 0, all = 0;
+        double took = -1;
+        assert(said && strstr(said, "] run: starts; disk: "));
+        end = strstr(said, "] run: ended, status 7, after ");
+        assert(end &&
+               sscanf(end, "] run: ended, status 7, after %lf s; disk: %llu MiB free of %llu MiB\n", &took, &room,
+                      &all) == 3 &&
+               took >= 0 && room <= all && all);
+        free(said);
+    }
+    snx_menu_settings = NULL;
+    settings_forget(&app);
+    assert(settings_of(&app));
+    free(app.data_dir);
+    app.data_dir = data_was;
+    gui_log_folder(NULL);
+    assert(!snx_remove_tree(run_logs));
+    free(run_lines);
+    free(run_logs);
     size_t size;
     unsigned char* runs = snx_read_file(program, &size);
     assert(runs && size == 1 && runs[0] == '2');
@@ -7320,6 +7358,7 @@ int main(int argc, char** argv) {
                     const char* kind;
                 } unlisted[] = {{"far away.nsp", GUI_SWITCH, "A dump, prepared when it runs"},
                                 {"tool.elf", GUI_LINUX, "Linux ARM ELF, run with scarletnx-gnuabi"},
+                                {"app.apk", GUI_ANDROID, "Android app, run with scarletnx-android"},
                                 {"homebrew.cia", GUI_3DS, "3DS game, opened with scarletnx-3ds"},
                                 {"card.3ds", GUI_3DS, "3DS game, opened with scarletnx-3ds"},
                                 {"homebrew.vpk", GUI_VITA, "Vita VPK, opened with scarletnx-vita"},
@@ -7344,7 +7383,7 @@ int main(int argc, char** argv) {
                 for (k = 0; k < sizeof unlisted / sizeof unlisted[0]; ++k) {
                     char* path = snx_path_join(temporary, unlisted[k].file);
                     int shown = recent_shown(&app), count = app.recent.count;
-                    bool linux_one = unlisted[k].driver == GUI_LINUX;
+                    bool linux_one = unlisted[k].driver == GUI_LINUX || unlisted[k].driver == GUI_ANDROID;
                     assert(!gui_recent_add(&app.recent, path, unlisted[k].driver, 0));
                     recent_changed(&app);
                     app.browser.selected = 0;
@@ -7919,6 +7958,79 @@ int main(int argc, char** argv) {
         free(program);
         free(folder);
         free(rom);
+        free(recent_file);
+    }
+    /* Android: an app's XAPK through scarletnx-android, which installs it itself. It runs as it is, as a Linux
+       program: no -r, no --data, nothing made, its recent row shown; R on it says so */
+    {
+        char* original_games = app.games_dir;
+        char* recent_file = snx_path_join(temporary, "prefs/android-recent.txt");
+        app.games_dir = snx_path_join(temporary, "apk-games");
+        char* apk = snx_path_join(app.games_dir, "app input.XAPK");
+        char kind[160];
+        assert(!snx_mkdirs(app.games_dir) && !snx_write_file(apk, "fixture", 7));
+        assert(gui_is_apk("a.apk") && gui_is_apk("a.APKS") && gui_is_apk("a.xapk") && !gui_is_apk("a.apkx") &&
+               !gui_is_apk("apk"));
+        char *got = snx_path_join(temporary, "driver argv"), *argv_got;
+        recent_open(&app, snx_strdup(recent_file));
+        launcher(&app, true);
+        driver_will(got, 0, "the app ran");
+        point(&app, entry_box(&app, GUI_ANDROID), true);
+        assert(app.menu.view == GUI_LOAD_DROP && app.menu.active == GUI_ANDROID);
+        e.type = SDL_EVENT_DROP_FILE;
+        e.drop.data = apk;
+        event(&app, &e);
+        assert(app.menu.running && app.menu.selected == GUI_ANDROID && !app.native && !app.queue.count);
+        argv_got = ran(&app, 0);
+        assert(strstr(argv_got, "scarletnx-android") < strchr(argv_got, '\n') && has_arg(argv_got, apk, NULL) &&
+               !has_arg(argv_got, "-r", NULL) && !has_arg(argv_got, "--data", NULL) &&
+               !has_arg(argv_got, "--outdir", NULL) && !has_arg(argv_got, "--fullscreen=1", NULL) &&
+               !strstr(argv_got, "--java-home")); /* Java home empty: the driver's own JDK */
+        free(argv_got);
+        assert(app.recent.count == 1 && app.recent.game[0].driver == GUI_ANDROID && !app.recent.game[0].prepared);
+        GuiRecent kept;
+        gui_recent_load(&kept, recent_file);
+        assert(kept.count == 1 && kept.game[0].driver == GUI_ANDROID && !kept.game[0].prepared);
+        assert(recent_shown(&app) == 1);
+        /* the XAPK in the games folder is one of Games', which Enter runs through scarletnx-android again */
+        leave_run(&app);
+        go_tab(&app, GUI_TAB_GAMES);
+        focus_game(&app, "app input.XAPK");
+        game_kind(&app, &app.games, app.browser.page * app.browser.page_size + app.browser.selected - app.browser.head,
+                  kind, sizeof kind);
+        assert(!strcmp(kind, "Android app, run with scarletnx-android"));
+        key(&app, SDLK_R);
+        assert(!app.menu.running && !app.queue.count &&
+               !strcmp(app.message, "R recompiles games: an Android app runs as it is."));
+        /* Java home set: the driver gets it, and a Switch run's recompile options do not */
+        assert(gui_settings_set(&app.settings, "java_home", "/opt/jdk 21"));
+        {
+            const char** options = calloc((size_t)app.settings.count + 1, sizeof *options);
+            size_t count = options ? gui_settings_recompile(&app.settings, 0, options) : 0;
+            assert(options);
+            for (size_t k = 0; k < count; ++k) assert(!strstr(options[k], "java"));
+            free(options);
+        }
+        key(&app, SDLK_RETURN);
+        assert(app.menu.running && !app.native && app.menu.selected == GUI_ANDROID && !app.queue.count);
+        argv_got = ran(&app, 0);
+        assert(has_arg(argv_got, apk, NULL) && !has_arg(argv_got, "-r", NULL) && !has_arg(argv_got, "--data", NULL) &&
+               has_arg(argv_got, "--java-home=/opt/jdk 21", NULL));
+        free(argv_got);
+        assert(gui_settings_set(&app.settings, "java_home", "") && !gui_settings_value(&app.settings, "java_home"));
+        leave_run(&app);
+        driver_will(NULL, 0, NULL);
+        free(got);
+        app.recent = (GuiRecent){0};
+        recent_changed(&app);
+        free(app.recent_file);
+        app.recent_file = NULL;
+        launcher(&app, false);
+        app.menu.selected = GUI_LINUX;
+        free(app.games_dir);
+        app.games_dir = original_games;
+        app.games_stamp = stamp_now(&app);
+        free(apk);
         free(recent_file);
     }
 
@@ -13121,6 +13233,76 @@ int main(int argc, char** argv) {
         free(first);
         free(state);
     }
+    /* the launcher's start's mark (run_mark.h) in its log's folder: a start whose mark no program holds said, with what
+       the system says, and deleted, this one's made; Logs changed, it goes with the log; the end deletes it; a start
+       that finds none says the last ended with an exit */
+    {
+        char *run_was = app.run_log, *job_was = app.job_log, *place_was = app.place[GUI_PLACE_STATE];
+        char *first = snx_path_join(temporary, "mark logs"), *second = snx_path_join(temporary, "mark logs 2");
+        char *stale = snx_path_join(first, ".running-77"), *console = console_in(first), *said, own[64];
+        char *mine, *moved;
+        size_t size = 0;
+        bool locked_was = app.run_locked;
+        intptr_t lock_was = app.run_lock;
+#ifdef _WIN32
+        snprintf(own, sizeof own, ".running-%lld", (long long)GetCurrentProcessId());
+#else
+        snprintf(own, sizeof own, ".running-%lld", (long long)getpid());
+#endif
+        mine = snx_path_join(first, own);
+        moved = snx_path_join(second, own);
+        assert(!snx_mkdirs(first) && !snx_mkdirs(second) && !snx_run_mark_held());
+        app.run_log = app.job_log = NULL;
+        app.run_locked = false;
+        app.place[GUI_PLACE_STATE] = snx_strdup(first);
+        run_log_follow(&app); /* no mark yet: the menu's start makes it, after its files */
+        assert(!snx_run_mark_held() && !snx_path_exists(mine));
+        said = snx_strdup("pid 77, started 2026-01-01 00:00:00\n1767225600\n");
+        assert(!snx_write_file(stale, said, strlen(said)));
+        free(said);
+        mark_start(&app, false);
+        said = (char*)snx_read_file(console, &size);
+        assert(said && strstr(said, "] last start: pid 77, started 2026-01-01 00:00:00 did not end with an exit: "));
+        assert(!strstr(said, "] last start: ended with an exit"));
+        free(said);
+        assert(!snx_path_exists(stale) && snx_is_file(mine) && snx_run_mark_held());
+        free(app.place[GUI_PLACE_STATE]);
+        app.place[GUI_PLACE_STATE] = snx_strdup(second);
+        if (app.run_locked) snx_unlock_file(app.run_lock);
+        app.run_locked = false;
+        run_log_follow(&app); /* Logs changed */
+        assert(!snx_path_exists(mine) && snx_is_file(moved) && snx_run_mark_held());
+        snx_run_mark_end(); /* the launcher's end */
+        assert(!snx_path_exists(moved) && !snx_run_mark_held());
+        free(app.place[GUI_PLACE_STATE]);
+        app.place[GUI_PLACE_STATE] = snx_strdup(first);
+        if (app.run_locked) snx_unlock_file(app.run_lock);
+        app.run_locked = false;
+        run_log_follow(&app);
+        mark_start(&app, false);
+        said = (char*)snx_read_file(console, &size);
+        assert(said && strstr(said, "] last start: ended with an exit, or none before\n") && snx_is_file(mine));
+        free(said);
+        snx_run_mark_end();
+        assert(!snx_path_exists(mine));
+        if (app.run_locked) snx_unlock_file(app.run_lock);
+        free(app.run_log);
+        free(app.job_log);
+        free(app.place[GUI_PLACE_STATE]);
+        app.place[GUI_PLACE_STATE] = place_was;
+        app.run_log = run_was;
+        app.job_log = job_was;
+        app.run_locked = locked_was;
+        app.run_lock = lock_was;
+        gui_log_folder(NULL);
+        assert(!snx_remove_tree(first) && !snx_remove_tree(second));
+        free(moved);
+        free(mine);
+        free(console);
+        free(stale);
+        free(second);
+        free(first);
+    }
     /* Android's menu: its own files in its data folder's config/ and state/ (.scarletnx/ in the app's own files, which
        the Files app shows). An older version's, in the app's own files, are neither moved nor read: the menu starts
        from its defaults, and the box of what older versions left names each file with its size, then how they go while
@@ -13175,6 +13357,14 @@ int main(int argc, char** argv) {
         expected = snx_path_join(state, "recent.txt");
         assert(!strcmp(app.recent_file, expected) && !snx_path_exists(expected));
         free(expected);
+        { /* the start's line of the data folder's disk: its MiB free and its size, no path */
+            char *console = console_in(state), *said = (char*)snx_read_file(console, &size), *disk;
+            unsigned long long room = 0, all = 0;
+            disk = said ? strstr(said, "] disk: ") : NULL;
+            assert(disk && sscanf(disk, "] disk: %llu MiB free of %llu MiB\n", &room, &all) == 2 && room <= all && all);
+            free(said);
+            free(console);
+        }
         assert(!strcmp(app.theme.id, "default") && app.menu.text_size == text_size && !app.recent.count &&
                app.folder_count == folder_count);
         /* the box: each file with its size, where this one keeps it for Share Log, then how they go */
