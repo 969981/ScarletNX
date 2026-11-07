@@ -4,6 +4,10 @@ on:
   schedule:
     - cron: '*/30 * * * *'
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fork-upstream-sync.yml'
 
 permissions:
   contents: write
