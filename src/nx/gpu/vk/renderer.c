@@ -72,9 +72,14 @@ static void vkr_mapping_begin(u64 gva, u64 size, int full) {
     g_mapping_size = full ? 0 : size;
     vk_release_drain();
     if (full) {
-        vk_buf_land_map();
+        /* A change of guest memory changes only its own guest pages, and a result pending elsewhere lands there as
+           before. So the buffer and compute results land, all of them as before, only when one covers a page of the
+           change. svcMapPhysicalMemory maps fresh memory, where none is pending: landing every result made each map
+           wait for all of the GPU's work, and one game's memory thread waited so with its core held */
+        int hit = pend_hit_guest(&g_pend_any, gva, size);
+        if (hit) vk_buf_land_map();
         vk_gfx_image_land();
-        vk_compute_land();
+        if (hit) vk_compute_land();
         /* last, as the landings may submit: mem.c's change of guest memory [gva, gva + size), whose in-place readers
            run and reach the driver first */
         vk_uma_mapping_begin(gva, size);
@@ -555,7 +560,15 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game, u64 release
         memcpy(was, is, sizeof was);
         last_present_ns = now_ns;
         g_vk_present++;
-        stats_frame(now_ns);
+        {
+            SnxStatsGpu gpu = {0};
+            if (__atomic_load_n(&g_settings.stats, __ATOMIC_RELAXED)) { /* read only while the box shows */
+                gpu.busy_ns = vk_gpuprof_busy_ns();
+                gpu.timed = vk_gpuprof_timed();
+                vk_mem_driver_use(&gpu.vram, &gpu.vram_budget);
+            }
+            stats_frame(now_ns, &gpu);
+        }
         if (g_vk_present == 1 || g_vk_present % 600 == 0) guest_stats_log(now_ns, g_vk_present);
         vk_mem_present();
         if (g_last) vk_surf_touch(g_last); /* what screenshots read stays */
@@ -597,7 +610,8 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game, u64 release
                 u64 bc7_levels, bc7_bytes, bc7_rgba8;
                 vk_astc_stats(&bc7_levels, &bc7_bytes, &bc7_rgba8);
                 if (bc7_levels)
-                    LOG("vulkan: %llu ASTC texture levels uploaded as BC7, %llu MB where RGBA8 takes %llu MB\n",
+                    LOG("vulkan: %llu ASTC texture levels or regions uploaded as BC7, %llu MB where RGBA8 takes %llu "
+                        "MB\n",
                         (unsigned long long)bc7_levels, (unsigned long long)(bc7_bytes >> 20),
                         (unsigned long long)(bc7_rgba8 >> 20));
                 u64 early_made, early_hits, early_left;
@@ -646,9 +660,10 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game, u64 release
                 (unsigned long long)g_vk_fb_draws, (unsigned long long)g_vk_fb_barriers,
                 (unsigned long long)g_vk_fb_restarts, (unsigned long long)g_vk_rt_copies);
             LOG("vulkan: %llu rendering passes, %llu clear commands, %llu attachments cleared and %llu left undefined "
-                "by their load op\n",
+                "by their load op; %llu buffers filled ahead of the passes\n",
                 (unsigned long long)g_vk_passes, (unsigned long long)g_vk_clear_cmds,
-                (unsigned long long)g_vk_clear_loads, (unsigned long long)g_vk_dontcare_loads);
+                (unsigned long long)g_vk_clear_loads, (unsigned long long)g_vk_dontcare_loads,
+                (unsigned long long)vk_buf_ahead());
             vk_pass_ends_log();
             vk_descriptors_stats();
             /* what the GPU engines keep on the GPU (docs/GPU_OWNERSHIP.md), and what the CPU had to wait for */

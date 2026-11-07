@@ -338,22 +338,24 @@ static int create_device(void) {
     WANT(sampleRateShading);
     WANT(alphaToOne); /* multisampled draws asking for it (pipeline.c) */
     /* BCn, ASTC and ETC2 sampled as they are (format.c) where the settings ask for it and the device has them, else
-       decoded on the GPU as they are uploaded; ASTC decoded so is encoded again as BC7 where the GPU samples BCn and
-       astc_bc asks for it */
-    if (g_settings.native_bc || g_settings.astc_bc) WANT(textureCompressionBC);
+       decoded on the GPU as they are uploaded; ASTC decoded so is encoded again as BC7 where the GPU samples BCn,
+       unless astc_mode asks for exact RGBA8 */
+    if (g_settings.native_bc || !g_settings.astc_mode) WANT(textureCompressionBC);
     g_vk.astc_bc7_could = have.textureCompressionBC && !have.textureCompressionASTC_LDR;
     if (g_settings.native_astc) WANT(textureCompressionASTC_LDR);
     if (g_settings.native_etc2) WANT(textureCompressionETC2);
     if (g_settings.native_bc && !want->textureCompressionBC)
         WARN("vulkan: the GPU can't sample BCn textures: they are decoded on the GPU as they are loaded\n");
-    const int astc_bc7 = g_settings.astc_bc && want->textureCompressionBC && !want->textureCompressionASTC_LDR;
+    const int astc_bc7 = !g_settings.astc_mode && want->textureCompressionBC && !want->textureCompressionASTC_LDR;
     if (g_settings.native_astc && !want->textureCompressionASTC_LDR)
         WARN("vulkan: native ASTC textures were asked for, but the GPU can't sample ASTC: they are decoded to %s\n",
-             astc_bc7 ? "RGBA8 and encoded again as BC7 (astc_bc=1)" : "RGBA8");
-    if (g_settings.astc_bc && !want->textureCompressionASTC_LDR && !want->textureCompressionBC)
-        WARN("vulkan: astc_bc=1, but the GPU samples neither ASTC nor BCn: ASTC textures are decoded to RGBA8\n");
+             astc_bc7 ? "RGBA8 and encoded again as BC7" : "RGBA8");
+    if (!want->textureCompressionASTC_LDR && !want->textureCompressionBC)
+        WARN("vulkan: the GPU samples neither ASTC nor BCn: ASTC textures are decoded to RGBA8, four times BC7's "
+             "memory\n");
     if (astc_bc7 && !g_settings.native_astc)
-        LOG("vulkan: ASTC textures are decoded and encoded again as BC7 (astc_bc=1), a quarter of RGBA8's memory\n");
+        LOG("vulkan: ASTC textures are decoded and encoded again as BC7, a quarter of RGBA8's memory (astc_mode=1 "
+            "keeps them exact)\n");
     if (g_settings.native_etc2 && !want->textureCompressionETC2)
         WARN("vulkan: native ETC2 textures were asked for, but the GPU can't sample ETC2: they are decoded\n");
     WANT(vertexPipelineStoresAndAtomics);
@@ -379,11 +381,15 @@ static int create_device(void) {
         u32 nq = 0;
         VkQueueFamilyProperties* q = snx_vk_queue_families(g_vk.phys, &nq);
         sparse_queue = g_vk.gfx_family < nq && (q[g_vk.gfx_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT);
+        g_vk.gfx_timestamp_bits = g_vk.gfx_family < nq ? q[g_vk.gfx_family].timestampValidBits : 0;
         free(q);
     }
     if (sparse_queue) WANT(sparseBinding);
-    /* and 3D textures with holes in their mapping given memory only where it is mapped (memory.c) */
-    if (sparse_queue) WANT(sparseResidencyImage3D);
+    /* and 2D and 3D textures with holes in their mapping given memory only where it is mapped (memory.c) */
+    if (sparse_queue) {
+        WANT(sparseResidencyImage2D);
+        WANT(sparseResidencyImage3D);
+    }
 #undef WANT
     /* points out of tessellation and geometry programs take the size those write, as the vertex program's do */
     g_shader_stage_point_size = want->shaderTessellationAndGeometryPointSize != 0;
@@ -391,7 +397,6 @@ static int create_device(void) {
     g_shader_tessellation = want->tessellationShader != 0;
     const char** ext = g_vk.dev_ext;
     int has_pipeline_robustness = 0, has_robustness2 = 0;
-    int has_budget = 0;
     u32 next = 0;
     int has_shader_clock = 0, has_feedback_dynamic = 0, has_cond = 0, has_provoking = 0, video_exts = 0;
     int has_portability = 0, has_reconvergence = 0;
@@ -425,7 +430,7 @@ static int create_device(void) {
         has_robustness2 = snx_vk_extensions_has(&e, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
         /* the driver's budget for each heap, the other processes' use taken out, for VMA: without it VMA took
            80% of a heap's size as its budget, blind to what the desktop and other programs hold */
-        has_budget = snx_vk_extensions_has(&e, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+        g_vk.has_budget = snx_vk_extensions_has(&e, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
         /* the GPU's clock next to the client's, for the profiler's GPU track (gpuprof.c's calibration) */
         has_calibrated = snx_vk_extensions_has(&e, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
         /* a portability driver's subset must be enabled when it has one (MoltenVK) */
@@ -460,7 +465,7 @@ static int create_device(void) {
     int uma_with = vk_uma_choose(has_host_import, has_ahb, has_placed && has_map2);
     if (uma_with == VK_UMA_WITH_HOST) ext[next++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
     if (uma_with == VK_UMA_WITH_AHB) ext[next++] = "VK_ANDROID_external_memory_android_hardware_buffer";
-    if (has_budget) ext[next++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+    if (g_vk.has_budget) ext[next++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
     if (g_vk.has_mixed_samples) ext[next++] = VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME;
     /* the extension only with a host time domain among the calibrateable ones: CLOCK_MONOTONIC_RAW is the clock
        the Tracy client keeps its own time in, so the two domains' pair maps the GPU's timestamps onto it */
@@ -921,7 +926,7 @@ static int create_device(void) {
                                   .preferredLargeHeapBlockSize = g_vk.alloc_cap < (256ull << 20) ? g_vk.alloc_cap : 0,
                                   .vulkanApiVersion = VK_API_VERSION_1_3,
                                   .pVulkanFunctions = &vf,
-                                  .flags = has_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0};
+                                  .flags = g_vk.has_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0};
     if (g_vk.has_descriptor_buffers) vai.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     if (!VK_OK(vmaCreateAllocator(&vai, &g_vk.vma))) return 0;
     __atomic_store_n(&g_vma_ready, 1, __ATOMIC_RELEASE);

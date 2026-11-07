@@ -177,8 +177,9 @@ setting Stats
     int 0 1
     default 0
     words Off|On
-    help 1 = the frames a second, the last frame's time, the processor and memory the game takes and a graph of its
-    help last 120 frames' times, in a corner over the game. F12 or the game's menu turns it on and off
+    help 1 = the frames a second, the last frame's time, the processor and memory the game takes, the GPU's busy share
+    help and time a frame, the video memory it uses of the driver's budget and a graph of its last 120 frames' times,
+    help in a corner over the game. F12 or the game's menu turns it on and off
 setting Stats corner
     key stats_corner
     text 3
@@ -247,16 +248,17 @@ setting Vertex input dynamic state
     help the pipeline. Dynamic,
     help one pipeline serves every layout a program is drawn with, so fewer pipelines are made; in the pipeline, each
     help layout takes one of its own. Any other value stops the game, saying so
-setting ASTC BC
-    label ASTC as BC7
-    key astc_bc
+setting ASTC mode
+    label ASTC textures
+    key astc_mode
     int 0 1
     default 0
     startup
-    words Off|On
-    help 0 = ASTC textures are decoded to RGBA8, exactly as the game's blocks decode. 1 = on a GPU that samples BCn
-    help but not ASTC (most desktop ones), they are decoded and then encoded again as BC7, in a quarter of RGBA8's
-    help memory, close to what the blocks decode to but not always the same. Where the GPU samples ASTC it does nothing
+    words Auto|Exact
+    help Auto = on a GPU that samples BCn but not ASTC (most desktop ones), ASTC textures are decoded and then encoded
+    help again as BC7, in a quarter of RGBA8's memory, close to what the blocks decode to but not always the same.
+    help Exact = they are decoded to RGBA8, exactly as the game's blocks decode, in four times the memory. Where the GPU
+    help samples ASTC it does nothing. It takes the place of astc_bc, whose 1 was Auto
 
 table g_performance_ini
 setting FPS limit
@@ -1068,6 +1070,23 @@ setting Script
     once
     set unattended_script_set
     help The scripted input: when:buttons, comma between, when in ms or a present's number and f (300f)
+setting Input record
+    key input_record
+    int 0 9
+    default 0
+    once
+    set unattended_record_set
+    help The game's slot player 1's input is recorded to as it runs, 1 to 9, 0 for none: tas/<id>.<slot>.snxtas in
+    help the game's folder, replaced, a line frame:buttons:lx,ly,rx,ry each present the input changed (frame the
+    help presents since the game's start, buttons in hex as the script's)
+setting Input replay
+    key input_replay
+    int 0 9
+    default 0
+    once
+    set unattended_replay_set
+    help The game's slot whose recording is played as player 1's input present by present, 1 to 9, 0 for none:
+    help neutral before its first line, the controls again at the present after its last line's
 setting Keyboard text
     key swkbd_text
     text 2004

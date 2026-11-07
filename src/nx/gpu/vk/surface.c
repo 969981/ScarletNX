@@ -701,15 +701,14 @@ static FlushPart flush_whole(const Surf* s) {
 static void flush_copy(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 at, u32 pitch, const FlushPart* part) {
     u64 slice = (u64)pitch * part->rows;
     u32 depth = s->type == VK_IMAGE_VIEW_TYPE_3D ? s->depth3d : 1; /* a 3D image's slices in one copy */
-    if (s->msaa) { /* the samples drawn into the guest's layout of them a layer at a time, and copied from there */
+    if (s->msaa) { /* the part's samples drawn into the guest's layout of them a layer at a time, copied from there */
         for (u32 layer = part->layer; layer < part->layer + part->layers; layer++) {
-            VkImage grid = vk_ms_unpack(cb, s, layer);
+            VkImage grid = vk_ms_unpack(cb, s, layer, part->y, part->rows);
             if (!grid) continue;
             VkBufferImageCopy c = {
                 .bufferOffset = at + (u64)(layer - part->layer) * slice,
                 .bufferRowLength = pitch / s->f.bpp,
                 .imageSubresource = {s->f.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                .imageOffset = {0, (i32)part->y, 0},
                 .imageExtent = {guest_w(s), part->rows, 1}};
             rec_CmdCopyImageToBuffer(cb, grid, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
         }
@@ -1156,6 +1155,10 @@ static void rt_retire_over(u64 gva, u64 size) {
    each, a fifth of the run. A pitch-linear one's rows go at the guest's pitch, over the bytes between them as the
    guest has them. 0 when it can't be (pitch-linear rows of part texels, or layers not a pitch's rows apart, no room):
    the caller flushes at once */
+static int surf_publishable(const Surf* s) {
+    return s->bl || (!(s->pitch % s->f.bpp) && s->type != VK_IMAGE_VIEW_TYPE_3D &&
+                     (s->layers == 1 || s->layer_size == (u64)s->pitch * guest_h(s)));
+}
 int vk_surf_publish(Surf* s) {
     u64 size = flush_bytes(s), off = 0;
     u32 mem_wgen = s ? s->mem_wgen : 0;
@@ -1163,9 +1166,7 @@ int vk_surf_publish(Surf* s) {
     VkCommandBuffer cb;
     if (!size || (s->gva >> 63)) return 0;
     if (!s->bl) {
-        if (s->pitch % s->f.bpp || s->type == VK_IMAGE_VIEW_TYPE_3D ||
-            (s->layers > 1 && s->layer_size != (u64)s->pitch * guest_h(s)))
-            return 0;
+        if (!surf_publishable(s)) return 0;
         size = rt_bytes(s);
     }
     vk_render_end();
@@ -1237,6 +1238,91 @@ int vk_surf_publish(Surf* s) {
     vk_surf_relist(s);
     if (!s->is_rt) vk_tex_note_writeback(s);
     return 1;
+}
+/* A draw's storage image kept on the GPU until the CPU touches its bytes, where the write-back read all of them on the
+   CPU before the draw, and copied the image back after it, to merge the two with what the CPU wrote between. Here
+   the span is GPU-owned from the bind on: by the owner a release published there before, or by one made now from
+   memory, which holds the image as the texture check before the bind left it. That owner is the span's bytes from
+   before the draw, and the host's trap tells whether the CPU touched them: at the release, a span it still owns whole
+   gets the image published over it, exactly what the merge would give, and one the CPU touched gets the merge, with
+   the owner's bytes read back as the ones from before the draw. It takes the host's traps, a span of whole pages that
+   is one run of guest memory (a page shared with other bytes would trap at each of their writes), and a span the CPU
+   hasn't touched lately: one it reads or writes every frame would trap and wait for the GPU each time, which the
+   write-back's copies never do */
+#define KEEP_CPU_PRESENTS 1200 /* as long as compute.c's storage buffers stay off the GPU once the CPU read them */
+/* the one owner of all of [cpu, cpu + size), the span at *off of it, or NULL (vk_lock) */
+static VkOwnRes* span_owner(u64 cpu, u64 size, u64* off) {
+    OwnRange r[2];
+    if (own_lookup(cpu, size, r, 2) != 1 || r[0].addr != cpu || r[0].size != size) return NULL;
+    *off = r[0].res_off;
+    return (VkOwnRes*)r[0].res;
+}
+int vk_surf_keep_begin(Surf* s, VkImageKeep* k) {
+    u64 size = rt_bytes(s), cpu = 0;
+    VkOwnRes* r;
+    *k = (VkImageKeep){0};
+    if (!own_traps() || !size || (s->gva >> 63) || ((s->gva | size) & 0xFFF) || !surf_publishable(s) ||
+        gmmu_run(s->gva, size, &cpu) != size || vk_own_cpu_read(cpu, size, KEEP_CPU_PRESENTS))
+        return 0;
+    if ((r = span_owner(cpu, size, &k->off)))
+        vk_own_res_ref(r);
+    else { /* memory's bytes, with the targets pending over them, as a release's publish stages them */
+        u32 mem_wgen = s->mem_wgen;
+        if (!(r = vk_own_res_new(size))) return 0;
+        if (!vk_guest_read_device(s->gva, size, r->buf, 0)) {
+            vk_own_res_unref(r);
+            return 0;
+        }
+        s->mem_wgen = s->wgen; /* a target goes over nothing of its own */
+        if (vk_rt_overlay(s->gva, size, r->buf, 0)) vk_all_barrier(vk_cmd());
+        s->mem_wgen = mem_wgen;
+        rt_retire_over(s->gva, size);
+        vk_own_publish(cpu, size, r, 0);
+        if (span_owner(cpu, size, &k->off) != r) { /* landed instead (unified memory over it) */
+            vk_own_res_unref(r);
+            return 0;
+        }
+        k->made = 1;
+        if (!s->is_rt) vk_tex_note_writeback(s); /* its image is memory's bytes, by their owner */
+        s->gw = gpu_mem_generation();
+    }
+    k->held = r;
+    mem_baseline(s); /* a write-back's merge (cpu_newer) counts the CPU's writes from the bind on */
+    return 1;
+}
+/* held's bytes from off on, size of them, read back (a wait for the GPU), malloc'd: NULL when they can't be */
+static u8* keep_original(VkOwnRes* held, u64 off, u64 size) {
+    VkBuffer buf;
+    const u8* p = size <= g_vk.alloc_cap ? vk_readback_buffer(size, &buf) : NULL;
+    u8* original = p ? (u8*)malloc(size) : NULL;
+    if (!original) {
+        LOG_LIMIT(4,
+                  "vulkan: a storage image's %llu bytes from before its draw found no room to be read back: the CPU's "
+                  "pages written since keep their bytes over the image's there\n",
+                  (unsigned long long)size);
+        return NULL;
+    }
+    vk_render_end();
+    VkCommandBuffer cb = vk_cmd();
+    vk_all_barrier(cb);
+    VkBufferCopy c = {off, 0, size};
+    rec_CmdCopyBuffer(cb, held->buf, buf, 1, &c);
+    flush_wait(cb);
+    memcpy(original, p, size);
+    return original;
+}
+int vk_surf_keep_end(Surf* s, const VkImageKeep* k, u8** original) {
+    u64 size = rt_bytes(s), cpu = 0, off = 0;
+    int whole = gmmu_run(s->gva, size, &cpu) == size;
+    *original = NULL;
+    if (whole && span_owner(cpu, size, &off) == k->held && off == k->off && vk_surf_publish(s)) {
+        vk_own_res_unref(k->held);
+        return 1;
+    }
+    if (whole) vk_own_cpu_touched(cpu, size); /* its next draws take the write-back */
+    *original = keep_original(k->held, k->off, size);
+    vk_own_res_unref(k->held);
+    return 0;
 }
 
 u64 g_vk_rt_readbacks; /* render targets written back to guest memory because the GPU's copy couldn't take them */
@@ -1836,8 +1922,8 @@ u64 vk_rt_reclaim_superseded(u32 before, u64 want) {
 }
 
 /* ------------------------------------------------------------ the budget */
-/* A trim that found the images short of memory, where ASTC textures were decoded to RGBA8 on a GPU that samples BCn
-   but not ASTC: the log suggests astc_bc=1 once a run, with the numbers, and never turns it on (snx_astc_bc_suggest).
+/* A trim that found the images short of memory, where ASTC textures were decoded to RGBA8 (astc_mode=1, Exact) on a
+   GPU that samples BCn but not ASTC: the log suggests astc_mode=0 once a run, with the numbers (snx_astc_bc_suggest).
    Short: an image allocation found no memory (force), the caches left past their budget once all that could go went,
    or the working set evicted (what the last two presents used, the trim's second step), which the next frames load
    again: a game held slow by eviction */
@@ -1848,7 +1934,7 @@ static void astc_bc_suggest(int force, u64 extra, u64 usage, u64 budget, u64 fre
               : working       ? SNX_ASTC_SHORT_WORKING_SET
                               : SNX_ASTC_SHORT_NONE;
     char said[128];
-    if (!snx_astc_bc_suggest(g_settings.astc_bc, g_vk.astc_bc7_could, 0, astc, why)) return;
+    if (!snx_astc_bc_suggest(!g_settings.astc_mode, g_vk.astc_bc7_could, 0, astc, why)) return;
     if (why == SNX_ASTC_SHORT_NO_MEMORY)
         snprintf(said, sizeof said, "an image of %llu MB found no memory", (unsigned long long)(extra >> 20));
     else if (why == SNX_ASTC_SHORT_PAST_BUDGET)
@@ -1857,11 +1943,11 @@ static void astc_bc_suggest(int force, u64 extra, u64 usage, u64 budget, u64 fre
     else
         snprintf(said, sizeof said, "a trim took %llu MB of textures and targets the last two presents used",
                  (unsigned long long)(working >> 20));
-    LOG_LIMIT(1,
-              "vulkan: %s, %llu of %llu MB budgeted in use: astc_bc=1 (Settings > Graphics) would hold the %llu MB of "
-              "ASTC textures decoded to RGBA8 in a quarter, as BC7\n",
-              said, (unsigned long long)(usage >> 20), (unsigned long long)(budget >> 20),
-              (unsigned long long)(astc >> 20));
+    LOG_LIMIT(
+        1,
+        "vulkan: %s, %llu of %llu MB budgeted in use: astc_mode=0 (Settings > Graphics) would hold the %llu MB of "
+        "ASTC textures decoded to RGBA8 in a quarter, as BC7\n",
+        said, (unsigned long long)(usage >> 20), (unsigned long long)(budget >> 20), (unsigned long long)(astc >> 20));
 }
 static u64 g_trimmed;   /* statistics: bytes freed for the budget */
 static u32 g_trim_dry;  /* the present a trim last found too little to free (+1: 0 is none) */

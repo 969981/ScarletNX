@@ -373,8 +373,9 @@ if(TARGET snx_ctr_board)
         endif()
         set_tests_properties(${snx_tests} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
-    # the two windows and the per-screen render scales: one window always, Separate screens and a minimized window
-    # when the host has a window; the dumps stay the framebuffer's own size whatever the scale
+    # the two windows and the per-screen render scales: one window always, Separate screens, a minimized window and a
+    # window whose images the display holds when the host has a window; the dumps stay the framebuffer's own size
+    # whatever the scale
     add_executable(snx-test-3ds-windows 3ds_windows.c)
     snx_test_target(snx-test-3ds-windows 11)
     target_link_libraries(snx-test-3ds-windows PRIVATE snx_ctr_gpu)
@@ -383,8 +384,10 @@ if(TARGET snx_ctr_board)
              COMMAND snx-test-3ds-windows "${CMAKE_CURRENT_BINARY_DIR}/window-frames-separate" --separate)
     add_test(NAME 3ds_windows_minimized
              COMMAND snx-test-3ds-windows "${CMAKE_CURRENT_BINARY_DIR}/window-frames-minimized" --minimize)
+    add_test(NAME 3ds_windows_no_image
+             COMMAND snx-test-3ds-windows "${CMAKE_CURRENT_BINARY_DIR}/window-frames-no-image" --no-image)
     set_tests_properties(3ds_windows 3ds_windows_separate PROPERTIES SKIP_RETURN_CODE 77)
-    set_tests_properties(3ds_windows_minimized PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(3ds_windows_minimized 3ds_windows_no_image PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     # the transfer engine alone: fills, display transfers, texture copies against hand-written goldens
     add_executable(snx-test-3ds-transfer 3ds_transfer.c)
     snx_test_target(snx-test-3ds-transfer 11)
@@ -951,13 +954,21 @@ snx_test_target(snx-test-hook-versions 99)
 target_include_directories(snx-test-hook-versions PRIVATE "${PROJECT_SOURCE_DIR}/src")
 snx_hookgen(snx-test-hook-versions SPEC "${CMAKE_CURRENT_SOURCE_DIR}/hook/versions.hook")
 add_test(NAME hook_versions COMMAND snx-test-hook-versions)
-# the route list (src/nx/loader/hook_routes.c): hookgen --routes over two specs (tests/hook/routes.hook and
-# versions.hook), and the runtime's own list, its lookup and the hashes a module carries
+# address hooks (tests/hook/address.hook), read as the second spec of one table after tests/hook/address_first.hook
+add_executable(snx-test-hook-address hook_address.c)
+snx_test_target(snx-test-hook-address 99)
+target_include_directories(snx-test-hook-address PRIVATE "${PROJECT_SOURCE_DIR}/src")
+snx_hookgen(snx-test-hook-address SPEC "${CMAKE_CURRENT_SOURCE_DIR}/hook/address_first.hook"
+            "${CMAKE_CURRENT_SOURCE_DIR}/hook/address.hook")
+add_test(NAME hook_address COMMAND snx-test-hook-address)
+# the route list (src/nx/loader/hook_routes.c): hookgen --routes over three specs (tests/hook/routes.hook,
+# versions.hook and address.hook), the runtime's own list, its lookup and the hashes a module carries, and the build
+# IDs an address hook's key names
 add_executable(snx-test-hook-routes hook_routes.c)
 snx_test_target(snx-test-hook-routes 99)
 target_link_libraries(snx-test-hook-routes PRIVATE snx_test_common snx_nx_module)
 snx_hook_routes(snx-test-hook-routes SPECS "${CMAKE_CURRENT_SOURCE_DIR}/hook/routes.hook"
-                "${CMAKE_CURRENT_SOURCE_DIR}/hook/versions.hook")
+                "${CMAKE_CURRENT_SOURCE_DIR}/hook/versions.hook" "${CMAKE_CURRENT_SOURCE_DIR}/hook/address.hook")
 add_test(NAME hook_routes COMMAND snx-test-hook-routes)
 # verify mode (src/nx/hle/hook/verify.c): pure hooks (tests/hook/verify.hook) checked against stand-ins for the
 # function's own code, on copies of their buffers, and each kind of difference it reports
@@ -970,7 +981,7 @@ add_test(NAME hook_verify COMMAND snx-test-hook-verify)
 add_executable(snx-test-diag-abort diag_abort.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/diag.c")
 snx_test_target(snx-test-diag-abort 11) # log.h has _Thread_local
 target_include_directories(snx-test-diag-abort PRIVATE "${PROJECT_SOURCE_DIR}/src")
-snx_hookgen(snx-test-diag-abort)
+snx_hookgen(snx-test-diag-abort SPEC "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/hooks.hook")
 add_test(NAME diag_abort COMMAND snx-test-diag-abort)
 # the hooks' NVN key (tests/hook/nvn_versions.hook): the API version read from a driver's nvnDeviceGetInteger
 # (src/nx/gpu/nvn/nvn_driver.c), the entry hook_select picks for it, and the versions the log calls described
@@ -1080,7 +1091,14 @@ foreach(bad IN ITEMS
         include_missing 2 "cannot find nx/none.h"
         function_type_versions 4 "nvnQueueFinish takes other types on line 3"
         handler_underived 2 "memcpy names no handler"
-        handler_derived 2 "nvn_DeviceFinalize is the handler that nvnDeviceFinalize names already")
+        handler_derived 2 "nvn_DeviceFinalize is the handler that nvnDeviceFinalize names already"
+        address_versioned 2 "an address hook is for one build of its module: it has no @version"
+        address_handler 2 "an address hook's name is its handler's"
+        address_unaligned 2 "offset 0x42 isn't a function's"
+        address_short 2 "a build ID is an even number of hex digits, 16 to 64"
+        address_zero 2 "a build ID of zeros names no build"
+        address_twice 4 "0123456789abcdef:40 is hooked on line 2 too"
+        address_keyword 2 "expected 'hook' after the address")
     if(NOT DEFINED bad_name)
         set(bad_name "${bad}")
     elseif(NOT DEFINED bad_line)
@@ -2737,10 +2755,11 @@ add_executable(snx-test-quad-indices quad_indices.c)
 snx_test_target(snx-test-quad-indices 99)
 target_include_directories(snx-test-quad-indices PRIVATE "${PROJECT_SOURCE_DIR}/src")
 add_test(NAME quad_indices COMMAND snx-test-quad-indices)
-add_executable(snx-test-unattended-script unattended_script.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c")
+add_executable(snx-test-unattended-script unattended_script.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c"
+    "${PROJECT_SOURCE_DIR}/src/common/filesystem/host.c") # plat_mkdir, the slots' folder
 snx_test_target(snx-test-unattended-script 11)
-target_link_libraries(snx-test-unattended-script PRIVATE m)
-add_test(NAME unattended_script COMMAND snx-test-unattended-script)
+target_link_libraries(snx-test-unattended-script PRIVATE m scarletnx-common) # snx_read_file, snx_fopen
+add_test(NAME unattended_script COMMAND snx-test-unattended-script "${CMAKE_CURRENT_BINARY_DIR}")
 # the environment variables an older runtime read, this run's values for their settings and said with them
 add_executable(snx-test-deprecated-env deprecated_env.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/deprecated_env.c")
 snx_test_target(snx-test-deprecated-env 11)
@@ -2778,6 +2797,12 @@ if(NOT WIN32 AND TARGET SDL3::SDL3) # SDL3 is there with a driver that draws (cm
              COMMAND snx-test-platform-posix "${CMAKE_CURRENT_BINARY_DIR}/platform_posix_hot" --write_tracking_hot=1)
     add_test(NAME platform_posix_no_tracking
              COMMAND snx-test-platform-posix "${CMAKE_CURRENT_BINARY_DIR}/platform_posix_no_tracking" --write_tracking=2)
+    # what the tracking costs on this host, with no game (bench_ww): page protection without and with hot pages, and
+    # the host's own way. Its timings are printed; it checks the scans' reports, and that hot pages take fewer faults
+    add_test(NAME platform_posix_bench_ww
+             COMMAND snx-test-platform-posix "${CMAKE_CURRENT_BINARY_DIR}" --bench-ww --write_tracking=1)
+    add_test(NAME platform_posix_bench_ww_own COMMAND snx-test-platform-posix "${CMAKE_CURRENT_BINARY_DIR}" --bench-ww)
+    set_tests_properties(platform_posix_bench_ww platform_posix_bench_ww_own PROPERTIES TIMEOUT 60)
 endif()
 if(WIN32 AND TARGET SDL3::SDL3)
     # the write watch of the reservation, the kernel's writes included (platform/plat_win32.c)
