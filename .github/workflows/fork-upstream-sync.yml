@@ -34,22 +34,47 @@ jobs:
           git remote add upstream https://github.com/scarletnx/ScarletNX.git
           git fetch --no-tags upstream main
           upstream_sha=$(git rev-parse upstream/main)
-          new_commits=$(git rev-list --count HEAD..upstream/main)
-          echo "Upstream: $upstream_sha, unseen commits: $new_commits"
-          if [ "$new_commits" -eq 0 ]; then
+          # GitHub's default Actions token cannot push commits that modify
+          # .github/workflows. Apply only source changes as a local commit
+          # instead of pushing upstream's workflow-bearing commit history.
+          state=.github/scarletnx-upstream.sha
+          if [ -f "$state" ]; then
+            previous=$(cat "$state")
+          else
+            previous=$(git merge-base HEAD upstream/main)
+          fi
+          test -n "$previous" && git cat-file -e "$previous^{commit}"
+          if [ "$previous" = "$upstream_sha" ]; then
             echo 'changed=false' >> "$GITHUB_OUTPUT"
-            echo 'No new upstream commits.'
+            echo "Already synchronized source: $upstream_sha"
             exit 0
+          fi
+          if ! git merge-base --is-ancestor "$previous" "$upstream_sha"; then
+            echo '::error::Upstream history was rewritten. Review changes before syncing.'
+            exit 1
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          # Keep this repo's workflows and other custom commits. Never force-push.
-          # Conflicts intentionally fail the job rather than overwriting custom files.
-          git merge --no-ff -m "chore(sync): upstream $upstream_sha" upstream/main
+          patch="$RUNNER_TEMP/scarletnx-upstream.patch"
+          git diff --binary "$previous" "$upstream_sha" -- . ':(exclude).github/workflows/**' > "$patch"
+          source_changed=false
+          if [ -s "$patch" ]; then
+            git apply --3way --index "$patch"
+            if ! git diff --cached --quiet; then source_changed=true; fi
+          fi
+          # The marker makes future syncs incremental despite no upstream
+          # merge parent. Preserve all local commits; never force-push.
+          printf '%s\n' "$upstream_sha" > "$state"
+          git add -- "$state"
+          if git diff --cached --name-only | grep -q '^.github/workflows/'; then
+            echo '::error::Refusing to modify workflow files from the sync bot.'
+            exit 1
+          fi
+          git commit -m "chore(sync): upstream source $upstream_sha"
           git push origin HEAD:main
-          echo 'changed=true' >> "$GITHUB_OUTPUT"
+          echo "changed=$source_changed" >> "$GITHUB_OUTPUT"
           echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
-
+          echo "Previous source: $previous -> $upstream_sha" >> "$GITHUB_STEP_SUMMARY"
       - name: Dispatch the existing upstream build matrix
         if: steps.sync.outputs.changed == 'true'
         env:
