@@ -511,7 +511,7 @@ list). The user's data folder and a portable copy's keep each kind of file apart
 
 | What | Another `--data`, an `--outdir` | Linux, the user's data folder | A portable copy's, the user's elsewhere |
 | --- | --- | --- | --- |
-| a game: its program, `<id>_code.so`, `<id>_data/` (saves, `control.nacp`), `captures/` | `recompiled/<id>/` | `~/.local/share/scarletnx/recompiled/<id>/` | `recompiled/<id>/` |
+| a game: its program, `<id>_code.so`, `<id>_data/` (saves, `control.nacp`, its SD card `sdmc/` with the pictures it saves to its album in `Nintendo/Album/`, as the console has them), `captures/` | `recompiled/<id>/` | `~/.local/share/scarletnx/recompiled/<id>/` | `recompiled/<id>/` |
 | its settings, `<id>.ini` | `recompiled/<id>/` | `~/.config/scarletnx/recompiled/<id>/` | `config/recompiled/<id>/` |
 | its `<id>.log` (this run's; the 4 before in `logs/<date>.log`) and `threads.txt` | `recompiled/<id>/` | `~/.local/state/scarletnx/recompiled/<id>/` | `state/recompiled/<id>/` |
 | its pipeline cache | `recompiled/<id>/shader_cache/` | `~/.cache/scarletnx/recompiled/<id>/shader_cache/` | `cache/recompiled/<id>/shader_cache/` |
@@ -669,6 +669,12 @@ dead zone in `gamepad_deadzone` and the game's vibration as strong as `gamepad_r
 *Controllers*, which names the pads connected; its *Player* row shows every player's settings (*All*) or one
 player's own Swap A/B, Vibration and Button map. Each connected gamepad uses its own player slot, up to eight.
 Keyboard and on-screen controls also drive player one.
+`gamepad_assign=1` gives the players out as a console does (after Eden's Modern Console): each controller that
+connects is the lowest player free ("P2: Xbox Wireless Controller joined"), and one that leaves keeps its player for
+45 seconds, which it takes back when it returns while another that connects goes past it. Once a player's controller
+has been gone 3 seconds the game pauses ("P2 disconnected: reconnect, or press + on another controller to go on")
+until it returns, or until + is let go on another controller, which goes on without that player. `0`, the default,
+gives them out as each player's `gamepad_p<N>_device` names its controller, the next to connect where it names none.
 `gamepad_joycon_pair=1` makes SDL combine a left and right Joy-Con. Set it to `0` to expose them separately and
 restart the game after changing it.
 
@@ -706,11 +712,13 @@ pad.
 | Q / E / 1 / 3 | L / R / ZL / ZR |
 | Enter / Backspace | Plus / Minus |
 
-F1 help; F2 the game's menu; F3 screenshot; F4 FPS limit off and on; F5 thread dump; F6 showcase on and off;
+F1 a page of the game's menu with these keys and the buttons above, a row each (Up/Down go over it, any other key goes
+back to the game); F2 the game's menu; F3 screenshot; F4 FPS limit off and on; F5 thread dump; F6 showcase on and off;
 F7 save state; F8 load state; F9 next save state slot; F10 60-second Tracy capture (SNX_TRACY builds); F11/Alt+Enter
-fullscreen; F12 stats on and off; Pause pauses the whole game and resumes it (the window's title says "(paused)");
-Escape quit. A window shows at most one image per refresh and drops the rest unless images tear, and the game keeps
-the pace `fps_limit` sets.
+fullscreen; F12 stats on and off; Ctrl+F12 a RenderDoc capture of the next frame, with RenderDoc in the game
+(`renderdoc`, or a game RenderDoc's program started); Pause pauses the whole game and resumes it (the window's title
+says "(paused)"); Escape quit. A window shows at most one image per refresh and drops the rest unless images tear, and
+the game keeps the pace `fps_limit` sets.
 
 A save state is the whole game at one moment, kept in `states/` in the game's folder, one file a slot. F7 saves to
 the selected slot and F8 loads it, and F9 selects the next slot and says what it holds. The menu's **Save states**
@@ -755,7 +763,11 @@ touch screen. They are on by default on Android and off elsewhere.
 The game's menu (Back on Android, Home on a gamepad, F2) has their page: show them, *Edit layout* (drag a control;
 tap one and size it with the bar on top; *Done* or Back ends it), snap to a grid, scale and opacity, the buttons
 shown, a stick's middle where the finger lands, a D-pad a finger slides on, a buzz on each press (Android), the touch
-screen, and *Reset layout*. The game's `.ini` keeps them: `controls`, `controls_scale`, `controls_opacity`,
+screen, and *Reset layout*. *Skin* goes round their looks: the built-in one and ScarletNX's own, yorha (the
+launcher's yorha theme on the controls). Any [RetroArch overlay](../dist/controls/skins/README.md) is a skin too:
+`controls_skin=` the path of its `.cfg` (the launcher's Settings take it as text), and the controls take its places,
+sizes, images and pressed looks; what it lacks keeps the built-in look, and the log says each part it leaves out. The
+game's `.ini` keeps them: `controls`, `controls_scale`, `controls_opacity`, `controls_skin`,
 `controls_snap`, `controls_rel_center`, `controls_dpad_slide`, `controls_haptics`, a control's place once it
 was moved (`controls_a=0.930 0.470 100`: its middle across the screen and its size in percent), and whether it is
 shown once that changed (`controls_a_shown=0`). The launcher's Settings have the same, but the layout.

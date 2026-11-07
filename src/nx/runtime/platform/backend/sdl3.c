@@ -23,6 +23,7 @@
 #include "nx/runtime/platform/ui.h"
 #include "nx/runtime/platform/vpad.h"
 #include "nx/runtime/platform/gamepad.h"
+#include "nx/runtime/platform/help.h"
 #include "common/utilities/pad_sdl.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -378,8 +379,8 @@ void backend_keyboard_hide(u32 ticket) {
     ui_unlock();
 }
 
-/* the on-screen controls' sprites, decoded from the PNG compiled in, to the atlas the renderer uploads */
-static void controls_atlas(void) {
+/* the on-screen controls' sprites, decoded from the PNG compiled in (malloc'd, w x h), NULL when they can't be */
+static u32* controls_sprites(int* w, int* h) {
     SDL_Surface* png = SDL_LoadPNG_IO(SDL_IOFromConstMem(snx_controls_png, snx_controls_png_size), true);
     SDL_Surface* rgba = png ? SDL_ConvertSurface(png, SDL_PIXELFORMAT_RGBA32) : NULL;
     u32* px = rgba ? malloc((size_t)rgba->w * (size_t)rgba->h * 4) : NULL;
@@ -387,12 +388,29 @@ static void controls_atlas(void) {
         for (int y = 0; y < rgba->h; y++)
             memcpy(px + (size_t)y * (size_t)rgba->w, (const u8*)rgba->pixels + (size_t)y * (size_t)rgba->pitch,
                    (size_t)rgba->w * 4);
-        ui_atlas_set(px, rgba->w, rgba->h);
+        *w = rgba->w;
+        *h = rgba->h;
     } else
         WARN("input: the on-screen controls' image could not be read: %s\n", SDL_GetError());
-    free(px);
     SDL_DestroySurface(rgba);
     SDL_DestroySurface(png);
+    return px;
+}
+/* the atlas the renderer uploads, from the sprites and the skin's rows as they are */
+static void controls_atlas(void) {
+    int w = 0, h = 0;
+    u32* px = controls_sprites(&w, &h);
+    if (px) ui_atlas_set(px, w, h);
+    free(px);
+}
+/* controls_skin's skin, its atlas and its controls: when the window opens, and on the main thread each time the
+   setting changes (the game's menu, a reload of the .ini) */
+static void controls_skin(void) {
+    int w = 0, h = 0;
+    u32* px = controls_sprites(&w, &h);
+    vpad_skin_changed();
+    vpad_skin_apply(px, w, h);
+    free(px);
 }
 /* Android's vibrator, which SDL lists as VIBRATOR_SERVICE; a gamepad's motors are no buzz for a finger */
 static void buzzer_open(void) {
@@ -475,7 +493,7 @@ void video_init(const char* title, const char* addons) {
     if (!g_win) fatal("SDL could not open a Vulkan window: %s", SDL_GetError());
     snx_window_icon(g_win);
     overlay_set_display_scale(SDL_GetWindowDisplayScale(g_win));
-    controls_atlas();
+    controls_skin();
     vpad_set_store(ini_set);
     buzzer_open();
     SDL_GetWindowSizeInPixels(g_win, &w, &h);
@@ -538,35 +556,6 @@ int backend_vk_surface(VkInstance instance, VkSurfaceKHR* surface) {
     LOG("video: no Vulkan surface: %s\n", SDL_GetError());
     return 0;
 }
-/* F1's text. It follows keymap (the game's buttons), hotkey and menu_event (the runtime's keys): a binding changed there
-   changes here */
-static const char* HELP =
-    "Controller: A, B, X and Y sit where the console has them (gamepad_swap_ab=1 swaps A and B). "
-    "Home opens the game's menu.\n\n"
-    "Keyboard, by key position on a US layout:\n"
-    "  Buttons      A: X or Space    B: Z    X: C    Y: V\n"
-    "  Shoulders    L: Q    R: E    ZL: 1    ZR: 3\n"
-    "  Plus, minus  +: Enter    -: Backspace\n"
-    "  D-Pad        the arrow keys\n"
-    "  Left stick   W, A, S and D\n"
-    "  Right stick  I, J, K and L\n\n"
-    "Runtime keys:\n"
-    "  F1  this help\n"
-    "  F2  open or close the game's menu (arrows move, Enter or Space picks, Esc or Backspace goes back)\n"
-    "  F3  take a screenshot\n"
-    "  F4  turn the FPS limit off or back on\n"
-    "  F5  write every thread's state to the log\n"
-    "  F6  turn showcase mode on or off\n"
-    "  F7  save the game's state to the selected slot\n"
-    "  F8  load the selected slot's state\n"
-    "  F9  select the next save state slot\n"
-#if defined(SNX_TRACY)
-    "  F10 record a 60 second Tracy capture\n"
-#endif
-    "  Pause  pause the whole game, and resume it\n"
-    "  F11 or Alt+Enter  switch fullscreen\n"
-    "  F12  turn the stats on or off\n"
-    "  Esc  quit the game";
 
 static PadKind gamepad_kind(int type) {
     switch (type) {
@@ -577,7 +566,7 @@ static PadKind gamepad_kind(int type) {
     }
 }
 
-/* keys -> HidNpadButton bits; 40..47 are the stick keys, turned into axes in video_poll. By scancode, the key's
+/* keys -> HidNpadButton bits, which F1's text lists (help.c); 40..47 are the stick keys, turned into axes in video_poll. By scancode, the key's
    position: the keycode depends on the layout and on the modifiers, so Shift pressed while 1 was held made its release
    a different key, and ZL stayed held */
 static u64 keymap(SDL_Scancode k) {
@@ -952,15 +941,21 @@ static void title_paused(int paused) {
     snprintf(title, sizeof title, "%.*s%s", (int)n, t, paused ? mark : "");
     SDL_SetWindowTitle(g_win, title);
 }
+static void menu_open(int open);
+/* the runtime's keys, which the game's menu's F1 page lists (overlay.c's KEYS) with the game's buttons of keymap: a
+   binding changed here changes there */
 static void hotkey(SDL_Keycode k) {
     switch (k) {
-        case SDLK_F1: {
-            int fs = g_fullscreen;
-            if (fs) set_fullscreen(0);
-            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "ScarletNX", HELP, g_win);
-            if (fs) set_fullscreen(1);
+        case SDLK_F1: /* the game's menu on its page of keys, over the game as the menu is, fullscreen or not */
+            ui_lock();
+            menu_open(1);
+            {
+                char debugger[SNX_DEBUGGER_NAME];
+                overlay_keys_extra(g_renderer->capture(0), snx_debugger(debugger, sizeof debugger) ? debugger : "");
+            }
+            overlay_keys();
+            ui_unlock();
             break;
-        }
         case SDLK_F3: g_shot_req = 1; break;
         case SDLK_F4: {
             /* off and back to the limit the player set (fps_limit=120 stays 120), or to the game's pace when it
@@ -1098,8 +1093,8 @@ static int menu_event(const SDL_Event* e) {
         switch (e->key.key) {
             case SDLK_UP: overlay_move(-1); break;
             case SDLK_DOWN: overlay_move(1); break;
-            case SDLK_LEFT: overlay_side(-1); break;
-            case SDLK_RIGHT: overlay_side(1); break;
+            case SDLK_LEFT: overlay_do(overlay_side(-1)); break;
+            case SDLK_RIGHT: overlay_do(overlay_side(1)); break;
             case SDLK_RETURN:
             case SDLK_SPACE:
                 if (!e->key.repeat) overlay_do(overlay_select());
@@ -1108,7 +1103,12 @@ static int menu_event(const SDL_Event* e) {
             case SDLK_BACKSPACE:
                 if (!e->key.repeat) overlay_do(overlay_back());
                 break;
-            default: break;
+            case SDLK_F1: /* its page of keys, or from there the game again */
+                if (!e->key.repeat) overlay_do(overlay_keys());
+                break;
+            default: /* F1's page goes back to the game on any key */
+                if (!e->key.repeat) overlay_do(overlay_other());
+                break;
         }
     } else if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
         /* the pads' presses act on the menu from the poll, with their sticks and the on-screen controls'; the button
@@ -1399,6 +1399,7 @@ void video_poll(void) {
         if (!fatal_screen(left)) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "ScarletNX", left, g_win);
         plat_exit_now(1);
     }
+    if (g_win && vpad_skin_changed()) controls_skin(); /* controls_skin set again since the last poll */
     /* the menu, or the keyboard's box, had the controls when this poll began: the press that closes it (B, or A that
        gives the box's line) is in this poll's state */
     int menu_had = overlay_shown() || vpad_editing() || overlay_keyboard_shown();
@@ -1445,6 +1446,12 @@ void video_poll(void) {
                 }
                 if (e.key.key == SDLK_RETURN && (e.key.mod & SDL_KMOD_ALT)) {
                     if (!e.key.repeat) set_fullscreen(!g_fullscreen);
+                    break;
+                }
+                /* Ctrl+F12: RenderDoc's capture of the next frame, F12 alone the stats' (hotkey) */
+                if (e.key.key == SDLK_F12 && (e.key.mod & SDL_KMOD_CTRL) &&
+                    !(e.key.mod & (SDL_KMOD_ALT | SDL_KMOD_GUI))) {
+                    if (!e.key.repeat) g_renderer->capture(1);
                     break;
                 }
                 /* not with Ctrl, Alt or the system key: Alt+F4 also arrives as F4 on Windows */
@@ -1500,7 +1507,8 @@ void video_poll(void) {
         u64 one_buttons;
         i32 one_sticks[4];
         u32 id = gamepad_slot_id(i);
-        int connected = id != 0;
+        int kept = !id && gamepad_slot_kept(i); /* gamepad_assign=1: the player kept for its controller a while */
+        int connected = id != 0 || kept;
         /* A disconnect and replacement can happen in one poll. Do not send the old player's rumble to the new pad. */
         if (previous_ids[i] != id) {
             __atomic_store_n(&player->rumble[0], 0, __ATOMIC_RELAXED);
@@ -1516,9 +1524,11 @@ void video_poll(void) {
                             __atomic_load_n(&player->rumble[1], __ATOMIC_RELAXED));
         /* each player as its settings say: seen or not, and the kind of controller the game sees */
         __atomic_store_n(&player->connected, (connected && gamepad_player_seen(i)) || i == 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&player->kind,
-                         gamepad_player_kind(i, connected ? gamepad_kind(gamepad_slot_type(i)) : SNX_PAD_FULL_KEY),
-                         __ATOMIC_RELAXED);
+        __atomic_store_n(
+            &player->kind,
+            gamepad_player_kind(i, connected ? gamepad_kind(kept ? gamepad_slot_kept_type(i) : gamepad_slot_type(i))
+                                             : SNX_PAD_FULL_KEY),
+            __ATOMIC_RELAXED);
         player->source_id = id;
         player->buttons = one_buttons;
         player->lx = one_sticks[0];
@@ -1605,6 +1615,7 @@ void video_poll(void) {
     vpad_showcase_input(b, st); /* what the game takes, a replay's included */
     ui_unlock();
     pm_unlock(&g_host.hid.input_lock);
+    gamepad_console(pb >> 10 & 1, SDL_GetTicksNS()); /* out of the input's lock: a pause stops the game's threads */
     keyboard_sync();
 }
 

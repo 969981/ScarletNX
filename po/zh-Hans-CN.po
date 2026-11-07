@@ -782,13 +782,13 @@ msgstr "方向键/鼠标: 移动. 空格/Enter/点击: 选择."
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
 #: src/gui/main.c
 #, snx-keys
-msgid "Up/Down: select. Enter/Space: open. Left/Right/PgUp/PgDown: scroll. F5: refresh."
+msgid "Up/Down: move. Enter/Space: open. Left/Right/PgUp/PgDn: scroll. F5: refresh."
 msgstr ""
 
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
 #: src/gui/main.c
 #, snx-keys
-msgid "Arrows: select. Enter/Space: open. PgUp/PgDown: scroll. F5: refresh."
+msgid "Arrows: move. Enter/Space: open. PgUp/PgDn: scroll. F5: refresh."
 msgstr ""
 
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
@@ -1006,13 +1006,13 @@ msgstr "按 [ESC] 返回游戏"
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
 #: src/gui/main.c
 #, snx-keys
-msgid "D-pad: move. A: select. Start: refresh. B: back."
-msgstr "十字键: 移动. A: 选择. Start: 更新. B: 返回."
+msgid "D-pad: move. A: select. Start: refresh. B: exit."
+msgstr "十字键: 移动. A: 选择. Start: 更新. B: 退出."
 
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
 #: src/gui/main.c
 #, snx-keys
-msgid "D-pad: select. A: open. LT/RT: scroll. Start: refresh. B: back."
+msgid "D-pad: move. A: open. LT/RT: scroll. Start: refresh. B: back."
 msgstr ""
 
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
@@ -3832,6 +3832,14 @@ msgid "Nothing to keep: no file of the menu's"
 msgstr "无需保留：菜单没有任何文件"
 
 #: src/gui/main.c
+msgid "Every screen"
+msgstr "每个画面"
+
+#: src/gui/main.c
+msgid "Shortcuts"
+msgstr "快捷键"
+
+#: src/gui/main.c
 #, c-format
 msgid "The game starts its program %d, %s, which is not made: Recompile the game to make its programs"
 msgstr ""
@@ -4525,12 +4533,6 @@ msgstr "PgUp"
 #, snx-key
 msgid "PgDn"
 msgstr "PgDn"
-
-#. A key of the foot's sentences, which a click finds by this word
-#: src/gui/main.c
-#, snx-key
-msgid "PgDown"
-msgstr "PgDown"
 
 #. A key of the foot's sentences, which a click finds by this word
 #: src/gui/main.c
@@ -5617,6 +5619,12 @@ msgstr "启动"
 #: src/nx/runtime/settings.txt
 msgid "LLVM Internals"
 msgstr "LLVM 内部选项"
+
+#~ msgid "D-pad: move. A: select. Start: refresh. B: back."
+#~ msgstr "十字键: 移动. A: 选择. Start: 更新. B: 返回."
+
+#~ msgid "PgDown"
+#~ msgstr "PgDown"
 
 #~ msgid "user=%d is deprecated: user_uid=%s (%s) replaces it"
 #~ msgstr "user=%d 是旧的设置：由 user_uid=%s（%s）取代"

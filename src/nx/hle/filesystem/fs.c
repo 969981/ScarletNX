@@ -27,6 +27,7 @@
 #include "common/utilities/mods.h"
 #include "common/utilities/patches.h"
 #include "common/utilities/ini_lines.h"
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -573,6 +574,28 @@ int fs_add_virtual_file(const char* path, const void* data, u64 size) {
     FsTreeResult r = fs_tree_add_virtual(&g_hle.fs.tree, path, data, size, NULL);
     pm_unlock(&g_hle.fs.tree.lock);
     return r ? -1 : 0;
+}
+int fs_sd_write_new(const char* dir, const char* name, const void* data, u64 size) {
+    char path[FS_TREE_PATH_MAX];
+    FsNode *folder, *file = NULL;
+    FsTreeResult r = FS_TREE_TOOLONG;
+    FILE* f;
+    if ((size_t)snprintf(path, sizeof path, "sdmc/%s", dir) >= sizeof path) return r;
+    pm_lock(&g_hle.fs.tree.lock);
+    r = fs_tree_mkdirs(&g_hle.fs.tree, path, &folder);
+    if (r == FS_TREE_OK) r = fs_tree_create(&g_hle.fs.tree, folder, name, 0, size, &file);
+    if (r == FS_TREE_OK) {
+        f = fs_tree_open(&g_hle.fs.tree, file, "r+b");
+        if (!f || fwrite(data, 1, (size_t)size, f) != size) r = FS_TREE_IO;
+        if (f && fclose(f)) r = FS_TREE_IO;
+        if (r) {
+            int e = errno; /* the write's reason, which the removal must not change */
+            fs_tree_remove(&g_hle.fs.tree, folder, name, 0, 0, 0);
+            errno = e;
+        }
+    }
+    pm_unlock(&g_hle.fs.tree.lock);
+    return (int)r;
 }
 
 /* The RomFS image's layout (Switchbrew's "RomFS"; the hash and bucket count as Eden's fsmitm_romfsbuild): a header of
@@ -2452,6 +2475,78 @@ static int nn_fssrv_sf_IFileSystemProxy_OpenSaveDataTransferProhibiter(SvcObj* s
 }
 static int nn_fssrv_sf_IFileSystemProxy_OpenMultiCommitManager(SvcObj* self, SvcObj** manager) {
     *manager = nn_fssrv_sf_IMultiCommitManager_new();
+    R_SUCCEED();
+}
+/* The file systems a manager commits together: a mask of their slots in g_hle.fs.fss (u[0]), at most the console's
+   10, and each once. Its answers past them, by their names in Ryubing's result table (ResultNames.cs): 0x346C02
+   MultiCommitFileSystemLimit and 0x327E02 MultiCommitHasOverlappingTargets */
+typedef char fs_multi_commit_mask[FS_FS_MAX <= 64 ? 1 : -1]; /* a manager's mask has a bit for each slot */
+#define FS_MULTI_COMMIT_MAX     10
+#define FS_MULTI_COMMIT_LIMIT   RC(2, 6710)
+#define FS_MULTI_COMMIT_OVERLAP RC(2, 6463)
+#define FS_INVALID_ARGUMENT     RC(2, 6001)
+static int nn_fssrv_sf_IMultiCommitManager_Add(SvcObj* self, SvcObj* filesystem) {
+    u64 bit, added;
+    int n = 0, i;
+    if (!filesystem || filesystem->dispatch != fs_disp) {
+        WARN("fs: the game adds %s to a commit of several file systems: InvalidArgument\n",
+             filesystem ? filesystem->name : "no object");
+        R_THROW(FS_INVALID_ARGUMENT);
+    }
+    bit = 1ull << POOL_INDEX(g_hle.fs.fss, (FsData*)filesystem->data);
+    pm_lock(&g_hle.fs.tree.lock);
+    added = self->u[0];
+    for (i = 0; i < FS_FS_MAX; i++) n += (int)(added >> i & 1);
+    if (!(added & bit) && n < FS_MULTI_COMMIT_MAX) self->u[0] = added | bit;
+    pm_unlock(&g_hle.fs.tree.lock);
+    R_UNLESS(!(added & bit), FS_MULTI_COMMIT_OVERLAP);
+    R_UNLESS(n < FS_MULTI_COMMIT_MAX, FS_MULTI_COMMIT_LIMIT);
+    R_SUCCEED();
+}
+/* each added file system committed as its Commit does it (its save's note), or none when one of them is gone: closed,
+   or its save deleted (NotFound, as its own Commit answers then) */
+static int nn_fssrv_sf_IMultiCommitManager_Commit(SvcObj* self) {
+    u64 added = self->u[0];
+    int i;
+    pm_lock(&g_hle.fs.tree.lock);
+    for (i = 0; i < FS_FS_MAX; i++)
+        if ((added >> i & 1) && (!g_hle.fs.fss[i].root || !g_hle.fs.fss[i].root->attached)) {
+            pm_unlock(&g_hle.fs.tree.lock);
+            R_THROW(FS_NOTFOUND);
+        }
+    for (i = 0; i < FS_FS_MAX; i++)
+        if ((added >> i & 1) && g_hle.fs.fss[i].noted) save_note_write(g_hle.fs.fss[i].root);
+    pm_unlock(&g_hle.fs.tree.lock);
+    R_SUCCEED();
+}
+/* nn::fs::SaveDataExtraData's fields past the attribute (Switchbrew) */
+#define FS_EXTRA_DATA_SIZE 0x200
+#define FS_EXTRA_OWNER     0x40
+#define FS_EXTRA_AVAILABLE 0x58
+#define FS_EXTRA_JOURNAL   0x60
+/* A save's extra data as the system made it: its attribute with the program it belongs to (0 asks for the game's own),
+   that program as its owner, and an account's or the device's sizes as am answers them (0 for the other types). Its
+   time stamp, flags and commit id are 0: no save here keeps them. Every save of the game is there, as it is made when
+   opened */
+static int nn_fssrv_sf_IFileSystemProxy_ReadSaveDataFileSystemExtraDataWithMaskBySaveDataAttribute(
+    SvcObj* self, nn_fs_SaveDataSpaceId space_id, const nn_fs_SaveDataAttribute* attribute, IpcBuf extra_data,
+    IpcBuf mask) {
+    u8 extra[FS_EXTRA_DATA_SIZE] = {0};
+    nn_fs_SaveDataAttribute stored = *attribute;
+    i64 available, journal;
+    u64 i, n = extra_data.size < mask.size ? extra_data.size : mask.size;
+    const u8* keep = GP(mask.addr);
+    u8* out = GP(extra_data.addr);
+    (void)self, (void)space_id;
+    if (stored.type && !stored.program_id) stored.program_id = save_title();
+    am_save_data_size(stored.type, &available, &journal);
+    memcpy(extra, &stored, sizeof stored);
+    swipc_le_nn_fs_SaveDataAttribute(extra);
+    snx_st_le64(extra + FS_EXTRA_OWNER, stored.program_id);
+    snx_st_le64(extra + FS_EXTRA_AVAILABLE, (u64)available);
+    snx_st_le64(extra + FS_EXTRA_JOURNAL, (u64)journal);
+    if (n > FS_EXTRA_DATA_SIZE) n = FS_EXTRA_DATA_SIZE;
+    for (i = 0; i < n; i++) out[i] = extra[i] & keep[i];
     R_SUCCEED();
 }
 static SvcObj* new_fsp(void) { return nn_fssrv_sf_IFileSystemProxy_new(); }

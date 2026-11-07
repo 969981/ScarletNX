@@ -782,13 +782,13 @@ msgstr "Setas/mouse: mover. Espaço/Enter/clique: escolher."
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
 #: src/gui/main.c
 #, snx-keys
-msgid "Up/Down: select. Enter/Space: open. Left/Right/PgUp/PgDown: scroll. F5: refresh."
+msgid "Up/Down: move. Enter/Space: open. Left/Right/PgUp/PgDn: scroll. F5: refresh."
 msgstr ""
 
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
 #: src/gui/main.c
 #, snx-keys
-msgid "Arrows: select. Enter/Space: open. PgUp/PgDown: scroll. F5: refresh."
+msgid "Arrows: move. Enter/Space: open. PgUp/PgDn: scroll. F5: refresh."
 msgstr ""
 
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
@@ -1006,13 +1006,13 @@ msgstr ""
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
 #: src/gui/main.c
 #, snx-keys
-msgid "D-pad: move. A: select. Start: refresh. B: back."
+msgid "D-pad: move. A: select. Start: refresh. B: exit."
 msgstr ""
 
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
 #: src/gui/main.c
 #, snx-keys
-msgid "D-pad: select. A: open. LT/RT: scroll. Start: refresh. B: back."
+msgid "D-pad: move. A: open. LT/RT: scroll. Start: refresh. B: back."
 msgstr ""
 
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
@@ -3832,6 +3832,14 @@ msgid "Nothing to keep: no file of the menu's"
 msgstr "Nada a guardar: nenhum arquivo do menu"
 
 #: src/gui/main.c
+msgid "Every screen"
+msgstr "Toda tela"
+
+#: src/gui/main.c
+msgid "Shortcuts"
+msgstr "Atalhos"
+
+#: src/gui/main.c
 #, c-format
 msgid "The game starts its program %d, %s, which is not made: Recompile the game to make its programs"
 msgstr "O jogo inicia o seu programa %d, %s, que não foi compilado: Recompilar o jogo compila os programas dele"
@@ -4525,12 +4533,6 @@ msgstr "PgUp"
 #, snx-key
 msgid "PgDn"
 msgstr "PgDn"
-
-#. A key of the foot's sentences, which a click finds by this word
-#: src/gui/main.c
-#, snx-key
-msgid "PgDown"
-msgstr "PgDown"
 
 #. A key of the foot's sentences, which a click finds by this word
 #: src/gui/main.c
@@ -5617,6 +5619,9 @@ msgstr "Inicialização"
 #: src/nx/runtime/settings.txt
 msgid "LLVM Internals"
 msgstr "Internos do LLVM"
+
+#~ msgid "PgDown"
+#~ msgstr "PgDown"
 
 #~ msgid "user=%d is deprecated: user_uid=%s (%s) replaces it"
 #~ msgstr "user=%d está obsoleto: user_uid=%s (%s) o substitui"

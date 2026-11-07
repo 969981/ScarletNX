@@ -1197,6 +1197,39 @@ static void icons_named(void) {
     }
     free(text);
 }
+/* every key of every key sentence in po/scarletnx.pot (the script's list of SNX_TR_KEYS, every platform's) has its icon
+   in F1's box (key_icon): one without is named. A sentence without keys, the setup's, has no F1 */
+static void help_icons_named(void) {
+    size_t size;
+    char* text = (char*)snx_read_file(SNX_GUI_POT, &size);
+    const char* line;
+    int sentences = 0, keys = 0;
+    assert(text);
+    for (line = text; line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL) {
+        char said[512], key[128], what[256];
+        const char* at = said;
+        if (strncmp(line, "#, snx-keys", 11)) continue;
+        line = strchr(line, '\n') + 1;
+        assert(sscanf(line, "msgid \"%511[^\"]\"", said) == 1);
+        ++sentences;
+        while (hint_next(&at, key, what, sizeof key)) {
+            if (!key[0]) continue;
+            if (key_icon(key, what) == GUI_ICON_NONE) {
+                fprintf(stderr, "\"%s: %s\" of \"%s\" has no icon in main.c's key_icon\n", key, what, said);
+                assert(!"a key's icon");
+            }
+            ++keys;
+        }
+    }
+    free(text);
+    assert(sentences >= 100 && keys >= 240);
+    /* select and choose by keys that move a row are moves, by those that pick one a pointer's; a key alone is a what */
+    assert(key_icon("Up/Down", "select") == GUI_ICON_MOVE && key_icon("D-pad", "choose") == GUI_ICON_MOVE);
+    assert(key_icon("Space/Enter/click", "select") == GUI_ICON_POINTER &&
+           key_icon("Tap", "select") == GUI_ICON_POINTER);
+    assert(key_icon("Refresh", "") == GUI_ICON_REFRESH_CW && key_icon("AOT pack", "") == GUI_ICON_PACKAGE);
+    assert(key_icon("F9", "jump") == GUI_ICON_NONE && key_icon("Refreshing", "") == GUI_ICON_NONE);
+}
 /* a running step's line ends in its progress as the theme says, a done one in OK */
 static void step_line(void) {
     GuiStep s;
@@ -1385,6 +1418,49 @@ static void view_box(App* app, const char* temporary) {
     assert(hint_keys[hint_pick("V", 0, false)].key == SDLK_V && !hint_keys[hint_pick("V", 0, false)].mod);
     assert(hint_keys[hint_pick("View", 1, false)].key == SDLK_V); /* a phone's: the word alone */
     assert(strstr(screen_said(app, true, said, sizeof said), "V: view."));
+    /* a heading under Recent Games' rows, over the games: two groups have theirs, the list's own, once; one group alone
+       its own there too, Recompiled or Dumps, so that a game's row reads apart from its recent row (a player took the
+       two for two entries of one game); none without recent rows. A heading is no row to take */
+    {
+        UiRowInfo info = {0};
+        assert(games_lead(app) == 2 && gui_games_heading(&app->games, 0) && !games_row_label(app, 1));
+        assert(ui_games_rows_get_row_info(app, 2, 300, &info) && !strcmp(info.label, "Recompiled") &&
+               (info.attr & UI_ATTR_LABEL));
+        app->options[GUI_OPTION_DUMPS] = 1; /* the ready games alone */
+        list_games(app);
+        assert(app->browser.head == 1 && !gui_games_heading(&app->games, 0) && games_lead(app) == 3);
+        assert(games_row_label(app, 0) && !games_row_label(app, 1) && games_row_label(app, 2) &&
+               !games_row_label(app, 3));
+        info = (UiRowInfo){0};
+        assert(ui_games_rows_get_row_info(app, 2, 300, &info) && !strcmp(info.label, "Recompiled") &&
+               (info.attr & UI_ATTR_LABEL));
+        info = (UiRowInfo){0};
+        assert(ui_games_rows_get_row_info(app, 3, 300, &info) && !strncmp(info.label, "alpha game", 10) &&
+               !(info.attr & UI_ATTR_LABEL));
+        render(app);
+        shows(app, "Recompiled", rgb(app->theme.soft));
+        app->browser.selected = 0; /* the recent row; a click on the heading leaves it there, and opens nothing */
+        ui_games_rows_row_action_cb(app, 2, UI_HIT_CLICK);
+        assert(app->browser.selected == 0 && !app->menu.running && !app->confirm.shown);
+        app->recompiled_off = true; /* the dumps alone, the recent game's row still there */
+        app->options[GUI_OPTION_DUMPS] = 0;
+        list_games(app);
+        assert(app->browser.head == 1 && games_lists(app, "beta dump.nsp") && games_lead(app) == 3);
+        info = (UiRowInfo){0};
+        assert(ui_games_rows_get_row_info(app, 2, 300, &info) && !strcmp(info.label, "Dumps") &&
+               (info.attr & UI_ATTR_LABEL));
+        app->recompiled_off = false;
+        app->options[GUI_OPTION_DUMPS] = 1;
+        app->recent = (GuiRecent){0}; /* no recent row: the games from the list's first row, as before */
+        recent_changed(app);
+        list_games(app);
+        assert(!app->browser.head && games_lead(app) == 0 && !games_row_label(app, 0));
+        assert(!gui_recent_add(&app->recent, game, GUI_SWITCH, 1));
+        recent_changed(app);
+        app->options[GUI_OPTION_DUMPS] = 0;
+        list_games(app);
+        assert(app->browser.head == 1 && games_lead(app) == 2 && app->browser.selected == 0);
+    }
     /* V opens the box, its rows the options, a value each between the arrows */
     key(app, SDLK_V);
     assert(app->options_shown && app->options_focus == 0 && app->menu.view == GUI_LOAD_GAMES);
@@ -1838,10 +1914,10 @@ static void grid_view(App* app, const char* temporary) {
             assert(!same_colour(in, back) && same_colour(beside, back));
         }
     }
-    { /* F1's box says the grid's keys: the arrows go over the tiles, PgUp and PgDn by the lines */
+    { /* F1's box says the grid's keys: the arrows move over the tiles, as the menu's do, PgUp and PgDn by the lines */
         char said[1024];
-        assert(strstr(screen_said(app, true, said, sizeof said), "Arrows: select.") &&
-               strstr(said, "PgUp/PgDown: scroll.") && !strstr(said, "Left/Right/PgUp/PgDown: scroll.") &&
+        assert(strstr(screen_said(app, true, said, sizeof said), "Arrows: move.") && !strstr(said, "select") &&
+               strstr(said, "PgUp/PgDn: scroll.") && !strstr(said, "Left/Right/PgUp/PgDn: scroll.") &&
                strstr(said, "V: view."));
     }
     /* Right and Left: the row after and before, past a label; nothing past the first */
@@ -4275,6 +4351,16 @@ int main(int argc, char** argv) {
     shows(&app, "Reset to Defaults", rgb(app.theme.soft));
     hides(&app, "\x1e", rgb(app.theme.soft)); /* every row shows: no arrows */
     hides(&app, "\x1f", rgb(app.theme.soft));
+    { /* F1's box here: every key every screen has, the groups' none of their own, so no title over them */
+        GuiHelpKeys k;
+        key(&app, SDLK_F1);
+        render(&app);
+        help_keys(&app, &k);
+        assert(app.help_shown && k.own == 0 && k.n >= 5 && help_rows(&k) == k.n);
+        hides(&app, "Every screen", normal);
+        key(&app, SDLK_ESCAPE);
+        assert(!app.help_shown && app.form == GUI_FORM_SETTINGS);
+    }
     key(&app, SDLK_DOWN);
     render(&app);
     shows_half(&app, "GDB stub, Extract to tmpfs", normal); /* a group's help names its settings */
@@ -5045,6 +5131,10 @@ int main(int argc, char** argv) {
             assert(app.help_shown);
             shows(&app, "linha", normal); /* F1's box: every key of the screen, translated */
             shows(&app, "tela", normal);
+            /* its title its own phrase, not the key files' Keys, which xx translates as the files */
+            assert(strcmp(SAY_SHORTCUTS, setup_step_names[SNX_SETUP_KEYS]) && !strcmp(snx_tr("Keys"), "Chaves"));
+            shows(&app, "Atalhos", normal);
+            hides(&app, "Chaves", normal);
             key(&app, SDLK_ESCAPE); /* any key closes it, and does nothing else */
             assert(!app.help_shown && app.editing && app.form == form);
             render(&app);
@@ -8653,6 +8743,77 @@ int main(int argc, char** argv) {
 #endif
                 assert(strstr(shown_keys(&app, said, sizeof said), "R: recompile.") && strstr(said, "B: AOT pack.") &&
                        strstr(said, "P: folders.") && strstr(said, "ESC: back."));
+                { /* F1's box of them, the most rows it has: an icon each, the keyboard's and a pad's, Games' own keys
+                     first, then under "Every screen" those every screen has; a window short of them shows those that
+                     fit, Up/Down, PgUp/PgDn and the wheel going over them as far as the last and moving nothing under
+                     it, any other key closing it and doing nothing else */
+                    GuiHelpBoxes h;
+                    GuiHelpKeys k;
+                    SDL_Event e = {0};
+                    char key_[128], what[256];
+                    unsigned icon;
+                    int w, height, rows, shown, i;
+                    size_t selected = app.browser.selected;
+                    key(&app, SDLK_F1);
+                    assert(app.help_shown && app.help_top == 0);
+                    render(&app);
+                    help_keys(&app, &k);
+                    rows = help_rows(&k);
+                    assert(k.n >= 13 && k.n <= GUI_HELP_ROWS && k.keys == gui_text_cols("Left/Right/PgUp/PgDn"));
+                    assert(k.own >= 7 && k.own < k.n && rows == k.n + 1 && !strncmp(k.said, "L: play. ", 9));
+                    for (i = 0; i < k.n; ++i) assert(k.icons[i] != GUI_ICON_NONE);
+                    assert(!help_row(&k, k.own, key_, what, sizeof key_, &icon)); /* the title, then every screen's */
+                    assert(help_row(&k, k.own + 1, key_, what, sizeof key_, &icon) && !strcmp(key_, "Up/Down") &&
+                           !strcmp(what, "move") && icon == GUI_ICON_MOVE); /* "select" is Enter's, as on the menu */
+                    assert(help_row(&k, rows - 1, key_, what, sizeof key_, &icon) && !strcmp(key_, "F2"));
+                    shows(&app, "Every screen", normal);
+                    shows(&app, "- " ICON_EYE, normal);
+                    shows(&app, "Left/Right/PgUp/PgDn", yellow);
+                    help_boxes(&app, &h);
+                    assert((int)ui_help_shown(h.rects, app.scale, UI_HELP_ROWS) == rows); /* all of them */
+                    app.pad_driven = true; /* a pad's buttons, with their icons */
+                    render(&app);
+                    help_keys(&app, &k);
+                    assert(strstr(k.said, "Right stick: play.") && strstr(k.said, "B: back."));
+                    for (i = 0; i < k.n; ++i) assert(k.icons[i] != GUI_ICON_NONE);
+                    assert(help_row(&k, k.own + 1, key_, what, sizeof key_, &icon) && !strcmp(key_, "D-pad") &&
+                           !strcmp(what, "move"));
+                    shows(&app, "Right stick", yellow);
+                    app.pad_driven = false;
+                    assert(SDL_GetWindowSize(app.window, &w, &height));
+                    assert(SDL_SetWindowSize(app.window, w, rows_height(GUI_LEAST_ROWS, app.scale)));
+                    render(&app);
+                    help_keys(&app, &k);
+                    rows = help_rows(&k);
+                    help_boxes(&app, &h);
+                    shown = (int)ui_help_shown(h.rects, app.scale, UI_HELP_ROWS);
+                    assert(shown > 0 && shown < rows);
+                    shows(&app, "play", normal);
+                    hides(&app, "side box", normal); /* the last row */
+                    key(&app, SDLK_DOWN);
+                    key(&app, SDLK_DOWN);
+                    assert(app.help_shown && app.help_top == 2);
+                    key(&app, SDLK_PAGEDOWN);
+                    key(&app, SDLK_DOWN); /* past the last: no further */
+                    assert(app.help_shown && app.help_top == rows - shown);
+                    render(&app);
+                    shows(&app, "side box", normal);
+                    hides(&app, "play", normal);
+                    e.type = SDL_EVENT_MOUSE_WHEEL;
+                    e.wheel.integer_y = 1; /* a notch up: a row */
+                    event(&app, &e);
+                    assert(app.help_top == rows - shown - 1 && app.browser.selected == selected);
+                    key(&app, SDLK_RETURN); /* closes it, opening nothing */
+                    assert(!app.help_shown && !app.addons_shown && app.browser.selected == selected);
+                    key(&app, SDLK_F1); /* again from its first row */
+                    assert(app.help_shown && app.help_top == 0);
+                    key(&app, SDLK_PAGEUP);
+                    assert(app.help_shown && app.help_top == 0);
+                    key(&app, SDLK_ESCAPE);
+                    assert(!app.help_shown && app.menu.view == GUI_LOAD_GAMES);
+                    assert(SDL_SetWindowSize(app.window, w, height));
+                    render(&app);
+                }
                 app.aot_state = state;
                 app.aot_match = match;
             }
@@ -9345,6 +9506,76 @@ int main(int argc, char** argv) {
                 free(list);
                 free(got);
                 free(played);
+                free(row);
+            }
+            { /* a DLC's package and an update's installed into the game (R on each): each add-on's own .ini names its
+                 package (source=), the game's names no dump, as for one made from a dump the launcher never saw. A
+                 package's recent entry, which Recent Games does not show, goes by the game's row: one entry, the
+                 game's, whichever ran last, in recompiled/ or a Library recompiled folder, and so in a list an older
+                 launcher kept */
+                char *row = snx_absolute(base), *dlc = snx_path_join(temporary, "the dlc.nsp"),
+                     *update = snx_path_join(temporary, "the update.nsp"),
+                     *other = snx_path_join(temporary, "not installed.nsp"),
+                     *list = snx_path_join(temporary, "recent-addon.txt"),
+                     *dlc_ini = snx_game_ini(own, "0100ABCD12340000_0100ABCD12341001"),
+                     *update_ini = snx_game_ini(own, "0100ABCD12340000_0100ABCD12340800v0"), *shown, *text,
+                     *games_was = app.games_dir, *folder_was;
+                int library_was;
+                GuiRecent recent = app.recent, kept = {0};
+                assert(row && !snx_write_file(dlc, "x", 1) && !snx_write_file(update, "x", 1) &&
+                       !snx_write_file(other, "x", 1) && !snx_is_file(dlc_ini) && !snx_is_file(update_ini));
+                assert(!snx_record_source(own, "0100ABCD12340000_0100ABCD12341001", dlc));
+                assert(!snx_record_source(own, "0100ABCD12340000_0100ABCD12340800v0", update));
+                shown = gui_game_shown(row);
+                app.recent = (GuiRecent){0}; /* the game's run the newer: its entry alone */
+                assert(!gui_recent_add(&app.recent, dlc, GUI_SWITCH, false));
+                assert(!gui_recent_add(&app.recent, row, GUI_SWITCH, true));
+                recent_as_games(&app);
+                assert(app.recent.count == 1 && !strcmp(app.recent.game[0].path, row));
+                /* the update's package the newer: its place, run as the game's program, by the game's name; a package
+                   no add-on names stays a dump not made yet */
+                assert(!gui_recent_add(&app.recent, other, GUI_SWITCH, false));
+                assert(!gui_recent_add(&app.recent, update, GUI_SWITCH, false));
+                recent_as_games(&app);
+                assert(app.recent.count == 2 && app.recent.game[0].prepared && !strcmp(app.recent.game[0].path, row) &&
+                       !strcmp(app.recent.game[0].name, shown));
+                assert(!app.recent.game[1].prepared && !strcmp(app.recent.game[1].path, other));
+                /* the game in a Library recompiled folder, not recompiled/ */
+                app.recent = (GuiRecent){0};
+                assert(!gui_recent_add(&app.recent, dlc, GUI_SWITCH, false));
+                folder_was = app.folders[app.folder_count];
+                library_was = app.folders_library[app.folder_count];
+                app.folders[app.folder_count] = games_was;
+                app.folders_library[app.folder_count++] = GUI_LIBRARY_RECOMPILED;
+                app.games_dir = NULL;
+                recent_as_games(&app);
+                app.games_dir = games_was;
+                app.folders[--app.folder_count] = folder_was;
+                app.folders_library[app.folder_count] = library_was;
+                assert(app.recent.count == 1 && app.recent.game[0].prepared && !strcmp(app.recent.game[0].path, row));
+                /* a list an older launcher kept: the game's line, then its DLC's package's, both read, then one */
+                text = snx_format("switch\tgames\t%s\t%s\nswitch\tfile\t%s\tthe dlc\n", row, shown, dlc);
+                assert(!snx_write_file(list, text, strlen(text)));
+                recent_open(&app, snx_strdup(list));
+                assert(app.recent.count == 2);
+                recent_as_games(&app);
+                assert(app.recent.count == 1 && !strcmp(app.recent.game[0].path, row));
+                gui_recent_load(&kept, list); /* and kept so */
+                assert(kept.count == 1 && !strcmp(kept.game[0].path, row));
+                free(app.recent_file); /* the rest runs with no list again */
+                app.recent_file = NULL;
+                app.recent = recent;
+                recent_changed(&app);
+                assert(!remove(list) && !remove(dlc) && !remove(update) && !remove(other) && !remove(dlc_ini) &&
+                       !remove(update_ini));
+                free(text);
+                free(shown);
+                free(update_ini);
+                free(dlc_ini);
+                free(list);
+                free(other);
+                free(update);
+                free(dlc);
                 free(row);
             }
             { /* a game made again from a copy of its dump elsewhere, the first dump gone: the made list has a game
@@ -11590,9 +11821,42 @@ int main(int argc, char** argv) {
                 mouse_px(&app, x + 4, mb.place.keys.y, true);
                 assert(app.help_shown);
                 render(&app);
-                shows(&app, "Keys", normal);
+                shows(&app, "Shortcuts", normal);
                 shows(&app, "Arrows/mouse", yellow); /* every key, the foot's and the others */
                 shows(&app, "side box", normal);
+                /* as the boxes over a screen are: the screen under it darkened, a row a key with its icon after the
+                   marker, OK under them in focus */
+                hides(&app, "Settings", normal);
+                shows(&app, "- " ICON_MOVE, normal);
+                shows(&app, "- OK", yellow);
+                { /* the menu's own F5 first, then under "Every screen" the keys every screen has, ESC's exit too */
+                    static const unsigned menu_icons[] = {GUI_ICON_REFRESH_CW, GUI_ICON_MOVE,
+                                                          GUI_ICON_POINTER,    GUI_ICON_LOG_OUT,
+                                                          GUI_ICON_APP_WINDOW, GUI_ICON_PANEL_RIGHT};
+                    GuiHelpKeys k;
+                    help_keys(&app, &k);
+                    assert(k.n == (int)SDL_arraysize(menu_icons) && k.own == 1 && help_rows(&k) == k.n + 1);
+                    assert(!memcmp(k.icons, menu_icons, sizeof menu_icons));
+                    shows(&app, "Every screen", normal);
+                    /* a pad's B does there what ESC does, and says so: exit, in the foot and in the box */
+                    app.pad_driven = true;
+                    help_keys(&app, &k);
+                    assert(strstr(k.said, "B: exit.") && !strstr(k.said, "back"));
+                    assert(k.n == (int)SDL_arraysize(menu_icons) - 1 && k.icons[k.n - 2] == GUI_ICON_LOG_OUT);
+                    {
+                        char said[512];
+                        assert(!strncmp(shown_keys(&app, said, sizeof said), "B: exit.\x1f", 9));
+                    }
+                    app.pad_driven = false;
+                }
+                { /* the wheel over it moves nothing under it, all its rows showing */
+                    SDL_Event e = {0};
+                    int selected = app.menu.selected;
+                    e.type = SDL_EVENT_MOUSE_WHEEL;
+                    e.wheel.integer_y = -1;
+                    event(&app, &e);
+                    assert(app.help_shown && app.help_top == 0 && app.menu.selected == selected);
+                }
                 mouse_px(&app, x + 4, y + 4, true);
                 assert(!app.help_shown && app.menu.view == GUI_LOAD_NONE);
             }
@@ -11616,20 +11880,19 @@ int main(int argc, char** argv) {
                 event(&app, &left);
                 assert(!app.hovering);
             }
-            /* Games, where each word of Left/Right/PgUp/PgDown moves a screen of rows its way, and its text, of words two
+            /* Games, where each word of Left/Right/PgUp/PgDn moves a screen of rows its way, and its text, of words two
                ways, none; Up/Down's each move the focus */
             key(&app, SDLK_TAB);
             assert(app.menu.view == GUI_LOAD_GAMES && gui_browser_pages(&app.browser) == 1);
             app.browser.selected = 0;
             {
                 size_t screen;
-                assert(hint_press(&app, "Left/Right/PgUp/PgDown", 18) && app.browser.selected > 1); /* PgDown */
+                assert(hint_press(&app, "Left/Right/PgUp/PgDn", 18) && app.browser.selected > 1); /* PgDn */
                 screen = app.browser.selected;
-                assert(!hint_press(&app, "Left/Right/PgUp/PgDown", 24) && app.browser.selected == screen); /* scroll */
-                assert(hint_press(&app, "Left/Right/PgUp/PgDown", 12) && !app.browser.selected);           /* PgUp */
-                assert(hint_press(&app, "Left/Right/PgUp/PgDown", 10) &&
-                       app.browser.selected == screen);                                          /* Right's / */
-                assert(hint_press(&app, "Left/Right/PgUp/PgDown", -1) && !app.browser.selected); /* before Left */
+                assert(!hint_press(&app, "Left/Right/PgUp/PgDn", 24) && app.browser.selected == screen); /* scroll */
+                assert(hint_press(&app, "Left/Right/PgUp/PgDn", 12) && !app.browser.selected);           /* PgUp */
+                assert(hint_press(&app, "Left/Right/PgUp/PgDn", 10) && app.browser.selected == screen);  /* Right's / */
+                assert(hint_press(&app, "Left/Right/PgUp/PgDn", -1) && !app.browser.selected); /* before Left */
             }
             assert(hint_press(&app, "Up/Down", 3) && app.browser.selected == 1);
             assert(hint_press(&app, "Up/Down", 0) && app.browser.selected == 0);
@@ -11719,6 +11982,21 @@ int main(int argc, char** argv) {
             press_key(&app, "ESC", 0, false, rgb(app.theme.page));
             assert(app.confirm.shown && app.confirm.ask == GUI_ASK_EXIT);
             key(&app, SDLK_ESCAPE);
+            /* F1's box in YoRHa: its head on the band of ink, each key on a band of the focus colour in the page's, as
+               the foot's keys are, what it does in ink on the row's dim */
+            key(&app, SDLK_F1);
+            render(&app);
+            assert(app.help_shown);
+            shows(&app, "Shortcuts", rgb(app.theme.page));
+            shows(&app, "exit", rgb(app.theme.ink));
+            hides(&app, "ESC", rgb(app.theme.focus));
+            {
+                int x, y;
+                assert(find_text(&app, "ESC", rgb(app.theme.page), 1, &x, &y));
+                assert(same_colour(pixel(&app, (float)x, (float)y), rgb(app.theme.focus))); /* the font's blank top */
+            }
+            key(&app, SDLK_ESCAPE);
+            assert(!app.help_shown && !app.confirm.shown);
             app.theme = *gui_theme_builtin("default");
             app.menu.selected = GUI_KEYS;
         }
@@ -12251,7 +12529,7 @@ int main(int argc, char** argv) {
         render(&app);
         menu_boxes(&app, &m);
         /* with its tabs and big title, a 1280x800 window still holds the whole menu, and Games Add Folder, three
-           recent games, the row for the rest and a page of games */
+           recent games, the row for the rest, the heading of the games' one group under them and a page of games */
         {
             GuiRecent kept = app.recent;
             int n;
@@ -12272,9 +12550,10 @@ int main(int argc, char** argv) {
                 GuiGamesBoxes g;
                 render(&app);
                 games_boxes(&app, &g);
-                assert(g.lead == 5 && ui_games_shown(g.rects, app.scale, UI_GAMES_ROWS) > (size_t)g.lead);
+                assert(g.lead == 6 && ui_games_shown(g.rects, app.scale, UI_GAMES_ROWS) > (size_t)g.lead);
                 shows(&app, "Recent Games", rgb(app.theme.soft));
                 shows(&app, "Show More", rgb(app.theme.ink));
+                shows(&app, "Recompiled", rgb(app.theme.soft));
             }
             go_tab(&app, GUI_TAB_MENU);
             app.recent = kept;
@@ -13333,6 +13612,7 @@ int main(int argc, char** argv) {
     }
     players_view(&app);
     icons_named();
+    help_icons_named();
     step_line();
     /* a row too long for its box with the labels' column gives the column up first, and is cut only past that: 1280x720
        at 2x leaves a group's rows fewer columns than Vulkan Video's label and a value, and Shadows ends its row whole and
