@@ -18,6 +18,7 @@
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
 #include "nx/gpu/vk/vk.h"
+#include "nx/gpu/vk/resource_stats.h"
 #include "nx/gpu/vk/pending_pages.h"
 #include "nx/gpu/texture/astc_bc.h"
 #include "nx/gpu/texture/blocklinear.h"
@@ -209,7 +210,7 @@ int vk_rt_same_layout(const Surf* s, u32 w, u32 h, int bl, u32 bh, u32 pitch) {
     return (w * s->f.bpp + 63) / 64 == (s->w * s->f.bpp + 63) / 64 && bl_height(h, bh) == bl_height(s->h, s->bh);
 }
 /* a surface of w by h pixels with the samples of the sample layout msaa (render targets only: textures have one) */
-static Surf* surf_create(u64 gva, u32 w, u32 h, VkFmt f, u32 fkey, u32 bl, u32 bh, u32 pitch, int is_rt, u32 layers,
+static Surf* surf_create_(u64 gva, u32 w, u32 h, VkFmt f, u32 fkey, u32 bl, u32 bh, u32 pitch, int is_rt, u32 layers,
                          u32 msaa) {
     Surf* s = calloc(1, sizeof *s);
     if (!s) return NULL;
@@ -320,6 +321,13 @@ static Surf* surf_create(u64 gva, u32 w, u32 h, VkFmt f, u32 fkey, u32 bl, u32 b
     g_surfh[k] = s;
     surf_changed(gva);
     if (is_rt) lru_add(s, VK_LRU_RT);
+    return s;
+}
+static Surf* surf_create(u64 gva, u32 w, u32 h, VkFmt f, u32 fkey, u32 bl, u32 bh, u32 pitch, int is_rt, u32 layers,
+                         u32 msaa) {
+    VkResourceScope scope = vk_resource_begin();
+    Surf* s = surf_create_(gva, w, h, f, fkey, bl, bh, pitch, is_rt, layers, msaa);
+    vk_resource_end(VK_RESOURCE_SURFACE_CREATE, scope);
     return s;
 }
 
@@ -653,7 +661,61 @@ static VkBlMove rt_bl_move(const Surf* s, u32 pitch) {
     }
     return m;
 }
-/* a block linear target loaded: its guest bytes staged as they are, from where they are, and deswizzled on the GPU */
+/* a block linear target's load that found no buffer (what) of bytes for its rows from y of a layer: 0 */
+static int load_fail(const Surf* s, u32 layer, u32 y, const char* what, u64 bytes) {
+    LOG_LIMIT(4,
+              "vulkan: a target at %llx found no %s of %llu bytes for its rows from %u of layer %u: memory's pixels "
+              "there don't reach its image\n",
+              (unsigned long long)s->gva, what, (unsigned long long)bytes, y, layer);
+    return 0;
+}
+/* rows [y, y + n) of a layer of an unscaled single-sampled target, in rows of pitch bytes from the start of buf,
+   copied into its image */
+static void rt_load_rows(VkCommandBuffer cb, Surf* s, VkBuffer buf, u32 pitch, u32 layer, u32 y, u32 n) {
+    VkBufferImageCopy c = {.bufferRowLength = pitch / s->f.bpp,
+                           .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1},
+                           .imageOffset = {0, (i32)y, 0},
+                           .imageExtent = {s->w, n, 1}};
+    vk_surf_use(cb, s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    rec_CmdCopyBufferToImage(cb, buf, s->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+}
+/* s's layers a band of rows at a time, as flush_parts reads them back: whole rows of blocks, VK_PART_SHARE of the cap
+   at most (a row of blocks at least), as the scratch buffer stays as big as the most asked of it. Each band is staged
+   from where it lies and deswizzled into the start of the scratch buffer: the barrier before its move orders the copy
+   of the band before out of there */
+static int load_bands(Surf* s, u32 pitch) {
+    u32 h = guest_h(s), band = 8u << bl_height(h, s->bh);
+    u32 rows = (u32)(g_vk.alloc_cap / VK_PART_SHARE / pitch) / band * band;
+    if (!rows) rows = band;
+    for (u32 l = 0; l < s->layers; l++)
+        for (u32 y = 0; y < h; y += rows) {
+            VkBlMove m = rt_bl_move(s, pitch);
+            VkBuffer staged, scratch;
+            u64 lo, hi, off, cap;
+            m.y0 = y;
+            m.rows = h - y < rows ? h - y : rows;
+            vk_bl_range(&m, &lo, &hi);
+            u64 from = s->gva + (u64)l * s->layer_size + lo;
+            u8* p = vk_stage_guest_input(from, hi - lo, hi - lo, &staged, &off);
+            if (!p) return load_fail(s, l, y, "staging", hi - lo);
+            vk_guest_read(from, hi - lo, p, staged, off);
+            /* after the read, which may land GPU results and submit: the command buffer, and the scratch buffer if
+               they grew it, are the ones from then */
+            VkCommandBuffer cb = vk_cmd();
+            if (!(scratch = vk_bl_scratch((u64)m.rows * pitch, &cap)))
+                return load_fail(s, l, y, "scratch buffer", (u64)m.rows * pitch);
+            vk_bl_barrier(cb, 1);
+            if (!vk_bl_move(cb, &m, 0, staged, off, scratch, 0)) return 0; /* said there */
+            vk_bl_barrier(cb, 0);
+            rt_load_rows(cb, s, scratch, pitch, l, y, m.rows);
+        }
+    return 1;
+}
+/* a block linear target loaded: its guest bytes staged as they are, from where they are, and deswizzled on the GPU.
+   One whose rows need more than VK_PART_SHARE of the cap goes in bands (load_bands); a multisampled one goes whole,
+   its layers drawn from the guest's layout of them (vk_ms_pack), and so do a scaled one, blitted from an unscaled
+   image, and a volume, its slices one move */
 static int surf_load_bl(Surf* s) {
     u64 sz = rt_bytes(s);
     u32 pitch = (guest_w(s) * s->f.bpp + 15) & ~15u, moves = s->volume ? 1 : s->layers, h = guest_h(s);
@@ -662,8 +724,11 @@ static int surf_load_bl(Surf* s) {
     VkBuffer staged, scratch;
     u64 off;
     vk_render_end();
-    u8* p = vk_stage(sz, vk_stage_align(), &staged, &off);
-    if (!p || !(scratch = vk_bl_scratch(lin, &cap))) return 0;
+    if (lin > g_vk.alloc_cap / VK_PART_SHARE && !s->msaa && s->sw == s->w && s->sh == s->h && !surf_volume(s))
+        return load_bands(s, pitch);
+    u8* p = vk_stage_guest_input(s->gva, sz, sz, &staged, &off);
+    if (!p) return load_fail(s, 0, 0, "staging", sz);
+    if (!(scratch = vk_bl_scratch(lin, &cap))) return load_fail(s, 0, 0, "scratch buffer", lin);
     vk_guest_read(s->gva, sz, p, staged, off); /* what the GPU holds of it copied on the GPU */
     VkCommandBuffer cb = vk_cmd();
     vk_bl_barrier(cb, 1);
@@ -681,7 +746,7 @@ static int surf_load_pitch(Surf* s) {
     VkBuffer buf;
     u64 off;
     vk_render_end();
-    u8* p = vk_stage(as_is ? sz : row * gh * s->layers, vk_stage_align(), &buf, &off);
+    u8* p = vk_stage_guest_input(s->gva, sz, as_is ? sz : row * gh * s->layers, &buf, &off);
     if (!p) return 0;
     if (as_is)
         vk_guest_read(s->gva, sz, p, buf, off);
@@ -696,7 +761,7 @@ static int surf_load_pitch(Surf* s) {
 }
 int vk_ms_load(Surf* s) { return vk_ms_moves(s) && (s->bl ? surf_load_bl(s) : surf_load_pitch(s)); }
 
-void vk_rt_reload(u64 gva) {
+static void rt_reload(u64 gva) {
     Surf* s = vk_rt_find(gva);
     if (!s) return;
     vk_surf_wrote(s); /* the copies of it (crops) are out of date */
@@ -711,7 +776,20 @@ void vk_rt_reload(u64 gva) {
         vk_surf_relist(s);
         return;
     }
-    if (s->bl ? surf_load_bl(s) : surf_load_pitch(s)) rt_loaded(s);
+    if (s->bl ? surf_load_bl(s) : surf_load_pitch(s)) {
+        rt_loaded(s);
+        return;
+    }
+    /* a load that failed left the image behind memory (its old pixels, or some bands of the new ones): undefined
+       until it is drawn to again, as above, so it is never written back over memory */
+    s->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    s->draw_wseen = 0;
+    vk_surf_relist(s);
+}
+void vk_rt_reload(u64 gva) {
+    VkResourceScope scope = vk_resource_begin();
+    rt_reload(gva);
+    vk_resource_end(VK_RESOURCE_RT_RELOAD, scope);
 }
 
 /* a depth target whose Vulkan format holds the guest's bytes (Z32F as D32_SFLOAT, Z16 as D16_UNORM): its depth
@@ -793,16 +871,11 @@ static void flush_copy(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 at, u32 pi
         }
     }
 }
-/* part of s's pixels into buf at at as flush_bytes says: tightly packed rows, or the guest's block linear layout, the
-   image copied into the scratch buffer and swizzled from there into buf, a layer at layer_size from the last (a band
-   of rows: its rows of blocks, from the first, vk_bl_range). 0 when that can't be done (said) */
-static int flush_record(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 at, const FlushPart* part) {
-    u32 row = guest_w(s) * s->f.bpp;
-    if (!s->bl) {
-        flush_copy(cb, s, buf, at, row, part);
-        return 1;
-    }
-    u32 pitch = (row + 15) & ~15u, moves = surf_volume(s) ? 1 : part->layers;
+/* part of a block linear target's pixels into buf at at in the guest's layout: the image copied into the scratch
+   buffer and swizzled from there into buf, a layer at layer_size from the last (a band of rows: its rows of blocks,
+   from the first, vk_bl_range). 0 when that can't be done (said) */
+static int flush_swizzle(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 at, const FlushPart* part) {
+    u32 pitch = (guest_w(s) * s->f.bpp + 15) & ~15u, moves = surf_volume(s) ? 1 : part->layers;
     u64 cap, need = (u64)pitch * part->rows * (surf_volume(s) ? surf_slices(s) : part->layers);
     VkBlMove m = rt_bl_move(s, pitch);
     m.y0 = part->y;
@@ -818,6 +891,38 @@ static int flush_record(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 at, const
     for (u32 i = 0; i < moves; i++)
         if (!vk_bl_move(cb, &m, 1, buf, at + (u64)i * s->layer_size, scratch, (u64)i * pitch * part->rows)) return 0;
     vk_bl_barrier(cb, 0);
+    return 1;
+}
+/* part of s's pixels into buf at at as flush_bytes says: tightly packed rows, or the guest's block linear layout
+   (flush_swizzle). Rows that need more than VK_PART_SHARE of the cap in scratch go a layer's band at a time, as the
+   scratch buffer stays as big as the most asked of it: whole rows of blocks, each band's bytes where the part's layout
+   has them, the next band's copy into the scratch buffer after the moves out of it (vk_bl_barrier). A volume and a
+   packed depth layer go whole, as flush_parts takes them, and a scaled target too: each band would blit its layer */
+static int flush_record(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 at, const FlushPart* part) {
+    u32 row = guest_w(s) * s->f.bpp, pitch = (row + 15) & ~15u;
+    u64 limit = g_vk.alloc_cap / VK_PART_SHARE, first, lo, hi;
+    if (!s->bl) {
+        flush_copy(cb, s, buf, at, row, part);
+        return 1;
+    }
+    if ((u64)pitch * part->rows * part->layers <= limit || surf_volume(s) || depth_packs(s) ||
+        (!s->msaa && (s->sw != s->w || s->sh != s->h)))
+        return flush_swizzle(cb, s, buf, at, part);
+    u32 band = 8u << bl_height(guest_h(s), s->bh), rows = (u32)(limit / pitch) / band * band,
+        end = part->y + part->rows;
+    VkBlMove m = rt_bl_move(s, pitch);
+    if (!rows) rows = band;
+    m.y0 = part->y;
+    m.rows = part->rows;
+    vk_bl_range(&m, &first, &hi); /* the part's bytes in buf start at its first row of blocks */
+    for (u32 i = 0; i < part->layers; i++)
+        for (u32 y = part->y; y < end; y += rows) {
+            FlushPart b = {part->layer + i, 1, y, end - y < rows ? end - y : rows};
+            m.y0 = y;
+            m.rows = b.rows;
+            vk_bl_range(&m, &lo, &hi);
+            if (!flush_swizzle(cb, s, buf, at + (u64)i * s->layer_size + (lo - first), &b)) return 0;
+        }
     return 1;
 }
 /* the copies recorded so far done, and their bytes readable by the host */
@@ -1915,7 +2020,7 @@ static u64 surf_evict(Surf* s) {
     vk_defer_bytes(bytes);
     return bytes;
 }
-u64 vk_surf_reclaim(int kind, u32 before, u64 want, int lossy) {
+static u64 surf_reclaim(int kind, u32 before, u64 want, int lossy) {
     /* A render target goes with its contents: guest memory has them as of its last write-back. They aren't written to
        memory as they go: memory is shared by targets the GPU drew over one another, parked and freed ones among them,
        and by textures and buffers that copied from them on the GPU, and the renderer doesn't know them all. Writing an
@@ -1955,9 +2060,15 @@ u64 vk_surf_reclaim(int kind, u32 before, u64 want, int lossy) {
     }
     return freed;
 }
+u64 vk_surf_reclaim(int kind, u32 before, u64 want, int lossy) {
+    VkResourceScope scope = vk_resource_begin();
+    u64 freed = surf_reclaim(kind, before, want, lossy);
+    vk_resource_end(VK_RESOURCE_SURFACE_RECLAIM, scope);
+    return freed;
+}
 /* the render targets last used before `before` that later ones drew all over (rt_superseded), from either list: the
    aged one holds those that went there with pixels memory lacked, which draws since may have made lossless */
-u64 vk_rt_reclaim_superseded(u32 before, u64 want) {
+static u64 rt_reclaim_superseded(u32 before, u64 want) {
     u64 freed = 0;
     for (int lru = VK_LRU_RT + LRU_AGED; lru >= VK_LRU_RT && freed < want; lru -= LRU_AGED)
         for (Surf *s = g_lru[lru].head, *n; s && freed < want; s = n) {
@@ -1966,6 +2077,12 @@ u64 vk_rt_reclaim_superseded(u32 before, u64 want) {
             if (s->layout != VK_IMAGE_LAYOUT_UNDEFINED && rt_superseded(s) && !vk_gfx_image_holds(s))
                 freed += surf_evict(s);
         }
+    return freed;
+}
+u64 vk_rt_reclaim_superseded(u32 before, u64 want) {
+    VkResourceScope scope = vk_resource_begin();
+    u64 freed = rt_reclaim_superseded(before, want);
+    vk_resource_end(VK_RESOURCE_SURFACE_RECLAIM, scope);
     return freed;
 }
 
@@ -2085,7 +2202,9 @@ int vk_cache_image_create(const VkImageCreateInfo* ii, VkImage* img, VmaAllocati
     VkMemoryRequirements2 req = {.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
     VkResult res;
     SNX_ZONE(z, "vk image create");
+    VkResourceScope query = vk_resource_begin();
     vkGetDeviceImageMemoryRequirements(g_vk.dev, &q, &req);
+    vk_resource_end(VK_RESOURCE_IMAGE_QUERY, query);
     *bytes = req.memoryRequirements.size;
     SNX_ZONE_VALUE(z, *bytes);
     *img = VK_NULL_HANDLE;

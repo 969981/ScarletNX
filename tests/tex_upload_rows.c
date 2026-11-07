@@ -98,6 +98,13 @@ u8* vk_stage(u64 size, u64 align, VkBuffer* buf, u64* off) {
     *off = at;
     return stage + at;
 }
+u8* vk_stage_upload(u64 size, u64 align, VkBuffer* buf, u64* off) {
+    return vk_stage(size, align, buf, off);
+}
+u8* vk_stage_guest_input(u64 gva, u64 source_size, u64 bytes, VkBuffer* buf, u64* off) {
+    (void)gva; (void)source_size;
+    return vk_stage_upload(bytes, vk_stage_align(), buf, off);
+}
 u64 vk_stage_align(void) { return 64; }
 /* the scratch buffer the GPU deswizzles and converts into, which a CPU model of those dispatches writes here */
 #define SCRATCH (8u << 20)
@@ -187,6 +194,12 @@ int vk_ok_(VkResult r, const char* what, const char* file, int line) {
     return r == VK_SUCCESS;
 }
 VkCommandBuffer vk_cmd(void) { return (VkCommandBuffer)(uintptr_t)0xCB; }
+/* surface.c's, for a storage image over a target, which no case here samples: an unoptimized build keeps the call, and
+   the test links at every level with this, which aborts if a case ever reaches it */
+int vk_rt_same_layout(const Surf* s, u32 w, u32 h, int bl, u32 bh, u32 pitch) {
+    (void)s, (void)w, (void)h, (void)bl, (void)bh, (void)pitch;
+    abort();
+}
 void vk_render_end_at(const char* file, int line) {
     (void)file;
     (void)line;

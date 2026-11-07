@@ -125,7 +125,10 @@ takes the place of the one checked before, as installing an older update means p
 game's updates and DLCs under it: opening a game that has some shows its updates as a choice of one (each version
 installed, the newest first, by its version from its own control data, or No update) and its DLCs as boxes to check
 (`DLC 1`, numbered from the base ID the game's control data gives). Save keeps the choice in `addons=` without
-playing, Play keeps it and plays the game, and Back leaves the list as it was.
+playing, Play keeps it and plays the game, and Back leaves the list as it was. A 3DS game's update and DLC CIAs are
+kept the same way by `scarletnx-3ds` (`scarletnx-3ds DLC.cia`, or `--update` with the game); an update there has no
+program of its own, as the game's reads its code, and is listed by its TMD's version (`Update v1040`): see
+[3DS.md](3DS.md).
 
 - **Programs:** an update is recompiled from its own ExeFS into a program beside the game,
   `recompiled/<id>/<id>_<its title ID>v<its version>`, which runs whenever it is checked. Every version of a game's update
@@ -715,10 +718,12 @@ pad.
 F1 a page of the game's menu with these keys and the buttons above, a row each (Up/Down go over it, any other key goes
 back to the game); F2 the game's menu; F3 screenshot; F4 FPS limit off and on; F5 thread dump; F6 showcase on and off;
 F7 save state; F8 load state; F9 next save state slot; F10 60-second Tracy capture (SNX_TRACY builds); F11/Alt+Enter
-fullscreen; F12 stats on and off; Ctrl+F12 a RenderDoc capture of the next frame, with RenderDoc in the game
-(`renderdoc`, or a game RenderDoc's program started); Pause pauses the whole game and resumes it (the window's title
-says "(paused)"); Escape quit. A window shows at most one image per refresh and drops the rest unless images tear, and
-the game keeps the pace `fps_limit` sets.
+fullscreen; F12 stats on and off; Ctrl+Shift+F12 a RenderDoc capture of the next frame, with RenderDoc in the game
+(`renderdoc`, or a game RenderDoc's program started), as the game's menu's **Capture frame** is, which shows only then;
+Pause pauses the whole game and resumes it (the window's title says "(paused)"); Escape quit. Each of these keys is a
+setting ([Shortcuts](SETTINGS.md#shortcuts)), set in the game's menu's **Shortcuts** page too, and F1 lists them as
+they are set. A window shows at most one image per refresh and drops the rest unless images tear, and the game keeps
+the pace `fps_limit` sets.
 
 A save state is the whole game at one moment, kept in `states/` in the game's folder, one file a slot. F7 saves to
 the selected slot and F8 loads it, and F9 selects the next slot and says what it holds. The menu's **Save states**

@@ -4016,16 +4016,24 @@ static int check_dma_bands(void) {
    every sample once, into an image no bigger than the part (an image past the cap goes in pieces, which lavapipe draws
    into in another layout than it copies from). Each is loaded from guest memory holding a pattern and drawn red only
    (a masked clear), so memory gets red 128 in every pixel's first byte and keeps the pattern in the others, each where
-   the guest's layout has it. They used to stay on the GPU, memory unchanged */
-static int flush_parts_case(u64 gva, u64 cpu, u32 width_reg, u32 h, u32 layout, u32 layers, u32 layer_bytes, u32 msaa) {
+   the guest's layout has it. They used to stay on the GPU, memory unchanged. With load_cap, a block linear one is
+   made over other bytes and drawn, then loaded again from the pattern and written back under a cap of load_cap: in
+   bands of rows, the scratch buffer asked for a quarter of the cap at most each way, as it stays as big as the most
+   asked of it (a write-back of a target that fits the cap goes whole, its swizzle in bands). Those loads used to ask
+   for the whole target, or found no staging past the cap and kept the old pixels, and that write-back asked for the
+   whole target too */
+static u8 flush_pattern(u64 i) { return (u8)(i % 4 ? i * 7 + (i >> 10) * 3 + 1 : (i * 5 + (i >> 9)) & 0x3F); }
+static int flush_parts_case(u64 gva, u64 cpu, u32 width_reg, u32 h, u32 layout, u32 layers, u32 layer_bytes, u32 msaa,
+                            u64 load_cap) {
     GpuChannel* ch = calloc(1, sizeof *ch);
     const u64 cap = g_vk.alloc_cap, size = (u64)layer_bytes * layers;
+    int bad = 0;
     CHECK(ch);
     u32* r = ch->r3d;
     u8* got = (u8*)malloc(size);
     CHECK(got);
     for (u64 i = 0; i < size; i++) /* below 64 in the red bytes */
-        GP(cpu)[i] = (u8)(i % 4 ? i * 7 + (i >> 10) * 3 + 1 : (i * 5 + (i >> 9)) & 0x3F);
+        GP(cpu)[i] = load_cap ? 0x33 : flush_pattern(i);
     r[0x574] = msaa;
     r[0x487] = 1;
     r[0x200] = (u32)(gva >> 32);
@@ -4040,17 +4048,47 @@ static int flush_parts_case(u64 gva, u64 cpu, u32 width_reg, u32 h, u32 layout, 
     memcpy(&r[0x360], red, sizeof red);
     for (u32 l = 0; l < layers; l++) engine_clear(ch, (1 << 2) | (l << 10));
     vk_render_end();
+    if (load_cap) {
+        for (u64 i = 0; i < size; i++) GP(cpu)[i] = flush_pattern(i);
+        g_vk.alloc_cap = load_cap;
+        vk_bl_scratch_asked();
+        vk_rt_reload(gva);
+        u64 asked = vk_bl_scratch_asked();
+        g_vk.alloc_cap = cap;
+        if (!asked || asked > load_cap / VK_PART_SHARE) {
+            fprintf(
+                stderr,
+                "load in bands of layout %#x, %u layers, under a cap of %llu: the scratch buffer was asked for %llu "
+                "bytes, %llu at most may stay\n",
+                layout, layers, (unsigned long long)load_cap, (unsigned long long)asked,
+                (unsigned long long)(load_cap / VK_PART_SHARE));
+            bad = 1;
+        }
+        for (u32 l = 0; l < layers; l++) engine_clear(ch, (1 << 2) | (l << 10));
+        vk_render_end();
+    }
     const Surf* s = vk_rt_find(gva);
     CHECK(s && s->msaa == msaa);
     u64 samples = msaa ? (u64)(s->w << ds_msaa_log2_x(msaa)) * (s->h << ds_msaa_log2_y(msaa)) * layers : 0;
-    u64 unpacked = vk_ms_unpacked();
-    g_vk.alloc_cap = 64 << 10;
+    u64 unpacked = vk_ms_unpacked(), flush_cap = load_cap ? load_cap : 64 << 10;
+    g_vk.alloc_cap = flush_cap;
+    vk_bl_scratch_asked();
     vk_rt_flush(gva);
+    u64 flush_asked = vk_bl_scratch_asked();
     g_vk.alloc_cap = cap;
+    if (!(layout & 0x1000) && flush_asked > flush_cap / VK_PART_SHARE) {
+        fprintf(
+            stderr,
+            "write-back of layout %#x, %u layers, msaa %u under a cap of %llu: the scratch buffer was asked for %llu "
+            "bytes, %llu at most may stay\n",
+            layout, layers, msaa, (unsigned long long)flush_cap, (unsigned long long)flush_asked,
+            (unsigned long long)(flush_cap / VK_PART_SHARE));
+        bad = 1;
+    }
     unpacked = vk_ms_unpacked() - unpacked;
     CHECK(!gmem_read(gva, got, size));
     for (u64 i = 0; i < size; i++) {
-        u8 want = (u8)(i % 4 ? i * 7 + (i >> 10) * 3 + 1 : 128);
+        u8 want = i % 4 ? flush_pattern(i) : 128;
         if (i % 4 ? got[i] != want : abs((int)got[i] - 128) > 1) {
             fprintf(stderr, "write-back in parts of layout %#x, %u layers, msaa %u: byte %llu is %u, not %u\n", layout,
                     layers, msaa, (unsigned long long)i, got[i], want);
@@ -4066,18 +4104,25 @@ static int flush_parts_case(u64 gva, u64 cpu, u32 width_reg, u32 h, u32 layout, 
                 layout, layers, msaa, (unsigned long long)unpacked, (unsigned long long)samples);
         return 1;
     }
-    return 0;
+    return bad;
 }
 static int check_flush_parts(void) {
     const u64 cpu = HEAP_BASE + 0xC00000, gva = 0xB000000ull;
     CHECK(mem_map(cpu, 0x100000, MS_NORMAL, PERM_RW) == 0);
     gmmu_map(gva, cpu, 0x100000);
-    CHECK(!flush_parts_case(gva, cpu, 256, 128, 0, 1, 256 * 128 * 4, 0)); /* block linear, 1 GOB high */
-    CHECK(!flush_parts_case(gva + 0x40000, cpu + 0x40000, 1024, 128, 0x1000, 1, 1024 * 128, 0)); /* pitch linear */
-    CHECK(!flush_parts_case(gva + 0x80000, cpu + 0x80000, 256, 32, 0x1000, 12, 256 * 32, 0));    /* 12 layers */
+    CHECK(!flush_parts_case(gva, cpu, 256, 128, 0, 1, 256 * 128 * 4, 0, 0)); /* block linear, 1 GOB high */
+    CHECK(!flush_parts_case(gva + 0x40000, cpu + 0x40000, 1024, 128, 0x1000, 1, 1024 * 128, 0, 0)); /* pitch linear */
+    CHECK(!flush_parts_case(gva + 0x80000, cpu + 0x80000, 256, 32, 0x1000, 12, 256 * 32, 0, 0));    /* 12 layers */
     /* 2x2 samples a pixel (registers in samples): each band of rows' samples drawn into the guest's layout of them */
-    CHECK(!flush_parts_case(gva + 0xC0000, cpu + 0xC0000, 256, 128, 0, 1, 256 * 128 * 4, DS_MSAA_2X2));
-    CHECK(!flush_parts_case(gva + 0xE0000, cpu + 0xE0000, 768, 128, 0x1000, 1, 768 * 128, DS_MSAA_2X2));
+    CHECK(!flush_parts_case(gva + 0xC0000, cpu + 0xC0000, 256, 128, 0, 1, 256 * 128 * 4, DS_MSAA_2X2, 0));
+    CHECK(!flush_parts_case(gva + 0xE0000, cpu + 0xE0000, 768, 128, 0x1000, 1, 768 * 128, DS_MSAA_2X2, 0));
+    /* loaded and written back in bands: 256x128 under the cap exactly (an 8K RGBA8 target under 256 MiB), 4 of 32
+       rows, and under half of it, 8 of 16 rows; 3 layers of 256x32 in blocks 2 GOBs high under 80 KiB, a band a row
+       of blocks (16 rows: 20 would cut one), 2 a layer */
+    int failed = flush_parts_case(gva + 0x20000, cpu + 0x20000, 256, 128, 0, 1, 256 * 128 * 4, 0, 128 << 10);
+    failed |= flush_parts_case(gva + 0x60000, cpu + 0x60000, 256, 128, 0, 1, 256 * 128 * 4, 0, 64 << 10);
+    failed |= flush_parts_case(gva + 0xA0000, cpu + 0xA0000, 256, 32, 0x10, 3, 256 * 32 * 4, 0, 80 << 10);
+    CHECK(!failed);
     CHECK(mem_unmap(cpu, 0x100000) == 0);
     return 0;
 }
@@ -4923,6 +4968,7 @@ static int check_uma_page_changes(void) {
 #include "vulkan_surface_loads.inc"
 #include "vulkan_rect_textures.inc"
 #include "vulkan_owned_readback.inc"
+#include "vulkan_guest_staging.inc"
 #include "vulkan_storage_suffix.inc"
 #include "vulkan_pending_index.inc"
 #include "vulkan_draw_storage_stages.inc"
@@ -4949,6 +4995,7 @@ static int check_uma_page_changes(void) {
 #include "vulkan_tex_partial.inc"
 
 #include "vulkan_descriptor_bench.inc"
+#include "vulkan_pipeline_probe.inc"
 #include "vulkan_indexed_map_bench.inc"
 #include "vulkan_nvn_storage.inc"
 #include "vulkan_nvn_compat.inc"
@@ -5027,6 +5074,8 @@ static int run_headless(int argc, char** argv) {
     u32 benchmark_sparse = 0, benchmark_storage = 0, benchmark_image = 0;
     u32 benchmark_buffer = 0;
     u32 benchmark_passes = 0;
+    const char* pipeline_probe = NULL;
+    int pipeline_probe_disable = 0;
     /* the runtime's startup flags (-H), its settings as it takes them (--vk_memory=2, --memory_traps=2,
        --vertex_input_dynamic_state=off), and the benchmarks'. Any other argument stops the run: one dropped unsaid ran
        the checks without it */
@@ -5036,6 +5085,15 @@ static int run_headless(int argc, char** argv) {
         unsigned flags = 0;
         char key[64];
         if (snx_cli_flag(argv[i], &flags) == 1) continue;
+        if (!strncmp(argv[i], "--pipeline-probe=", 17)) {
+            pipeline_probe = argv[i] + 17;
+            continue;
+        }
+        if (!strncmp(argv[i], "--pipeline-probe-disable-opt=", 29)) {
+            CHECK(!strcmp(argv[i] + 29, "0") || !strcmp(argv[i] + 29, "1"));
+            pipeline_probe_disable = argv[i][29] - '0';
+            continue;
+        }
         if (!strncmp(argv[i], "--bench-indexed-map=", 20)) {
             indexed_map_benchmark = (int)strtol(argv[i] + 20, NULL, 10);
             continue;
@@ -5094,7 +5152,8 @@ static int run_headless(int argc, char** argv) {
                 "snx-test-vulkan: %s is not an option it takes: -H, --KEY=VALUE of the runtime's settings, "
                 "--bench-descriptors=N, --descriptor-images=N, --descriptor-indexed=N, --descriptor-count=N, "
                 "--bench-sparse-volume, --bench-sparse-texture, --bench-storage-lookup, --bench-storage-image, "
-                "--bench-storage-buffer, --bench-pass-breaks=N, --nvn-draw-bench=N, --bench-indexed-map=N\n",
+                "--bench-storage-buffer, --bench-pass-breaks=N, --nvn-draw-bench=N, --bench-indexed-map=N, "
+                "--pipeline-probe=FILE, --pipeline-probe-disable-opt=0|1\n",
                 argv[i]);
             return 2;
         }
@@ -5114,6 +5173,13 @@ static int run_headless(int argc, char** argv) {
     g_settings.vulkan_video_decode = 1; /* a Vulkan Video decode queue where the device has one (lavapipe has none) */
     video_init("Headless Vulkan fixture", "");
     CHECK(g_opt_headless && g_renderer_up && g_vk.dev && !g_vk.surface && !g_vk.swapchain && !g_vk.sc_count);
+    if (pipeline_probe) {
+        int result = probe_pipeline_compile(pipeline_probe, pipeline_probe_disable);
+        vk_pipeline_quiesce();
+        CHECK(!snx_remove_tree(root));
+        free(root); free(shot); free(ppm);
+        return result;
+    }
     if (getenv("SNX_TEST_RECORDER_ONLY")) { /* the recording thread's own sync alone, on the driver the loader picks */
         CHECK(!check_recorder_self_sync());
         vk_finish();
@@ -5417,6 +5483,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_chunk_written_first());
     CHECK(!check_stream_epoch());
     CHECK(!check_owned_readback());
+    CHECK(!check_guest_staging());
     CHECK(!check_owned_writable());
     CHECK(!check_owned_in_place_write());
     CHECK(!check_owned_read_device());

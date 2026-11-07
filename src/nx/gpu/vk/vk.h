@@ -22,7 +22,7 @@
    render.c    the render target set (dynamic rendering), clears and draws
    compute.c   compute dispatches (on a queue of their own when there is one), landing their results in guest memory
    renderer.c  the renderer interface the GPU front end calls (gpu/renderer.h) and presenting
-   renderdoc.c RenderDoc captures of chosen frames (renderdoc) and of Ctrl+F12's
+   renderdoc.c RenderDoc captures of chosen frames (renderdoc) and of the capture key's
    ui.c        the on-screen controls and the game's menu, drawn over the swapchain image
    vma.cpp     VulkanMemoryAllocator's implementation
 
@@ -115,7 +115,7 @@ typedef struct {
     int has_vertex_robustness2; /* exact zero/default components for out-of-range mesh fetches */
     int has_calibrated_host;    /* VK_EXT_calibrated_timestamps with CLOCK_MONOTONIC_RAW: the GPU's clock goes next to
                                 the client's, one driver call (gpuprof.c's calibration) */
-    int has_xfb;                /* VK_EXT_transform_feedback: draws capture their outputs into guest memory */
+    int has_xfb;                /* VK_EXT_transform_feedback (without it, g_shader_xfb_stores) */
     int has_mixed_samples;      /* VK_NV_framebuffer_mixed_samples: coverage at more samples than color storage */
     int has_coverage_to_color, has_post_depth_coverage;
     VkSampleLocationCaps sample_locations;
@@ -340,6 +340,8 @@ u8* vk_stage(u64 size, u64 align, VkBuffer* buf, u64* off);
 u64 vk_stage_chunk(void);
 /* Streamed buffer snapshots in host RAM, with the same frame lifetime as vk_stage. */
 u8* vk_stage_upload(u64 size, u64 align, VkBuffer* buf, u64* off);
+/* One-use guest input: host staging for CPU-only bytes, output staging when GPU-owned or in-place writes cover it. */
+u8* vk_stage_guest_input(u64 gva, u64 source_size, u64 bytes, VkBuffer* buf, u64* off);
 /* GPU-written storage, device-local when host-visible memory and its budget allow;
    includes the allocation for invalidation after its frame fence. */
 u8* vk_stage_output(u64 size, u64 align, VkBuffer* buf, u64* off, VmaAllocation* mem);
@@ -1083,6 +1085,10 @@ int vk_astc_upload(VkCommandBuffer cb, Surf* t, u32 x, u32 y, u32 w, u32 h, u32 
 /* the image levels (or regions of them) uploaded as BC7 so far, their bytes, and the bytes they would have taken as
    RGBA8 */
 void vk_astc_stats(u64* levels, u64* bytes, u64* rgba8_bytes);
+/* Internal ASTC, BC7, block-linear, conversion, multisample and depth-packing pipelines, apart from guest shaders.
+   Both functions run under vk_lock. Cumulative time is in nanoseconds, including time inside the driver. */
+void vk_texture_pipeline_made(u64 ns);
+void vk_texture_pipeline_stats(u64* count, u64* ns);
 /* the bytes of the ASTC textures decoded to RGBA8 so far (astc_mode=1, or a GPU without BCn) */
 u64 vk_astc_rgba8_bytes(void);
 
@@ -1256,9 +1262,10 @@ int vk_buf_pending_unsubmitted(void); /* one is in the commands recorded since t
    the results on the range's pages alone (tests count them) */
 u64 vk_buf_pending_inspected(void);
 /* renderdoc.c: RenderDoc loaded before the instance exists, with renderdoc set, or taken where RenderDoc's program
-   started the game (load); the frames renderdoc_frames names and Ctrl+F12 asks for captured (present, at each present
-   under vk_lock). capture: whether a capture can be taken (RenderDoc is in the process), and with ask, the next frame
-   captured, said in the log either way; the renderer's capture. Any thread */
+   started the game (load); the frames renderdoc_frames names and the capture key asks for captured (present, at each
+   present under vk_lock, where RenderDoc writes each, the game stopped, a thread of its own saying how long). capture:
+   whether a capture can be taken (RenderDoc is in the process), and with ask, the frame after the next present
+   captured, said in the log and over the game; the renderer's capture. Any thread */
 /* RenderDoc's library, by the name its own program puts in a game it starts: the one load looks for and opens */
 #if defined(_WIN32)
 #define SNX_VK_RENDERDOC_LIBRARY "renderdoc.dll"

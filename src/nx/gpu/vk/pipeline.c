@@ -41,10 +41,7 @@
 static char g_cache_dir[1100], g_pcache_path[1200], g_pcache_tmp[1230];
 static int g_pcache_dirty; /* pipelines made since the cache was last written (atomic: it is saved outside vk_lock) */
 static u64 g_pcache_used;  /* plat_ns when a pipeline last went into the cache (atomic) */
-static void pcache_note(void) {
-    __atomic_store_n(&g_pcache_used, plat_ns(), __ATOMIC_RELAXED);
-    __atomic_store_n(&g_pcache_dirty, 1, __ATOMIC_RELAXED);
-}
+static void pcache_note(void);
 #if defined(SNX_TRACY)
 /* the stages' names, for the shader translate zone's text */
 static const char* const vk_tracy_stage[6] = {"vert", "tess ctrl", "tess eval", "geom", "frag", "comp"};
@@ -1176,6 +1173,9 @@ static VkPipeline pipe_make(const Pipe* e, int record) {
     SNX_ZONE_T(z_pipe, "pipeline make", "hash %016llx", (unsigned long long)e->h);
     u64 t0 = plat_ns();
     SNX_ZONE(z, "pipeline make");
+    /* A new-area pipeline can arrive after a long quiet spell. Mark it before entering the driver, so a periodic
+       cache snapshot doesn't mistake an in-flight compile for idleness and contend for the driver's cache lock. */
+    pcache_note();
     VkPipeline p = pipe_create(e);
     SNX_ZONE_END(z);
     pcache_note();
@@ -1438,51 +1438,7 @@ void vk_pipeline_stats(u64* pipes, u64* hits, u64* make_ms, u64* wait_ms, u64* s
     *shader_ms = g_sh_ns / 1000000;
 }
 
-VkPipelineCache vk_pipeline_cache(void) {
-    pcache_note();
-    return g_pcache;
-}
-/* writes the pipeline cache when pipelines were made since the last write. Asked every few seconds and at exit (the
-   renderer's save), outside vk_lock: the driver synchronizes the cache itself. The driver holds the cache's lock while
-   it copies the cache out, so a pipeline made meanwhile waits for the whole copy, and the copies came every five seconds
-   while pipelines were being made: a pipeline once waited 3.2 s with recording stopped behind it. So the asking every
-   few seconds writes it only after PCACHE_QUIET_NS without a new pipeline, and at exit it is written regardless. Saves
-   one at a time, so the one at exit waits for one in progress to finish its file before the process ends */
-#define PCACHE_QUIET_NS 20000000000ull
-static PMutex g_psave = PMUTEX_INIT;
-void vk_pipeline_save(int at_exit) {
-    if (!at_exit && plat_ns() - __atomic_load_n(&g_pcache_used, __ATOMIC_RELAXED) < PCACHE_QUIET_NS) return;
-    pm_lock(&g_psave);
-    /* the shipped file's shaders the draws found, when that changed: nidx is settled once ship_ready */
-    if (__atomic_load_n(&g_pf.ship_ready, __ATOMIC_ACQUIRE) && g_pf.nidx) {
-        u32 used = __atomic_load_n(&g_pf.ship_used, __ATOMIC_RELAXED);
-        if (used != g_pf.ship_said) {
-            g_pf.ship_said = used;
-            LOG("vulkan: %u of the %u shaders translated from the game's files found by its draws so far\n", used,
-                g_pf.nidx);
-        }
-    }
-    if (!g_pcache || !__atomic_exchange_n(&g_pcache_dirty, 0, __ATOMIC_RELAXED)) {
-        pm_unlock(&g_psave);
-        return;
-    }
-    size_t n = 0;
-    void* d = NULL;
-    if (vkGetPipelineCacheData(g_vk.dev, g_pcache, &n, NULL) == VK_SUCCESS && n) d = malloc(n);
-    if (d && vkGetPipelineCacheData(g_vk.dev, g_pcache, &n, d) == VK_SUCCESS) {
-        FILE* f = fopen(g_pcache_tmp, "wb");
-        if (f) {
-            int ok = fwrite(d, 1, n, f) == n;
-            if (fclose(f)) ok = 0;
-            if (ok)
-                plat_replace_file(g_pcache_tmp, g_pcache_path); /* the old cache stays whole until this */
-            else
-                remove(g_pcache_tmp);
-        }
-    }
-    free(d);
-    pm_unlock(&g_psave);
-}
+#include "nx/gpu/vk/pipeline_cache_save.inc"
 
 /* ------------------------------------------------------------ the shaders and pipelines of earlier runs */
 /* a module's handle as the file knows it, and back (a pointer, or a 64-bit integer on 32-bit hosts) */
@@ -1802,6 +1758,8 @@ static void pf_key(char* out, size_t n, size_t* guest) {
                   (u32)g_shader_geometry_streams,
                   (u32)g_shader_geometry_streams_lines_triangles,
                   (u32)g_shader_tessellation,
+                  (u32)g_shader_xfb_stores,
+                  (u32)g_vk.has_xfb,
                   (u32)g_shader_clock_scopes,
                   (u32)g_vk_flush_denorm,
                   (u32)g_vk_preserve_infnan,

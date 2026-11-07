@@ -63,7 +63,30 @@ update high bits 0x0004000e00000000, in partition 7 or a New 3DS's 6) is played 
 that update: the update NCCH's ExHeader, code, ExeFS sections and RomFS are the
 game's, as Azahar's `overlay_ncch` is, so the process the game runs in is the update
 title's, as the console runs it once an update is applied, while the game's folder
-stays named by the base NCCH's title ID, as the card is one game. A CIA's content
+stays named by the base NCCH's title ID, as the card is one game.
+
+A game's standalone update (a CIA of title type 0x0004000e, or a bare update NCCH) and
+its DLC (a CIA of title type 0x0004008c) are kept as a Switch game's are: each is
+recorded beside the game in its folder, `<title ID>_<its entry>.ini` naming its file
+(`source=`, read where it lies) and its data folder `<title ID>_<its entry>_data`, and
+checked in the game's `addons=` (one update at most). `scarletnx-3ds UPDATE.cia` or
+`scarletnx-3ds DLC.cia`, alone once the game is made, or `scarletnx-3ds GAME.cia
+--update UPDATE.cia --update DLC.cia`, records each and plays the game with them; the
+launcher's box of the game lists them and picks them as a Switch game's. An update's
+title ID is the game's low half under 0x0004000e, as Azahar's `am` makes it, and a
+DLC's the low half's 28 bits under 0x0004008c, as Azahar's game list finds it; another
+game's is refused with both IDs. The game plays with what its `addons=` checks: the
+update's ExHeader, code and RomFS are the game's, its ExeFS files answering by name
+before the base's, and a DLC's contents are read where they lie, served by the NCCH
+archive (0x2345678A) by their place in the TMD, and answered by `am:app` as Azahar
+answers for an installed DLC at 6e42de8: GetDLCContentInfoCount gives the TMD's
+contents, ListDLCContentInfos lists them from the given start (owned, and downloaded
+when the CIA holds the content), GetDLCTitleInfos gives the main content's size, the
+title version and type. A checked update or DLC whose file is not there is said, with
+the path, and the game plays without it; a game played from its extraction plays with
+none, and says which it leaves out. Each is decrypted, when it needs it, as a game is.
+
+A CIA's content
 table, ticket and TMD are parsed as before;
 a cartridge and a bare NCCH have none, and their NCCH is checked as a CIA's boot
 content is.
@@ -455,6 +478,30 @@ down), what they gained and lost since the entry before, and the C-stick's posit
 the raw C-stick, which Azahar does not model either, gives the position without its
 direction bits; each is said on the standard error with the value asked for.
 
+`mic:u` (`services/mic.c`, ported from Azahar's `mic_u.cpp`) answers as Azahar does
+with no input device: sampling starts and stops, the settings a game stores (gain,
+power, clamp, the shell closed) read back, and the buffer full event is a real event
+that is never signalled, as no sample is ever written.
+
+`cam:u` (`services/cam.c`, ported from Azahar's `cam.cpp`) has Azahar's blank camera
+behind it: the ports activate, capture and receive as Azahar's do, a receiving
+completes at its camera's frame rate's latency with a black frame (whole or
+trimmed, YUV422 or RGB565), an activated port's vsync event fires at that latency
+and GetLatestVsyncTiming gives the last five. A frame rate or a size preset past
+Azahar's tables, and a width of 0, which Azahar would read past or divide by, are
+refused with InvalidEnumValue and OutOfRange.
+
+`csnd:SND` (`services/csnd.c`, with the CSND hardware in `audio/csnd.c`, ported from
+Azahar's `csnd_snd.cpp` and `csnd.cpp`) plays: each session gets its shared memory
+and mutex at Initialize, and the command lists the game writes there configure,
+start, pause and stop the 32 channels (PCM8, PCM16, IMA-ADPCM; one-shot, looping,
+held; linear interpolation), with Azahar's 40-step volume fades before a pause or a
+stop, and write back the state the game reads. While a session is initialized or a
+channel plays, the hardware renders a frame each DSP frame time, a command landing at
+the sample it comes at, and the frame is mixed into the DSP's output as Azahar mixes
+it, or played alone when the DSP is idle. PSG and noise play silence and the capture
+units capture nothing, as in Azahar.
+
 `ir:USER` (`services/ir.c`) answers as Azahar does with no IR accessory in range.
 InitializeIrNopShared writes the shared block's header and empty receive queue, the
 receive, send and connection-status events are real kernel events, and RequireConnection
@@ -698,8 +745,9 @@ status**. When the last thread ends with ExitThread the driver prints
 
 Only application content is supported: a CIA (encrypted ones decrypted with the
 user's keys as above, without seed crypto), a cartridge image's game partition and
-update partition, and a bare NCCH — not a cartridge's manual or DLP partitions as
-content of their own, DLC, system titles or nonstandard NCCH media units/platforms. A
+update partition, a standalone update and a DLC beside their game, and a bare NCCH —
+not a cartridge's manual or DLP partitions as content of their own, system titles or
+nonstandard NCCH media units/platforms. A
 cartridge image may be as large as a card (8 GiB), since it is read where it lies; a
 CIA's input, the total materialized output and a RomFS view are each capped at 4 GiB
 (the runtime's policy, not a format limit); metadata tables at 16 MiB,

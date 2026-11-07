@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 #include "nx/gpu/shader/shader.h"
+#include "nx/gpu/vk/xfb_stores.h"
 #include "common/utilities/endian.h"
 #include <limits.h>
 #include <stdio.h>
@@ -42,6 +43,7 @@ static const char* attribute_paths[7];
 static const char* pexit_path;
 static const char* global_dynamic_path;
 static const char* xfb_path;
+static const char* xfb_stores_path;
 static const char* passthrough_paths[6];
 static const char* structured_paths[2];
 static const char* fswzadd_path;
@@ -3081,6 +3083,93 @@ static int decorations(const u32* code, size_t words, u32 decoration, u32 litera
     }
     return found;
 }
+/* whether the module binds a resource at binding (OpDecorate Binding) */
+static int has_binding(const u32* code, size_t words, u32 binding) {
+    return decorations(code, words, 33, binding) > 0;
+}
+/* without the extension (MoltenVK) the vertex program stores the capture into storage buffers after its global
+   buffers, with no TransformFeedback capability, and keeps the key for the renderer */
+static void transform_feedback_stores(void) {
+    const u64 instructions[] = {mov32i(0, 0x3f800000), mov32i(1, 0x40000000), mov32i(2, 0x40400000),
+                                mov32i(3, 0x40800000), 0xeff000000007ff00ull | (0x80ull << 20) | (3ull << 47)};
+    ShaderInfo info;
+    size_t slots, words = 0;
+    u64* code = guest_program(instructions, 5, NULL, &slots);
+    if (!code) return;
+    memset(&info, 0, sizeof info);
+    info.xfb.layout[0][0] = 33;
+    info.xfb.layout[0][1] = 34;
+    info.xfb.count[0] = 2;
+    info.xfb.stride[0] = 8;
+    info.xfb.layout[1][0] = 32;
+    info.xfb.count[1] = 1;
+    info.xfb.stride[1] = 4;
+    g_shader_xfb_stores = 1;
+    u32* spv = spirv_of(code, slots * sizeof *code, ST_VS, &info, &words, 0, 1, 1, 1);
+    g_shader_xfb_stores = 0;
+    free(code);
+    check_translated(spv, &info, "a transform feedback capture by stores translates");
+    if (spv) {
+        check(count_opcode(spv, words, 17, 53) == 0 && count_opcode(spv, words, 16, 11) == 0,
+              "a capture by stores declares no TransformFeedback and no Xfb");
+        check(count_opcode(spv, words, 71, 36) == 0, "a capture by stores decorates no XfbBuffer");
+        check(has_binding(spv, words, SNX_VKB_XFB_PARAMS) && has_binding(spv, words, SNX_VKB_XFB) &&
+                  has_binding(spv, words, SNX_VKB_XFB + 1) && !has_binding(spv, words, SNX_VKB_XFB + 2),
+              "a capture by stores binds its parameters and the buffers it captures into");
+        check(info.xfb.count[0] == 2 && info.xfb.count[1] == 1, "a capture by stores keeps its layout in its info");
+        check(count_opcode(spv, words, 199, 0xffffffffu) >= 2,
+              "a capture by stores tests the bound mask of each buffer it captures into (OpBitwiseAnd)");
+        save_fixture(xfb_stores_path, spv, words);
+    }
+    free(spv);
+}
+/* a capture by stores of the fog (layout word 186, a[0x2e8]) stores generic 21's x (word 116), where the fog moved */
+static void transform_feedback_stores_fog(void) {
+    const u64 instructions[] = {mov32i(0, 0x3f800000), 0xeff07f800007ff00ull | 0x2e8ull << 20};
+    size_t slots, words[2] = {0};
+    u64* code = guest_program(instructions, 2, NULL, &slots);
+    u32* spv[2] = {NULL, NULL};
+    if (!code) return;
+    g_shader_xfb_stores = 1;
+    for (int i = 0; i < 2; i++) {
+        ShaderInfo info;
+        memset(&info, 0, sizeof info);
+        info.xfb.layout[0][0] = i ? 116 : 186;
+        info.xfb.count[0] = 1;
+        info.xfb.stride[0] = 4;
+        spv[i] = spirv_of(code, slots * sizeof *code, ST_VS, &info, &words[i], 0, 1, 1, 1);
+        check_translated(spv[i], &info, "a capture by stores of the fog translates");
+    }
+    g_shader_xfb_stores = 0;
+    check(spv[0] && spv[1] && words[0] == words[1] && !memcmp(spv[0], spv[1], words[0] * sizeof *spv[0]),
+          "a capture by stores of the fog stores the component it moved to (x), as a capture of that generic does");
+    free(spv[0]);
+    free(spv[1]);
+    free(code);
+}
+
+/* xfb_stores.h over a begin, two draws, a pause and a resume: buffer 2 has a bad stride, and the guest left 3 off */
+static void transform_feedback_stores_ranges(void) {
+    const u32 stride[4] = {16, 8, 6, 4}, words[4] = {4, 1, 2, 1}, size[4] = {112, 1000, 64, 0};
+    u32 from[4] = {0};
+    SnxXfbRange r;
+    snx_xfb_range(3, 3, stride, words, size, from, &r);
+    check(r.declared == 0xb && r.bound == 3 && r.limit == 3 && r.start[0] == 0 && r.start[1] == 0 &&
+              r.used[0] == 48 && r.used[1] == 24 && r.end[0] == 48 && r.end[1] == 24,
+          "a capture by stores from a begin takes the triangle, from each buffer's start");
+    for (int b = 0; b < 4; b++) from[b] = r.end[b];
+    snx_xfb_range(6, 3, stride, words, size, from, &r);
+    check(r.bound == 3 && r.limit == 3 && r.start[0] == 48 && r.start[1] == 24 && r.end[0] == 96 && r.end[1] == 48,
+          "a second draw resumes at the first's ends and takes the whole triangles that fit");
+    const u32 paused[4] = {r.end[0], r.end[1], r.end[2], r.end[3]};
+    snx_xfb_range(1, 1, stride, words, size, paused, &r);
+    check(r.bound == 3 && r.limit == 1 && r.start[0] == 96 && r.start[1] == 48 && r.used[0] == 16 &&
+              r.used[1] == 8 && r.end[0] == 112 && r.end[1] == 56,
+          "a resume from the pause's ends captures the point after them");
+    for (int b = 0; b < 4; b++) from[b] = r.end[b];
+    snx_xfb_range(1, 1, stride, words, size, from, &r);
+    check(r.declared == 0xb && r.bound == 0 && r.limit == 0, "a full buffer stops the capture of every buffer");
+}
 
 /* The fixed function's varyings take the generics 17-31, the same in every stage (legacy_varyings): a vertex
    program's front diffuse green from R43 (AST a[0x284], one game's), another's whole first texture coordinate
@@ -4332,6 +4421,7 @@ int main(int argc, char** argv) {
         pexit_path = fixture_path(argv[1], "pexit");
         global_dynamic_path = fixture_path(argv[1], "global_dynamic");
         xfb_path = fixture_path(argv[1], "xfb");
+        xfb_stores_path = fixture_path(argv[1], "xfb_stores");
         for (int i = 0; i < 6; i++) {
             char name[32];
             snprintf(name, sizeof name, "passthrough_%d", i);
@@ -4402,6 +4492,9 @@ int main(int argc, char** argv) {
     draw_buffer_surfaces();
     layered_surface_loads();
     transform_feedback();
+    transform_feedback_stores();
+    transform_feedback_stores_fog();
+    transform_feedback_stores_ranges();
     nro_shader_modes();
     issue126_shader_modes();
     between_stages();

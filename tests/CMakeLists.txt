@@ -251,6 +251,21 @@ if(TARGET snx_ctr_board)
     foreach(case startup permissions accessory lifecycle metadata)
         add_test(NAME 3ds_ir_${case} COMMAND snx-test-3ds-ir ${case})
     endforeach()
+    # mic:u with no input device, as Azahar's
+    add_executable(snx-test-3ds-mic 3ds_mic.c support/3ds_guest.c)
+    snx_test_target(snx-test-3ds-mic 11)
+    target_link_libraries(snx-test-3ds-mic PRIVATE snx_ctr_process)
+    add_test(NAME 3ds_mic COMMAND snx-test-3ds-mic)
+    # cam:u with Azahar's blank camera
+    add_executable(snx-test-3ds-cam 3ds_cam.c support/3ds_guest.c)
+    snx_test_target(snx-test-3ds-cam 11)
+    target_link_libraries(snx-test-3ds-cam PRIVATE snx_ctr_process)
+    add_test(NAME 3ds_cam COMMAND snx-test-3ds-cam)
+    # csnd:SND and the CSND hardware, rendered and mixed into the output
+    add_executable(snx-test-3ds-csnd 3ds_csnd.c support/3ds_guest.c)
+    snx_test_target(snx-test-3ds-csnd 11)
+    target_link_libraries(snx-test-3ds-csnd PRIVATE snx_ctr_process)
+    add_test(NAME 3ds_csnd COMMAND snx-test-3ds-csnd)
     # the pointer's touch on the window's bottom screen, from the presenter to hid:USER's samples
     add_executable(snx-test-3ds-mouse-touch 3ds_mouse_touch.c support/3ds_guest.c)
     snx_test_target(snx-test-3ds-mouse-touch 11)
@@ -429,6 +444,21 @@ if(TARGET snx_ctr_board)
     target_link_libraries(snx-test-3ds-dsp PRIVATE snx_ctr_process m)
     add_test(NAME 3ds_dsp COMMAND snx-test-3ds-dsp)
 
+    # the loader's probe of a game read where it lies, and a standalone update laid over its game
+    if(Python3_Interpreter_FOUND)
+        add_executable(snx-test-3ds-container 3ds_container.c)
+        snx_test_target(snx-test-3ds-container 11)
+        target_link_libraries(snx-test-3ds-container PRIVATE snx_ctr_process)
+        add_test(NAME 3ds_update COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_update.py"
+            $<TARGET_FILE:snx-test-3ds-container>)
+        # a game's DLC laid beside it, served by the NCCH archive and am:app
+        add_executable(snx-test-3ds-dlc 3ds_dlc.c support/3ds_guest.c)
+        snx_test_target(snx-test-3ds-dlc 11)
+        target_link_libraries(snx-test-3ds-dlc PRIVATE snx_ctr_process)
+        add_test(NAME 3ds_dlc COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_dlc.py"
+            $<TARGET_FILE:snx-test-3ds-dlc>)
+    endif()
+
     if(NOT WIN32)
         if(Python3_Interpreter_FOUND)
             add_executable(snx-test-3ds-fs 3ds_fs.c support/3ds_guest.c)
@@ -439,10 +469,10 @@ if(TARGET snx_ctr_board)
                 $<TARGET_FILE:snx-swipc>)
             add_test(NAME 3ds_driver COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_driver.py"
                 "${SNX_CTR_PROGRAM}")
-            # a CIA read where it lies (snx_ctr_cia_open) against its extraction, on the same fixtures and mutants
-            add_executable(snx-test-3ds-container 3ds_container.c)
-            snx_test_target(snx-test-3ds-container 11)
-            target_link_libraries(snx-test-3ds-container PRIVATE snx_ctr_process)
+            # a game's update and DLC recorded beside it, checked in its addons= and played with it
+            add_test(NAME 3ds_addons COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_addons.py"
+                "${SNX_CTR_PROGRAM}")
+            set_tests_properties(3ds_addons PROPERTIES TIMEOUT 300)
             add_test(NAME 3ds_container COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_container.py"
                 "${SNX_CTR_PROGRAM}" $<TARGET_FILE:snx-test-3ds-container>)
             # a cartridge image or a bare NCCH against its extraction, and the update partition played as the update
@@ -1370,17 +1400,20 @@ add_test(NAME llvm_dependency COMMAND "${CMAKE_COMMAND}"
     "-DSNX_SOURCE_DIR=${PROJECT_SOURCE_DIR}" "-DSNX_TEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/llvm-dependency"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/llvm_dependency.cmake")
 
-add_executable(snx-test-overlay overlay.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/overlay.c"
-    "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/fatal_screen.c"
-    "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/prepare_screen.c"
-    "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/vpad.c"
-    "${PROJECT_BINARY_DIR}/generated/controls_skins.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ui.c"
-    "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/stats.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c")
-snx_test_target(snx-test-overlay 11)
-target_link_libraries(snx-test-overlay PRIVATE scarletnx-common snx_splash m)
 include("${PROJECT_SOURCE_DIR}/cmake/gui_themes.cmake")
-target_include_directories(snx-test-overlay PRIVATE "${PROJECT_BINARY_DIR}/generated")
-add_test(NAME overlay COMMAND snx-test-overlay)
+if(TARGET SDL3::SDL3) # F1's and the Shortcuts pages name the runtime's keys as SDL names them
+    add_executable(snx-test-overlay overlay.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/overlay.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/fatal_screen.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/prepare_screen.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/vpad.c"
+        "${PROJECT_BINARY_DIR}/generated/controls_skins.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ui.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/stats.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/hotkeys.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c")
+    snx_test_target(snx-test-overlay 11)
+    target_link_libraries(snx-test-overlay PRIVATE scarletnx-common snx_splash m SDL3::SDL3)
+    target_include_directories(snx-test-overlay PRIVATE "${PROJECT_BINARY_DIR}/generated")
+    add_test(NAME overlay COMMAND snx-test-overlay)
+endif()
 
 add_executable(snx-test-vpad vpad.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/vpad.c"
     "${PROJECT_BINARY_DIR}/generated/controls_skins.c"
@@ -1408,7 +1441,16 @@ target_link_libraries(snx-test-hud PRIVATE scarletnx-common snx_splash m)
 target_include_directories(snx-test-hud PRIVATE "${PROJECT_BINARY_DIR}/generated") # the theme's colours
 add_test(NAME hud COMMAND snx-test-hud)
 
-# F1's text (runtime/platform/help.c): Ctrl+F12 while RenderDoc can capture, the debugger while one traces the game
+if(TARGET SDL3::SDL3) # the keys' names are SDL's
+    # the runtime's keys (runtime/platform/hotkeys.c): settings.txt's Shortcuts read as SDL names keys, a key pressed
+    # found by them, a value that isn't a key refused with the one in effect
+    add_executable(snx-test-hotkeys hotkeys.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/hotkeys.c")
+    snx_test_target(snx-test-hotkeys 11)
+    target_link_libraries(snx-test-hotkeys PRIVATE SDL3::SDL3)
+    add_test(NAME hotkeys COMMAND snx-test-hotkeys)
+endif()
+# F1's text (runtime/platform/help.c): Ctrl+Shift+F12 while RenderDoc can capture, the debugger while one traces the
+# game
 add_executable(snx-test-help help.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/help.c")
 snx_test_target(snx-test-help 99)
 target_include_directories(snx-test-help PRIVATE "${PROJECT_SOURCE_DIR}/src")
@@ -1494,6 +1536,15 @@ add_test(NAME ini_lines COMMAND snx-test-ini-lines)
 add_executable(snx-test-result-macros result_macros.c)
 snx_test_target(snx-test-result-macros 99)
 add_test(NAME result_macros COMMAND snx-test-result-macros)
+# the results the runtime answers (src/nx/hle/result_codes.inc) and their lookup (result.c), strict C99 as result.h
+add_executable(snx-test-result-codes result_codes.c)
+snx_test_target(snx-test-result-codes 99)
+add_test(NAME result_codes COMMAND snx-test-result-codes)
+# and none made outside it: no RC() but result.h's, no result written as a number in the HLE
+if(Python3_Interpreter_FOUND)
+    add_test(NAME result_codes_sources COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/result_codes.py"
+                                               --repo "${PROJECT_SOURCE_DIR}")
+endif()
 
 # generated and checked in (the controls' atlas, their shaders): their sources must still make them
 if(Python3_Interpreter_FOUND)
@@ -1506,6 +1557,8 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME gpu_hotpath_benchmark COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/bench_gpu_hotpaths_test.py")
     add_test(NAME gpu_tuner COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tune_gpu_test.py")
     add_test(NAME nvn_draw_benchmark COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/bench_nvn_draws_test.py")
+    add_test(NAME nvn_game_benchmark COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/bench_nvn_game_test.py")
+    add_test(NAME pipeline_compile_probe_inputs COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/prepare_pipeline_probe_test.py")
     add_test(NAME gpu_descriptor_benchmark COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/bench_gpu_descriptors_test.py")
     add_test(NAME controls_atlas_current
         COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/build-controls.py" --check)
@@ -1940,6 +1993,21 @@ if(NOT SNX_TOOLS_ONLY)
     snx_test_target(snx-test-pipeline-file 23)
     target_link_libraries(snx-test-pipeline-file PRIVATE snx_nx_flags snx_zstd scarletnx-common)
     add_test(NAME pipeline_file COMMAND snx-test-pipeline-file)
+    add_executable(snx-test-vk-pipeline-probe-flags vk_pipeline_probe_flags.c)
+    snx_test_target(snx-test-vk-pipeline-probe-flags 23)
+    target_link_libraries(snx-test-vk-pipeline-probe-flags PRIVATE snx_nx_flags)
+    add_test(NAME vk_pipeline_probe_flags COMMAND snx-test-vk-pipeline-probe-flags)
+    add_executable(snx-test-vk-resource-stats vk_resource_stats.c)
+    snx_test_target(snx-test-vk-resource-stats 11)
+    add_test(NAME vk_resource_stats COMMAND snx-test-vk-resource-stats)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # The real cache saver with a fake driver: compilation defers periodic snapshots without losing dirty work.
+        # Include only its implementation; sanitizer-retained callback tables make whole-file linker GC unsuitable.
+        add_executable(snx-test-vk-pipeline-save vk_pipeline_save.c)
+        snx_test_target(snx-test-vk-pipeline-save 23)
+        target_link_libraries(snx-test-vk-pipeline-save PRIVATE snx_nx_flags)
+        add_test(NAME vk_pipeline_save COMMAND snx-test-vk-pipeline-save)
+    endif()
     # graphics storage images' write-backs (gpu/vk/image_out.c) against a stand-in GPU: a draw over one whose copy is
     # recorded goes on from it with no read or wait, and they land in order, each over the bytes the last one left
     add_executable(snx-test-vk-image-out vk_image_out.c tracy_stubs.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/image_out.c")
@@ -1947,12 +2015,13 @@ if(NOT SNX_TOOLS_ONLY)
     target_link_libraries(snx-test-vk-image-out PRIVATE snx_nx_flags)
     add_test(NAME vk_image_out COMMAND snx-test-vk-image-out)
     # RenderDoc's captures (gpu/vk/renderdoc.c) against a stand-in RenderDoc: neither renderdoc= nor RenderDoc's program,
-    # renderdoc= without the library, RenderDoc's program that started the game, and renderdoc= loading it; Ctrl+F12's
-    # capture of the next frame and renderdoc_frames', and what the stats box is told. A process each
+    # renderdoc= without the library, RenderDoc's program that started the game, and renderdoc= loading it; the capture
+    # key's capture and renderdoc_frames', what the stats box is told, the notices over the game and the write's
+    # progress lines (a thread the test lets tick), and RenderDoc's own captures. A process each
     add_executable(snx-test-vk-renderdoc vk_renderdoc.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/renderdoc.c")
     snx_test_target(snx-test-vk-renderdoc 23)
     target_link_libraries(snx-test-vk-renderdoc PRIVATE snx_nx_flags)
-    foreach(case none missing started setting)
+    foreach(case none missing started setting write theirs)
         add_test(NAME vk_renderdoc_${case} COMMAND snx-test-vk-renderdoc ${case})
     endforeach()
     # vertex_input_dynamic_state (gpu/vk/vertex_input.c): its values, read from a .ini without it and with it, the
@@ -2827,6 +2896,9 @@ add_test(NAME depth_texel COMMAND snx-test-depth-texel)
 add_executable(snx-test-write-pages write_pages.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/write_pages.c")
 snx_test_target(snx-test-write-pages 23)
 add_test(NAME write_pages COMMAND snx-test-write-pages)
+add_executable(snx-test-memory-own-cut memory_own_cut.c)
+snx_test_target(snx-test-memory-own-cut 11)
+add_test(NAME memory_own_cut COMMAND snx-test-memory-own-cut)
 add_executable(snx-test-draw-state-mx draw_state_mx.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/draw_state.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/draw_state.c")
 snx_test_target(snx-test-draw-state-mx 99)
 add_test(NAME draw_state_mx COMMAND snx-test-draw-state-mx)

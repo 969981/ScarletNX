@@ -161,17 +161,19 @@ static u32 tex_variant(u32 kind, u32 i) {
 }
 #define HAIR_VARIANTS 24u
 #define NOSE_VARIANTS 6u
-/* the hair styles with tails, the console's part list's: twin tails high on the sides, low behind the ears, curled,
-   one ponytail on the side or at the back; each its own hair shape (variants past HAIR_VARIANTS), over the shell
-   variant shell, with the ties its hat part is (for those of them the part list gives a hat) */
-enum { TAIL_TWIN_HIGH = 1, TAIL_TWIN_LOW, TAIL_TWIN_CURL, TAIL_SIDE, TAIL_BACK };
+/* the hair styles with tails, the console's part list's: twin tails high on the sides, low behind the ears, twin
+   drills (the curled ones: short ringlets out from the sides), one ponytail on the side or at the back; each its own hair
+   shape (variants past HAIR_VARIANTS), over the shell variant shell, with the ties its hat part is (for those of them
+   the part list gives a hat), and one of the drill styles with an ahoge, a lock standing up from the crown
+   (TAIL_AHOGE: drawn as a tail is, never a style's tail) */
+enum { TAIL_TWIN_HIGH = 1, TAIL_TWIN_LOW, TAIL_TWIN_DRILL, TAIL_SIDE, TAIL_BACK, TAIL_AHOGE };
 #define TAIL_STYLES 10u
 static const struct {
-    u8 style, tail, shell;
-} tail_styles[TAIL_STYLES] = {{9, TAIL_BACK, 3},       {19, TAIL_TWIN_LOW, 6},   {29, TAIL_TWIN_CURL, 6},
-                              {78, TAIL_TWIN_HIGH, 9}, {84, TAIL_SIDE, 9},       {97, TAIL_BACK, 4},
-                              {104, TAIL_TWIN_LOW, 7}, {112, TAIL_TWIN_CURL, 6}, {126, TAIL_TWIN_HIGH, 7},
-                              {130, TAIL_BACK, 5}};
+    u8 style, tail, shell, ahoge;
+} tail_styles[TAIL_STYLES] = {{9, TAIL_BACK, 3, 0},       {19, TAIL_TWIN_LOW, 6, 0},    {29, TAIL_TWIN_DRILL, 6, 0},
+                              {78, TAIL_TWIN_HIGH, 9, 0}, {84, TAIL_SIDE, 9, 0},        {97, TAIL_BACK, 4, 0},
+                              {104, TAIL_TWIN_LOW, 7, 0}, {112, TAIL_TWIN_DRILL, 6, 1}, {126, TAIL_TWIN_HIGH, 7, 0},
+                              {130, TAIL_BACK, 5, 0}};
 static int tail_of(u32 style) {
     u32 k;
     for (k = 0; k < TAIL_STYLES; k++)
@@ -336,27 +338,31 @@ static u8* part_buffer(Out* o, u32 n) {
 /* ============================================================ the head */
 
 /* one faceline's head: its radii (the upper half's raised by ty, as the hair and the face's features are), its center
-   and how much its jaw narrows toward the chin */
+   and how much its jaw narrows toward the chin. Every faceline is a plush's: wide and round, a short chin under a low
+   face, the crown not much higher than the head is wide */
 typedef struct {
     float rx, ry_up, ry_down, rz_front, rz_back, cy, cz, jaw, ty;
 } Head;
+#define HEAD_RX 32.0f
+#define HEAD_UP 28.0f
+#define HEAD_CY 18.0f
 static Head head_of(u32 f) {
     /* per faceline: the jaw's narrowing, the width, the chin's length and the upper half's rise */
     static const float t[FACELINES][4] = {
-        {0.18f, 1.00f, 30.0f, 0.0f},  {0.12f, 1.00f, 30.0f, 0.0f}, {0.26f, 0.98f, 31.5f, 2.5f},
-        {0.05f, 1.03f, 30.0f, 0.0f},  {0.22f, 1.00f, 30.5f, 0.0f}, {0.10f, 1.02f, 29.5f, 0.0f},
-        {0.30f, 0.97f, 31.0f, 2.5f},  {0.16f, 0.99f, 31.0f, 2.5f}, {0.14f, 1.01f, 30.5f, 1.5f},
-        {0.20f, 1.00f, 28.5f, -2.0f}, {0.08f, 1.04f, 30.5f, 1.5f}, {0.24f, 0.98f, 31.5f, 2.5f},
+        {0.135f, 1.00f, 18.0f, 0.0f},  {0.09f, 1.00f, 18.0f, 0.0f},  {0.195f, 0.98f, 18.9f, 2.5f},
+        {0.0375f, 1.03f, 18.0f, 0.0f}, {0.165f, 1.00f, 18.3f, 0.0f}, {0.075f, 1.02f, 17.7f, 0.0f},
+        {0.225f, 0.97f, 18.6f, 2.5f},  {0.12f, 0.99f, 18.6f, 2.5f},  {0.105f, 1.01f, 18.3f, 1.5f},
+        {0.15f, 1.00f, 17.1f, -2.0f},  {0.06f, 1.04f, 18.3f, 1.5f},  {0.18f, 0.98f, 18.9f, 2.5f},
     };
     Head h;
     h.jaw = t[f][0];
-    h.rx = 25.5f * t[f][1];
+    h.rx = HEAD_RX * t[f][1];
     h.ry_down = t[f][2];
     h.ty = t[f][3];
-    h.ry_up = 34.0f + h.ty;
-    h.rz_front = 23.0f;
-    h.rz_back = 21.0f;
-    h.cy = 30.0f;
+    h.ry_up = HEAD_UP + h.ty;
+    h.rz_front = 21.0f;
+    h.rz_back = 24.0f;
+    h.cy = HEAD_CY;
     h.cz = 2.0f;
     return h;
 }
@@ -373,32 +379,56 @@ static Vec head_at(const Head* h, float th, float ph) {
     return vec(x + (st < 0 ? -ear : ear), h->cy + ry * sp, h->cz + rz * cp * ct);
 }
 static Vec head_center(const Head* h) { return vec(0, h->cy, h->cz); }
+/* The plush face: the features a Mii's mask and faceline textures carry (eyes, brows, mouth, wrinkles, makeup) where
+   the SDK puts them, on a face of a plush's: the eyes big and low, the mouth small just under them. face_sdk takes a
+   point (x, y) of the face, the faceline risen by ty, to where the SDK's frame has it (xs, ys): above FACE_BREAK under
+   the eyes' line both ways FACE_KE times smaller (the eyes and brows that much bigger), the eyes' line (34 above the
+   chin in the SDK's frame) at FACE_EYE_Y; under it ys gains FACE_KM times faster (the mouth that much shorter, close
+   under the eyes) and xs FACE_KXM times */
+#define FACE_EYE_Y 18.0f
+#define FACE_KE    1.3f
+#define FACE_KX    1.6f
+#define FACE_KM    0.45f
+#define FACE_KXM   1.0f
+#define FACE_BREAK 5.0f
+static void face_sdk(float x, float y, float ty, float* xs, float* ys) {
+    float yb = FACE_EYE_Y + ty - FACE_BREAK, sb = 34.0f + ty - FACE_BREAK / FACE_KE;
+    float k = mixf(FACE_KXM, FACE_KX, smooth(yb - 3.0f, yb + 3.0f, y));
+    *xs = x / k;
+    *ys = y >= yb ? sb + (y - yb) / FACE_KE : sb - (yb - y) / FACE_KM;
+}
+/* the face's height whose point the SDK's frame has at ys: face_sdk's inverse */
+static float face_y(float ys, float ty) {
+    float yb = FACE_EYE_Y + ty - FACE_BREAK, sb = 34.0f + ty - FACE_BREAK / FACE_KE;
+    return ys >= sb ? yb + (ys - sb) * FACE_KE : yb - (sb - ys) * FACE_KM;
+}
 
 /* ============================================================ shapes */
 
-/* a shape: up to three grids (g) of ns by nt quads, each over a parametric surface (shape_at), one after the other
+/* a shape: up to four grids (g) of ns by nt quads, each over a parametric surface (shape_at), one after the other
    in its vertices and triangles; its vertices' attributes */
 enum { A_POS, A_NRM, A_UV, A_TAN, A_COL };
-#define GRIDS_MAX 3u
+#define GRIDS_MAX 4u
 typedef struct {
     u32 kind, variant, grids, g; /* g: the grid shape_at draws */
     u32 ns[GRIDS_MAX], nt[GRIDS_MAX];
     u32 attrs; /* the attributes present, a bit per A_ */
 } Shape;
 
-/* hair styles' looks, from their variant: length 0 to 2, the fringe 0 to 3, a large volume */
+/* hair styles' looks, from their variant: length 0 to 2, the fringe 0 to 3, a large volume. Every one a plush's: thick,
+   the fringe down to the eyes' top, the sides and the back down to the jaw or lower */
 typedef struct {
     float thick, front, side, back, part, spikes, hang;
 } Hair;
 static Hair hair_of(u32 v) {
     if (v >= HAIR_VARIANTS) v = tail_styles[v - HAIR_VARIANTS].shell;
     {
-        static const float fronts[4] = {0.66f, 0.54f, 0.38f, 0.58f};
-        static const float sides[3] = {0.12f, -0.18f, -0.60f};
-        static const float backs[3] = {-0.25f, -0.55f, -1.05f};
+        static const float fronts[4] = {0.46f, 0.34f, 0.18f, 0.38f};
+        static const float sides[3] = {-0.98f, -1.28f, -1.45f};
+        static const float backs[3] = {-0.9f, -1.2f, -1.45f};
         Hair r;
         u32 len = v % 3, fringe = (v / 3) % 4, big = v / 12;
-        r.thick = big ? 6.0f : 3.2f + 0.6f * (float)(v % 2);
+        r.thick = big ? 10.5f : 6.5f + 0.8f * (float)(v % 2);
         r.front = fronts[fringe];
         r.side = sides[len];
         r.back = backs[len];
@@ -408,47 +438,86 @@ static Hair hair_of(u32 v) {
         return r;
     }
 }
-/* a tail of a tail style (k 0 or 1 of a pair): where it leaves the hair, the way out, how long it falls, its
-   thickness at the root and the tip, and whether it curls */
+/* a tail of a tail style (k 0 or 1 of a pair): where it leaves the hair, the way out (taken over its first part, or
+   along all of it as spread goes to 1), how long it falls, its thickness at the root and the tip, for a drill the
+   turns its ringlet winds down its length (0 for a plain tail), how much of its width its thickness front to back is
+   (flat, 1 round), and whether it is a lock (leaf): narrow at its tie, widest a third of the way, then to a point */
 typedef struct {
     Vec root, out;
-    float fall, r0, r1, curl;
+    float fall, r0, r1, turns, spread, flat;
+    int leaf;
 } Tail;
 static Tail tail_of_style(u32 tail, u32 k) {
     float side = k ? -1.0f : 1.0f;
     Tail t;
-    t.curl = 0;
+    t.turns = 0;
+    t.spread = 0;
+    t.flat = 1.0f;
+    t.leaf = 0;
     switch (tail) {
-        case TAIL_TWIN_HIGH: /* long, from high on the sides */
-            t.root = vec(side * 28.0f, 52.0f, -8.0f), t.out = vec(side * 9.0f, 2.0f, -4.0f);
-            t.fall = 64.0f, t.r0 = 4.4f, t.r1 = 1.8f;
+        case TAIL_TWIN_HIGH: /* wide flat locks from high on the sides, far out and down past the chin */
+            t.root = vec(side * 0.86f * HEAD_RX, HEAD_CY + 0.70f * HEAD_UP, -8.0f),
+            t.out = vec(side * 28.0f, -2.0f, -4.0f);
+            t.fall = 48.0f, t.r0 = 7.5f, t.r1 = 0.6f, t.spread = 1.0f, t.flat = 0.45f, t.leaf = 1;
             break;
-        case TAIL_TWIN_LOW:
-        case TAIL_TWIN_CURL: /* from behind the ears, the curled ones in rings down their length */
-            t.root = vec(side * 21.0f, 34.0f, -16.0f), t.out = vec(side * 5.0f, 0, -3.0f);
-            t.fall = tail == TAIL_TWIN_CURL ? 40.0f : 34.0f, t.r0 = 3.8f, t.r1 = tail == TAIL_TWIN_CURL ? 2.4f : 1.4f;
-            t.curl = tail == TAIL_TWIN_CURL ? 0.35f : 0;
+        case TAIL_TWIN_LOW: /* wide flat locks from behind the ears, out a little and down past the chin */
+            t.root = vec(side * 0.82f * HEAD_RX, HEAD_CY + 0.12f * HEAD_UP, -16.0f),
+            t.out = vec(side * 10.0f, -2.0f, -3.0f);
+            t.fall = 32.0f, t.r0 = 8.0f, t.r1 = 0.6f, t.spread = 0.6f, t.flat = 0.5f, t.leaf = 1;
             break;
-        case TAIL_SIDE: /* one, high on one side */
-            t.root = vec(25.0f, 54.0f, -12.0f), t.out = vec(8.0f, 3.0f, -4.0f);
-            t.fall = 52.0f, t.r0 = 4.8f, t.r1 = 1.8f;
+        case TAIL_TWIN_DRILL: /* out from the sides at the eyes' height: short and chunky, nearly as thick at the end
+                                 as at the root, three rings */
+            t.root = vec(side * 0.70f * HEAD_RX, HEAD_CY + 0.4f * HEAD_UP, -6.0f),
+            t.out = vec(side * 25.0f, -3.0f, 1.0f);
+            t.fall = 0.0f, t.r0 = 18.0f, t.r1 = 12.0f, t.turns = 3.0f, t.spread = 1.0f;
             break;
-        default: /* TAIL_BACK: one, at the back of the head */
-            t.root = vec(0, 46.0f, -28.0f), t.out = vec(0, 1.0f, -6.0f);
-            t.fall = 34.0f, t.r0 = 4.2f, t.r1 = 1.5f;
+        case TAIL_SIDE: /* one wide flat lock, from high on one side, close to the hair, down past the jaw */
+            t.root = vec(0.98f * HEAD_RX, HEAD_CY + 0.76f * HEAD_UP, -10.0f), t.out = vec(8.0f, 2.0f, -4.0f);
+            t.fall = 42.0f, t.r0 = 10.0f, t.r1 = 0.6f, t.spread = 0.6f, t.flat = 0.5f, t.leaf = 1;
+            break;
+        case TAIL_AHOGE: /* thin, up from the crown, leaning forward and to one side */
+            t.root = vec(0, HEAD_CY + HEAD_UP + 3.5f, 1.0f), t.out = vec(7.0f, 0, 5.0f); /* inside the crown's hair */
+            t.fall = -12.0f, t.r0 = 2.8f, t.r1 = 0.3f, t.spread = 1.0f;
+            break;
+        default: /* TAIL_BACK: one wide flat lock down the back of the head */
+            t.root = vec(0, HEAD_CY + 0.47f * HEAD_UP, -26.0f), t.out = vec(0, 1.0f, -5.0f); /* out of the hair */
+            t.fall = 34.0f, t.r0 = 9.0f, t.r1 = 0.6f, t.spread = 0.6f, t.flat = 0.5f, t.leaf = 1;
             break;
     }
     return t;
 }
 static u32 tail_count(u32 tail) { return tail == TAIL_SIDE || tail == TAIL_BACK ? 1 : 2; }
+/* the grids past the head's of a hair variant with tails: its tails, then its ahoge */
+static u32 hair_grids(u32 variant) {
+    return variant < HAIR_VARIANTS
+               ? 1
+               : 1 + tail_count(tail_styles[variant - HAIR_VARIANTS].tail) + tail_styles[variant - HAIR_VARIANTS].ahoge;
+}
+/* a tail's radius at t along it (0 its root, 1 its tip) and angle a around it. A drill swells from a narrow root
+   inside the hair to its thickest a sixth of the way out, then narrows ring by ring to a point; each turn of its
+   ringlet is a cone, narrow where it starts and wide where it ends, the next one starting inside it, and the turn a
+   point is on moves on as a goes around, so the edges between them wind along the tail. A grid with fewer than eight
+   rows a turn draws a drill without its rings (rings 0): sampled that sparsely they fold its surface */
+static float tail_radius(const Tail* tl, float t, float a, float rings) {
+    float env, f;
+    if (tl->leaf) return mixf(tl->r0 * mixf(0.5f, 1.0f, smooth(0.0f, 0.3f, t)), tl->r1, smooth(0.4f, 1.0f, t));
+    if (tl->turns == 0) return mixf(tl->r0, tl->r1, t);
+    env = mixf(tl->r0, tl->r1, t) * mixf(0.3f, 1.0f, smooth(0.0f, 0.15f, t)) * (1.0f - 0.8f * smooth(0.85f, 1.0f, t));
+    f = tl->turns * t + a / (2 * PI_F);
+    f -= floorf(f);
+    /* the rings start past the root, which only swells, or a ring's edge would fold the surface there; each ring
+       narrows to six tenths, deeper folds a drill this thick */
+    return env * mixf(1.0f, 0.6f + 0.4f * sqrtf(smooth(0.0f, 0.82f, f)) * (1.0f - smooth(0.82f, 1.0f, f)),
+                      rings * smooth(0.1f, 0.2f, t));
+}
 /* the tail's middle at t (0 its root, 1 its tip): out, then falling, a little back */
 static Vec tail_axis(const Tail* tl, float t) {
-    float o = sinf(clampf(t * 2.5f, 0, 1) * PI_F * 0.5f);
+    float o = mixf(sinf(clampf(t * 2.5f, 0, 1) * PI_F * 0.5f), t, tl->spread);
     return vec(tl->root.x + tl->out.x * o, tl->root.y + tl->out.y * o - tl->fall * t * t * 0.4f - tl->fall * t * 0.6f,
                tl->root.z + tl->out.z * o - 3.0f * t);
 }
-/* a ring of radius r around the tail's axis at t, at angle a: s around it counterclockwise as the axis runs, so the
-   grid faces out */
+/* a ring of radius r around the tail's axis at t, at angle a, flattened front to back by its flat: s around it
+   counterclockwise as the axis runs, so the grid faces out */
 static Vec tail_ring(const Tail* tl, float t, float a, float r) {
     Vec c = tail_axis(tl, t), d = vsub(tail_axis(tl, t + 0.01f), tail_axis(tl, t - 0.01f)), n1, n2;
     d = vnorm(d);
@@ -456,14 +525,24 @@ static Vec tail_ring(const Tail* tl, float t, float a, float r) {
     if (vlen(n1) < 0.2f) n1 = vcross(d, vec(1, 0, 0));
     n1 = vnorm(n1);
     n2 = vcross(d, n1);
-    return vadd(c, vadd(vmul(n1, r * cosf(a)), vmul(n2, r * sinf(a))));
+    return vadd(c, vadd(vmul(n1, r * cosf(a)), vmul(n2, r * tl->flat * sinf(a))));
 }
-/* the hair's lower edge's elevation at azimuth th: the fringe at the front, the sides at the ears, the back */
+/* what grid g (past the head's) of a hair variant with tails draws: tail g - 1, or past its tails its ahoge */
+static Tail hair_grid_tail(u32 variant, u32 g) {
+    u32 tail = tail_styles[variant - HAIR_VARIANTS].tail;
+    return g > tail_count(tail) ? tail_of_style(TAIL_AHOGE, 0) : tail_of_style(tail, g - 1);
+}
+/* the locks the hair's edge ends in, around the head, each a point */
+#define HAIR_LOCKS 16
+/* the hair's lower edge's elevation at azimuth th: the fringe at the front, the sides at the ears, the back. Across the
+   fringe and the sides it ends in locks, pointed at their tips and rounded between them, one at the front's middle */
 static float hair_edge(const Hair* r, float th) {
     float a = fabsf(th) / PI_F; /* 0 front, 0.5 side, 1 back */
-    float e = a < 0.5f ? mixf(r->front, r->side, smooth(0.0f, 0.5f, a)) : mixf(r->side, r->back, smooth(0.5f, 1.0f, a));
+    float e =
+        a < 0.5f ? mixf(r->front, r->side, smooth(0.16f, 0.3f, a)) : mixf(r->side, r->back, smooth(0.5f, 1.0f, a));
+    float u = th * (float)HAIR_LOCKS / (2 * PI_F), lock = 1.0f - 2.0f * fabsf(u - floorf(u + 0.5f));
     if (a < 0.35f) e -= r->part * (th > 0 ? 1.0f : -0.3f) * (1.0f - a / 0.35f); /* a side part: lower on one side */
-    return e;
+    return e - 0.10f * lock * lock * (1.0f - smooth(0.4f, 0.7f, a));
 }
 static const Head* base_head(Head* h) {
     *h = head_of(0);
@@ -473,13 +552,18 @@ static const Head* base_head(Head* h) {
 /* the cap line a cap form keeps its hair under */
 #define CAP_EDGE 0.30f
 
+/* the middle of a bow (at the back of the head, high) or a clip (on its side), over the hair */
+static Vec hat_ball(u32 variant) {
+    return variant == HAT_BOW ? vec(0, HEAD_CY + 0.97f * HEAD_UP, -23.5f)
+                              : vec(HEAD_RX + 6.5f, HEAD_CY + 0.59f * HEAD_UP, 4.0f);
+}
 /* a hat part that is no cap: the ties of a tail style (one ring a tail around its root), a headband over the crown
    from ear to ear, a bow at the back of the head, a clip on its side */
 static Vec hat_part_at(const Shape* sh, float s, float t) {
     Head h;
     if (sh->variant <= TAIL_STYLES) { /* a tie: grid g around tail g's root */
         Tail tl = tail_of_style(tail_styles[sh->variant - 1].tail, sh->g);
-        float a = s * 2 * PI_F, b = t * 2 * PI_F, big = tl.r0 + 0.5f;
+        float a = s * 2 * PI_F, b = t * 2 * PI_F, big = tail_radius(&tl, 0.06f, a, 1.0f) + 0.5f;
         Vec c = tail_axis(&tl, 0.06f), ring = vsub(tail_ring(&tl, 0.06f, a, 1.0f), c);
         Vec d = vnorm(vsub(tail_axis(&tl, 0.07f), tail_axis(&tl, 0.05f)));
         return vadd(c, vadd(vmul(ring, big + 1.1f * cosf(b)), vmul(d, 1.1f * sinf(b))));
@@ -488,22 +572,22 @@ static Vec hat_part_at(const Shape* sh, float s, float t) {
     if (sh->variant == HAT_BAND) {
         float u = (s - 0.5f) * 2, ph = (1.0f - fabsf(u)) * (PI_F * 0.5f - 0.1f) + 0.1f;
         Vec p = head_at(&h, u >= 0 ? PI_F * 0.5f : -PI_F * 0.5f, ph);
-        p = vadd(head_center(&h), vmul(vsub(p, head_center(&h)), 1.0f + 6.0f / vlen(vsub(p, head_center(&h)))));
+        p = vadd(head_center(&h), vmul(vsub(p, head_center(&h)), 1.0f + 8.0f / vlen(vsub(p, head_center(&h)))));
         return vadd(p, vec(0, 0, (0.5f - t) * 4.0f));
     }
     {
-        Vec c = sh->variant == HAT_BOW ? vec(0, 63.0f, -17.0f) : vec(26.0f, 50.0f, 4.0f);
-        float r = sh->variant == HAT_BOW ? 4.0f : 3.0f, th = s * 2 * PI_F, ph = (t - 0.5f) * PI_F;
+        Vec c = hat_ball(sh->variant);
+        float r = sh->variant == HAT_BOW ? 6.0f : 4.5f, th = s * 2 * PI_F, ph = (t - 0.5f) * PI_F;
         return vadd(c, vec(r * cosf(ph) * sinf(th), r * sinf(ph), r * cosf(ph) * cosf(th)));
     }
 }
 /* the shape's point at grid (s, t), both in [0, 1], of its grid g */
 static Vec shape_at(const Shape* sh, float s, float t) {
     Head h;
-    if ((sh->kind == S_HAIR_NORMAL || sh->kind == S_HAIR_CAP) && sh->g) { /* a tail */
-        Tail tl = tail_of_style(tail_styles[sh->variant - HAIR_VARIANTS].tail, sh->g - 1);
-        float r = mixf(tl.r0, tl.r1, t) * (1.0f + tl.curl * sinf(t * 10.0f * PI_F));
-        return tail_ring(&tl, t, s * 2 * PI_F, r);
+    if ((sh->kind == S_HAIR_NORMAL || sh->kind == S_HAIR_CAP) && sh->g) { /* a tail or the ahoge */
+        Tail tl = hair_grid_tail(sh->variant, sh->g);
+        float rings = tl.turns > 0 ? smooth(6.0f, 8.0f, (float)sh->nt[sh->g] / tl.turns) : 0;
+        return tail_ring(&tl, t, s * 2 * PI_F, tail_radius(&tl, t, s * 2 * PI_F, rings));
     }
     if ((sh->kind == S_HAT_NORMAL || sh->kind == S_HAT_CAP) && sh->variant) return hat_part_at(sh, s, t);
     switch (sh->kind) {
@@ -529,7 +613,9 @@ static Vec shape_at(const Shape* sh, float s, float t) {
             Hair r = hair_of(sh->variant);
             float th = (s - 0.5f) * 2 * PI_F, lo = hair_edge(&r, th), hi = PI_F * 0.5f, ph, thick;
             Vec p, c, d;
-            if (sh->kind == S_HAIR_CAP) hi = lo < CAP_EDGE ? CAP_EDGE : lo; /* under a cap: only below its line */
+            if (sh->kind ==
+                S_HAIR_CAP) /* under a cap: only below its line, a strip at least where the edge reaches it */
+                hi = fmaxf(lo + 0.05f, CAP_EDGE);
             ph = mixf(lo, hi, t);
             base_head(&h);
             p = head_at(&h, th, ph);
@@ -540,6 +626,13 @@ static Vec shape_at(const Shape* sh, float s, float t) {
                 r.spikes * (0.5f + 0.5f * sinf(th * 7.0f)) * smooth(0.2f, 0.7f, ph) * (1.0f - smooth(1.05f, 1.45f, ph));
             d = vnorm(vsub(p, c));
             p = vadd(p, vmul(d, thick));
+            if (ph < 0) { /* under the head's widest line the hair falls straight, a bell as wide as that line */
+                Vec q = head_at(&h, th, 0), b;
+                float k = 0.4f * smooth(0.0f, 0.5f, -ph);
+                q = vadd(q, vmul(vnorm(vsub(q, c)), thick));
+                b = vec(mixf(p.x, q.x, k), p.y, mixf(p.z, q.z, k));
+                p = b;
+            }
             if (ph < 0 && r.hang > 0) { /* long hair hangs straight below the head's widest line */
                 float drop = -sinf(ph);
                 p.y -= r.hang * drop * smooth(0.25f, 0.6f, fabsf(th) / PI_F);
@@ -548,13 +641,13 @@ static Vec shape_at(const Shape* sh, float s, float t) {
             return p;
         }
         case S_HAT_NORMAL:
-        case S_HAT_CAP: { /* a knit cap over the head, its rim at the brow */
+        case S_HAT_CAP: { /* a knit cap over the head and the thickest hair, its rim at the brow */
             float th = (s - 0.5f) * 2 * PI_F, ph = mixf(0.42f, PI_F * 0.5f, t);
             Vec p, c;
             base_head(&h);
             p = head_at(&h, th, ph);
             c = head_center(&h);
-            return vadd(c, vmul(vsub(p, c), 1.16f));
+            return vadd(p, vmul(vnorm(vsub(p, c)), 12.0f));
         }
         case S_BEARD: { /* a full beard over the jaw, under the mouth, up to the ears */
             float th = (s - 0.5f) * 4.0f, a = fabsf(th) / 2.0f, top = mixf(-0.62f, 0.05f, a * a);
@@ -584,16 +677,17 @@ static Vec shape_at(const Shape* sh, float s, float t) {
 static Vec shape_center(const Shape* sh, float s, float t) {
     Head h;
     if ((sh->kind == S_HAIR_NORMAL || sh->kind == S_HAIR_CAP) && sh->g) {
-        Tail tl = tail_of_style(tail_styles[sh->variant - HAIR_VARIANTS].tail, sh->g - 1);
+        Tail tl = hair_grid_tail(sh->variant, sh->g);
         return tail_axis(&tl, t);
     }
     if ((sh->kind == S_HAT_NORMAL || sh->kind == S_HAT_CAP) && sh->variant && sh->variant != HAT_BAND) {
         if (sh->variant <= TAIL_STYLES) {
             Tail tl = tail_of_style(tail_styles[sh->variant - 1].tail, sh->g);
             Vec c = tail_axis(&tl, 0.06f);
-            return vadd(c, vmul(vsub(tail_ring(&tl, 0.06f, s * 2 * PI_F, 1.0f), c), tl.r0 + 0.5f));
+            return vadd(c, vmul(vsub(tail_ring(&tl, 0.06f, s * 2 * PI_F, 1.0f), c),
+                                tail_radius(&tl, 0.06f, s * 2 * PI_F, 1.0f) + 0.5f));
         }
-        return sh->variant == HAT_BOW ? vec(0, 63.0f, -17.0f) : vec(26.0f, 50.0f, 4.0f);
+        return hat_ball(sh->variant);
     }
     switch (sh->kind) {
         case S_NOSE: return vec(0, 1.5f, -12.0f);
@@ -615,6 +709,7 @@ static Vec shape_normal(const Shape* sh, float s, float t, Vec p) {
 }
 static void shape_uv(const Shape* sh, Vec p, float s, float t, float uv[2]) {
     Head h;
+    float xs, ys;
     switch (sh->kind) {
         case S_FACELINE: /* the faceline texture across the face, mirrored at its middle (u 1), its back at a corner */
             h = head_of(sh->variant);
@@ -622,13 +717,15 @@ static void shape_uv(const Shape* sh, Vec p, float s, float t, float uv[2]) {
                 uv[0] = uv[1] = 0;
                 break;
             }
-            uv[0] = clampf(1.0f + p.x / 35.6f, 0, 2);
-            uv[1] = clampf((49.6f + h.ty - p.y) / 48.0f, 0, 1);
+            face_sdk(p.x, p.y, h.ty, &xs, &ys);
+            uv[0] = clampf(1.0f + xs / 35.6f, 0, 2);
+            uv[1] = clampf((49.6f + h.ty - ys) / 48.0f, 0, 1);
             break;
         case S_MASK: /* the mask texture the SDK composes, 100 units across, its top 80.35 above the chin's line */
             h = head_of(sh->variant);
-            uv[0] = 0.5f + p.x / 100.0f;
-            uv[1] = 0.8035f + h.ty / 100.0f - p.y / 100.0f;
+            face_sdk(p.x, p.y, h.ty, &xs, &ys);
+            uv[0] = 0.5f + xs / 100.0f;
+            uv[1] = 0.8035f + h.ty / 100.0f - ys / 100.0f;
             break;
         case S_HAT_NORMAL:
         case S_HAT_CAP:
@@ -659,10 +756,10 @@ static Shape shape_of(u32 kind, u32 variant) {
         case S_FACELINE: ns = 32, nt = 18; break;
         case S_MASK: ns = 22, nt = 16; break;
         case S_HAIR_NORMAL:
-        case S_HAIR_CAP:
-            ns = 32, nt = 10;
+        case S_HAIR_CAP: /* four quads a lock around */
+            ns = 4 * HAIR_LOCKS, nt = 10;
             sh.attrs = 1u << A_POS | 1u << A_NRM | 1u << A_TAN | 1u << A_COL;
-            if (variant >= HAIR_VARIANTS) grids = 1 + tail_count(tail_styles[variant - HAIR_VARIANTS].tail);
+            grids = hair_grids(variant);
             break;
         case S_HAT_NORMAL:
         case S_HAT_CAP:
@@ -681,8 +778,15 @@ static Shape shape_of(u32 kind, u32 variant) {
     }
     sh.grids = grids;
     for (g = 0; g < grids; g++) {
-        sh.ns[g] = g && (kind == S_HAIR_NORMAL || kind == S_HAIR_CAP) ? 10 : ns;
-        sh.nt[g] = g && (kind == S_HAIR_NORMAL || kind == S_HAIR_CAP) ? 12 : nt;
+        sh.ns[g] = ns;
+        sh.nt[g] = nt;
+        if (g && (kind == S_HAIR_NORMAL || kind == S_HAIR_CAP)) {
+            /* a drill's turns take a dozen quads around it and a dozen along each; the thin ahoge few */
+            int drill = hair_grid_tail(variant, g).turns > 0;
+            int ahoge = g > tail_count(tail_styles[variant - HAIR_VARIANTS].tail);
+            sh.ns[g] = drill ? 12 : ahoge ? 6 : 10;
+            sh.nt[g] = drill ? 36 : ahoge ? 8 : 12;
+        }
     }
     return sh;
 }
@@ -720,19 +824,27 @@ static u32 fewer(u32 n, u32 least) {
     return n <= least ? n : m < least ? least : m;
 }
 /* a part of a shape file of quality q: shape_of's, with an eighth fewer quads each way at a time (down to 3 by 1 a
-   grid) until its bytes are no more than the console's largest of its kind there */
+   grid) until its bytes are no more than the console's largest of its kind there. Hair that does not fit first goes
+   to a column a lock's tip and one its valley around the head, which keeps its locks pointed, and gives up quads
+   from its tails (down to five around) and its head's rows (down to four) before its columns */
 static Shape shape_in(u32 kind, u32 variant, u32 q) {
     Shape sh = shape_of(kind, variant);
-    u32 off[5], size[5], idx_off, idx_size;
+    u32 off[5], size[5], idx_off, idx_size, keep = 0;
+    if ((kind == S_HAIR_NORMAL || kind == S_HAIR_CAP) &&
+        shape_raw_size(&sh, off, size, &idx_off, &idx_size) > shape_budget[q][kind]) {
+        sh.ns[0] = 2 * HAIR_LOCKS;
+        keep = 1;
+    }
     while (shape_raw_size(&sh, off, size, &idx_off, &idx_size) > shape_budget[q][kind]) {
         u32 g, changed = 0;
         for (g = 0; g < sh.grids; g++) {
-            u32 ns = fewer(sh.ns[g], 3), nt = fewer(sh.nt[g], 1);
+            u32 ns = keep && !g ? sh.ns[g] : fewer(sh.ns[g], keep ? 5 : 3), nt = fewer(sh.nt[g], keep && !g ? 4 : 1);
             changed |= ns != sh.ns[g] || nt != sh.nt[g];
             sh.ns[g] = ns;
             sh.nt[g] = nt;
         }
-        if (!changed) break;
+        if (!changed && !keep) break;
+        if (!changed) keep = 0; /* still too big: the head's columns and rows too */
     }
     return sh;
 }
@@ -821,7 +933,7 @@ static void hair_transform(u32 style, float out[18]) {
 /* a faceline's transforms: the hair's place (raised as the head is), the nose's on the face's front, the beard's */
 static void faceline_transform(u32 f, float out[9]) {
     Head h = head_of(f);
-    float ny = 25.0f + 0.5f * h.ty, ph = asinf((ny - h.cy) / h.ry_down);
+    float ny = face_y(25.0f + 0.5f * h.ty, h.ty), ph = asinf((ny - h.cy) / h.ry_down);
     Vec front = head_at(&h, 0, ph);
     memset(out, 0, 9 * sizeof *out);
     out[1] = h.ty;
@@ -869,14 +981,18 @@ static float speckle(float x, float y) {
     return (float)((h >> 8) & 0xff) / 255.0f;
 }
 
-/* the eye: G its white, B its iris (the pupil in it left black), A all of it with its outline and lashes */
+/* the eye: G its white, B its iris (the pupil in it left black, a catchlight in it white toward the outer corner), A
+   all of it with its outline and lashes */
 static void tex_eye(u32 v, float x, float y, float aa, float c[4]) {
-    float cx = 0.73f, cy = 0.52f; /* the eye sits right of the middle, as the SDK places it */
-    float rx = 0.31f + 0.04f * (float)(v % 3), ry = 0.18f + 0.03f * (float)((v / 3) % 3);
+    /* the eye sits right of the middle, as the SDK places it, and low; a plush's, big: as wide and tall as its texture
+       holds with its outline and lash */
+    float cx = 0.69f, cy = 0.58f;
+    float rx = 0.36f + 0.015f * (float)(v % 3), ry = 0.27f + 0.015f * (float)((v / 3) % 3);
     float tilt = 0.08f * ((float)(v % 4) - 1.5f), ir = ry * (0.95f + 0.08f * (float)(v % 2));
     float d = sd_ellipse(x, y, cx, cy, rx, ry, tilt), lid = cover(d, aa);
     float iris = cover(sd_circle(x, y, cx + 0.02f, cy + 0.01f, ir), aa) * lid;
     float pupil = cover(sd_circle(x, y, cx + 0.02f, cy + 0.01f, ir * 0.42f), aa) * lid;
+    float glint = cover(sd_circle(x, y, cx + 0.02f - 0.4f * ir, cy + 0.01f - 0.4f * ir, ir * 0.26f), aa) * iris;
     /* the outline, its upper lid twice as thick as its lower */
     float all = cover(d - mixf(0.035f, 0.075f, smooth(cy, cy - 0.6f * ry, y)), aa);
     if (v % 2) { /* a lash at the outer corner */
@@ -884,8 +1000,8 @@ static void tex_eye(u32 v, float x, float y, float aa, float c[4]) {
         all = fmaxf(all, cover(sd_capsule(x, y, ex + 0.03f, ey, ex - 0.09f, ey - 0.10f, 0.022f), aa));
     }
     c[0] = 0;
-    c[1] = fmaxf(0, lid - iris);
-    c[2] = fmaxf(0, iris - pupil);
+    c[1] = fmaxf(0, lid - iris) + glint;
+    c[2] = fmaxf(0, iris - pupil - glint);
     c[3] = all;
 }
 /* the mouth: R its lips and tongue, G its teeth, A all of it; what A has without R or G is its dark inside and
@@ -1365,17 +1481,20 @@ u32 snx_mii_model_write(u32 i, u8* out) { return i < 4 ? texture_file(i >= 2, ou
 
 /* ============================================================ a Mii's picture */
 
-/* the picture's window: x from -42 to 42, y from -8 to 76 (the chin at 0, the hair's top near 70), seen from +z */
-#define PIC_X0   (-42.0f)
-#define PIC_Y1   76.0f
-#define PIC_SPAN 84.0f
+/* the picture's window: x from -55 to 55, y from -32 to 78 (the chin at 0, the plush's wide hair inside it, its
+   shoulders under it), seen from +z */
+#define PIC_X0   (-55.0f)
+#define PIC_Y1   78.0f
+#define PIC_SPAN 110.0f
 enum { PIC_NONE, PIC_SKIN, PIC_FACE, PIC_HAIR, PIC_TIE }; /* what a pixel shows: the face takes the features */
+#define PIC_EDGE 0x80u /* with what: the pixel is on an outline, the edge of a part in front of another or of nothing */
 typedef struct {
     int side;
     float scale;
-    float* z;   /* side * side depths, nearest kept */
-    u8* what;   /* PIC_ each */
-    float* lit; /* its shading */
+    float* z;     /* side * side depths, nearest kept */
+    u8* what;     /* PIC_ each */
+    float* lit;   /* its shading */
+    float* shine; /* the light the hair reflects there, added as white */
 } Pic;
 /* the triangle a, b, c (normals na, nb, nc) into the depth buffer as what, its back left out */
 static void pic_triangle(Pic* p, Vec a, Vec b, Vec c, Vec na, Vec nb, Vec nc, u8 what) {
@@ -1383,7 +1502,7 @@ static void pic_triangle(Pic* p, Vec a, Vec b, Vec c, Vec na, Vec nb, Vec nc, u8
           by = (PIC_Y1 - b.y) * p->scale, cx = (c.x - PIC_X0) * p->scale, cy = (PIC_Y1 - c.y) * p->scale;
     float area = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
     int x0, x1, y0, y1, x, y;
-    Vec light = vnorm(vec(0.3f, 0.5f, 0.8f));
+    Vec light = vnorm(vec(0.3f, 0.5f, 0.8f)), half = vnorm(vadd(light, vec(0, 0, 1)));
     if (fabsf(area) < 1e-6f) return;
     x0 = (int)floorf(fminf(ax, fminf(bx, cx))), x1 = (int)ceilf(fmaxf(ax, fmaxf(bx, cx)));
     y0 = (int)floorf(fminf(ay, fminf(by, cy))), y1 = (int)ceilf(fmaxf(ay, fmaxf(by, cy)));
@@ -1407,6 +1526,11 @@ static void pic_triangle(Pic* p, Vec a, Vec b, Vec c, Vec na, Vec nb, Vec nc, u8
             p->z[i] = z;
             p->what[i] = what;
             p->lit[i] = 0.55f + 0.45f * fmaxf(0, vdot(n, light));
+            if (what == PIC_HAIR) { /* a band across its strands, which run down it, where they reflect the light */
+                Vec strand = vec(n.x * n.y, n.y * n.y - 1.0f, n.z * n.y);
+                float along = vlen(strand) > 0.05f ? vdot(vnorm(strand), half) : 0;
+                p->shine[i] = 0.18f * powf(fmaxf(0, 1.0f - along * along), 60.0f);
+            }
         }
 }
 /* a shape's every grid into the picture, moved by at and mirrored in x with flip */
@@ -1431,28 +1555,65 @@ static void pic_shape(Pic* p, Shape sh, Vec at, int flip, u8 what) {
             }
     }
 }
-/* the color a face pixel at (x, y) takes from the features drawn on it: eyes, brows and mouth where the CharInfo puts
-   them (our own reading of its fields), over skin; ty the faceline's rise */
-static void pic_features(const u8* c, const SnxMiiLook* look, float x, float y, float ty, float aa, float rgb[3]) {
-    float eye_y = 34.0f + ty - ((float)c[0x3a] - 12.0f);
-    int side, k;
-    for (side = -1; side <= 1; side += 2) {
-        /* the eye: its texture's middle where the eye goes, mirrored for the Mii's left; G its white, B its iris */
-        float w = 12.0f * (1.0f + 0.1f * ((float)c[0x36] - 4.0f)), h = w * 128.0f / 152.0f;
-        float ex = (float)side * (8.0f + 0.9f * (float)c[0x39]), u = (x - ex) / w * (float)side * -1.0f + 0.5f;
-        float v = (eye_y - y) / h + 0.5f, col[4];
-        if (u >= 0 && u <= 1 && v >= 0 && v <= 1) {
-            tex_eye(tex_variant(T_EYE, c[0x34]), u * 152.0f / 128.0f, v, aa / h, col);
-            for (k = 0; k < 3; k++) {
-                float want = (look->eye[k] / 255.0f) * col[2] + col[1] + 0.08f * fmaxf(0, col[3] - col[1] - col[2]);
-                rgb[k] = rgb[k] * (1 - col[3]) + fminf(1, want) * col[3];
+/* the outlines: a pixel of a part whose neighbor (w pixels away) is nothing, or the face's while it is hair's or the
+   hair's while it is the face's and behind it, or hair 3 units or more behind it (a tail in front of the head's hair) */
+static void pic_edges(Pic* p) {
+    int w = 1 + p->side / 256, x, y, k;
+    static const int d[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    for (y = 0; y < p->side; y++)
+        for (x = 0; x < p->side; x++) {
+            size_t i = (size_t)y * (size_t)p->side + (size_t)x;
+            u8 a = p->what[i] & 0x7fu;
+            if (a == PIC_NONE) continue;
+            for (k = 0; k < 4; k++) {
+                int nx = x + w * d[k][0], ny = y + w * d[k][1];
+                size_t j;
+                u8 b;
+                int hair_a = a == PIC_HAIR || a == PIC_TIE, hair_b;
+                if (nx < 0 || ny < 0 || nx >= p->side || ny >= p->side) continue;
+                j = (size_t)ny * (size_t)p->side + (size_t)nx;
+                b = p->what[j] & 0x7fu;
+                hair_b = b == PIC_HAIR || b == PIC_TIE;
+                if (b == PIC_NONE || (hair_a != hair_b && p->z[j] < p->z[i]) ||
+                    (hair_a && hair_b && p->z[j] < p->z[i] - 3.0f)) {
+                    p->what[i] |= PIC_EDGE;
+                    break;
+                }
             }
         }
-        /* the brow above it, its thick end toward the nose */
-        w = 12.0f * (1.0f + 0.1f * ((float)c[0x3d] - 4.0f)), h = w * 128.0f / 144.0f;
-        ex = (float)side * (8.0f + 0.9f * (float)c[0x40]);
-        u = (x - ex) / w * (float)side * -1.0f + 0.5f;
-        v = (eye_y + 8.0f - 0.8f * ((float)c[0x41] - 10.0f) - y) / h + 0.5f;
+}
+/* what an outline keeps of the color it darkens in a picture side pixels wide: more in a small one, of which a line
+   a pixel wide is more */
+static float pic_line(int side) { return mixf(0.85f, 0.55f, smooth(32.0f, 128.0f, (float)side)); }
+/* the eye texel the CharInfo c puts at (x, y) of the SDK's frame (face_sdk's), the faceline risen by ty: its texture's
+   middle where the eye goes (our own reading of the fields), mirrored for the Mii's left; G its white, B its iris, A
+   all of it. 0 where no eye's texture is */
+static int face_eye(const u8* c, float x, float y, float ty, float aa, float col[4]) {
+    float w = 12.0f * (1.0f + 0.1f * ((float)c[0x36] - 4.0f)), h = w * 128.0f / 152.0f;
+    float ey = 34.0f + ty - ((float)c[0x3a] - 12.0f), v = (ey - y) / h + 0.5f;
+    int side;
+    for (side = -1; side <= 1; side += 2) {
+        float ex = (float)side * (8.0f + 0.9f * (float)c[0x39]), u = (x - ex) / w * (float)side * -1.0f + 0.5f;
+        if (u < 0 || u > 1 || v < 0 || v > 1) continue;
+        tex_eye(tex_variant(T_EYE, c[0x34]), u * 152.0f / 128.0f, v, aa / h, col);
+        return col[3] > 0;
+    }
+    return 0;
+}
+/* the color a face pixel at (x, y) of the SDK's frame (face_sdk's) takes from the features drawn on it: eyes, brows and
+   mouth where the CharInfo puts them (our own reading of its fields), over skin; ty the faceline's rise */
+static void pic_features(const u8* c, const SnxMiiLook* look, float x, float y, float ty, float aa, float rgb[3]) {
+    float eye_y = 34.0f + ty - ((float)c[0x3a] - 12.0f), col[4];
+    int side, k;
+    if (face_eye(c, x, y, ty, aa, col)) /* the eye in its color, its white, its outline dark */
+        for (k = 0; k < 3; k++) {
+            float want = (look->eye[k] / 255.0f) * col[2] + col[1] + 0.08f * fmaxf(0, col[3] - col[1] - col[2]);
+            rgb[k] = rgb[k] * (1 - col[3]) + fminf(1, want) * col[3];
+        }
+    for (side = -1; side <= 1; side += 2) { /* the brow above each eye, its thick end toward the nose */
+        float w = 12.0f * (1.0f + 0.1f * ((float)c[0x3d] - 4.0f)), h = w * 128.0f / 144.0f;
+        float ex = (float)side * (8.0f + 0.9f * (float)c[0x40]), u = (x - ex) / w * (float)side * -1.0f + 0.5f;
+        float v = (eye_y + 8.0f - 0.8f * ((float)c[0x41] - 10.0f) - y) / h + 0.5f;
         if (u >= 0 && u <= 1 && v >= 0 && v <= 1) {
             float a =
                 tex_value(T_EYEBROW, tex_variant(T_EYEBROW, c[0x3b]), u * 144.0f / 128.0f, v, aa / h, 144.0f / 128.0f);
@@ -1474,19 +1635,21 @@ static void pic_features(const u8* c, const SnxMiiLook* look, float x, float y, 
 int snx_mii_picture(const u8 charinfo[SNX_MII_CHARINFO], const SnxMiiLook* look, int side, u8* rgba) {
     const u8* c = charinfo;
     u32 face = c[0x2d] % FACELINES, style = c[0x31] % HAIR_STYLES, nose = c[0x42] % 18u, n, i;
-    float tf[9], ty, aa;
+    float tf[9], ty, aa, line;
     Pic p;
     u8* block;
     if (side < 16 || side > 1024) return -1;
     n = (u32)side * (u32)side;
-    block = (u8*)malloc((size_t)n * (sizeof(float) * 2 + 1)); /* the depths, the shading, then what each shows */
+    /* the depths, the shading, the shine, then what each shows */
+    block = (u8*)malloc((size_t)n * (sizeof(float) * 3 + 1));
     if (!block) return -1;
     p.side = side;
     p.scale = (float)side / PIC_SPAN;
     p.z = (float*)(void*)block;
     p.lit = p.z + n;
-    p.what = block + (size_t)n * sizeof(float) * 2;
-    for (i = 0; i < n; i++) p.z[i] = -1e30f, p.what[i] = PIC_NONE, p.lit[i] = 1;
+    p.shine = p.lit + n;
+    p.what = block + (size_t)n * sizeof(float) * 3;
+    for (i = 0; i < n; i++) p.z[i] = -1e30f, p.what[i] = PIC_NONE, p.lit[i] = 1, p.shine[i] = 0;
     faceline_transform(face, tf);
     ty = tf[1];
     aa = PIC_SPAN / (float)side;
@@ -1497,15 +1660,18 @@ int snx_mii_picture(const u8 charinfo[SNX_MII_CHARINFO], const SnxMiiLook* look,
         pic_shape(&p, shape_of(S_HAIR_NORMAL, hair_variant(style)), vec(0, ty, 0), c[0x33] & 1, PIC_HAIR);
     if (shape_present(S_HAT_NORMAL, style))
         pic_shape(&p, shape_of(S_HAT_NORMAL, hat_variant(style)), vec(0, ty, 0), c[0x33] & 1, PIC_TIE);
+    pic_edges(&p);
+    line = pic_line(side);
     for (i = 0; i < n; i++) {
         float x = PIC_X0 + ((float)(i % (u32)side) + 0.5f) / p.scale,
               y = PIC_Y1 - ((float)(i / (u32)side) + 0.5f) / p.scale;
         float rgb[3], light = 1.0f - 0.25f * (float)(i / (u32)side) / (float)side;
         u32 k;
-        const uint8_t* col = p.what[i] == PIC_HAIR ? look->hair : p.what[i] == PIC_TIE ? look->favorite : look->skin;
+        u8 what = p.what[i] & 0x7fu;
+        const uint8_t* col = what == PIC_HAIR ? look->hair : what == PIC_TIE ? look->favorite : look->skin;
         for (k = 0; k < 3; k++) /* the background: the favorite color lightened, darker toward the bottom */
             rgb[k] = (0.7f + 0.3f * (look->favorite[k] / 255.0f)) * light;
-        if (p.what[i] == PIC_NONE) {
+        if (what == PIC_NONE) {
             /* the shirt over the shoulders, the neck above it */
             float sx = x / 34.0f, sy = (y + 34.0f) / 30.0f;
             if (sx * sx + sy * sy < 1.0f && y < 4.0f)
@@ -1514,8 +1680,12 @@ int snx_mii_picture(const u8 charinfo[SNX_MII_CHARINFO], const SnxMiiLook* look,
                 for (k = 0; k < 3; k++) rgb[k] = look->skin[k] / 255.0f * 0.8f;
         } else {
             for (k = 0; k < 3; k++) rgb[k] = col[k] / 255.0f;
-            if (p.what[i] == PIC_FACE) pic_features(c, look, x, y, ty, aa, rgb);
-            for (k = 0; k < 3; k++) rgb[k] *= p.lit[i];
+            if (what == PIC_FACE) {
+                float xs, ys;
+                face_sdk(x, y, ty, &xs, &ys);
+                pic_features(c, look, xs, ys, ty, aa / FACE_KX, rgb);
+            }
+            for (k = 0; k < 3; k++) rgb[k] = (rgb[k] * p.lit[i] + p.shine[i]) * (p.what[i] & PIC_EDGE ? line : 1.0f);
         }
         for (k = 0; k < 3; k++) rgba[4 * i + k] = (u8)lroundf(clampf(rgb[k], 0, 1) * 255.0f);
         rgba[4 * i + 3] = 255;
