@@ -202,7 +202,7 @@ typedef struct {
 typedef struct {
     u32 obj;
     u32 applet_id, mode;
-    u32 state_ev, out_ev, interactive_ev;
+    u32 state_ev, out_ev, interactive_ev, unknown170_ev; /* unknown170_ev: never signaled (am.swipc) */
     SvcObj* in[AM_IN_DATA]; /* the storages the game pushed, in order (common arguments first) */
     int nin;
     SvcObj* out[AM_OUT_DATA]; /* the interactive replies, oldest first */
@@ -326,6 +326,14 @@ typedef struct {
     float* hist; /* the last ntaps samples of each channel at 48 kHz, a ring at hpos */
     u32 queued, cap, phase, ntaps, hpos;
 } HwOpus;
+/* a decoder of one stream outside the service (audio.c), for hle/hook/codec.c: NULL when it can't be opened. A packet
+   is the service's, behind its 8 byte header; out takes its samples, interleaved, little-endian */
+HwOpus* hwopus_new(u32 rate, u32 channels);
+void hwopus_delete(HwOpus* h);
+int hwopus_decode_packet(HwOpus* h, const u8* in, u64 in_size, i16* out, u64 out_size, int reset, u32* consumed,
+                         u32* samples);
+/* the Ounce's output streams (hle/hook/audio_stream.c) played up to now, guest time: the audio clock's turn */
+void outstream_tick(u64 now);
 typedef struct {
     u32 ev;              /* the renderers' system event, every frame */
     AudOut* outs;        /* every open audio out, for the clock */

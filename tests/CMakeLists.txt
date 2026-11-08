@@ -38,9 +38,10 @@ endfunction()
 # what the tests reach that this list misses
 if(SNX_TEST_SANITIZERS)
     cmake_language(DEFER DIRECTORY "${PROJECT_SOURCE_DIR}" CALL snx_test_sanitize
-        # the common code: network, filesystems, LZ4 and xxHash, the Vulkan setup the frontends share, the launcher's
-        # HTTPS and the roots it carries, the zip reader of VPKs and APKs, the glTF reader of a Mii's parts
-        scarletnx-common scarletnx-net scarletnx-ldn scarletnx-filesystem snx_demangle snx_lz4
+        # the common code: the platform layer, network, filesystems, LZ4 and xxHash, the Vulkan setup the frontends
+        # share, the launcher's HTTPS and the roots it carries, the zip reader of VPKs and APKs, the glTF reader of a
+        # Mii's parts
+        scarletnx-common scarletnx-platform scarletnx-net scarletnx-ldn scarletnx-filesystem snx_demangle snx_lz4
         snx_xxhash snx_vk_common snx_https snx_cacert snx_zip snx_cgltf
         snx-logscan
         # the recompiler and its backends
@@ -625,8 +626,11 @@ if(TARGET hactool_internals)
     endif()
 endif()
 if(UNIX)
-    # host.c by itself: shared files, folders and the mutex
-    add_executable(snx-test-fs-host filesystem_host.c "${PROJECT_SOURCE_DIR}/src/common/filesystem/host.c")
+    # the platform's files by themselves: shared files, folders and the mutex
+    add_executable(snx-test-fs-host filesystem_host.c "${PROJECT_SOURCE_DIR}/src/common/platform/file.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/file_map.c" "${PROJECT_SOURCE_DIR}/src/common/platform/file_share.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/file_replace.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/thread.c")
     snx_test_target(snx-test-fs-host 11)
     target_link_libraries(snx-test-fs-host PRIVATE Threads::Threads)
     add_test(NAME filesystem_host COMMAND snx-test-fs-host WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
@@ -660,6 +664,11 @@ add_executable(snx-test-cas128 cas128.c)
 snx_test_target(snx-test-cas128 11)
 target_link_libraries(snx-test-cas128 PRIVATE scarletnx-common Threads::Threads)
 add_test(NAME cas128 COMMAND snx-test-cas128)
+# the drivers' common options (common/utilities/cli.h): their forms, older names, refusals and help
+add_executable(snx-test-cli cli.c)
+snx_test_target(snx-test-cli 99)
+target_link_libraries(snx-test-cli PRIVATE scarletnx-common)
+add_test(NAME cli COMMAND snx-test-cli)
 # bits.h's helpers with the compiler's builtins and 128-bit integer, and in ISO C alone, strict C99
 add_executable(snx-test-bits bits.c)
 snx_test_target(snx-test-bits 99)
@@ -760,7 +769,7 @@ snx_test_target(snx-test-crc32-helper 11)
 target_link_libraries(snx-test-crc32-helper PRIVATE snx_llvm snx_driver ${CMAKE_DL_LIBS})
 add_test(NAME crc32_helper COMMAND snx-test-crc32-helper)
 
-# the NVN header Part C builds on (src/nx/gpu/nvn/nvn.h, h1k421's, MIT) as strict C99, against docs/NVN_HLE.md's fields,
+# the NVN header Part C builds on (src/nx/gpu/nvn/nvn.h, h1k421's, MIT) as strict C99, against docs/layers/gpu/nvn.md's fields,
 # and the NVN functions' types that hookgen makes of gpu/nvn/nvn.hook, against prototypes in NVN's types
 add_executable(snx-test-nvn-header nvn_header.c)
 snx_test_target(snx-test-nvn-header 99)
@@ -1599,7 +1608,7 @@ if(Python3_Interpreter_FOUND)
              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tracked_material.py" "${PROJECT_SOURCE_DIR}")
     set_tests_properties(tracked_material_self_test tracked_material PROPERTIES SKIP_RETURN_CODE 77)
     # the docs held to the checkout (scripts/check-docs.py): their links and anchors, the ## Index of each long one,
-    # docs/README.md linking every doc, and docs/SETTINGS.md's keys and defaults against src/nx/runtime/settings.txt;
+    # docs/README.md linking every doc, and docs/user/settings.md's keys and defaults against src/nx/runtime/settings.txt;
     # then the checks on checkouts made to fail them
     add_test(NAME docs_check COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/check-docs.py")
     add_test(NAME docs_check_script COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/docs_test.py")
@@ -1727,6 +1736,7 @@ add_library(snx_test_common STATIC "${PROJECT_SOURCE_DIR}/src/common/utilities/c
     "${PROJECT_SOURCE_DIR}/src/common/utilities/script.c")
 snx_test_target(snx_test_common 99)
 target_link_libraries(snx_test_common PUBLIC snx_libdeflate) # a control.nacp's titles in deflate
+target_link_libraries(snx_test_common PUBLIC scarletnx-platform) # the clocks (snx_seconds)
 if(WIN32)
     target_link_libraries(snx_test_common PUBLIC advapi32)
 endif()
@@ -1796,14 +1806,14 @@ add_executable(snx-test-link-file link_file.c)
 snx_test_target(snx-test-link-file 99)
 target_link_libraries(snx-test-link-file PRIVATE snx_test_common)
 add_test(NAME link_file COMMAND snx-test-link-file)
-# the macOS Vulkan driver a run picks, in folders the test makes: on every system (docs/APPLE.md)
+# the macOS Vulkan driver a run picks, in folders the test makes: on every system (docs/hosts/apple.md)
 add_executable(snx-test-vulkan-driver-pick vulkan_driver_pick.c)
 snx_test_target(snx-test-vulkan-driver-pick 99)
 target_link_libraries(snx-test-vulkan-driver-pick PRIVATE snx_test_common)
 add_test(NAME vulkan_driver_pick COMMAND snx-test-vulkan-driver-pick)
 if(APPLE)
     # MoltenVK and KosmicKrisp, which the app carries and a game's runtime copy (outside the bundle) gets beside it: the
-    # paths, and the KosmicKrisp device of the Mac through its ICD and the loader (docs/APPLE.md)
+    # paths, and the KosmicKrisp device of the Mac through its ICD and the loader (docs/hosts/apple.md)
     add_executable(snx-test-vulkan-driver vulkan_driver.c)
     snx_test_target(snx-test-vulkan-driver 99)
     target_link_libraries(snx-test-vulkan-driver PRIVATE snx_test_common Vulkan::Headers)
@@ -1827,12 +1837,12 @@ if(UNIX)
         add_test(NAME ${name} COMMAND ${target})
     endforeach()
 endif()
-# the setup's files and choices (common/utilities/setup.c), its notices against docs/DEPRECATIONS.md
+# the setup's files and choices (common/utilities/setup.c), its notices against docs/user/deprecations.md
 if(UNIX AND TARGET snx_setup)
     add_executable(snx-test-setup setup.c)
     snx_test_target(snx-test-setup 99)
     target_link_libraries(snx-test-setup PRIVATE snx_setup)
-    target_compile_definitions(snx-test-setup PRIVATE SNX_DEPRECATIONS="${PROJECT_SOURCE_DIR}/docs/DEPRECATIONS.md")
+    target_compile_definitions(snx-test-setup PRIVATE SNX_DEPRECATIONS="${PROJECT_SOURCE_DIR}/docs/user/deprecations.md")
     add_test(NAME setup COMMAND snx-test-setup)
     # the driver's setup in a terminal, its answers from a file
     add_executable(snx-test-setup-terminal setup_terminal.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/driver/setup.c")
@@ -2051,6 +2061,13 @@ if(NOT SNX_TOOLS_ONLY)
     add_executable(snx-test-vk-resource-stats vk_resource_stats.c)
     snx_test_target(snx-test-vk-resource-stats 11)
     add_test(NAME vk_resource_stats COMMAND snx-test-vk-resource-stats)
+    # the BC7 cache of ASTC levels (gpu/vk/bc7_cache.c), without a GPU: every input that changes a level's blocks
+    # changes its key, records come back as written and from the file in a later run, another version or a damaged
+    # record starts the file over or drops the record, a record cut short is cut off, and the bound starts it over
+    add_executable(snx-test-bc7-cache bc7_cache.c tracy_stubs.c)
+    snx_test_target(snx-test-bc7-cache 23)
+    target_link_libraries(snx-test-bc7-cache PRIVATE snx_nx_flags snx_xxhash scarletnx-common)
+    add_test(NAME bc7_cache COMMAND snx-test-bc7-cache)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         # The real cache saver with a fake driver: compilation defers periodic snapshots without losing dirty work.
         # Include only its implementation; sanitizer-retained callback tables make whole-file linker GC unsuitable.
@@ -2288,7 +2305,7 @@ snx_test_target(snx-test-runtime-module-abi 99)
 target_link_libraries(snx-test-runtime-module-abi PRIVATE snx_test_common)
 add_test(NAME runtime_module_abi COMMAND snx-test-runtime-module-abi $<TARGET_FILE:scarletnx>
     $<TARGET_FILE:snx-test-module-abi> $<TARGET_FILE:snx-test-module-abi-arm>)
-# edenprobe (docs/EDENPROBE.md) as CI runs it, against its baseline, once with guest buffers copied and once read in
+# edenprobe (docs/dev/edenprobe.md) as CI runs it, against its baseline, once with guest buffers copied and once read in
 # place (vk_memory=2: the path a GPU that shares memory takes, lavapipe's in CI). -DSNX_TEST_EDENPROBE=/path/to/
 # edenprobe.nro, the release that .github/workflows/build.yml pins
 if(SNX_TEST_EDENPROBE AND Python3_Interpreter_FOUND AND NOT CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
@@ -2338,7 +2355,7 @@ elseif(SNX_JEMALLOC AND ANDROID)
     add_test(NAME jemalloc COMMAND "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:scarletnx-run>" "-DNM=${CMAKE_NM}"
         "-DNAMES=${snx_jemalloc_names}" -P "${CMAKE_CURRENT_SOURCE_DIR}/jemalloc.cmake")
 endif()
-# the module contract's layout as recorded when SNX_ABI last rose (docs/ARCHITECTURE.md, Module ABI)
+# the module contract's layout as recorded when SNX_ABI last rose (docs/dev/architecture.md, Module ABI)
 add_executable(snx-test-module-contract module_contract.c)
 snx_test_target(snx-test-module-contract 99)
 add_test(NAME module_contract COMMAND snx-test-module-contract)
@@ -2873,6 +2890,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     snx_test_target(snx-test-plat-cpus 11)
     target_link_libraries(snx-test-plat-cpus PRIVATE SDL3::SDL3) # plat_posix.c's threads end SDL's per-thread state
     target_link_libraries(snx-test-plat-cpus PRIVATE scarletnx-common) # plat_posix.c names its threads (snx_thread_name)
+    target_link_libraries(snx-test-plat-cpus PRIVATE scarletnx-platform) # plat_thread, plat_cpus, the waits
     add_test(NAME plat_cpus COMMAND snx-test-plat-cpus)
 endif()
 
@@ -2886,6 +2904,12 @@ add_executable(snx-test-process-threads process_threads.c)
 snx_test_target(snx-test-process-threads 11)
 target_link_libraries(snx-test-process-threads PRIVATE scarletnx-common)
 add_test(NAME process_threads COMMAND snx-test-process-threads)
+# a thread at the system's low priority as common.c sets it, the pipeline workers' past the first two
+# (thread_priority.c)
+add_executable(snx-test-thread-priority thread_priority.c)
+snx_test_target(snx-test-thread-priority 11)
+target_link_libraries(snx-test-thread-priority PRIVATE scarletnx-common)
+add_test(NAME thread_priority COMMAND snx-test-thread-priority)
 # the debugger tracing the process as common.c reads it, which the stats box and F1's help name (process_debugger.c)
 add_executable(snx-test-process-debugger process_debugger.c)
 snx_test_target(snx-test-process-debugger 11)
@@ -2915,7 +2939,11 @@ if(UNIX)
         "${PROJECT_SOURCE_DIR}/src/nx/memory/mem.c" "${PROJECT_SOURCE_DIR}/src/nx/memory/own.c"
         "${PROJECT_SOURCE_DIR}/src/nx/hle/svc/svc_mem.c"
         "${PROJECT_SOURCE_DIR}/src/nx/hle/hle.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/plat_posix.c"
-        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/plat_sdl.c" "${PROJECT_SOURCE_DIR}/src/common/filesystem/host.c")
+        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/plat_sdl.c" "${PROJECT_SOURCE_DIR}/src/common/platform/file.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/file_map.c" "${PROJECT_SOURCE_DIR}/src/common/platform/file_share.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/file_replace.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/thread.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/thread_spawn.c")
     snx_test_target(snx-test-memory-alias 11)
     target_link_libraries(snx-test-memory-alias PRIVATE SDL3::SDL3 ${CMAKE_DL_LIBS})
     target_link_libraries(snx-test-memory-alias PRIVATE scarletnx-common) # plat_posix.c names its threads (snx_thread_name)
@@ -2939,7 +2967,11 @@ if(UNIX)
     add_executable(snx-test-memory-own memory_own.c
         "${PROJECT_SOURCE_DIR}/src/nx/memory/mem.c" "${PROJECT_SOURCE_DIR}/src/nx/memory/own.c"
         "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/plat_posix.c"
-        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/plat_sdl.c" "${PROJECT_SOURCE_DIR}/src/common/filesystem/host.c")
+        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/plat_sdl.c" "${PROJECT_SOURCE_DIR}/src/common/platform/file.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/file_map.c" "${PROJECT_SOURCE_DIR}/src/common/platform/file_share.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/file_replace.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/thread.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/thread_spawn.c")
     snx_test_target(snx-test-memory-own 11)
     target_link_libraries(snx-test-memory-own PRIVATE Threads::Threads SDL3::SDL3 ${CMAKE_DL_LIBS})
     target_link_libraries(snx-test-memory-own PRIVATE scarletnx-common) # plat_posix.c names its threads (snx_thread_name)
@@ -2999,7 +3031,10 @@ snx_test_target(snx-test-quad-indices 99)
 target_include_directories(snx-test-quad-indices PRIVATE "${PROJECT_SOURCE_DIR}/src")
 add_test(NAME quad_indices COMMAND snx-test-quad-indices)
 add_executable(snx-test-unattended-script unattended_script.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c"
-    "${PROJECT_SOURCE_DIR}/src/common/filesystem/host.c") # plat_mkdir, the slots' folder
+    "${PROJECT_SOURCE_DIR}/src/common/platform/file.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/file_map.c" "${PROJECT_SOURCE_DIR}/src/common/platform/file_share.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/file_replace.c"
+    "${PROJECT_SOURCE_DIR}/src/common/platform/thread.c") # plat_mkdir, the slots' folder
 snx_test_target(snx-test-unattended-script 11)
 target_link_libraries(snx-test-unattended-script PRIVATE m scarletnx-common) # snx_read_file, snx_fopen
 add_test(NAME unattended_script COMMAND snx-test-unattended-script "${CMAKE_CURRENT_BINARY_DIR}")
@@ -3007,16 +3042,23 @@ add_test(NAME unattended_script COMMAND snx-test-unattended-script "${CMAKE_CURR
 add_executable(snx-test-deprecated-env deprecated_env.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/deprecated_env.c")
 snx_test_target(snx-test-deprecated-env 11)
 add_test(NAME deprecated_env COMMAND snx-test-deprecated-env)
-# the log's file, early lines, stamps, redirect, limits, fatal and crash mode (platform/plat.c)
-add_executable(snx-test-platform-log platform_log.c "${PROJECT_SOURCE_DIR}/src/common/filesystem/host.c")
+# the log's file, early lines, stamps, redirect, limits, fatal and crash mode (platform/log.c)
+add_executable(snx-test-platform-log platform_log.c "${PROJECT_SOURCE_DIR}/src/common/platform/file.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/file_map.c" "${PROJECT_SOURCE_DIR}/src/common/platform/file_share.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/file_replace.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/thread.c")
 snx_test_target(snx-test-platform-log 11)
 target_link_libraries(snx-test-platform-log PRIVATE scarletnx-common) # the runs' logs: snx_list_dir, snx_file_time
 add_test(NAME platform_log COMMAND snx-test-platform-log "${CMAKE_CURRENT_BINARY_DIR}")
 if(NOT WIN32 AND TARGET SDL3::SDL3) # SDL3 is there with a driver that draws (cmake/dependencies.cmake)
-    # written-page tracking, decommit, pread, file maps, replace, folders, waits and threads (platform/plat_posix.c and
-    # plat_sdl.c)
+    # written-page tracking, decommit, pread, file maps, replace, folders, waits and threads (platform/plat_posix.c,
+    # plat_sdl.c and common/platform)
     add_executable(snx-test-platform-posix platform_posix.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/plat_sdl.c"
-        "${PROJECT_SOURCE_DIR}/src/common/filesystem/host.c")
+        "${PROJECT_SOURCE_DIR}/src/common/platform/file.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/file_map.c" "${PROJECT_SOURCE_DIR}/src/common/platform/file_share.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/file_replace.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/thread.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/thread_spawn.c")
     snx_test_target(snx-test-platform-posix 11)
     target_link_libraries(snx-test-platform-posix PRIVATE SDL3::SDL3 ${CMAKE_DL_LIBS})
     target_link_libraries(snx-test-platform-posix PRIVATE scarletnx-common) # plat_posix.c names its threads (snx_thread_name)
@@ -3055,7 +3097,11 @@ endif()
 if(WIN32 AND TARGET SDL3::SDL3)
     # the write watch of the reservation, the kernel's writes included (platform/plat_win32.c)
     add_executable(snx-test-platform-win32 platform_win32.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/plat_sdl.c"
-        "${PROJECT_SOURCE_DIR}/src/common/filesystem/host.c")
+        "${PROJECT_SOURCE_DIR}/src/common/platform/file.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/file_map.c" "${PROJECT_SOURCE_DIR}/src/common/platform/file_share.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/file_replace.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/thread.c"
+        "${PROJECT_SOURCE_DIR}/src/common/platform/thread_spawn.c")
     snx_test_target(snx-test-platform-win32 11)
     target_link_libraries(snx-test-platform-win32 PRIVATE SDL3::SDL3 synchronization powrprof)
     # plat_win32.c names its threads and says the system's reasons (snx_thread_name, snx_os_error)
@@ -3151,6 +3197,11 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
         snx_test_target(snx-test-vk-memory-model 11)
         target_link_libraries(snx-test-vk-memory-model PRIVATE snx_vk_common)
         add_test(NAME vk_memory_model COMMAND snx-test-vk-memory-model)
+        # how many pipeline workers there are, and how many of them run at the system's low priority
+        add_executable(snx-test-vk-pipeline-workers vk_pipeline_workers.c "${volk_SOURCE_DIR}/volk.c")
+        snx_test_target(snx-test-vk-pipeline-workers 11)
+        target_link_libraries(snx-test-vk-pipeline-workers PRIVATE snx_vk_common)
+        add_test(NAME vk_pipeline_workers COMMAND snx-test-vk-pipeline-workers)
         # the presentation the vsync setting picks, for every frontend's swapchain
         add_executable(snx-test-vk-present-mode vk_present_mode.c "${volk_SOURCE_DIR}/volk.c")
         snx_test_target(snx-test-vk-present-mode 11)

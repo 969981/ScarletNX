@@ -430,6 +430,13 @@ void vk_pipeline_init(void) {
     if (!g_vk_playout) fatal("vulkan: cannot create shader pipeline layout");
     snprintf(g_cache_dir, sizeof g_cache_dir, "%sshader_cache", g_cachedir);
     plat_mkdir(g_cache_dir);
+    /* the BC7 blocks of earlier ASTC encodes, where ASTC textures are held as BC7 (astc.c) */
+    if (vk_astc_bc7()) {
+        char bc7[1200];
+        snprintf(bc7, sizeof bc7, "%s/%s.vkbc7", g_cache_dir, g_exename);
+        snx_path_native(bc7);
+        vk_astc_cache_open(bc7);
+    }
     /* each driver's files apart: a game run with the system's driver, then a package's (gpu_driver), then the
        system's again keeps the first one's */
     pf_driver_tag(g_driver_tag, sizeof g_driver_tag, g_vk.driver_id, g_vk.props.vendorID, g_vk.props.deviceID,
@@ -1379,9 +1386,16 @@ static void pipe_job(Pipe* e, int queue) {
     pc_broadcast(&g_pj_done);
     pm_unlock(&g_pj_lock);
 }
-static void pipe_worker(void* arg) {
-    (void)arg;
+static void pipe_worker(void* low) {
     SNX_THREAD_NAME("Vulkan pipelines");
+    if (low) { /* one past the first two (snx_vk_pipeline_low_workers) */
+        char why[256];
+        if (snx_thread_priority_low(why, sizeof why))
+            WARN_LIMIT(1,
+                       "vulkan: a pipeline worker asked for %s, the system's low priority: %s (said for the first "
+                       "one refused)\n",
+                       snx_thread_priority_low_name(), why);
+    }
     for (;;) {
         Pipe* e;
         int queue;
@@ -1433,14 +1447,26 @@ void vk_pipeline_quiesce(void) {
 static int pipe_workers(void) {
     if (!g_pj_started) {
         int cpus = plat_cpu_count(), n = snx_vk_pipeline_workers(g_settings.pipeline_threads, cpus);
+        int low = snx_vk_pipeline_low_workers(n), started[2] = {0, 0};
+        char why[256] = "";
         g_pj_started = 1;
-        LOG("vulkan: pipeline_threads=%d%s: %d workers make the new pipelines, of %d CPUs\n",
-            g_settings.pipeline_threads, g_settings.pipeline_threads ? "" : " (Auto)", n, cpus);
         pc_init(&g_pj_work);
         pc_init(&g_pj_done);
-        for (int i = 0; i < n; i++)
-            if (!plat_thread(pipe_worker, NULL, (size_t)1 << 20)) g_pj_threads++;
+        for (int i = 0; i < n; i++) {
+            int lowered = i >= n - low;
+            if (!plat_thread(pipe_worker, (void*)(uintptr_t)lowered, (size_t)1 << 20))
+                started[lowered]++;
+            else
+                snx_os_error(why, sizeof why);
+        }
+        g_pj_threads = started[0] + started[1];
         g_po_max = g_pj_threads > 1 ? g_pj_threads / 2 : 1;
+        LOG("vulkan: pipeline_threads=%d%s: %d workers make the new pipelines, of %d CPUs: %d at the system's normal "
+            "priority, %d at its low one (%s)\n",
+            g_settings.pipeline_threads, g_settings.pipeline_threads ? "" : " (Auto)", g_pj_threads, cpus, started[0],
+            started[1], snx_thread_priority_low_name());
+        if (g_pj_threads < n)
+            WARN("vulkan: %d of the %d pipeline workers did not start: %s\n", n - g_pj_threads, n, why);
     }
     return g_pj_threads;
 }
@@ -2208,7 +2234,7 @@ static void idx_add(u64 hash, int stage, u32 clip, u32 len, u64 qh, u32 len_a, u
 }
 /* The key's clip word the pass translates a stage with, as the draws ask for it (render.c): the clip distances the 3D
    engine enables, all eight (0xff) in the NVN games tried, for the stages that can be the last before rasterization
-   (docs/NVN_HLE.md); SNX_SH_NOT_LAST for tessellation control, which never is; none for fragment */
+   (docs/layers/gpu/nvn.md); SNX_SH_NOT_LAST for tessellation control, which never is; none for fragment */
 static u32 ship_clip(int stage) { return stage == ST_TCS ? SNX_SH_NOT_LAST : stage == ST_FS ? 0 : 0xFFu; }
 /* a key whose words are all zero but the clip word: the keys the pass translates with */
 static int ship_key_only_clip(const u32 mask[26]) {
@@ -2360,7 +2386,7 @@ static int ship_make(const u8* code, u64 h, int stage, u32 len, u64 qh, u32 len_
     return SHIP_NEW;
 }
 /* A VertexA with the VertexB after it, merged as a draw that binds the two merges them (vk_shader_get): the VertexB is
-   the first SPH of one in the 256-byte slots past A's code, where NVN's compiler puts it (docs/NVN_HLE.md). A
+   the first SPH of one in the 256-byte slots past A's code, where NVN's compiler puts it (docs/layers/gpu/nvn.md). A
    VertexA without one, or that won't merge, is SHIP_SKIPPED: no draw asks for it alone */
 static int ship_dual(const u8* sph, size_t avail) {
     u8 *a = ship_window(sph, avail), *b = NULL, *m = NULL;

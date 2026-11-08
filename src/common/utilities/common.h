@@ -25,12 +25,6 @@ char* snx_strdup(const char* s);
 char* snx_format(const char* fmt, ...);
 /* 1 when text ends with ending, ASCII letters of either case alike (a file's extension) */
 int snx_ends_with_nocase(const char* text, const char* ending);
-/* a shared library (a DLL on Windows, its UTF-8 path widened) loaded with its symbols bound now and kept to itself
-   (RTLD_NOW | RTLD_LOCAL); NULL with "cannot load PATH: reason" in error when it can't be */
-void* snx_library_open(const char* path, char* error, size_t error_size);
-/* a symbol of a library snx_library_open loaded, NULL when it has none of that name */
-void* snx_library_symbol(void* library, const char* name);
-void snx_library_close(void* library);
 /* a path's / turned into \ on Windows, the separator its system shows (C:\Users\...); nothing elsewhere */
 void snx_path_native(char* path);
 /* the room of a path made in a caller's buffer: Linux's PATH_MAX, past what Windows takes without its long paths */
@@ -67,6 +61,8 @@ char* snx_game_folder(const char* repo, const char* outdir, const char* argv0, c
 int snx_parse_seconds(const char* text, double* seconds);
 /* whether path is a full one, from a root (a drive's or a share's on Windows), not one relative to a working folder */
 int snx_path_is_full(const char* path);
+/* the running program's full path, as the system tells it (/proc/self/exe on Linux, KERN_PROC_PATHNAME on FreeBSD),
+   else argv0 found on PATH; NULL when neither says it (argv0 NULL). The caller's to free */
 char* snx_executable(const char* argv0);
 int snx_is_file(const char* path);
 int snx_is_dir(const char* path);
@@ -133,7 +129,6 @@ void snx_vulkan_driver_free(SnxVulkanDriver* driver);
    reason said. Nothing to do, and 0, where the system's loader serves or the program carries none */
 int snx_deploy_vulkan_driver(const char* program, const char* folder);
 int snx_path_within(const char* path, const char* parent);
-int snx_replace(const char* src, const char* dst);
 int snx_list_dir(const char* path, char*** names, size_t* count);
 void snx_free_strings(char** strings, size_t count);
 unsigned char* snx_read_file(const char* path, size_t* size);
@@ -144,6 +139,14 @@ int snx_file_has_record(const char* path, const void* magic, size_t magic_size, 
                         int (*accept)(const unsigned char* record, const void* context), const void* context);
 int snx_write_file(const char* path, const void* data, size_t size);
 int snx_write_changed(const char* path, const void* data, size_t size);
+/* The orders of the 4 bytes of a pixel that snx_ppm_write reads: R, G, B and one it skips; B, G, R and one skipped; or
+   a 32-bit word in the host's order with red in its low byte, then green and blue */
+enum { SNX_PPM_RGBA, SNX_PPM_BGRA, SNX_PPM_WORD };
+/* A binary PPM (P6) of width by height pixels into f. The first pixel is at pixels, the next one in a row pixel_step
+   bytes on, and the next row row_step bytes on (a step can be negative, as a rotated read takes). 0, or -1 when a
+   write fails */
+int snx_ppm_write(FILE* f, uint32_t width, uint32_t height, const unsigned char* pixels, ptrdiff_t pixel_step,
+                  ptrdiff_t row_step, int order);
 char* snx_temp_dir(const char* parent);
 /* the system's folder for temporary files: TMPDIR, else /tmp; on Windows GetTempPath's */
 char* snx_temp_root(void);
@@ -210,7 +213,7 @@ extern const SnxGameFile snx_game_files[SNX_GAME_FILES];
    work/ in the data folder stays, a line on stdout saying so */
 char* snx_work_dir(const char* data_dir);
 /* recompiled/ of a data folder, where the drivers make its games. An older version made them in games/, which stays
-   and is still run from until the player moves it (docs/DEPRECATIONS.md): snx_recompiled_game is game name's folder,
+   and is still run from until the player moves it (docs/user/deprecations.md): snx_recompiled_game is game name's folder,
    recompiled/<name>, else games/<name> when only that one is there; snx_recompiled_left says on stderr that games/ is
    still there */
 char* snx_recompiled_dir(const char* data_dir);
@@ -227,7 +230,7 @@ char* snx_portable_dir(const char* program_dir);
 char* snx_checkout(const char* checkout, const char* build, const char* program_dir);
 /* What an older version kept in the checkout of a build tree's program, its data folder then: games/, work/, the
    keys and scarletnx-gnuabi's sysroot, linux/. snx_checkout_now names where this one keeps each for the data folder data; snx_checkout_left says so on
-   stderr for each still there. Nothing is moved: the player does that (docs/DEPRECATIONS.md) */
+   stderr for each still there. Nothing is moved: the player does that (docs/user/deprecations.md) */
 #define SNX_CHECKOUT_FILES 5
 extern const char* const snx_checkout_files[SNX_CHECKOUT_FILES];
 char* snx_checkout_now(const char* data, int file);
@@ -258,12 +261,8 @@ unsigned snx_cpu_count(void);
    system says them, else the processors, capped at 75% of that (a reserve of one whole core, or a quarter), so a
    part of the computer stays free; at least 1, never more than snx_cpu_count() */
 unsigned snx_build_threads(void);
-/* seconds on a monotonic clock, for durations */
+/* plat_ns in seconds, for durations */
 double snx_seconds(void);
-/* Address space for code the process writes and then runs: reserved without access, then given access in whole pages.
-   snx_vm_protect commits the pages it makes accessible and decommits them with SNX_VM_NONE on Windows. 0 or -1 */
-enum { SNX_VM_NONE, SNX_VM_READ, SNX_VM_READ_WRITE, SNX_VM_READ_EXECUTE };
-size_t snx_vm_page_size(void);
 /* A run that cannot be killed (the driver on a thread of the app, where an app may start no process) is stopped by
    asking: the player's abort sets this, and the long loops (the recompiler's units) end early once it is set */
 void snx_abort_request(int on);
@@ -292,6 +291,20 @@ void snx_thread_clock_close(SnxU64 clock);
 /* names the calling thread for the system, which debuggers, crash reports, the system's tools and snx_threads show:
    Linux and Android keep its first 15 bytes, FreeBSD 19, the others 63 (Windows from 10 1607; earlier ones none) */
 void snx_thread_name(const char* name);
+/* The nice a thread snx_thread_priority_low lowers gets above its own on Linux and Android. Their scheduler shares a
+   busy CPU by weight, 1.25 times less a step of nice (sched_prio_to_weight: 1024 at 0, 110 at 10, 15 at 19): at 10 a
+   game thread at 0 keeps 90% of a CPU it shares with one and is given it first when it wakes, while a pipeline the
+   frame waits on still gets a tenth of it, where at 19 it would crawl at 1.4%. Android's background threads take 10
+   too */
+#define SNX_THREAD_LOW_NICE 10
+/* The calling thread at the system's low priority, where it takes the CPUs only as far as the process's other threads
+   leave them free: on Linux and Android SNX_THREAD_LOW_NICE above the nice it has, 19 at most; on macOS and iOS the
+   utility QoS class; on Windows below normal; on FreeBSD the idle class, which needs root, the idletime group with
+   mac_priority, or security.bsd.unprivileged_idprio=1. 0 when it runs there now; -1 when the system refused it or has
+   none for a thread, with what was asked, the system's reason and the priority the thread runs at instead into why */
+int snx_thread_priority_low(char* why, size_t size);
+/* what snx_thread_priority_low asks of this system, for a log: "nice +10", "the utility QoS class"... */
+const char* snx_thread_priority_low_name(void);
 /* one of the process's threads, as snx_threads reads it */
 typedef struct {
     /* the system's id for it, with its start where the system gives an ended thread's id to a new one (Linux,
@@ -311,9 +324,6 @@ int snx_memory_available(SnxU64* bytes);
 /* the machine's physical memory, in bytes, into *bytes: what the system counts as installed (sysconf's _SC_PHYS_PAGES
    on Linux, Android, FreeBSD, macOS and iOS, GlobalMemoryStatusEx on Windows); whether the system told it */
 int snx_memory_total(SnxU64* bytes);
-void* snx_vm_reserve(size_t size); /* NULL when the system refuses */
-int snx_vm_protect(void* p, size_t size, int access);
-void snx_vm_release(void* p, size_t size);
 /* Makes instructions written to [p, p + size) visible to instruction fetch, once the pages are executable. Another
    core needs nothing more when the pages were never executable before: it cannot hold old instructions for them */
 void snx_vm_flush_code(void* p, size_t size);
@@ -340,7 +350,7 @@ void snx_set_stage_runner(int (*run)(int argc, char** argv));
 /* As above, but intentional debugger stops do not abort the game. */
 int snx_run_debug_stage(const char* const* argv, const char* cwd, const char* stage);
 FILE* snx_fopen(const char* path, const char* mode);
-/* The launcher's logs, in its state folder (docs/USAGE.md#folders): what it says, a file a day named after this one
+/* The launcher's logs, in its state folder (docs/user/usage.md#folders): what it says, a file a day named after this one
    (gui/log.h's gui_log_console_name; this name the versions before wrote, kept), and a fatal error of it or of a game
    in the other one too */
 #define SNX_CONSOLE_LOG "scarletnx-console.log"
@@ -364,6 +374,8 @@ void snx_unlock_file(intptr_t lock);
 int snx_seek(FILE* f, SnxU64 offset);
 /* f's offset from its start, past 2 GiB too; signed, so that -1 can report an error */
 int64_t snx_tell(FILE* f);
+/* f's file cut to size bytes, past 2 GiB too, with nothing of f's own buffered (its writes flushed); 0, or -1 */
+int snx_cut(FILE* f, SnxU64 size);
 
 /* 1 when the n bytes at text are well-formed UTF-8 (no overlong form, surrogate, or code point past U+10FFFF), else 0
    and the first 16 of them in hex into hex ("2a 9c e3", "..." after when there are more), when hex_size is not 0 */

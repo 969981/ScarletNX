@@ -57,6 +57,148 @@ u64 hook_memset(CPU* c, u64 dst, i32 value, u64 size) {
     (void)c, (void)value, (void)size;
     return dst;
 }
+/* codec.c's and audio_stream.c's, none reached here */
+u32 audio_open_stream_event(CPU* c, u64 stream, u64 event, u64 work, u64 size, u64 device, u64 format, i32 capacity,
+                            i32 threshold) {
+    (void)c, (void)stream, (void)event, (void)work, (void)size, (void)device, (void)format, (void)capacity,
+        (void)threshold;
+    return 0;
+}
+u32 audio_open_stream(CPU* c, u64 stream, u64 work, u64 size, u64 device, u64 format, i32 capacity, u32 flags) {
+    (void)c, (void)stream, (void)work, (void)size, (void)device, (void)format, (void)capacity, (void)flags;
+    return 0;
+}
+u32 audio_stop_stream(CPU* c, u64 stream) {
+    (void)c, (void)stream;
+    return 0;
+}
+void audio_close_stream(CPU* c, u64 stream) { (void)c, (void)stream; }
+u32 audio_purge_stream(CPU* c, u64 stream) {
+    (void)c, (void)stream;
+    return 0;
+}
+u32 audio_start_stream(CPU* c, u64 stream) {
+    (void)c, (void)stream;
+    return 0;
+}
+i32 audio_write_stream(CPU* c, u64 stream, u64 data, i32 frames) {
+    (void)c, (void)stream, (void)data, (void)frames;
+    return 0;
+}
+void audio_set_stream_gain(CPU* c, u64 stream, f32 gain, i64 fade) { (void)c, (void)stream, (void)gain, (void)fade; }
+u32 audio_stream_state(CPU* c, u64 stream) {
+    (void)c, (void)stream;
+    return 0;
+}
+void audio_stream_statistics(CPU* c, u64 stream, int reset) { (void)c, (void)stream, (void)reset; }
+u32 audio_default_virtual_output(CPU* c, u64 name) {
+    (void)c, (void)name;
+    return 0;
+}
+i32 audio_stream_free_frames(CPU* c, u64 stream) {
+    (void)c, (void)stream;
+    return 0;
+}
+i32 audio_stream_filled_frames(CPU* c, u64 stream) {
+    (void)c, (void)stream;
+    return 0;
+}
+u32 audio_virtual_output_properties(CPU* c, u64 props, u64 name) {
+    (void)c, (void)props, (void)name;
+    return 0;
+}
+i32 audio_list_virtual_inputs(CPU* c, u64 names, i32 count) {
+    (void)c, (void)names, (void)count;
+    return 0;
+}
+u32 audio_open_input(CPU* c, u64 stream, u64 work, u64 size, u64 device, u64 format, i32 capacity) {
+    (void)c, (void)stream, (void)work, (void)size, (void)device, (void)format, (void)capacity;
+    return 0;
+}
+u32 audio_open_input_event(CPU* c, u64 stream, u64 event, u64 work, u64 size, u64 device, u64 format, i32 capacity,
+                           i32 threshold) {
+    (void)c, (void)stream, (void)event, (void)work, (void)size, (void)device, (void)format, (void)capacity,
+        (void)threshold;
+    return 0;
+}
+u32 audio_start_input(CPU* c, u64 stream) {
+    (void)c, (void)stream;
+    return 0;
+}
+u32 audio_stop_input(CPU* c, u64 stream) {
+    (void)c, (void)stream;
+    return 0;
+}
+u32 audio_purge_input(CPU* c, u64 stream) {
+    (void)c, (void)stream;
+    return 0;
+}
+void audio_close_input(CPU* c, u64 stream) { (void)c, (void)stream; }
+u32 audio_input_state(CPU* c, u64 stream) {
+    (void)c, (void)stream;
+    return 0;
+}
+i32 audio_input_filled_frames(CPU* c, u64 stream) {
+    (void)c, (void)stream;
+    return 0;
+}
+i32 audio_input_free_frames(CPU* c, u64 stream) {
+    (void)c, (void)stream;
+    return 0;
+}
+i32 audio_input_capacity_frames(CPU* c, u64 stream) {
+    (void)c, (void)stream;
+    return 0;
+}
+i32 audio_read_input(CPU* c, u64 stream, u64 data, i32 frames) {
+    (void)c, (void)stream, (void)data, (void)frames;
+    return 0;
+}
+void codec_decoder_reset(CPU* c, u64 decoder) { (void)c, (void)decoder; }
+void codec_decoder_finalize(CPU* c, u64 decoder) { (void)c, (void)decoder; }
+u32 codec_decoder_init(CPU* c, u64 decoder, i32 rate, i32 channels, i64 frame, u64 manager) {
+    (void)c, (void)decoder, (void)rate, (void)channels, (void)frame, (void)manager;
+    return 0;
+}
+u32 codec_manager_execute(CPU* c, u64 manager) {
+    (void)c, (void)manager;
+    return 0;
+}
+void codec_manager_finalize(CPU* c, u64 manager) { (void)c, (void)manager; }
+u32 codec_decoder_enqueue(CPU* c, u64 decoder, u64 consumed, u64 data, u64 size) {
+    (void)c, (void)decoder, (void)consumed, (void)data, (void)size;
+    return 0;
+}
+u32 codec_manager_init(CPU* c, u64 manager, u64 event, i32 rate, i32 channels, i64 frame, i32 decoders, i32 buffers,
+                       u64 work) {
+    (void)c, (void)manager, (void)event, (void)rate, (void)channels, (void)frame, (void)decoders, (void)buffers,
+        (void)work;
+    return 0;
+}
+u64 codec_manager_work_size(CPU* c, i32 rate, i32 channels, i64 frame, i32 decoders, i32 buffers) {
+    (void)c, (void)rate, (void)channels, (void)frame, (void)decoders, (void)buffers;
+    return 0;
+}
+i32 codec_manager_free_buffers(CPU* c, u64 manager) {
+    (void)c, (void)manager;
+    return 0;
+}
+i32 codec_decoder_waiting(CPU* c, u64 decoder) {
+    (void)c, (void)decoder;
+    return 0;
+}
+u32 codec_decoder_dequeue(CPU* c, u64 decoder, u64 samples, u64 out, u64 size) {
+    (void)c, (void)decoder, (void)samples, (void)out, (void)size;
+    return 0;
+}
+i32 codec_decoder_completed(CPU* c, u64 decoder) {
+    (void)c, (void)decoder;
+    return 0;
+}
+i32 codec_decoder_executing(CPU* c, u64 decoder) {
+    (void)c, (void)decoder;
+    return 0;
+}
 
 static void put(CPU* c, u64 at, const char* s) { memcpy(c->mem + at, s, strlen(s) + 1); }
 

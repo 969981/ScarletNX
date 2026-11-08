@@ -51,7 +51,7 @@ snx_svcgen(snx_kernel)
 snx_component(hle hle/services/services.c hle/services/audren.c hle/services/audren_dsp.c hle/services/pl.c hle/services/pl_font.c hle/services/sm.c hle/services/am.c hle/services/set.c hle/services/time.c hle/services/acc.c hle/services/users.c hle/services/audio.c
               hle/services/misc.c hle/services/ldr.c hle/services/network/bsd.c hle/services/network/dns.c
               hle/services/network/nifm.c hle/services/network/ssl.c hle/services/network/ldn.c hle/services/network/room.c hle/filesystem/fs.c hle/services/hid.c hle/services/hid_motion.c hle/services/hid_touch.c hle/services/vi.c hle/services/nvdrv.c
-              hle/hook/hook.c hle/hook/libc.c hle/hook/diag.c hle/hook/verify.c hle/hook/version.c)
+              hle/hook/hook.c hle/hook/libc.c hle/hook/diag.c hle/hook/codec.c hle/hook/audio_stream.c hle/hook/verify.c hle/hook/version.c)
 # the shared fonts' stand-ins (cmake/shared_fonts.cmake), which hle/services/pl.c hands out
 target_sources(snx_hle PRIVATE "${PROJECT_BINARY_DIR}/generated/shared_fonts.c")
 # the hooks' adapters and table, generated from hle/hook/hooks.hook and the game patches' address hooks
@@ -60,7 +60,7 @@ include("${PROJECT_SOURCE_DIR}/cmake/hookgen.cmake")
 snx_hookgen(snx_hle)
 file(GLOB snx_patch_handlers CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/patches/*.c")
 target_sources(snx_hle PRIVATE ${snx_patch_handlers})
-# the IPC interfaces of the services (docs/IPC.md): their dispatchers are generated, the handlers are in the services'
+# the IPC interfaces of the services (docs/platforms/nx/ipc.md): their dispatchers are generated, the handlers are in the services'
 # files. A type is defined before the files that use it
 include("${PROJECT_SOURCE_DIR}/cmake/swipc.cmake")
 snx_swipc(snx_hle FNS ROOT "${CMAKE_CURRENT_SOURCE_DIR}" FILES
@@ -89,7 +89,7 @@ snx_ship_walk(gpu/shipped_pass.c)
 include("${PROJECT_SOURCE_DIR}/cmake/controls_atlas.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/controls_skins.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/gui_themes.cmake")
-set(platform runtime/platform/plat.c runtime/platform/plat_sdl.c runtime/platform/unattended.c
+set(platform runtime/platform/log.c runtime/platform/plat_sdl.c runtime/platform/unattended.c
              runtime/platform/backend/sdl3.c
              runtime/platform/backend/gamepad.c runtime/platform/connect.c runtime/platform/tracy.c
              runtime/platform/help.c runtime/platform/hotkeys.c runtime/platform/hud.c runtime/platform/overlay.c
@@ -122,7 +122,7 @@ snx_shaderdec(snx_shader)
 include("${PROJECT_SOURCE_DIR}/cmake/vk_extension_bans.cmake")
 snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/descriptors.c gpu/vk/descriptor_heaps.c gpu/vk/descriptor_objects.c gpu/vk/cmd.c gpu/vk/record.c gpu/vk/format.c gpu/vk/surface.c gpu/vk/texture.c
                  gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/xfb.c gpu/vk/display.c gpu/vk/compute.c
-                 gpu/vk/pending_pages.c gpu/vk/checkpoints.c gpu/vk/image_out.c gpu/vk/depth_pack.c gpu/vk/memory.c gpu/vk/resource_stats.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/blocklinear.c gpu/vk/texconv.c gpu/vk/owned.c gpu/vk/nvdec.c gpu/vk/dma.c gpu/vk/blit.c gpu/vk/msaa.c gpu/vk/ui.c gpu/texture/blocklinear.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/vma.cpp gpu/vk/gpuprof.c gpu/vk/uma.c
+                 gpu/vk/pending_pages.c gpu/vk/checkpoints.c gpu/vk/image_out.c gpu/vk/depth_pack.c gpu/vk/memory.c gpu/vk/resource_stats.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/bc7_cache.c gpu/vk/blocklinear.c gpu/vk/texconv.c gpu/vk/owned.c gpu/vk/nvdec.c gpu/vk/dma.c gpu/vk/blit.c gpu/vk/msaa.c gpu/vk/ui.c gpu/texture/blocklinear.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/vma.cpp gpu/vk/gpuprof.c gpu/vk/uma.c
                  gpu/vk/ftz_probe.c gpu/vk/vertex_input.c gpu/vk/extension_bans.c gpu/vk/pipeline_library.c
                  "${PROJECT_BINARY_DIR}/generated/vk_extension_bans_text.c"
                  gpu/vk/draw_texture.c gpu/vk/draw_texture_shader.c gpu/vk/tess_passthrough.c gpu/vk/present_quad.c gpu/vk/capture.c gpu/vk/depth_shadow.c
@@ -137,6 +137,12 @@ include("${PROJECT_SOURCE_DIR}/cmake/glsl.cmake")
 target_link_libraries(snx_vk PUBLIC snx_xxhash snx_vk_common PRIVATE snx_zstd)
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/astc.comp NAME astc_spv HEADER nx/gpu/texture/astc_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/bc7.comp NAME bc7_spv HEADER nx/gpu/texture/bc7_spv.h)
+# the fast build, every mode only where mode 6 is not close, for large levels, and mode 6 alone for the largest
+# (gpu/vk/astc.c)
+snx_glsl_spirv(snx_vk SOURCE gpu/texture/bc7.comp NAME bc7_fast_spv HEADER nx/gpu/texture/bc7_spv.h
+               DEFINES SNX_BC7_FAST=1)
+snx_glsl_spirv(snx_vk SOURCE gpu/texture/bc7.comp NAME bc7_mode6_spv HEADER nx/gpu/texture/bc7_spv.h
+               DEFINES SNX_BC7_FAST=2)
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/blocklinear.comp NAME blocklinear_spv HEADER nx/gpu/texture/blocklinear_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/texconv.comp NAME texconv_spv HEADER nx/gpu/texture/texconv_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/video/vic.comp NAME vic_spv HEADER nx/gpu/video/vic_spv.h)
@@ -486,17 +492,18 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
         set(snx_astc_plat runtime/platform/plat_posix.c runtime/platform/plat_sdl.c)
     endif()
     add_executable(snx-test-astc-vulkan "${PROJECT_SOURCE_DIR}/tests/astc_vulkan.c" "${PROJECT_SOURCE_DIR}/tests/tracy_stubs.c"
-        "${PROJECT_SOURCE_DIR}/tests/support/astc.c" gpu/vk/astc.c
+        "${PROJECT_SOURCE_DIR}/tests/support/astc.c" gpu/vk/astc.c gpu/vk/bc7_cache.c
         gpu/vk/blocklinear.c gpu/texture/blocklinear.c gpu/vk/texconv.c "${PROJECT_SOURCE_DIR}/tests/support/etc2.c"
         "${PROJECT_SOURCE_DIR}/tests/support/bcn.c"
         gpu/vk/cmd.c gpu/vk/descriptors.c gpu/vk/descriptor_heaps.c gpu/vk/descriptor_objects.c
         gpu/vk/memory.c gpu/vk/resource_stats.c gpu/vk/record.c gpu/vk/checkpoints.c gpu/vk/vma.cpp ${snx_astc_plat} "${volk_SOURCE_DIR}/volk.c"
         "${PROJECT_BINARY_DIR}/generated/spirv/astc_spv.c" "${PROJECT_BINARY_DIR}/generated/spirv/blocklinear_spv.c"
         "${PROJECT_BINARY_DIR}/generated/spirv/texconv_spv.c" "${PROJECT_BINARY_DIR}/generated/spirv/bc7_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/bc7_fast_spv.c" "${PROJECT_BINARY_DIR}/generated/spirv/bc7_mode6_spv.c"
         "${PROJECT_SOURCE_DIR}/tests/glsl/bc7_cpu.cpp")
     target_include_directories(snx-test-astc-vulkan PRIVATE "${PROJECT_SOURCE_DIR}/tests/glsl")
-    target_link_libraries(snx-test-astc-vulkan PRIVATE snx_nx_flags scarletnx-filesystem snx_xxhash Threads::Threads
-                                                      SDL3::SDL3 ${CMAKE_DL_LIBS})
+    target_link_libraries(snx-test-astc-vulkan PRIVATE snx_nx_flags scarletnx-filesystem snx_xxhash snx_vk_common
+                                                      Threads::Threads SDL3::SDL3 ${CMAKE_DL_LIBS})
     if(WIN32)
         target_link_libraries(snx-test-astc-vulkan PRIVATE powrprof)
     endif()

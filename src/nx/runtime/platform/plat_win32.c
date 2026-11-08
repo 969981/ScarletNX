@@ -1,11 +1,12 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* The platform layer on Windows: threads, condition variables, the guest's address space with its write watch, file
-   reads and maps, the environment and the crash handler (plat_sdl.c has the clocks, sleeping,
-   libraries and path queries). Paths are UTF-8, converted to wide for the W functions (the
-   manifest's UTF-8 code page makes the A functions and the CRT take UTF-8 too) */
+/* The platform layer on Windows: threads, condition variables, the guest's address space with its write watch, the
+   environment and the crash handler (plat_sdl.c has the libraries and path queries, common/platform the clocks,
+   sleeping and files). Paths are UTF-8, converted to wide for the W functions (the manifest's UTF-8 code page makes
+   the A functions and the CRT take UTF-8 too) */
 #include "nx/runtime/platform/plat.h"
 #include "common/utilities/run_mark.h"
+#include "common/platform/vm.h"
 #include "nx/runtime/main.h"
 #include "nx/runtime/options.h"
 #include "nx/runtime/platform/log.h"
@@ -19,104 +20,17 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define STACK_GUARANTEE 32768 /* room for the crash report after a stack overflow */
-#define GUARANTEE_MIN_THREAD ((size_t)256 << 10)
-
-/* ================================================================ timer resolution */
-/* The scheduler's default tick is 15.6 ms: asked once for 1 ms before the first timed wait (plat_sleep_ns's
-   high-resolution timer needs none). winmm is loaded here so the runtime doesn't link it */
-static int g_period_asked;
-static void timer_period_1ms(void) {
-    HMODULE winmm;
-    if (__atomic_load_n(&g_period_asked, __ATOMIC_ACQUIRE) || __atomic_exchange_n(&g_period_asked, 1, __ATOMIC_ACQ_REL))
-        return;
-    winmm = LoadLibraryW(L"winmm.dll");
-    if (winmm) {
-        FARPROC f = GetProcAddress(winmm, "timeBeginPeriod");
-        UINT(WINAPI * begin)(UINT);
-        if (f) {
-            memcpy(&begin, &f, sizeof begin);
-            begin(1);
-        }
-    }
-}
-
-/* ================================================================ condition variables */
-void pc_init(PCond* c) { InitializeConditionVariable(&c->c); }
-void pc_signal(PCond* c) { WakeConditionVariable(&c->c); }
-void pc_broadcast(PCond* c) { WakeAllConditionVariable(&c->c); }
-static int cond_wait(PCond* c, PMutex* m, i64 timeout_ns) {
-    DWORD ms = INFINITE;
-    if (timeout_ns >= 0) {
-        /* whole milliseconds rounded up, in u64 so a timeout near INT64_MAX can't overflow, and kept below INFINITE
-           so a long timeout neither wraps in the DWORD nor becomes a wait without end */
-        u64 r = (u64)timeout_ns / 1000000u + ((u64)timeout_ns % 1000000u != 0);
-        ms = r >= (u64)INFINITE ? INFINITE - 1 : (DWORD)r;
-        timer_period_1ms();
-    }
-    if (SleepConditionVariableSRW(&c->c, &m->l, ms, 0)) return 0;
-    return GetLastError() == ERROR_TIMEOUT;
-}
-/* the wait noted while it lasts, for a hang report (pm_waits) */
-int pc_wait(PCond* c, PMutex* m, i64 timeout_ns) {
-    int r;
-    pm_wait_note(m, __builtin_return_address(0), 1);
-    r = cond_wait(c, m, timeout_ns);
-    pm_wait_note(NULL, NULL, 0);
-    return r;
-}
-
-void plat_wait_word(u32* w, u32 v, i64 timeout_ns) {
-    DWORD ms = INFINITE;
-    if (timeout_ns >= 0) {
-        u64 r = (u64)timeout_ns / 1000000u + ((u64)timeout_ns % 1000000u != 0); /* as cond_wait rounds it */
-        ms = r >= (u64)INFINITE ? INFINITE - 1 : (DWORD)r;
-        timer_period_1ms();
-    }
-    WaitOnAddress(w, &v, sizeof v, ms);
-}
-void plat_wake_word(u32* w) { WakeByAddressAll(w); }
-
 /* ================================================================ threads */
-typedef struct {
-    PThreadFn fn;
-    void* arg;
-    int guarantee;
-} ThreadStart;
-
-static DWORD WINAPI thread_start(LPVOID p) {
-    ThreadStart s = *(ThreadStart*)p;
-    free(p);
-    if (s.guarantee) {
-        ULONG g = STACK_GUARANTEE;
-        SetThreadStackGuarantee(&g);
-    }
-    s.fn(s.arg);
-    SDL_CleanupTLS(); /* SDL's per-thread state, plat_sleep_ns's waitable timer among it */
-    return 0;
+/* what each thread plat_thread starts (common/platform/thread.c) does here: SDL's per-thread state (plat_sleep_ns's
+   waitable timer among it) ended with it, and the sampling profiler given it. A constructor, so it is in place before
+   any thread, in the runtime and in each test that compiles this file */
+static void sdl_thread_end(void) { SDL_CleanupTLS(); }
+static void profile_thread(HANDLE h) {
+    if (g_settings.profiler) plat_prof_add_thread(h);
 }
-
-int plat_thread(PThreadFn fn, void* arg, size_t stack) {
-    ThreadStart* s = malloc(sizeof *s);
-    HANDLE h;
-    if (!s) return -1;
-    s->fn = fn;
-    s->arg = arg;
-    s->guarantee = stack == 0 || stack >= GUARANTEE_MIN_THREAD;
-    h = CreateThread(NULL, stack, thread_start, s, stack ? STACK_SIZE_PARAM_IS_A_RESERVATION : 0, NULL);
-    if (!h) {
-        DWORD why = GetLastError(); /* the reason, for what the caller says */
-        free(s);
-        SetLastError(why);
-        return -1;
-    }
-    if (g_settings.profiler) plat_prof_add_thread(h); /* the profiler takes its own handle */
-    CloseHandle(h);
-    return 0;
-}
-void plat_thread_exit(void) {
-    SDL_CleanupTLS();
-    ExitThread(0);
+__attribute__((constructor)) static void plat_win32_threads(void) {
+    static const PThreadHooks hooks = {NULL, sdl_thread_end, profile_thread};
+    plat_thread_hooks(&hooks);
 }
 
 /* ================================================================ the system's low memory */
@@ -194,15 +108,6 @@ int plat_power_watch(void) {
         return -1;
     return 0;
 }
-int plat_cpus(int* ids, int max) {
-    (void)ids;
-    (void)max;
-    return 0;
-}
-void plat_thread_cpus(const int* ids, int n) {
-    (void)ids;
-    (void)n;
-}
 typedef LONG(WINAPI* RtlGetVersionFn)(RTL_OSVERSIONINFOW*);
 void plat_system_info(char* out, size_t cap) {
     static const char key[] = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
@@ -235,7 +140,6 @@ void plat_system_info(char* out, size_t cap) {
              (unsigned long)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS),
              (unsigned long long)((m.ullTotalPhys + (512ull << 20)) >> 30));
 }
-void plat_yield(void) { SwitchToThread(); }
 void plat_exit_now(int code) {
     fflush(NULL);
     snx_run_mark_end(); /* an exit: TerminateProcess runs no atexit handler */
@@ -300,9 +204,8 @@ u8* plat_vm_reserve(u64 size) {
     if (p) g_ww_watched = p;
     return p;
 }
-u8* plat_vm_reserve_unwatched(u64 size) {
-    return vm_reserved(VirtualAlloc(NULL, (SIZE_T)size, MEM_RESERVE, PAGE_NOACCESS));
-}
+/* at the 64 KiB allocation granularity, which commits any 4 KiB page */
+u8* plat_vm_reserve_unwatched(u64 size) { return (u8*)plat_mem_reserve(size, 0); }
 void plat_vm_track(u8* p, u64 size) {
     if (g_settings.write_tracking == 1)
         WARN("memory: write_tracking=1 (page protection) has no Windows version: %s\n",
@@ -359,12 +262,12 @@ void plat_ww_cool(u8* p, u64 size, void (*cb)(u8* p, u64 size)) {
 
 int plat_vm_commit(u8* p, u64 size) {
     /* MEM_COMMIT charges the whole range to the commit limit at once */
-    if (VirtualAlloc(p, (SIZE_T)size, MEM_COMMIT, PAGE_READWRITE)) return 0;
+    if (!plat_mem_protect(p, size, PLAT_MEM_READ | PLAT_MEM_WRITE)) return 0;
     WARN("memory: could not commit %llu KB (error %lu): out of memory or page file\n", (unsigned long long)(size >> 10),
          (unsigned long)GetLastError());
     return -1;
 }
-void plat_vm_decommit(u8* p, u64 size) { VirtualFree(p, (SIZE_T)size, MEM_DECOMMIT); }
+void plat_vm_decommit(u8* p, u64 size) { (void)plat_mem_decommit(p, size); }
 int plat_vm_share(u8* p, int fd, u64 size) {
     (void)p, (void)fd, (void)size;
     errno = ENOSYS;
@@ -435,9 +338,8 @@ void plat_alias_host_free(u8* p, u64 size) {
     (void)p;
     (void)size;
 }
-/* no pool, so no mirror and no traps yet: a GPU result lands at its own fence (docs/GPU_OWNERSHIP.md) */
+/* no pool, so no mirror and no traps yet: a GPU result lands at its own fence (docs/layers/gpu/ownership.md) */
 u8* plat_alias_mirror(void) { return NULL; }
-u32 plat_tid(void) { return (u32)GetCurrentThreadId(); }
 int plat_thread_in_fault(u32 tid) {
     (void)tid;
     return -1; /* no traps here */
@@ -469,86 +371,9 @@ void plat_freeze(u8* p, u64 size) {
 }
 void plat_thaw(void) {}
 
-/* ================================================================ libraries */
-void* plat_dl_loaded(const char* name) { return GetModuleHandleA(name); }
-
 /* ================================================================ environment */
 int plat_setenv(const char* name, const char* value) { return _putenv_s(name, value) ? -1 : 0; }
 
-/* ================================================================ files */
-i64 plat_pread(FILE* f, void* buf, u64 size, u64 off) {
-    HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
-    u64 got = 0;
-    if (h == INVALID_HANDLE_VALUE || size > (u64)INT64_MAX || off > (u64)INT64_MAX - size) return -1;
-    while (got < size) {
-        OVERLAPPED o;
-        DWORD want = size - got > (1u << 30) ? (1u << 30) : (DWORD)(size - got), n = 0;
-        u64 at = off + got;
-        memset(&o, 0, sizeof o);
-        o.Offset = (DWORD)at;
-        o.OffsetHigh = (DWORD)(at >> 32);
-        if (!ReadFile(h, (u8*)buf + got, want, &n, &o)) {
-            if (GetLastError() == ERROR_HANDLE_EOF) break;
-            return -1;
-        }
-        if (!n) break;
-        got += n;
-    }
-    return (i64)got;
-}
-
-static void file_map_clear(PFileMap* m) {
-    m->data = NULL;
-    m->size = 0;
-    m->borrowed = 0;
-    m->heap = 0;
-}
-static int file_map(PFileMap* m, const char* path, int ask_size, u64 size) {
-    wchar_t* w;
-    HANDLE file, section;
-    void* view;
-    file_map_clear(m);
-    w = snx_host_wpath(path); /* NULL for a path that isn't UTF-8 */
-    if (!w) return -1;
-    /* a folder doesn't open without FILE_FLAG_BACKUP_SEMANTICS, so this is a file. Others may read it, or delete or
-       rename it as on POSIX */
-    file = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-                       FILE_ATTRIBUTE_NORMAL, NULL);
-    free(w);
-    if (file == INVALID_HANDLE_VALUE) return -1;
-    if (ask_size) {
-        LARGE_INTEGER s;
-        if (!GetFileSizeEx(file, &s) || s.QuadPart < 0) {
-            CloseHandle(file);
-            return -1;
-        }
-        size = (u64)s.QuadPart;
-    }
-    if (size > (u64)SIZE_MAX || size > (u64)INT64_MAX) {
-        CloseHandle(file);
-        return -1;
-    }
-    if (!size) {
-        CloseHandle(file);
-        return 0;
-    }
-    section = CreateFileMappingW(file, NULL, PAGE_READONLY, (DWORD)(size >> 32), (DWORD)size, NULL);
-    view = section ? MapViewOfFile(section, FILE_MAP_READ, 0, 0, (SIZE_T)size) : NULL;
-    if (section) CloseHandle(section); /* the view keeps the section and the file */
-    CloseHandle(file);
-    if (!view) return -1;
-    m->data = (const u8*)view;
-    m->size = size;
-    return 0;
-}
-int plat_file_map(PFileMap* m, const char* path) { return file_map(m, path, 1, 0); }
-int plat_file_map_sized(PFileMap* m, const char* path, u64 size) { return file_map(m, path, 0, size); }
-void plat_file_unmap(PFileMap* m) {
-    if (m->heap)
-        free((void*)m->data);
-    else if (m->data && !m->borrowed) UnmapViewOfFile(m->data);
-    file_map_clear(m);
-}
 /* ================================================================ the crash handler */
 static LONG g_crash_reporting;
 static LONG g_shutdown_said;
@@ -651,11 +476,9 @@ static LONG WINAPI shutdown_note(EXCEPTION_POINTERS* e) {
 }
 
 void plat_install_crash_handler(void) {
-    ULONG g = STACK_GUARANTEE; /* the main thread's room for a report after a stack overflow */
+    ULONG g = PLAT_STACK_GUARANTEE; /* the main thread's room for a report after a stack overflow */
     SetThreadStackGuarantee(&g);
     AddVectoredExceptionHandler(1, shutdown_note);
     AddVectoredExceptionHandler(1, code_fault);
     SetUnhandledExceptionFilter(crash_filter);
 }
-
-u64 plat_monotonic_ns(void) { return 0; }

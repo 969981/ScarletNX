@@ -10,7 +10,7 @@
    stores while it runs and a later CPU write wins.
 
    A queue of its own only waits for compute, so holding signals until results land costs a dispatch's run time,
-   not the rendering backlog's (which made that ordering too slow under the old OpenGL renderer, ROADMAP.md Phase 2).
+   not the rendering backlog's (which made that ordering too slow under the old OpenGL renderer, an old roadmap phase).
    Dispatches that read textures run on the graphics queue, after everything recorded before them. */
 #include <stdlib.h>
 #include <string.h>
@@ -745,23 +745,9 @@ static CsPipe* cs_make(const u8* code, u32 blen, u64 key, u32 flow_base, u32 lx,
         p->failed = 1;
         return p;
     }
-    VkShaderModuleCreateInfo mi = {
-        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nw * 4, .pCode = spv};
-    VkShaderModule m;
-    int ok = VK_OK(vkCreateShaderModule(g_vk.dev, &mi, NULL, &m));
-    free(spv);
-    if (!ok) {
+    if (!VK_OK(snx_vk_compute_pipeline(g_vk.dev, vk_pipeline_cache(), g_vk.cs_playout, spv, (size_t)nw * 4, &p->p)))
         p->failed = 1;
-        return p;
-    }
-    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-                                      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                                                .module = m,
-                                                .pName = "main"},
-                                      .layout = g_vk.cs_playout};
-    if (!VK_OK(vkCreateComputePipelines(g_vk.dev, vk_pipeline_cache(), 1, &ci, NULL, &p->p))) p->failed = 1;
-    vkDestroyShaderModule(g_vk.dev, m, NULL);
+    free(spv);
     if (!p->failed)
         LOG_LIMIT(12, "vulkan: compute %016llx ready: block %ux%ux%u, %d global buffers, %d textures, %d images\n",
                   (unsigned long long)key, lx, ly, lz, p->si.ngbuf, p->si.ntex, p->si.nimg);
@@ -946,7 +932,7 @@ static u32 cs_read_code(u64 pa, u8* dst) {
 
 /* Storage buffers kept on the GPU (the model of Citron Neo's buffer cache, buffer_cache.h's
    BindHostComputeStorageBuffers and MarkWrittenBuffer, Copyright 2022 yuzu Emulator Project and 2025 citron Emulator
-   Project, GPL-3.0-or-later), on the ownership ScarletNX's engines already use (docs/GPU_OWNERSHIP.md), so that the
+   Project, GPL-3.0-or-later), on the ownership ScarletNX's engines already use (docs/layers/gpu/ownership.md), so that the
    guest's own pages are trapped and land only when the CPU touches them, not at a sync point. A range one resource
    holds whole is bound where it is. Any other is copied, the CPU's bytes by the CPU and the GPU's by the GPU
    (vk_guest_read_device): into staging when it is only read, into a resource of its own when it is written, which then

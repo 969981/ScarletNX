@@ -26,10 +26,14 @@
 #endif
 
 #include "hle/services/audio.swipc.inc"
+#include "common/utilities/bits.h"
 
 #define AUDIO_RATE      48000u /* the DSP's, the only rate an audio out plays at */
 #define AUDIO_FRAME_NS  5000000 /* the DSP's frame */
-#define AUDIO_REVISION  15      /* the newest renderer revision understood (Eden's CurrentRevision) */
+/* the newest renderer revision understood: Eden's CurrentRevision, 15, and the Ounce's 16 (REV@, and REv@ with its
+   lowercase v), which an SDK 22 game asks for. No feature of 16's is known: Eglantine (Eden's Ounce fork) takes its
+   native 16 as 15, and so does the renderer here (audren_dsp.c's features go by revision 15 and earlier) */
+#define AUDIO_REVISION  16
 #define AUDIO_NAME_SIZE 0x100   /* an AudioDeviceName */
 
 static const char audout_name[] = "DeviceOut";
@@ -439,7 +443,6 @@ static int nn_audio_detail_IAudioRenderer_GetVoiceDropParameter(SvcObj* self, fl
 }
 
 /* ------------------------------------------------------------ audren:u */
-static u64 align_up(u64 v, u64 a) { return (v + a - 1) & ~(a - 1); }
 
 /* the work buffer the game gives OpenAudioRenderer, in the shape of the console's (Eden's System::GetWorkBufferSize).
    The runtime keeps its state in host memory and never touches it, so the sizes of the console's structures are
@@ -447,36 +450,36 @@ static u64 align_up(u64 v, u64 a) { return (v + a - 1) & ~(a - 1); }
 static u64 work_buffer_size(const nn_audio_detail_AudioRendererParameterInternal* p) {
     u64 mixes = (u64)p->sub_mix_count + 1, size = 0, voices = p->voice_count, dests, infos;
     u32 rev = revision_number(p->revision);
-    size += align_up((u64)p->mix_buffer_count * 4, 0x40);
+    size += snx_align_up((u64)p->mix_buffer_count * 4, 0x40);
     size += (u64)p->sub_mix_count * 256 * 4; /* the submixes' effect order */
     size += mixes * 0x940;                   /* MixInfo */
     size += voices * (0x220 + 0x70 + 0x100); /* VoiceInfo, VoiceChannelResource, VoiceState */
-    size += align_up(mixes * 8, 0x10) + align_up(voices * 8, 0x10);
-    size += align_up((((u64)p->sink_count + p->sub_mix_count) * 240 * 4 + (u64)p->sample_count * 4) *
+    size += snx_align_up(mixes * 8, 0x10) + snx_align_up(voices * 8, 0x10);
+    size += snx_align_up((((u64)p->sink_count + p->sub_mix_count) * 240 * 4 + (u64)p->sample_count * 4) *
                          ((u64)p->mix_buffer_count + 6),
                      0x40);
     if (rev >= 2) { /* splitters: the mix graph's nodes and edges, then the splitters themselves */
-        size += align_up(mixes * 16 + align_up(mixes * mixes / 8 + 1, 0x10), 0x10);
+        size += snx_align_up(mixes * 16 + snx_align_up(mixes * mixes / 8 + 1, 0x10), 0x10);
         dests = p->splitter_send_channel_count;
         infos = p->splitter_count;
         size += dests * 0xE0 + infos * 0x20;
-        if (rev >= 5) size += align_up(dests * 4, 0x10);
+        if (rev >= 5) size += snx_align_up(dests * 4, 0x10);
     }
     size += ((u64)p->effect_count + voices * 4) * 0x20; /* MemoryPoolInfo */
     if (rev >= 9) size += (u64)p->effect_count * 0x80;  /* EffectResultState */
-    size = align_up(size + 0x50, 0x40);
+    size = snx_align_up(size + 0x50, 0x40);
     size += ((u64)p->sink_count + p->sub_mix_count) * 0x280; /* UpsamplerInfo */
     size += (u64)p->effect_count * 0x1B0;                   /* EffectInfoBase */
-    size += align_up(voices * 0x100, 0x40);
+    size += snx_align_up(voices * 0x100, 0x40);
     size += (u64)p->sink_count * 0x170;
     if (rev >= 9) size += (u64)p->effect_count * 0x80;
     if (p->performance_frame_count)
-        size += align_up((0x18 + (voices + p->effect_count + p->sink_count + mixes + 1) * 0x18 + 100 * 0x18) *
+        size += snx_align_up((0x18 + (voices + p->effect_count + p->sink_count + mixes + 1) * 0x18 + 100 * 0x18) *
                              ((u64)p->performance_frame_count + 1) +
                              0xC0,
                          0x100);
     size += 0x18000 + (0x40 - 1) * 2; /* the command buffer */
-    return align_up(size, 0x1000);
+    return snx_align_up(size, 0x1000);
 }
 
 static int open_renderer(const nn_audio_detail_AudioRendererParameterInternal* params, u32 process, int manual,
@@ -681,6 +684,7 @@ void audio_clock(void* arg) {
         now = plat_ns();
         SNX_ZONE_VALUE(z_audio, now > next ? (u64)(now - next) / AUDIO_FRAME_NS : 0);
         audout_tick(guest_ns());
+        outstream_tick(guest_ns());
         SNX_ZONE_END(z_audio);
         next += AUDIO_FRAME_NS;
         if (now > next + 10 * (u64)AUDIO_FRAME_NS) next = now + AUDIO_FRAME_NS;
@@ -933,6 +937,30 @@ static int hwopus_decode(HwOpus* h, const u8* in, u64 in_size, i16* out, u64 out
     *consumed = 8 + size;
     *samples = want;
     R_SUCCEED();
+}
+
+/* An Ounce game's hardware Opus decoders (hle/hook/codec.c), which its SDK runs on the audio DSP and the hooks run
+   here: the same decoding, outside the service's objects and their save states */
+HwOpus* hwopus_new(u32 rate, u32 channels) {
+    HwOpus* h = calloc(1, sizeof *h);
+    if (h && !hwopus_open(h, rate, channels, 1, channels - 1, NULL)) {
+        free(h);
+        return NULL;
+    }
+    return h;
+}
+void hwopus_delete(HwOpus* h) {
+    if (!h) return;
+    hwopus_free(h);
+    free(h);
+}
+int hwopus_decode_packet(HwOpus* h, const u8* in, u64 in_size, i16* out, u64 out_size, int reset, u32* consumed,
+                         u32* samples) {
+    int rc;
+    pm_lock(&h->lk);
+    rc = hwopus_decode(h, in, in_size, out, out_size, reset, consumed, samples);
+    pm_unlock(&h->lk);
+    return rc;
 }
 
 /* a decode command: the guest's buffers checked, the time it took in microseconds */

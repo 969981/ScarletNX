@@ -113,6 +113,27 @@ typedef struct {
     u32 rowb, th, lbh, lbd, gobs_x;
     int layers;
 } LevelSource;
+/* The part of an ASTC level's BC7 key (vk_bc7_level_key) that its guest bytes make: the words that lay its blocks out
+   in guest memory, and those bytes as the CPU has them, of each of nlayers layers. 0 when the GPU holds any of them
+   (they are not here to hash: an owner's pages hold another's bytes until they land) or memory maps them not all. What
+   is pending over them lands first, as a change check's hash has it, which can submit the frame's command buffer */
+static int astc_content(const LevelSource* l, u32 nlayers, u64 content[2]) {
+    const Surf* t = l->t;
+    const u32 layout[8] = {(u32)t->bl, t->bl ? 0 : t->pitch, l->rowb, l->th, l->lbh, l->lbd, l->gobs_x, nlayers};
+    content[0] = content[1] = 0;
+    vk_bc7_content(content, layout, sizeof layout);
+    for (u32 k = 0; k < nlayers; k++) {
+        const u64 gva = l->gva + (u64)k * t->layer_size;
+        for (u64 o = 0; o < l->lsz;) {
+            u64 cpu = 0, n = gmmu_run(gva + o, l->lsz - o, &cpu);
+            if (!n || (own_any() && own_lookup(cpu, n, NULL, 0))) return 0;
+            gmem_need(gva + o, n);
+            vk_bc7_content(content, GP(cpu), n);
+            o += n;
+        }
+    }
+    return 1;
+}
 /* A guest read while staging lands GPU results, and landing can submit the frame's command buffer: the upload's
    commands then belong to the one recording after it, with the image's transfer use established there again */
 static VkCommandBuffer upload_cb(Surf* t, VkCommandBuffer cb) {
@@ -766,6 +787,14 @@ static u32 later_encode(VkCommandBuffer cb, Surf* t, u32 left) {
         const u32 slices = is3d ? (t->depth3d >> l ? t->depth3d >> l : 1) : t->layers;
         const u32 cx = (lw + 3) / 4, cy = (lh + 3) / 4;
         const u64 room = left > used ? left - used : 1, slice_blocks = (u64)cx * cy, row_texels = (u64)lw * 4;
+        const int keyed = l < VK_TEX_MAX_LEVELS && (t->bc7.keyed >> l & 1);
+        /* a level the BC7 cache has: copied from it, a sixteenth of the encoder's cost a block counted */
+        if (keyed && !t->bc7.slice && !t->bc7.row &&
+            vk_bc7_cache_level(cb, t->bc7.img, t->bc7.key[l], l, lw, lh, slices, is3d)) {
+            used += (u32)((slice_blocks * slices + 15) / 16);
+            t->bc7.level++;
+            continue;
+        }
         u32 nz = 1, n;
         if (!t->bc7.row && slice_blocks <= room && row_texels * cy <= cap) {
             /* whole slices, as many as the blocks left and the scratch take */
@@ -781,7 +810,7 @@ static u32 later_encode(VkCommandBuffer cb, Surf* t, u32 left) {
             n = cy - t->bc7.row < k ? cy - t->bc7.row : (u32)k;
         }
         const u32 y = t->bc7.row * 4, rows = lh - y < n * 4 ? lh - y : n * 4;
-        if (!vk_bc7_encode_image(cb, t->img, t->bc7.img, l, lw, lh, is3d, t->bc7.slice, nz, y, rows)) break;
+        if (!vk_bc7_encode_image(cb, t->img, t->bc7.img, l, lw, lh, slices, is3d, t->bc7.slice, nz, y, rows)) break;
         used += cx * n * nz;
         if (n == cy)
             t->bc7.slice += nz;
@@ -790,6 +819,8 @@ static u32 later_encode(VkCommandBuffer cb, Surf* t, u32 left) {
             t->bc7.slice++;
         }
         if (t->bc7.slice == slices) {
+            /* the level whole: its blocks read back for the cache, where it has room for them now */
+            if (keyed) vk_bc7_capture_level(cb, t->bc7.img, t->bc7.key[l], l, lw, lh, slices, is3d);
             t->bc7.slice = 0;
             t->bc7.level++;
         }
@@ -890,6 +921,7 @@ static int tex_upload_(Surf* t) {
     if (t->bricks) return t->upload_valid = resident_upload(t);
     /* held as BC7 and whole: RGBA8 again, made BC7 again between frames */
     if (t->bc7_later && is_bc7(f->vk) && !later_rgba8_again(t)) return t->upload_valid = 0;
+    t->bc7.keyed = 0; /* the BC7 cache's keys of the bytes loaded now, below */
     VkCommandBuffer cb = vk_cmd();
     vk_surf_use(cb, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                 VK_ACCESS_2_TRANSFER_WRITE_BIT);
@@ -914,11 +946,27 @@ static int tex_upload_(Surf* t) {
                             : (u64)t->pitch * th * ld;
             u32 gobs_x = bl_level_gobs_x(rowb, th, ld, t->bh, t->bd, t->tile_w);
             if (f->conv == VKC_ASTC) { /* decoded on the GPU from its block rows, deswizzled on the GPU */
-                complete = up_flush(&u);
                 LevelSource ls = {t, t->gva + at, lsz, rowb, th, lbh, lbd, gobs_x, astc_layers};
+                /* the BC7 cache's key of a level held as BC7, straight (vk_astc_upload takes it) or between frames
+                   (kept for the encoder there), hashed before the upload stages the same bytes */
+                const u32 nlayers = astc_layers ? layers : 1, slices = astc_layers ? layers : ld;
+                const int straight = is_bc7(f->vk), later = t->bc7_later && !straight;
+                u64 content[2];
+                const int keyed = (straight || later) && l < VK_TEX_MAX_LEVELS && vk_astc_cached(lw, lh, slices) &&
+                                  astc_content(&ls, nlayers, content);
+                if (keyed && later) {
+                    const VkFormat bc7 = later_bc7(f->vk);
+                    vk_bc7_level_key(content, lw, lh, is3d ? ld : 1, nlayers, f->bw, f->bh,
+                                     bc7 == VK_FORMAT_BC7_SRGB_BLOCK, vk_bc7_build(lw, lh, is3d ? ld : 1),
+                                     t->bc7.key[l]);
+                    t->bc7.keyed |= 1u << l;
+                }
+                const u64* key_content = keyed && straight ? content : NULL;
+                complete = up_flush(&u); /* after the hash, which can submit: the batch's buffer is the one recording */
                 complete =
-                    complete && (astc_layers ? vk_astc_upload_layers(u.cb, t, lw, lh, l, 0, layers, astc_rows, &ls)
-                                             : vk_astc_upload(u.cb, t, 0, 0, lw, lh, ld, l, layer, astc_rows, &ls));
+                    complete &&
+                    (astc_layers ? vk_astc_upload_layers(u.cb, t, lw, lh, l, 0, layers, astc_rows, &ls, key_content)
+                                 : vk_astc_upload(u.cb, t, 0, 0, lw, lh, ld, l, layer, astc_rows, &ls, key_content));
                 u.scratch = VK_NULL_HANDLE; /* astc_rows may have grown the scratch buffer: asked for again */
                 u.cap = 0;
             } else {
@@ -1614,7 +1662,7 @@ static int level_patch_astc(Upload* u, const UpLevel* lv, u64 gva, u64 lsz, u32 
             LevelSource ls = {t, gva + k * block, lsz - k * block, rowb, 8u << lbh, lbh, lbd, 0};
             if (w > lv->lw - tx) w = lv->lw - tx;
             if (h > lv->lh - ty) h = lv->lh - ty;
-            if (!up_flush(u) || !vk_astc_upload(u->cb, t, tx, ty, w, h, 1, lv->level, lv->layer, astc_rows, &ls))
+            if (!up_flush(u) || !vk_astc_upload(u->cb, t, tx, ty, w, h, 1, lv->level, lv->layer, astc_rows, &ls, NULL))
                 return 0;
             u->scratch = VK_NULL_HANDLE; /* astc_rows may have grown the scratch buffer: asked for again */
             u->cap = 0;
@@ -1720,6 +1768,7 @@ static int tex_patch(Surf* t, const TexPieces* p) {
     for (u32 i = 0; i < p->count && ok && t->bl; i++)
         ok = tex_patch_range(&u, p->piece[i].at, p->piece[i].at + p->piece[i].n);
     ok = up_flush(&u) && ok;
+    t->bc7.keyed = 0;       /* its levels' bytes changed: no longer the cache's keys */
     if (ok) later_queue(t); /* an RGBA8 one the encoder starts on again */
     g_tex_loads.partial++;
     g_tex_loads.partial_bytes += g_tex_loads.bytes - bytes;
@@ -1791,6 +1840,37 @@ static int tex_load_pieces(Surf* t) {
     t->upload_valid = 1;
     return tex_patch(t, &p);
 }
+/* p's bytes that are t's: a layer's levels from where the layer starts, each layer_size from the last. A texture of a
+   base level on, as a shader binds one level of a mip chain, has the whole chain's layer as its stride, and the bytes
+   between its layers are the chain's other levels. Writes there (each other level written through a view of its own,
+   surface.c publish_own) aren't the texture's, and loaded all of it when they were more than half its span */
+static void pieces_own(const Surf* t, TexPieces* p) {
+    u64 between = (u64)(t->layers - 1) * t->layer_size;
+    if (p->all || !p->count || t->layers < 2 || t->size <= between || t->size - between >= t->layer_size) return;
+    u64 own = t->size - between;
+    TexPieces q;
+    q.count = 0, q.all = 0;
+    for (u32 i = 0; i < p->count; i++) {
+        u64 at = p->piece[i].at, end = at + p->piece[i].n;
+        for (u64 k = at / t->layer_size; k < t->layers && k * t->layer_size < end; k++) {
+            u64 lo = k * t->layer_size, hi = lo + own;
+            if (lo < at) lo = at;
+            if (hi > end) hi = end;
+            if (lo < hi) pieces_add(&q, lo, hi - lo);
+        }
+    }
+    *p = q;
+}
+/* p without the pieces that t's last publish as a storage image still owns, not written since (vk_guest_owned_by):
+   memory there holds t's own texels. The GPU's records are of pages, and the views of a cube's last levels share
+   theirs: each view's publish marked the others' texels written, and each loaded them again every frame */
+static void pieces_published(const Surf* t, u64 gva, TexPieces* p) {
+    u32 n = 0;
+    if (p->all || !t->pub_serial) return;
+    for (u32 i = 0; i < p->count; i++)
+        if (!vk_guest_owned_by(gva + p->piece[i].at, p->piece[i].n, t->pub_serial)) p->piece[n++] = p->piece[i];
+    p->count = n;
+}
 /* the checks of a texture loaded a piece at a time (tex_can_piece; with holes, or loaded whole): the pages the GPU's
    records and write tracking name since the last ones, loaded once both were asked, so the image holds what either
    found. 0 when write tracking can't tell: checked by contents (an engine's write after that check in the same epoch
@@ -1813,6 +1893,8 @@ static int tex_check_pieces(Surf* t, u64 gva) {
         if (!r.mapped) p.all = 1; /* found through the guest's addresses alone (SNX_ALIAS_CHECK) */
     }
     t->gw = gw;
+    pieces_own(t, &p);
+    pieces_published(t, gva, &p);
     if (p.count || p.all) {
         t->stable = 0;
         tex_patch(t, &p);
@@ -2092,17 +2174,38 @@ texture_from_memory:
         return NULL;
     }
     u32 fkey = (tic[0] & 0x7FFFF) | ((u32)srgb << 31) | ((u32)raw << 30);
+    /* A texture sampled through its sRGB or its linear twin is the same image: its views take the header's sRGB-ness
+       (vk_tex_view, from vk_view_formats' list), as a render target's twins do above. A twin made apart from it held
+       the same bytes twice, and each saw the other's writes only through guest memory: one game's compute program
+       stores a 2560x1440 RGBA8 frame through a linear header and its draw samples it through an sRGB one, and that
+       twin loaded the 15 MB frame from the storage image's owner again every frame (a copy, a deswizzle and an
+       upload). A sampled lookup takes the twin that holds memory's bytes now (nothing written since it was checked,
+       as a storage image right after its publish, vk_tex_note_writeback), else its own, which the check below loads
+       again as before. A storage or raw lookup keeps its own format, which its views need */
+    Surf *same = NULL, *twin = NULL;
     for (Surf* t = vk_surf_first(gva); t; t = t->next) {
         if (t->is_rt || t->gva != gva || t->w != w || t->h != h || t->layers != layers || t->depth3d != d3 ||
-            t->fkey != fkey || t->levels != levels || t->type != vt || t->bl != (u32)bl || t->bh != bh || t->bd != bd ||
+            t->levels != levels || t->type != vt || t->bl != (u32)bl || t->bh != bh || t->bd != bd ||
             t->tile_w != tile_w || t->pitch != pitch || t->layer_size != stride || t->msaa != msaa)
             continue;
-        return tex_check(t, gva);
+        if (t->fkey == fkey) {
+            if (!same) same = t;
+        } else if (!twin && !storage && !raw && t->fkey == (fkey ^ (1u << 31)) && t->f.vk != f.vk &&
+                   vk_srgb_as(t->f.vk, srgb) == f.vk && t->f.conv == f.conv && !t->f.depth)
+            twin = t;
     }
+    if (twin &&
+        (!same || (gpu_mem_dirty_since(same->gw, gva, same->size) && !gpu_mem_dirty_since(twin->gw, gva, twin->size))))
+        same = twin;
+    if (same) return tex_check(same, gva);
     if (!format_samples(f.vk)) return NULL;
-    /* this texture's levels in one layer; the layers before the last one take their whole stride */
+    /* this texture's levels in one layer; the layers before the last one take their whole stride. Its levels from the
+       base level on, of the base level's size and blocks: of the size of level 0 (gw, gh), a view of one level of a
+       128x128 cube's mip chain took the bytes of a 128x128 level from that level's start in each layer, which reached
+       over the next levels, and loaded each again when another view wrote one of them */
     u64 sz = 0;
-    for (u32 l = 0; l < levels; l++) sz += bl ? bl_level_size(gw, gh, d3, &f, bh, bd, tile_w, l, NULL, NULL) : stride;
+    u32 vw = w << ds_msaa_log2_x(msaa), vh = h << ds_msaa_log2_y(msaa);
+    for (u32 l = 0; l < levels; l++) sz += bl ? bl_level_size(vw, vh, d3, &f, bh, bd, tile_w, l, NULL, NULL) : stride;
     sz += stride * (layers - 1);
     TexRuns runs = {0};
     int holes = 0;

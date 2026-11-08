@@ -438,7 +438,7 @@ static void renderer_failed(const char* what) {
     if (why && why[0]) fatal("%s: %s.", what, why);
     fatal("%s (see the log). ScarletNX needs a GPU and driver with Vulkan 1.3.", what);
 }
-/* The Vulkan driver this run picked (the game's vulkan_driver, docs/APPLE.md): on a Mac the library SDL loads, and for
+/* The Vulkan driver this run picked (the game's vulkan_driver, docs/hosts/apple.md): on a Mac the library SDL loads, and for
    KosmicKrisp the ICD the Vulkan loader takes; elsewhere the system's, which moltenvk and kosmickrisp also take, said.
    Once a run, before SDL opens the window or the headless renderer its loader */
 static const SnxVulkanDriver* vulkan_driver(void) {
@@ -483,7 +483,7 @@ static const SnxVulkanDriver* vulkan_driver(void) {
 
 void video_init(const char* title, const char* addons) {
     /* MoltenVK's library or the KosmicKrisp loader, before SDL opens the window and loads one of its own, or the
-       headless renderer one (docs/APPLE.md); and the setting checked on every system */
+       headless renderer one (docs/hosts/apple.md); and the setting checked on every system */
     vulkan_driver();
     if (g_opt_headless) {
         /* No SDL video subsystem: this also works without DISPLAY, WAYLAND_DISPLAY or a seat. */
@@ -638,7 +638,7 @@ static void set_fullscreen(int on) {
     else
         LOG("video: fullscreen %s failed: %s\n", on ? "on" : "off", SDL_GetError());
 }
-/* ---- a fatal error's box (plat.c's fatal): the game's menu panel (overlay.c) with the error, what it means and what
+/* ---- a fatal error's box (log.c's fatal): the game's menu panel (overlay.c) with the error, what it means and what
    to do, until the player closes it. The game's renderer lets go of the window first (its device may be what was
    lost), and an SDL renderer of its own draws the panel's quads from the same atlas ---- */
 static char* g_fatal_left; /* an error another thread left for the main thread to show */
@@ -796,7 +796,7 @@ static int fatal_screen(const char* msg) {
     panel.msg = msg;
     panel.how = what;
     panel.focus = SNX_OVERLAY_ERROR_CLOSE;
-    /* the log plat.c writes, in the state folder. Beside the game that is argv[0]'s folder, which may be relative (./
+    /* the log log.c writes, in the state folder. Beside the game that is argv[0]'s folder, which may be relative (./
        for ./MyGame): Share Log and a file URI need an absolute path */
     snprintf(log_path, sizeof log_path, "%s%s.log", g_statedir, g_exename);
     full = snx_absolute(log_path);
@@ -805,7 +805,7 @@ static int fatal_screen(const char* msg) {
 #ifdef __ANDROID__
     snprintf(what, sizeof what, "%s", how);
 #else
-    /* a link only to a log that is there: plat.c makes it once the game's code has loaded, so an error before that has
+    /* a link only to a log that is there: log.c makes it once the game's code has loaded, so an error before that has
        none, and the path stays plain text */
     if (snx_is_file(log_path) && fatal_log_url(log_path, log_url, sizeof log_url)) {
         snprintf(what, sizeof what, "%s", how);
@@ -919,12 +919,12 @@ static int fatal_screen(const char* msg) {
     SDL_DestroyRenderer(r);
     return 1;
 }
-/* plat.c's fatal error: the screen above on the main thread, which owns the window; SDL's box when it can't be drawn.
+/* log.c's fatal error: the screen above on the main thread, which owns the window; SDL's box when it can't be drawn.
    From another thread, the main thread's loop (video_poll) shows it, and this thread waits for the exit; when the main
    thread doesn't come (held up elsewhere), Windows' own box (it takes any thread) and none on Linux: the error is in
    the log and on stderr. Nothing for an unattended run, where nobody would close it */
 void win_fatal_box(const char* msg) {
-    /* beside the launcher's log (docs/USAGE.md#folders), whose Share Log sends it, for a game of a data folder: in that
+    /* beside the launcher's log (docs/user/usage.md#folders), whose Share Log sends it, for a game of a data folder: in that
        folder's state folder; another folder's game beside its own log, or before it has one in its folder; on iOS in
        the app's Documents' logs/, which the Files app shows, since a phone shows no stderr */
     {
@@ -1695,7 +1695,7 @@ void video_poll(void) {
     vpad_showcase_input(b, st); /* what the game takes, a replay's included */
     ui_unlock();
     pm_unlock(&g_host.hid.input_lock);
-    gamepad_console(pb >> 10 & 1, SDL_GetTicksNS()); /* out of the input's lock: a pause stops the game's threads */
+    gamepad_console(pb >> 10 & 1, plat_ns()); /* out of the input's lock: a pause stops the game's threads */
     keyboard_sync();
 }
 
@@ -1733,7 +1733,7 @@ void frontend_frame(void) {
     int full = log_full_take();
     g_press.listening = 0; /* the game's first thread runs: its presses are its own */
     g_press.kind = PRESS_NONE;
-    if (full) { /* the log's first cut (plat.c), said over the game once */
+    if (full) { /* the log's first cut (log.c), said over the game once */
         snprintf(p, sizeof p, "Log full at %d MiB: older lines cut (Debug > Log size limit)", full);
         ui_lock();
         overlay_toast(p, plat_ns());

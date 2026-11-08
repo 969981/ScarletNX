@@ -928,6 +928,7 @@ static void am_applet_destroy(SvcObj* o) {
     kobj_unref(kobj_at(a->state_ev));
     kobj_unref(kobj_at(a->out_ev));
     kobj_unref(kobj_at(a->interactive_ev));
+    kobj_unref(kobj_at(a->unknown170_ev));
 }
 static void am_applet_finish(LibApplet* a) {
     a->completed = 1;
@@ -936,6 +937,8 @@ static void am_applet_finish(LibApplet* a) {
 /* the applet has finished by the time the game looks, its state changed and its output there; an inline keyboard
    runs until it is finalized */
 static SvcObj* am_applet_new(u32 applet_id, u32 mode) {
+    /* an Ounce's SDK numbers the same applets from 0x01000000, and has a second of some at 0x01010000 */
+    if (applet_id >> 24 == 1) applet_id &= 0xff;
     SvcObj* o = nn_am_service_ILibraryAppletAccessor_new_data(g_hle.am.applets, g_hle.am.applet_next, "library applets");
     LibApplet* a = (LibApplet*)o->data;
     a->applet_id = applet_id;
@@ -943,6 +946,7 @@ static SvcObj* am_applet_new(u32 applet_id, u32 mode) {
     a->state_ev = owned_event("am:applet state changed");
     a->out_ev = owned_event("am:applet out data");
     a->interactive_ev = owned_event("am:applet interactive out data");
+    a->unknown170_ev = owned_event("am:applet unknown 170");
     a->kb_max = SWKBD_TEXT_CHARS - 1;
     o->destroy = am_applet_destroy;
     if (applet_id == AM_APPLET_SWKBD) LOG("am: library applet %#x (mode %u)\n", applet_id, mode);
@@ -1174,7 +1178,11 @@ static int am_kb_wait(OverlayKeyboard* k, char* out, size_t size) {
 /* the software keyboard as a whole applet: swkbd_text's answer (--swkbd_text=, for scripted runs), else the box's
    (am_kb_unasked's without a window). KeyboardConfig (SwkbdConfigCommon, the second storage, as Eden's
    applet_software_keyboard_types.h lays it out) gives the texts, the kind, the length limits, whether the answer is
-   UTF-8, and where the initial text is in the work buffer (the third) */
+   UTF-8, and where the initial text is in the work buffer (the third). An Ounce game's SDK sends KbdConfigForGen2
+   instead (nn::swkbd::keyboardConfig2kbdConfig), of this size: its texts, limits and password are in the same place, but
+   the UTF-8 flag and the work buffer's fields aren't. Read where they were, the game that asked for UTF-8 got UTF-16 and
+   took the name a player typed for its first letter */
+#define AM_SWKBD_GEN2  0x530
 #define AM_SWKBD_OUT   0x7d8                       /* SwkbdResult and the 0x7d4 byte string buffer */
 #define AM_SWKBD_UNITS ((AM_SWKBD_OUT - 4) / 2 - 1) /* the UTF-16 text that fits with its terminator */
 static SvcObj* am_swkbd(LibApplet* a) {
@@ -1201,10 +1209,11 @@ static SvcObj* am_swkbd(LibApplet* a) {
             k.min = snx_ld_le32(cfg + 0x3b0); /* min_text_length */
         }
         if (size >= 0x3d4) {
+            int gen2 = size >= AM_SWKBD_GEN2;
             k.password = snx_ld_le32(cfg + 0x3b4) != 0; /* password_mode */
-            utf8 = cfg[0x3bd];
-            off = snx_ld_le32(cfg + 0x3c0); /* initial_string_offset and _length, in the work buffer */
-            len = snx_ld_le32(cfg + 0x3c4);
+            utf8 = cfg[gen2 ? 0x3aa : 0x3bd];
+            off = snx_ld_le32(cfg + (gen2 ? 0x3bc : 0x3c0)); /* initial_string_offset and _length, in the work buffer */
+            len = snx_ld_le32(cfg + (gen2 ? 0x3c0 : 0x3c4));
         }
     }
     am_kb_least(&k);
@@ -1684,6 +1693,10 @@ static int nn_am_service_ILibraryAppletAccessor_GetPopOutDataEvent(SvcObj* self,
 }
 static int nn_am_service_ILibraryAppletAccessor_GetPopInteractiveOutDataEvent(SvcObj* self, u32* event) {
     *event = ev_handle(((LibApplet*)self->data)->interactive_ev);
+    R_SUCCEED();
+}
+static int nn_am_service_ILibraryAppletAccessor_GetUnknown170Event(SvcObj* self, u32* event) {
+    *event = ev_handle(((LibApplet*)self->data)->unknown170_ev);
     R_SUCCEED();
 }
 static int nn_am_service_ILibraryAppletAccessor_GetLibraryAppletInfo(SvcObj* self,
