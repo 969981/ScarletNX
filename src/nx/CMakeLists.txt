@@ -379,6 +379,11 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     add_test(NAME vulkan_storage_buffer_keep COMMAND snx-test-vulkan -H --vk_memory=1)
     set_tests_properties(vulkan_storage_buffer_keep PROPERTIES TIMEOUT 60 ENVIRONMENT "SNX_TEST_BUFFER_KEEP_ONLY=1"
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
+    # the budget's trim alone (tests/vulkan_trim.inc): a trim that wants more than everything held would take what the
+    # other checks hold
+    add_test(NAME vulkan_trim COMMAND snx-test-vulkan -H)
+    set_tests_properties(vulkan_trim PROPERTIES TIMEOUT 30 ENVIRONMENT "SNX_TEST_TRIM_ONLY=1"
+        PASS_REGULAR_EXPRESSION "PASS headless Vulkan trim only" FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     # every check again with graphics descriptors in descriptor buffers (gpu/vk/descriptors.c, vk_descriptors_mode),
     # also with guest memory read in place, under the validation layer when it is installed. A device without
     # VK_EXT_descriptor_buffer skips them (77). The layer reports errors only: the targetless-stores check draws with
@@ -427,6 +432,11 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     # target's baseline cools its pages, or its write-back keeps the CPU's old bytes over its pixels
     add_test(NAME vulkan_headless_hot COMMAND snx-test-vulkan -H --write_tracking=1 --write_tracking_hot=1)
     set_tests_properties(vulkan_headless_hot PROPERTIES TIMEOUT 60
+        FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
+    # the checks of guest memory read in place again with the write tracking by page protection: the driver takes an
+    # import's pages for writing, and amdgpu refuses those a scan left protected (VK_ERROR_INVALID_EXTERNAL_HANDLE)
+    add_test(NAME vulkan_uma_hot COMMAND snx-test-vulkan -H --vk_memory=2 --write_tracking=1 --write_tracking_hot=1)
+    set_tests_properties(vulkan_uma_hot PROPERTIES TIMEOUT 60 ENVIRONMENT "SNX_TEST_UMA_ONLY=1"
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     # the write tracking's contract alone (tests/vulkan_write_tracking.inc), with each way the host tracks: its own
     # (userfaultfd on Linux), page protection and the fault handler for the tracking and the traps (macOS, FreeBSD,

@@ -3624,12 +3624,16 @@ static int resident_texture(const RsFmt* as, u32 size, u32 layers, u64 gva, u64 
     CHECK(t->bytes == want + block && !rs_differ("a tile mapped", t, whole, &r));
     CHECK(bytes[1] - bytes[0] == RS_TILE); /* the tile alone (an ASTC one made whole, its memory no longer with
                                                holes, is checked by its hash) */
-    /* a tile unmapped: its memory goes, it reads zeros */
+    /* a tile unmapped: its memory goes, it reads zeros. Each step comes 7 frames (14 presents) after the one before: an
+       ASTC texture made whole and held as BC7, written again within the frames its encode takes and one, is held Exact
+       (texture.c later_soon), RGBA8 where the resident one is BC7 */
+    CHECK(!rs_frames(&r, &ref, t, whole, 7));
     for (u32 j = 0; j < 2; j++) gmmu_space_unmap((j ? ref_gva : gva) + rs_page(&r, at[made + 1]) * RS_TILE, RS_TILE);
     CHECK(!rs_frames(&r, &ref, t, whole, 1));
     CHECK(t->bytes == want && !rs_differ("a tile unmapped", t, whole, &r));
     /* a mip tail unmapped, its memory released and freed once the frames are done; then 4 KiB of it mapped again from
        another page: the tail bound again, likely over the memory it had, and loaded whole, the rest of it zeros */
+    CHECK(!rs_frames(&r, &ref, t, whole, 7));
     for (u32 j = 0; j < 2; j++) gmmu_space_unmap((j ? ref_gva : gva) + rs_page(&r, at[tail]) * RS_TILE, RS_TILE);
     CHECK(!rs_frames(&r, &ref, t, whole, 1));
     const u64 untailed = t->bytes;
@@ -3640,6 +3644,7 @@ static int resident_texture(const RsFmt* as, u32 size, u32 layers, u64 gva, u64 
         vk_cmd();
     }
     vk_unlock();
+    CHECK(!rs_frames(&r, &ref, t, whole, 7));
     for (u32 j = 0; j < 2; j++)
         gmmu_map((j ? ref_gva : gva) + rs_page(&r, at[tail]) * RS_TILE, cpu + (u64)(made + 2) * RS_TILE, 0x1000);
     CHECK(!rs_frames(&r, &ref, t, whole, 1));
@@ -3956,7 +3961,10 @@ static int resident_in_flight(const RsFmt* as, u64 gva, u64 ref_gva, u64 cpu) {
     vk_readback_ready();
     memcpy(got[4], back + 64, n);
     vk_unlock();
-    if (as->astc) { /* the texture made whole over the same pages, for what the tile holds now */
+    if (as->astc) {
+        /* the texture made whole over the same pages, for what the tile holds now; written 5 frames after it was made,
+           past the 3 its encode takes and one, as held Exact it would be RGBA8 (texture.c later_soon) */
+        for (int i = 0; i < 4; i++) CHECK(sv_frame(ref.tic) == whole);
         gmmu_map(ref_gva + rs_page(&r, a) * RS_TILE, cpu + 2 * (u64)RS_TILE, RS_TILE);
         CHECK(sv_frame(ref.tic) == whole);
     }
@@ -5247,6 +5255,7 @@ static int check_uma_page_changes(void) {
 #include "vulkan_storage_buffer_keep.inc"
 #include "vulkan_fragment_barrier.inc"
 #include "vulkan_capture_cap.inc"
+#include "vulkan_trim.inc"
 
 /* key's row among the settings the runtime applies itself (options.c's), or NULL */
 static const IniOpt* setting_row(const char* key) {
@@ -5733,6 +5742,13 @@ static int run_headless(int argc, char** argv) {
         printf("PASS headless Vulkan vertex input only: %u validation messages\n", g_vk_validation_messages);
         return 0;
     }
+    if (getenv("SNX_TEST_TRIM_ONLY")) { /* the budget's trim alone: a trim that wants everything takes the others' */
+        CHECK(!check_trim_working_set());
+        vk_finish();
+        vk_pipeline_quiesce();
+        printf("PASS headless Vulkan trim only: %u validation messages\n", g_vk_validation_messages);
+        return 0;
+    }
     if (getenv("SNX_TEST_PASS_BREAKS_ONLY")) { /* vulkan_pass_breaks.inc's checks alone */
         CHECK(!check_pass_breaks());
         vk_pipeline_quiesce();
@@ -5772,12 +5788,16 @@ static int run_headless(int argc, char** argv) {
         if (!strcmp(name, "feedback") && ++ran) CHECK(!check_uma_feedback());
         if (!strcmp(name, "publish") && ++ran) CHECK(!check_uma_publish());
         if (!strcmp(name, "dispatch") && ++ran) CHECK(!check_uma_dispatch());
+        if (!strcmp(name, "texture_pending") && ++ran) CHECK(!check_uma_texture_pending());
+        if (!strcmp(name, "dispatch_constants") && ++ran) CHECK(!check_uma_dispatch_constants());
+        if (!strcmp(name, "header_words") && ++ran) CHECK(!check_uma_header_words());
         if (!strcmp(name, "placed") && ++ran) CHECK(!check_uma_placed());
         if (!strcmp(name, "placed_view") && ++ran) CHECK(!check_uma_placed_view());
         if (!ran) {
             fprintf(stderr,
                     "SNX_TEST_UMA_ONLY=%s names no check: 1, runtime_write, constants, migrate, way, region_writes, "
-                    "region_merge, writes, feedback, publish, dispatch, placed or placed_view\n",
+                    "region_merge, writes, feedback, publish, dispatch, texture_pending, dispatch_constants, "
+                    "header_words, placed or placed_view\n",
                     name);
             return 2;
         }
@@ -5795,6 +5815,9 @@ static int run_headless(int argc, char** argv) {
         CHECK(!check_uma_feedback());
         CHECK(!check_uma_publish());
         CHECK(!check_uma_dispatch());
+        CHECK(!check_uma_texture_pending());
+        CHECK(!check_uma_dispatch_constants());
+        CHECK(!check_uma_header_words());
         CHECK(!check_uma_placed());
         CHECK(!check_uma_placed_view());
         CHECK(!check_uma_page_changes());
@@ -5897,6 +5920,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_mesh_inputs());
     CHECK(!check_lone_lane());
     CHECK(!check_frag_coord_origin());
+    CHECK(!check_rt_other_layout());
     CHECK(!check_vertex_restride());
     CHECK(!check_vertex_input_layouts());
     CHECK(!check_vertex_input_file_key());
@@ -5960,6 +5984,9 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_uma_feedback());
     CHECK(!check_uma_publish());
     CHECK(!check_uma_dispatch());
+    CHECK(!check_uma_texture_pending());
+    CHECK(!check_uma_dispatch_constants());
+    CHECK(!check_uma_header_words());
     CHECK(!check_uma_placed());
     CHECK(!check_uma_placed_view());
     CHECK(!check_uma_page_changes());

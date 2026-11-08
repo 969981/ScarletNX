@@ -144,8 +144,18 @@ u64 vk_cs_skipped(char* why, size_t size) {
 
 static u8 g_cb[QMD_NUM_CONST_BUFFERS][MAX_CONST_BUFFER_BYTES];
 static u32 g_cbn[QMD_NUM_CONST_BUFFERS];
+/* The constant buffers a pending write in place covers: g_cb doesn't hold them. The GPU copies them for the dispatch,
+   after the write, and the CPU reads them, waiting for the submit, only for words a translation depends on. One game's
+   dispatches bound 256 bytes of constants such a write covered once a frame, and the wait held the GPU thread for about
+   18 ms of each frame with the GPU idle behind it */
+static u32 g_cb_later;
+static u64 g_cb_at[QMD_NUM_CONST_BUFFERS];
 static int cs_cb_read(u32 idx, u32 off, u32* out) {
     if (idx < QMD_NUM_CONST_BUFFERS && off + 4 <= g_cbn[idx]) {
+        if (g_cb_later >> idx & 1) {
+            g_cb_later &= ~(1u << idx);
+            gmem_read(g_cb_at[idx], g_cb[idx], g_cbn[idx]);
+        }
         *out = snx_ld_le32(g_cb[idx] + off); /* g_cb keeps the guest's bytes, for the uniform buffers */
         return 1;
     }
@@ -1032,6 +1042,7 @@ void vk_dispatch(const DispatchState* d) {
     cs_init();
     cs_take_loaded();
     /* the constant buffers bound (reading them lands results they overlap), or the dispatch's inline blocks */
+    g_cb_later = 0;
     for (u32 i = 0; i < QMD_NUM_CONST_BUFFERS; i++) {
         g_cbn[i] = 0;
         if (!(d->cb_on >> i & 1)) continue;
@@ -1044,6 +1055,11 @@ void vk_dispatch(const DispatchState* d) {
         u32 sz = d->cb_size[i];
         if (!sz || sz > sizeof g_cb[i]) sz = sizeof g_cb[i];
         g_cbn[i] = sz;
+        if (vk_uma_pending(d->cb_addr[i], sz)) {
+            g_cb_later |= 1u << i;
+            g_cb_at[i] = d->cb_addr[i];
+            continue;
+        }
         gmem_read(d->cb_addr[i], g_cb[i], sz);
     }
     /* Recheck code at a new submit or instruction invalidation, as vk_shader_get does: unchanged by write tracking
@@ -1338,7 +1354,14 @@ rebind:
                 o = arena_alloc(range);
                 dst = g_ar_ptr + o;
             }
-            memcpy(dst, g_cb[i], n);
+            if (g_cb_later >> i & 1 && deferred) {
+                vk_render_end(); /* copies happen outside rendering passes */
+                vk_guest_read(g_cb_at[i], n, dst, cbuf, o);
+            } else {
+                u32 unused;
+                if (g_cb_later >> i & 1) cs_cb_read((u32)i, 0, &unused); /* the arena isn't a copy's target */
+                memcpy(dst, g_cb[i], n);
+            }
             memset(dst + n, 0, range - n);
             if (!i) {
                 cb0_buf = cbuf;
@@ -1484,6 +1507,27 @@ rebind:
                 return;
             }
             vk_gmem_words(tic_base + (h & 0xFFFFF) * 32ull, tic, 8);
+            /* a slot with nothing bound (an empty header): an empty image, which nothing writes back. One game's
+               program that makes a texture's levels from its first has seven image slots, one for each level, and
+               the game leaves those past the texture's last level empty (images 4 to 6 of a texture of 4 levels).
+               Skipped whole for them, the dispatch left levels 1 to 3 zero, and the trilinear lookups of the
+               texture drew a dark square under the game's kart */
+            VkImageView null_view = VK_NULL_HANDLE;
+            Surf* null_image = vk_tic_empty(tic)
+                                   ? vk_null_storage(vk_storage_image_type(&p->si, i), p->si.img[i].kind, &null_view)
+                                   : NULL;
+            if (null_image) {
+                vk_surf_use(vk_cmd(), null_image, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                            VK_STORAGE_IMAGE_ACCESS);
+                ii[p->si.ntex + i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, null_view, VK_IMAGE_LAYOUT_GENERAL};
+                w[nw++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                                 .dstSet = set,
+                                                 .dstBinding = SNX_VKB_IMG + i,
+                                                 .descriptorCount = 1,
+                                                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                 .pImageInfo = &ii[p->si.ntex + i]};
+                continue;
+            }
             Surf* t = vk_tex_from_tic_storage(tic);
             u64 image_bytes;
             VkImageView view = vk_storage_image_view(t, &p->si, i, &image_bytes);

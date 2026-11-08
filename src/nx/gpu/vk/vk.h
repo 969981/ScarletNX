@@ -300,6 +300,9 @@ void vk_uma_host_barrier(VkCommandBuffer cb, u64 frame); /* at that submit's end
 int vk_uma_pending(u64 gva, u64 len);                    /* an in-place write is pending over GPU range [gva, +len) */
 int vk_uma_pending_cpu(u64 cpu, u64 len);                /* the same by guest address */
 u64 vk_uma_out_adds(void);                               /* in-place writes added so far, as vk_buf_adds counts */
+/* the waits for a submit with an in-place write since the last statistics line (every 600 presents): a test tells by a
+   change in it that a read waited, where a write the GPU finished meanwhile is no longer pending either */
+u64 vk_uma_out_waits(void);
 /* the runtime's CPU is about to read [gva, gva + len): the in-place writes pending there are done first (gmem_need's
    hook), unless the calling thread copies them on the GPU (vk_uma_gpu_reads) */
 void vk_uma_mem_need(u64 gva, u64 len);
@@ -806,6 +809,11 @@ typedef struct Surf {
     /* textures: an ASTC one held as BC7 whose image is RGBA8 until the BC7 encoder has made its BC7 one between frames
        (texture.c vk_tex_later_frame), and again each time the game writes it whole */
     u8 bc7_later;
+    /* held Exact for its writes (texture.c later_wrote): the game wrote it again before the encoder could have made its
+       BC7 image, so it stays RGBA8 until it goes unwritten a while (later_cool); and the present it was last written
+       in, plus one (0: never) */
+    u8 bc7_hot;
+    u32 bc7_wrote;
     /* that BC7 image while it is made (VK_NULL_HANDLE before the encoder starts on it), its memory, and how far the
        encoder got: level, then slice (a layer, or a 3D level's depth slice) and row of BC7 blocks, from the RGBA8
        image's texels of write generation wgen. queued: in the encoder's queue */
@@ -1216,10 +1224,14 @@ int vk_ms_pack(VkCommandBuffer cb, Surf* s, u32 layer, VkBuffer buf, u64 off, u3
 /* surface.c: a multisampled surface's samples loaded from guest memory (a texture's upload): 0 when they can't be */
 int vk_ms_load(Surf* s);
 
-/* n little-endian words of guest memory at gva as host numbers (texture and sampler headers, constant buffer words),
-   as gmem_read reads them */
+/* n little-endian words of a texture or sampler header in guest memory at gva as host numbers, as gmem_read reads them.
+   No program writes headers, so a program's pending write in place that covers them isn't waited for: one game's
+   dispatches found one over their headers in each frame, and the wait held the GPU thread for about 20 ms of each
+   frame with the GPU idle behind it */
 static inline void vk_gmem_words(u64 gva, u32* w, u32 n) {
+    vk_uma_gpu_reads(1);
     gmem_read(gva, w, (u64)n * 4);
+    vk_uma_gpu_reads(0);
     snx_le32_array(w, n);
 }
 
@@ -1247,6 +1259,13 @@ VkImageView vk_tex_storage_view(Surf* s, VkImageViewType type);
 /* an empty texture of a view type: num 0 float, 1 unsigned, 2 signed integer, 3 depth at 1.0 (shadow samplers);
    ms: a multisampled one (2D and 2D array views, not depth) */
 VkImageView vk_null_view(VkImageViewType type, int num, int ms);
+/* An image slot a program declares whose header is empty (word 0 zero: no format, nothing bound there): a 1x1 storage
+   image of zeros, its format by the slot's kind (ShaderInfo.img[].kind), viewed as type (2D, 2D array or 3D) in
+   *view. The caller makes it ready for its stage (vk_surf_use, layout GENERAL) and writes nothing of it back. NULL
+   when it can't be made */
+Surf* vk_null_storage(VkImageViewType type, int kind, VkImageView* view);
+/* a storage image header with nothing bound: no format and no component types in word 0 */
+static inline int vk_tic_empty(const u32* tic) { return tic[0] == 0; }
 /* the sampler for a TSC: raise lets anisotropy= raise its filtering (a 2D texture with mipmaps), integer gives its
    border color as integers (an integer texture) */
 VkSampler vk_sampler(const u32* tsc, int raise, int integer);
@@ -1262,10 +1281,11 @@ void vk_tex_later_frame(void);
 /* s goes: its place in the queue and the BC7 image being made for it with it (surface.c surf_free) */
 void vk_tex_later_forget(Surf* s);
 /* statistics since the start: textures made BC7, the RGBA8 bytes that freed, encodes started over for a write or
-   given up, blocks encoded; and now: textures waiting, the bytes their RGBA8 images take */
+   given up, blocks encoded, textures held Exact for their writes and made BC7 again after; and now: textures waiting,
+   the bytes their RGBA8 images take, textures held Exact for their writes */
 typedef struct {
-    u64 made, freed, restarted, blocks, waiting_bytes;
-    u32 waiting;
+    u64 made, freed, restarted, blocks, waiting_bytes, went_hot, cooled;
+    u32 waiting, hot;
 } VkLaterStats;
 void vk_tex_later_stats(VkLaterStats* s);
 
@@ -1778,6 +1798,8 @@ int vk_tic_unnormalized(const u32* tic);
 int vk_image_keyable(const ShaderInfo* si, int i);
 int vk_image_key(const ShaderInfo* si, int i, const u32* tic);
 VkImageView vk_storage_image_view(Surf* t, const ShaderInfo* si, int i, u64* bytes);
+/* the view type of storage image slot i of si: 3D for a volume, 2D array for an array (1D too), else 2D */
+VkImageViewType vk_storage_image_type(const ShaderInfo* si, int i);
 u32 vk_gbuf_desc(int stage, u32 off, const u32* v, u64* addr);
 /* the access a storage image is moved to GENERAL with: image atomics read it as well as write it, and only the
    accesses a barrier names see the writes before it */
