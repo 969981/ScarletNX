@@ -822,8 +822,13 @@ static void push_string(Method* m, const char* text) {
 static unsigned class_ref(Method* m, const char* desc) {
     return m->scan ? 0 : pool_check(m, cf_class_descriptor(m->pool, desc));
 }
+static bool is_interface(const Method* m, const char* desc);
+/* A cast that only the JVM's verifier needs, to a value's narrower class where it is used (DEX's own check-cast is
+   not this one). The verifier takes any reference where an interface type is wanted, as ART's does, so a value of
+   an interface type gets no cast: R8 leaves classes that the code stores in a field of an interface type they no
+   longer implement, and a cast to it throws where Android's code runs on */
 static void checkcast(Method* m, const char* desc) {
-    if (!desc || !strcmp(desc, "Ljava/lang/Object;")) return;
+    if (!desc || !strcmp(desc, "Ljava/lang/Object;") || (desc[0] == 'L' && is_interface(m, desc))) return;
     op_u2(m, J_CHECKCAST, class_ref(m, desc), 0);
 }
 
@@ -1103,7 +1108,8 @@ static void store_result(Method* m, uint32_t pc, const Insn* in, const char* ret
 
 /* Calls of the JDK that behave otherwise on Android, sent to the runtime's own. An instance method becomes a static
    one with the receiver as its first parameter. System.loadLibrary must load the app's native libraries through the
-   native bridge (docs/android/NATIVE.md), not HotSpot's loader */
+   native bridge (docs/android/NATIVE.md), not HotSpot's loader. ByteBuffer.allocateDirect gives a buffer that native
+   code reaches, which for 32-bit libraries must be in their window */
 typedef struct {
     const char *owner, *name, *desc;
     const char *to_owner, *to_name;
@@ -1113,6 +1119,7 @@ static const Remap remaps[] = {
     {"Ljava/lang/System;", "load", "(Ljava/lang/String;)V", "Lsnx/dalvik/Runtime;", "load"},
     {"Ljava/lang/Runtime;", "loadLibrary", "(Ljava/lang/String;)V", "Lsnx/dalvik/Runtime;", "runtimeLoadLibrary"},
     {"Ljava/lang/Runtime;", "load", "(Ljava/lang/String;)V", "Lsnx/dalvik/Runtime;", "runtimeLoad"},
+    {"Ljava/nio/ByteBuffer;", "allocateDirect", "(I)Ljava/nio/ByteBuffer;", "Lsnx/dalvik/Runtime;", "allocateDirect"},
 };
 static const Remap* remap_of(const char* owner, const char* name, const char* desc) {
     for (size_t i = 0; i < sizeof remaps / sizeof *remaps; ++i)

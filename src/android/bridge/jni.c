@@ -7,6 +7,7 @@
    translator makes each native method of the app call */
 #define _GNU_SOURCE
 #include "android/bridge/args.h"
+#include "android/bridge/arm32.h"
 #include "android/bridge/bridge.h"
 #include "android/bridge/hle.h"
 #include "android/bridge/hle_impl.h"
@@ -444,8 +445,7 @@ static void jni_get_java_vm(CPU* c, void* data) {
 /* ---- strings in ART's modified UTF-8, where HotSpot's is CESU-8: a supplementary character (a surrogate pair) is
    UTF-8's 4 bytes, not 6, and NUL C0 80 and a lone surrogate its 3 bytes in both ---- */
 
-/* n UTF-16 units as ART's modified UTF-8 into out (none: counted): its length, without a NUL */
-static size_t art_utf8(const jchar* units, size_t n, unsigned char* out) {
+size_t bridge_art_utf8(const jchar* units, size_t n, unsigned char* out) {
     size_t at = 0;
     for (size_t i = 0; i < n; ++i) {
         uint32_t u = units[i];
@@ -478,24 +478,8 @@ static size_t art_utf8(const jchar* units, size_t n, unsigned char* out) {
     }
     return at;
 }
-/* NewStringUTF(env, bytes): a 4-byte sequence a surrogate pair, as ART reads it, where HotSpot's ends the string at
-   its second byte */
-static void jni_new_string_utf(CPU* c, void* data) {
-    (void)data;
-    JNIEnv* env = host_env(X(0));
-    const unsigned char* b = PTR(1);
-    if (!b) {
-        X(0) = 0;
-        return;
-    }
-    size_t n = strlen((const char*)b), k = 0;
-    jchar* units = malloc((n ? n : 1) * sizeof *units); /* a unit for each byte at most */
-    if (!units) {
-        jclass oom = (*env)->FindClass(env, "java/lang/OutOfMemoryError");
-        if (oom) (*env)->ThrowNew(env, oom, "NewStringUTF: no memory for the string's characters");
-        X(0) = 0;
-        return;
-    }
+size_t bridge_art_units(const unsigned char* b, size_t n, jchar* units) {
+    size_t k = 0;
     for (size_t i = 0; i < n;) {
         uint32_t one = b[i++];
         if (!(one & 0x80)) {
@@ -517,6 +501,27 @@ static void jni_new_string_utf(CPU* c, void* data) {
         units[k++] = (jchar)((cp >> 10) + 0xd7c0);
         units[k++] = (jchar)((cp & 0x3ff) + 0xdc00);
     }
+    return k;
+}
+/* NewStringUTF(env, bytes): a 4-byte sequence a surrogate pair, as ART reads it, where HotSpot's ends the string at
+   its second byte */
+static void jni_new_string_utf(CPU* c, void* data) {
+    (void)data;
+    JNIEnv* env = host_env(X(0));
+    const unsigned char* b = PTR(1);
+    if (!b) {
+        X(0) = 0;
+        return;
+    }
+    size_t n = strlen((const char*)b), k = 0;
+    jchar* units = malloc((n ? n : 1) * sizeof *units); /* a unit for each byte at most */
+    if (!units) {
+        jclass oom = (*env)->FindClass(env, "java/lang/OutOfMemoryError");
+        if (oom) (*env)->ThrowNew(env, oom, "NewStringUTF: no memory for the string's characters");
+        X(0) = 0;
+        return;
+    }
+    k = bridge_art_units(b, n, units);
     X(0) = (uint64_t)(uintptr_t)(*env)->NewString(env, units, (jsize)k);
     free(units);
 }
@@ -527,7 +532,7 @@ static void jni_get_string_utf_length(CPU* c, void* data) {
     jstring s = (jstring)(uintptr_t)X(1);
     jsize n = (*env)->GetStringLength(env, s);
     const jchar* units = (*env)->GetStringChars(env, s, NULL);
-    X(0) = units ? art_utf8(units, (size_t)n, NULL) : 0;
+    X(0) = units ? bridge_art_utf8(units, (size_t)n, NULL) : 0;
     if (units) (*env)->ReleaseStringChars(env, s, units);
 }
 /* GetStringUTFChars(env, string, is_copy): a copy of the bridge's, which ReleaseStringUTFChars frees */
@@ -537,8 +542,8 @@ static void jni_get_string_utf_chars(CPU* c, void* data) {
     jstring s = (jstring)(uintptr_t)X(1);
     jsize n = (*env)->GetStringLength(env, s);
     const jchar* units = (*env)->GetStringChars(env, s, NULL);
-    unsigned char* out = units ? malloc(art_utf8(units, (size_t)n, NULL) + 1) : NULL;
-    if (out) out[art_utf8(units, (size_t)n, out)] = 0;
+    unsigned char* out = units ? malloc(bridge_art_utf8(units, (size_t)n, NULL) + 1) : NULL;
+    if (out) out[bridge_art_utf8(units, (size_t)n, out)] = 0;
     if (units) (*env)->ReleaseStringChars(env, s, units);
     if (units && !out) {
         jclass oom = (*env)->FindClass(env, "java/lang/OutOfMemoryError");
@@ -565,7 +570,7 @@ static void jni_get_string_utf_region(CPU* c, void* data) {
     (*env)->GetStringRegion(env, (jstring)(uintptr_t)X(1), start, length, units);
     if (!(*env)->ExceptionCheck(env)) {
         unsigned char* out = PTR(4);
-        out[art_utf8(units, (size_t)length, out)] = 0;
+        out[bridge_art_utf8(units, (size_t)length, out)] = 0;
     }
     free(units);
 }
@@ -690,10 +695,29 @@ static bool start(JNIEnv* env, jstring library_dir) {
 }
 
 /* nativeLoad(path, libraryDir): null when the library loaded and its JNI_OnLoad ran, else dlerror's text */
+/* whether the file at path is an ELF of 32 bits (an armeabi or armeabi-v7a library) */
+static bool elf32(const char* path) {
+    unsigned char ident[5] = {0};
+    FILE* f = fopen(path, "rb");
+    size_t n = f ? fread(ident, 1, sizeof ident, f) : 0;
+    if (f) fclose(f);
+    return n == sizeof ident && !memcmp(ident, "\177ELF", 4) && ident[4] == 1;
+}
+
 static jstring JNICALL native_load(JNIEnv* env, jclass unused, jstring path, jstring library_dir) {
     (void)unused;
     if (!start(env, library_dir)) return (*env)->NewStringUTF(env, "dlopen failed: the native bridge doesn't start");
     const char* p = (*env)->GetStringUTFChars(env, path, NULL);
+    if (elf32(p)) {
+        /* the 32-bit bridge's (arm32.h), with its own window, loader and JNI */
+        const char* dir = library_dir ? (*env)->GetStringUTFChars(env, library_dir, NULL) : NULL;
+        char* error = arm32_jni_load(env, p, dir);
+        if (dir) (*env)->ReleaseStringUTFChars(env, library_dir, dir);
+        (*env)->ReleaseStringUTFChars(env, path, p);
+        jstring text = error && !(*env)->ExceptionCheck(env) ? (*env)->NewStringUTF(env, error) : NULL;
+        free(error);
+        return text;
+    }
     char error[1024];
     guest_env(env);
     /* the JVM's handlers are in place by now: the guest's crash report goes before them */
@@ -735,6 +759,14 @@ static jstring JNICALL native_load(JNIEnv* env, jclass unused, jstring path, jst
    reference (invokeL) or none */
 static uint64_t invoke(JNIEnv* env, jstring key, jobject self, jlongArray prims, jobjectArray refs, char* result) {
     const char* k = (*env)->GetStringUTFChars(env, key, NULL);
+    if (arm32_active()) {
+        bool found = false;
+        uint64_t r = arm32_jni_invoke(env, k, self, prims, refs, result, &found);
+        if (found) {
+            (*env)->ReleaseStringUTFChars(env, key, k);
+            return r;
+        }
+    }
     uint64_t fn = native_function(k);
     char* params = params_of(strchr(k, '('), result);
     if (!fn) {
@@ -819,8 +851,68 @@ static void JNICALL invoke_v(JNIEnv* env, jclass unused, jstring key, jobject se
     invoke(env, key, self, prims, refs, &result);
 }
 
+static jobject JNICALL allocate_guest(JNIEnv* env, jclass unused, jint capacity, jlongArray address) {
+    (void)unused;
+    return arm32_jni_allocate(env, capacity, address);
+}
+static void JNICALL free_guest(JNIEnv* env, jclass unused, jlong address) {
+    (void)env, (void)unused;
+    if (arm32_active()) arm32_free((uint32_t)address);
+}
+
+/* NativeActivity's glue and its input queue: the 32-bit bridge's (arm32.h); the 64-bit bridge has none yet */
+static jlong JNICALL activity_create(JNIEnv* env, jclass unused, jobject activity, jstring function, jstring internal,
+                                     jstring external, jint sdk) {
+    (void)unused;
+    if (!arm32_active()) return 0;
+    const char* f = (*env)->GetStringUTFChars(env, function, NULL);
+    const char* in = internal ? (*env)->GetStringUTFChars(env, internal, NULL) : NULL;
+    const char* ex = external ? (*env)->GetStringUTFChars(env, external, NULL) : NULL;
+    uint32_t a = arm32_jni_activity_create(env, activity, f, in, ex, sdk);
+    (*env)->ReleaseStringUTFChars(env, function, f);
+    if (in) (*env)->ReleaseStringUTFChars(env, internal, in);
+    if (ex) (*env)->ReleaseStringUTFChars(env, external, ex);
+    return a;
+}
+static void JNICALL activity_call(JNIEnv* env, jclass unused, jlong activity, jint callback, jlong argument) {
+    (void)unused;
+    if (arm32_active()) arm32_jni_activity_call(env, (uint32_t)activity, callback, (uint32_t)argument);
+}
+static jlong JNICALL input_queue_new(JNIEnv* env, jclass unused) {
+    (void)env, (void)unused;
+    return arm32_active() ? arm32_input_queue_new() : 0;
+}
+static void JNICALL input_queue_motion(JNIEnv* env, jclass unused, jlong queue, jint device, jint source, jint action,
+                                       jint flags, jint meta, jint buttons, jint edges, jlong down, jlong time,
+                                       jfloat xprec, jfloat yprec, jintArray ids, jintArray tools, jfloatArray axes) {
+    (void)unused;
+    jsize n = (*env)->GetArrayLength(env, ids);
+    if (n > 10) n = 10;
+    jint id[10], tool[10];
+    jfloat axis[90];
+    (*env)->GetIntArrayRegion(env, ids, 0, n, id);
+    (*env)->GetIntArrayRegion(env, tools, 0, n, tool);
+    (*env)->GetFloatArrayRegion(env, axes, 0, 9 * n, axis);
+    int32_t fields[7] = {device, source, action, flags, meta, edges, buttons};
+    arm32_input_motion((uint32_t)queue, fields, down, time, xprec, yprec, (unsigned)n, id, tool, axis);
+}
+static void JNICALL input_queue_key(JNIEnv* env, jclass unused, jlong queue, jint device, jint source, jint action,
+                                    jint flags, jint key, jint scan, jint meta, jint repeat, jlong down, jlong time) {
+    (void)env, (void)unused;
+    int32_t fields[8] = {device, source, action, flags, key, scan, meta, repeat};
+    arm32_input_key((uint32_t)queue, fields, down, time);
+}
+
 bool android_bridge_register(JNIEnv* env) {
     static const JNINativeMethod methods[] = {
+        {(char*)"activityCreate",
+         (char*)"(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)J", (void*)activity_create},
+        {(char*)"activityCall", (char*)"(JIJ)V", (void*)activity_call},
+        {(char*)"inputQueueNew", (char*)"()J", (void*)input_queue_new},
+        {(char*)"inputQueueMotion", (char*)"(JIIIIIIIJJFF[I[I[F)V", (void*)input_queue_motion},
+        {(char*)"inputQueueKey", (char*)"(JIIIIIIIIJJ)V", (void*)input_queue_key},
+        {(char*)"allocateGuest", (char*)"(I[J)Ljava/nio/ByteBuffer;", (void*)allocate_guest},
+        {(char*)"freeGuest", (char*)"(J)V", (void*)free_guest},
         {(char*)"nativeLoad", (char*)"(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", (void*)native_load},
         {(char*)"invokeJ", (char*)"(Ljava/lang/String;Ljava/lang/Object;[J[Ljava/lang/Object;)J", (void*)invoke_j},
         {(char*)"invokeL",

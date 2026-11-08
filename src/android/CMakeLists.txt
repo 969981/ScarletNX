@@ -43,13 +43,15 @@ if(NOT EXISTS "${SNX_JAVA_HOME}/include/jni.h")
                         "SNX_JAVA_HOME to one, or SNX_BUILD_ANDROID=OFF")
 endif()
 
-add_library(snx_android_program STATIC runtime/main.c runtime/jvm.c runtime/app.c runtime/install.c res/axml.c
+add_library(snx_android_program STATIC runtime/main.c runtime/jvm.c runtime/app.c runtime/install.c runtime/audio.c res/axml.c
                                        res/xml_jni.c res/arsc.c
                                        res/asset_jni.c db/sqlite_jni.c hwui/text.c hwui/image.c hwui/path.c
                                        hwui/render.c "${volk_SOURCE_DIR}/volk.c")
-# FFmpeg decodes and encodes the images of BitmapFactory and Bitmap.compress (hwui/image.c)
+# FFmpeg decodes and encodes the images of BitmapFactory and Bitmap.compress (hwui/image.c), and decodes the audio of
+# MediaPlayer and SoundPool, which SDL plays (runtime/audio.c)
 target_link_libraries(snx_android_program PUBLIC snx_android_dex snx_zip snx_sqlite snx_harfbuzz snx_vk_common
-                      FFmpeg::avcodec FFmpeg::swscale SDL3::SDL3 Vulkan::Headers ${CMAKE_DL_LIBS})
+                      FFmpeg::avformat FFmpeg::avcodec FFmpeg::swresample FFmpeg::swscale SDL3::SDL3 Vulkan::Headers
+                      ${CMAKE_DL_LIBS})
 if(NOT WIN32)
     target_link_libraries(snx_android_program PUBLIC m)
 endif()
@@ -67,6 +69,8 @@ target_include_directories(snx_android_program SYSTEM PUBLIC "${SNX_JAVA_HOME}/i
 target_compile_definitions(snx_android_program PRIVATE SNX_JAVA_HOME="${SNX_JAVA_HOME}")
 set_target_properties(snx_android_program PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
 target_compile_options(snx_android_program PRIVATE ${snx_android_c_options})
+# libavformat's avformat.h has an anonymous union, which C11 brought: the file that includes it is C11
+set_source_files_properties(runtime/audio.c TARGET_DIRECTORY snx_android_program PROPERTIES COMPILE_OPTIONS "-std=c11")
 if(NOT WIN32)
     find_package(Threads REQUIRED)
     target_link_libraries(snx_android_program PUBLIC Threads::Threads)
@@ -86,6 +90,14 @@ add_library(snx_android_bridge STATIC bridge/bridge.c bridge/host.c bridge/linke
                                       bridge/hle_egl.c bridge/gles_vk.c bridge/hle_gles.c bridge/gles2.c
                                       bridge/gles2_object.c bridge/gles2_program.c bridge/gles2_draw.c
                                       bridge/hle_zlib.c)
+# the 32-bit bridge (bridge/arm32.h) takes bionic's ILP32 layouts from the host's POSIX ones: on Windows, which has
+# none of them, arm32_none.c refuses an app's 32-bit libraries instead
+if(WIN32)
+    target_sources(snx_android_bridge PRIVATE bridge/arm32_none.c)
+else()
+    target_sources(snx_android_bridge PRIVATE bridge/arm32.c bridge/arm32_libc.c bridge/arm32_jni.c bridge/arm32_posix.c
+                                              bridge/arm32_thread.c bridge/arm32_shim.c)
+endif()
 # the guest's signals, threads and futexes: the GNU ABI runtime's kernel (src/gnuabi/kernel), here too without that
 # runtime
 if(NOT TARGET scarletnx-gnuabi-kernel)
@@ -188,6 +200,21 @@ if(BUILD_TESTING)
     set_target_properties(snx-test-android-bionic PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
     target_compile_options(snx-test-android-bionic PRIVATE -Wall -Wextra -Werror -UNDEBUG)
     add_test(NAME android_bionic COMMAND snx-test-android-bionic)
+    # the 32-bit bridge (bridge/arm32*.c, which Windows leaves out): its loader on ELF32 libraries the test writes, and
+    # bionic's functions as 32-bit guest code calls them
+    if(NOT WIN32)
+        add_executable(snx-test-android-arm32 "${PROJECT_SOURCE_DIR}/tests/android_arm32.c")
+        if(APPLE)
+            target_link_libraries(snx-test-android-arm32 PRIVATE snx_android_program snx_android_bridge)
+        else()
+            target_link_libraries(snx-test-android-arm32 PRIVATE
+                                  "$<LINK_GROUP:RESCAN,snx_android_program,snx_android_bridge>")
+        endif()
+        set_target_properties(snx-test-android-arm32 PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+        target_compile_options(snx-test-android-arm32 PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+        add_test(NAME android_arm32 COMMAND snx-test-android-arm32)
+        set_tests_properties(android_arm32 PROPERTIES TIMEOUT 60)
+    endif()
     # JNI as the bridge gives it to an app's code (bridge/jni.c), on the JVM of javac's JDK in the test's process: on
     # Linux, where it runs, and not in a sanitizer build, whose runtime has not been tried under HotSpot
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT SNX_TEST_SANITIZERS)
@@ -234,6 +261,6 @@ endif()
 
 if(COMMAND snx_sanitizer_path) # tests/CMakeLists.txt: this folder's tests
     snx_test_sanitize(snx-test-bionic-sync snx-test-android-image snx-test-android-host-anon snx-test-android-gles2
-                      snx-test-android-inputs snx-test-android-bionic)
+                      snx-test-android-inputs snx-test-android-bionic snx-test-android-arm32)
     snx_sanitizer_path()
 endif()
