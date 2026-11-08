@@ -25,12 +25,14 @@ Generated modules include runtime ABI code. Game assets, keys and firmware are e
 | jemalloc (the `scarletnx` program's malloc, on Android `libscarletnx-run.so`'s, with `SNX_JEMALLOC`) | BSD-2-Clause |
 | Noto Sans JP, SC, TC and KR Subsets (the shared fonts' stand-ins, fetched by `cmake/dependencies.cmake`, made by `tools/subset_fonts.py` from Google Fonts commit `e7db6ca603fd4862010383ff17ffd6cc4ffac1c0`) | SIL OFL 1.1 ([text](../dist/licenses/Noto/OFL.txt)) |
 | yuzu's controller button glyphs (`font_nintendo_extended.cpp`, as Eden carries it) | GPL-2.0-or-later |
-| The 3DS system archives' open stand-ins (`cmake/ctr_system_archives.cmake`): the Mii data, country list, shared font and bad word list B3n30/citra_system_archives makes (Weiyi Wang's generators), as Azahar carries them | GPL-2.0-or-later |
+| The 3DS system archives' open stand-ins (`cmake/ctr_system_archives.cmake`): the country list, shared font and bad word list B3n30/citra_system_archives makes (Weiyi Wang's generators), as Azahar carries them; the layout of the Mii data's `CFL_Res.dat` and its RomFS (`mii/mii.py`, `mii/mii-archive-format.md`, `common/romfs.py`), which `src/common/utilities/mii_model.c` writes our own parts in | GPL-2.0-or-later |
 | Montserrat and GNU Unifont 10.0.05, the glyphs of the 3DS shared font's stand-in | OFL-1.1 ([text](../dist/licenses/Montserrat/OFL.txt)) / GPL-2.0-or-later with the GNU font embedding exception |
 | LZ4 (the library, `lib/`) | BSD-2-Clause |
 | xxHash 0.8.4 (XXH3 and its x86 dispatcher, the renderer's content hashes: `src/nx/gpu/vk/xxh3.c`) | BSD-2-Clause |
 | Vulkan-Headers | Apache 2.0 |
 | volk / Vulkan Memory Allocator | MIT |
+| KosmicKrisp (Mesa's Vulkan driver on Metal, which the macOS app carries with `SNX_KOSMICKRISP`) | MIT |
+| The Vulkan Loader (the macOS app carries it for KosmicKrisp) | Apache 2.0 |
 | SDL3 | zlib |
 | The AppImage's runtime (uruntime) and launcher (sharun, with Anylinux-sharun's `anylinux.so` and cross-libc-dlopen) | MIT |
 | Tracy (the profiler client, built only with `SNX_TRACY`) | BSD-3-Clause |
@@ -82,7 +84,9 @@ a source keep that source's copyright lines and license, most with the revision 
 | `src/3ds/gpu/shader.c` and `shader.h` (the instruction fields) | nihstro | BSD-3-Clause |
 | `src/agb/` (the board and its memory, the APU, the PPU, the HLE BIOS, the cartridge and the runner: the files whose header names the mGBA contributors) | mGBA | MPL-2.0 |
 | `src/common/cpu/` (the recompiler's instruction semantics: `recompiler/llvm/ir_int.c`, `ir_ldst.c`, `ir_fpu.c`, `ir_vec.c`, `ir_vec_fp.c` and `ir_vec_crypto.c`, the integer, branch, system, load/store, scalar floating-point and AdvSIMD emitters ported from `translate-a64.c`'s `trans_*` functions, `gengvec.c`, `vec_helper.c` and `translate.c`'s `asimd_imm_const`, and the A32/T32 block compiler) | QEMU's `target/arm/tcg/` | LGPL-2.1-or-later |
-| `src/common/cpu/aarch64/decode/a64.decode` (the A64 encodings, unmodified, from commit `a19f59a`, which `tools/a64dec` generates the decoder from; [README](../src/common/cpu/aarch64/decode/README.md)) | QEMU's `target/arm/tcg/a64.decode` | LGPL-2.1-or-later |
+| `src/common/cpu/aarch64/decode/a64.decode` (the A64 encodings, unmodified, from commit `a19f59a`, which `tools/decodetree` generates the decoder from; [README](../src/common/cpu/aarch64/decode/README.md)) | QEMU's `target/arm/tcg/a64.decode` | LGPL-2.1-or-later |
+| `src/common/cpu/arm/decode/` (`a32.decode`, `a32-uncond.decode`, `t32.decode`, `t16.decode`: the A32, T32 and T16 encodings, unmodified, from commit `a19f59a`, which `tools/decodetree` generates the decoders from; [README](../src/common/cpu/arm/decode/README.md)) and `src/common/cpu/arm/decodetree.h` (the bit operations and the decoders' `!function=` helpers) | QEMU's `target/arm/tcg/` (`*.decode`, `translate.c`) and `include/qemu/bitops.h` | LGPL-2.1-or-later |
+| `tools/decodetree/decodetree.c` (the `.decode` language, its parse, the decode tree and the generated C) | QEMU's `scripts/decodetree.py` | LGPL-2.1-or-later |
 | `src/common/cpu/aarch64/` (`cpu.h`, `cpu_helpers.c` and `helpers/`, the generated code's FP, SIMD, integer and crypto helpers) | QEMU's `target/arm/` and its softfloat, with the SoftFloat-2a notice | LGPL-2.1-or-later, SoftFloat-2a, BSD |
 | `src/common/cpu/aarch64/helpers/vector.c` (the SM4 S-box, GB/T 32907-2016's table) | OpenSSL's `crypto/sm4/sm4.c` | Apache 2.0 |
 | `src/nx/gpu/gpu.c` (the block linear offset), the register layouts of the 3D and compute engines in `tests/support/maxwell_3d_regs.h` and `kepler_compute_regs.h` with their translation in `tests/support/mx_state.c`, and the DMA and 2D engines' CPU references in `tests/support/dma_ref.c` and `fermi2d_ref.c` | Eden and yuzu (`video_core/textures/decoders.cpp`, `engines/`: `maxwell_3d.h`, `kepler_compute.h`, `maxwell_dma.cpp`, `sw_blitter/`) | GPL-3.0-or-later, GPL-2.0-or-later |
@@ -105,6 +109,7 @@ a source keep that source's copyright lines and license, most with the revision 
 | `src/common/utilities/gpu_driver.c`, `src/gui/gpu_driver.c`, `src/gui/gpu_driver_fetch.c` and `src/nx/runtime/platform/gpu_driver_load.c` (GPU driver packages: meta.json's fields and size, the zip checked before it is unpacked, the devices that load one, libadrenotools' call; Freedreno Settings' presets; Download Driver's repositories, their releases and the recommendation by Adreno model) | Eden and yuzu (`src/android/app/src/main/java/org/yuzu/yuzu_emu/utils/GpuDriverHelper.kt`, `GpuDriverMetadata.kt`, `NativeFreedrenoConfig.kt`, `fragments/DriverFetcherFragment.kt`, `jni/native.cpp`'s `InitializeGpuDriver` and `SupportsCustomDriver`), the model only | GPL-3.0-or-later, GPL-2.0-or-later |
 | `src/gui/i18n.c` (`snx_mo_lookup`, the reader of the menu's catalogs; notice in [`src/gui/MUSL-NOTICE.txt`](../src/gui/MUSL-NOTICE.txt)) | musl (`src/locale/__mo_lookup.c`) | MIT |
 | The files of `src/android/framework/` whose header names the Android Open Source Project (exception messages, and parts of method bodies) | The Android Open Source Project's source of the same classes, as the Android SDK's sources for API level 36 carry it | Apache 2.0 ([text](../dist/licenses/AOSP/LICENSE.txt), [notice](../dist/licenses/AOSP/NOTICE.txt)) |
+| `src/android/framework/android/icu/text/PluralRules.java` (each language's cardinal plural rules) | Unicode CLDR (`common/supplemental/plurals.xml`, version 47, as OpenJDK carries it) | Unicode License v3 ([text](../dist/licenses/Unicode/LICENSE.txt)) |
 | `src/android/framework/org/xmlpull/v1/XmlPullParserException.java` (the message its constructor makes) | XmlPull's API (Stefan Haustein and Aleksander Slominski), as the Android Open Source Project carries it | Public domain |
 | `dist/controls/*.xml`, and `controls.png` made from them | yuzu's Android overlay, as Eden and rEden carry it | GPL-3.0-or-later |
 

@@ -365,9 +365,9 @@ With `--out work/Game` and `--outdir games` as above (without them, see [Folders
 | `recompiled/<id>/<id>[.exe]`, `<id>_code.so/.dll` | Runtime + AOT module |
 | `recompiled/<id>/<id>_data/`, `<id>.ini` | Data/saves (and `control.nacp`) + settings |
 | `recompiled/<id>/<id>_build/` | Generated code, only with `--keep-ir` |
-| `recompiled/<id>/shader_cache/vk_pipelines.bin` | Vulkan pipeline cache |
-| `recompiled/<id>/shader_cache/<id>.vkshaders` | Translated shaders and the pipelines made, made again at the next start, compute pipelines too (before the game starts, from their programs, so a new build or driver compiles them there); packed with zstd as they add up (`compress_shader_cache`) |
-| `recompiled/<id>/shader_cache/<id>.vkshipped` | The shaders found in the game's own files and executables, prepared ahead of time (`prepare_shaders`), each read when the game first draws with it, each packed with zstd on its own (`compress_prepared_shaders`). Unpacked it can be large: one game's 2,700 shaders took 245 MB, another's 18,500 took 2 GB; packed, about a quarter of that |
+| `recompiled/<id>/shader_cache/vk_pipelines.<driver>.bin` | Vulkan pipeline cache, one per driver (`<driver>`: `d<driver ID>-<GPU vendor>-<GPU device>`, and `-<package>` for a `gpu_driver` package's), so going back to a driver finds its own |
+| `recompiled/<id>/shader_cache/<id>.<driver>.vkshaders` | One per driver: translated shaders and the pipelines made, made again at the next start, compute pipelines too (before the game starts, from their programs, so a new build or driver compiles them there); packed with zstd as they add up (`compress_shader_cache`) |
+| `recompiled/<id>/shader_cache/<id>.<driver>.vkshipped` | One per driver: the shaders found in the game's own files and executables, prepared ahead of time (`prepare_shaders`), each read when the game first draws with it, each packed with zstd on its own (`compress_prepared_shaders`). Unpacked it can be large: one game's 2,700 shaders took 245 MB, another's 18,500 took 2 GB; packed, about a quarter of that |
 | `recompiled/<id>/shader_cache/<id>.vkscan` | The game's files found to hold no shaders, so that after an update of ScarletNX or the driver the files aren't all read again to look for them |
 
 ## GDB (Linux)
@@ -774,7 +774,7 @@ retropad; the default) and yorha (the launcher's yorha theme on the controls), a
 [RetroArch overlay](../dist/controls/skins/README.md) is a skin too:
 `controls_skin=` the path of its `.cfg` (the launcher's Settings take it as text), and the controls take its places,
 sizes, images and pressed looks; what it lacks keeps the built-in look, and the log says each part it leaves out. The
-game's `.ini` keeps them: `controls`, `controls_scale`, `controls_opacity`, `controls_skin`,
+game's `.ini` keeps them: `controls`, `controls_scale`, `controls_alpha`, `controls_skin`,
 `controls_snap`, `controls_rel_center`, `controls_dpad_slide`, `controls_haptics`, a control's place once it
 was moved (`controls_a=0.930 0.470 100`: its middle across the screen and its size in percent), and whether it is
 shown once that changed (`controls_a_shown=0`). The launcher's Settings have the same, but the layout.

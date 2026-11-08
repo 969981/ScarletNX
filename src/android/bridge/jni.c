@@ -141,6 +141,10 @@ static struct {
 } j = {.lock = PTHREAD_MUTEX_INITIALIZER};
 
 static _Thread_local GuestEnv* t_env;
+/* the app's native methods under way on this thread (NativeBridge's invoke), and the loads of its libraries (their
+   constructors and JNI_OnLoad): FindClass looks in the app's class loader within them, as ART's in the loader of the
+   class whose native method runs. A thread with none, one the app attached, has the system class loader alone */
+static _Thread_local unsigned t_app_calls;
 
 /* ---- the guest's JNIEnv of this thread ---- */
 
@@ -158,6 +162,7 @@ static JNIEnv* host_env(uint64_t guest) {
 JNIEnv* bridge_jni_host(uint64_t guest_env) {
     return host_env(guest_env);
 }
+uint64_t bridge_jni_env(JNIEnv* host) { return (uint64_t)(uintptr_t)guest_env(host); }
 
 /* ---- method signatures ---- */
 
@@ -224,6 +229,12 @@ static const char* jni_params(const char* name) {
     if (set && n > 10 && !strcmp(name + n - 10, "FloatField")) return "IIIF";
     if (set && n > 11 && !strcmp(name + n - 11, "DoubleField")) return "IIID";
     return NULL;
+}
+
+/* GetVersion: Android's JNI, 1.6, where the host's JVM gives its own (JDK 25's is 24) */
+static void jni_get_version(CPU* c, void* data) {
+    (void)data;
+    X(0) = JNI_VERSION_1_6;
 }
 
 static void jni_generic(CPU* c, void* data) {
@@ -330,14 +341,28 @@ static void jni_variadic(CPU* c, void* data) {
     hle_call(c, ((void**)*env)[a_form], functions[a_form].kind, NULL);
 }
 
-/* FindClass: the host's, which looks in the loader of the native method that runs (the framework's here), then the
-   app's class loader, as Android's looks in the loader of the class that loaded the library */
+/* FindClass: the host's, which looks in the loader of the native method that runs (the framework's here), then within
+   the app's native methods the app's class loader, as Android's looks in the loader of the class that loaded the
+   library. Elsewhere ART's system class loader, which has no class of the app, throws ClassNotFoundException where
+   the host's JVM throws NoClassDefFoundError */
 static void jni_find_class(CPU* c, void* data) {
     (void)data;
     JNIEnv* env = host_env(X(0));
     const char* name = STR(1);
     jclass found = (*env)->FindClass(env, name);
-    if (!found && (*env)->ExceptionCheck(env)) {
+    if (!found && (*env)->ExceptionCheck(env) && !t_app_calls) {
+        (*env)->ExceptionClear(env);
+        char* dotted = snx_format("%s", name);
+        for (char* p = dotted; *p; ++p)
+            if (*p == '/') *p = '.';
+        char* text = snx_format("Didn't find class \"%s\" in the system class loader (no native method of the app "
+                                "runs on this thread)",
+                                dotted);
+        jclass not_found = (*env)->FindClass(env, "java/lang/ClassNotFoundException");
+        if (not_found) (*env)->ThrowNew(env, not_found, text);
+        free(text);
+        free(dotted);
+    } else if (!found && (*env)->ExceptionCheck(env)) {
         jthrowable pending = (*env)->ExceptionOccurred(env);
         (*env)->ExceptionClear(env);
         jclass app = (*env)->FindClass(env, "snx/android/app/App");
@@ -416,6 +441,135 @@ static void jni_get_java_vm(CPU* c, void* data) {
     X(0) = 0;
 }
 
+/* ---- strings in ART's modified UTF-8, where HotSpot's is CESU-8: a supplementary character (a surrogate pair) is
+   UTF-8's 4 bytes, not 6, and NUL C0 80 and a lone surrogate its 3 bytes in both ---- */
+
+/* n UTF-16 units as ART's modified UTF-8 into out (none: counted): its length, without a NUL */
+static size_t art_utf8(const jchar* units, size_t n, unsigned char* out) {
+    size_t at = 0;
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t u = units[i];
+        if (u >= 0xd800 && u < 0xdc00 && i + 1 < n && units[i + 1] >= 0xdc00 && units[i + 1] < 0xe000) {
+            uint32_t cp = 0x10000 + ((u - 0xd800) << 10) + (units[++i] - 0xdc00u);
+            if (out) {
+                out[at] = (unsigned char)(0xf0 | cp >> 18);
+                out[at + 1] = (unsigned char)(0x80 | (cp >> 12 & 0x3f));
+                out[at + 2] = (unsigned char)(0x80 | (cp >> 6 & 0x3f));
+                out[at + 3] = (unsigned char)(0x80 | (cp & 0x3f));
+            }
+            at += 4;
+        } else if (u && u < 0x80) {
+            if (out) out[at] = (unsigned char)u;
+            at += 1;
+        } else if (u < 0x800) {
+            if (out) {
+                out[at] = (unsigned char)(0xc0 | u >> 6);
+                out[at + 1] = (unsigned char)(0x80 | (u & 0x3f));
+            }
+            at += 2;
+        } else {
+            if (out) {
+                out[at] = (unsigned char)(0xe0 | u >> 12);
+                out[at + 1] = (unsigned char)(0x80 | (u >> 6 & 0x3f));
+                out[at + 2] = (unsigned char)(0x80 | (u & 0x3f));
+            }
+            at += 3;
+        }
+    }
+    return at;
+}
+/* NewStringUTF(env, bytes): a 4-byte sequence a surrogate pair, as ART reads it, where HotSpot's ends the string at
+   its second byte */
+static void jni_new_string_utf(CPU* c, void* data) {
+    (void)data;
+    JNIEnv* env = host_env(X(0));
+    const unsigned char* b = PTR(1);
+    if (!b) {
+        X(0) = 0;
+        return;
+    }
+    size_t n = strlen((const char*)b), k = 0;
+    jchar* units = malloc((n ? n : 1) * sizeof *units); /* a unit for each byte at most */
+    if (!units) {
+        jclass oom = (*env)->FindClass(env, "java/lang/OutOfMemoryError");
+        if (oom) (*env)->ThrowNew(env, oom, "NewStringUTF: no memory for the string's characters");
+        X(0) = 0;
+        return;
+    }
+    for (size_t i = 0; i < n;) {
+        uint32_t one = b[i++];
+        if (!(one & 0x80)) {
+            units[k++] = (jchar)one;
+            continue;
+        }
+        uint32_t two = i < n ? b[i++] & 0x3fu : 0;
+        if (!(one & 0x20)) {
+            units[k++] = (jchar)((one & 0x1f) << 6 | two);
+            continue;
+        }
+        uint32_t three = i < n ? b[i++] & 0x3fu : 0;
+        if (!(one & 0x10)) {
+            units[k++] = (jchar)((one & 0x0f) << 12 | two << 6 | three);
+            continue;
+        }
+        uint32_t four = i < n ? b[i++] & 0x3fu : 0;
+        uint32_t cp = (one & 0x07) << 18 | two << 12 | three << 6 | four;
+        units[k++] = (jchar)((cp >> 10) + 0xd7c0);
+        units[k++] = (jchar)((cp & 0x3ff) + 0xdc00);
+    }
+    X(0) = (uint64_t)(uintptr_t)(*env)->NewString(env, units, (jsize)k);
+    free(units);
+}
+/* GetStringUTFLength(env, string) */
+static void jni_get_string_utf_length(CPU* c, void* data) {
+    (void)data;
+    JNIEnv* env = host_env(X(0));
+    jstring s = (jstring)(uintptr_t)X(1);
+    jsize n = (*env)->GetStringLength(env, s);
+    const jchar* units = (*env)->GetStringChars(env, s, NULL);
+    X(0) = units ? art_utf8(units, (size_t)n, NULL) : 0;
+    if (units) (*env)->ReleaseStringChars(env, s, units);
+}
+/* GetStringUTFChars(env, string, is_copy): a copy of the bridge's, which ReleaseStringUTFChars frees */
+static void jni_get_string_utf_chars(CPU* c, void* data) {
+    (void)data;
+    JNIEnv* env = host_env(X(0));
+    jstring s = (jstring)(uintptr_t)X(1);
+    jsize n = (*env)->GetStringLength(env, s);
+    const jchar* units = (*env)->GetStringChars(env, s, NULL);
+    unsigned char* out = units ? malloc(art_utf8(units, (size_t)n, NULL) + 1) : NULL;
+    if (out) out[art_utf8(units, (size_t)n, out)] = 0;
+    if (units) (*env)->ReleaseStringChars(env, s, units);
+    if (units && !out) {
+        jclass oom = (*env)->FindClass(env, "java/lang/OutOfMemoryError");
+        if (oom) (*env)->ThrowNew(env, oom, "GetStringUTFChars: no memory for the string's bytes");
+    }
+    if (out && X(2)) *(jboolean*)PTR(2) = JNI_TRUE;
+    X(0) = (uint64_t)(uintptr_t)out;
+}
+static void jni_release_string_utf_chars(CPU* c, void* data) {
+    (void)data;
+    free(PTR(2));
+}
+/* GetStringUTFRegion(env, string, start, length, buffer): with a NUL after, as HotSpot's */
+static void jni_get_string_utf_region(CPU* c, void* data) {
+    (void)data;
+    JNIEnv* env = host_env(X(0));
+    jsize start = (jsize)X(2), length = (jsize)X(3);
+    jchar* units = malloc((length > 0 ? (size_t)length : 1) * sizeof *units);
+    if (!units) {
+        jclass oom = (*env)->FindClass(env, "java/lang/OutOfMemoryError");
+        if (oom) (*env)->ThrowNew(env, oom, "GetStringUTFRegion: no memory for the string's characters");
+        return;
+    }
+    (*env)->GetStringRegion(env, (jstring)(uintptr_t)X(1), start, length, units);
+    if (!(*env)->ExceptionCheck(env)) {
+        unsigned char* out = PTR(4);
+        out[art_utf8(units, (size_t)length, out)] = 0;
+    }
+    free(units);
+}
+
 /* ---- the JavaVM functions ---- */
 
 static void vm_destroy(CPU* c, void* data) {
@@ -458,6 +612,12 @@ static void make_tables(void) {
         else if (!strcmp(name, "RegisterNatives")) h = jni_register_natives;
         else if (!strcmp(name, "UnregisterNatives")) h = jni_unregister_natives;
         else if (!strcmp(name, "GetJavaVM")) h = jni_get_java_vm;
+        if (!strcmp(name, "GetVersion")) h = jni_get_version;
+        if (!strcmp(name, "NewStringUTF")) h = jni_new_string_utf;
+        if (!strcmp(name, "GetStringUTFLength")) h = jni_get_string_utf_length;
+        if (!strcmp(name, "GetStringUTFChars")) h = jni_get_string_utf_chars;
+        if (!strcmp(name, "ReleaseStringUTFChars")) h = jni_release_string_utf_chars;
+        if (!strcmp(name, "GetStringUTFRegion")) h = jni_get_string_utf_region;
         char* export = snx_format("JNIEnv::%s#%u", name, i);
         j.env_table[i] = i < 4 ? 0 : bridge_export(export, h, (void*)(uintptr_t)i);
         free(export);
@@ -538,7 +698,9 @@ static jstring JNICALL native_load(JNIEnv* env, jclass unused, jstring path, jst
     guest_env(env);
     /* the JVM's handlers are in place by now: the guest's crash report goes before them */
     fault_install();
+    ++t_app_calls;
     GuestLibrary* l = linker_load(p, error, sizeof error);
+    --t_app_calls;
     (*env)->ReleaseStringUTFChars(env, path, p);
     if (!l) {
         char text[1100];
@@ -554,7 +716,9 @@ static jstring JNICALL native_load(JNIEnv* env, jclass unused, jstring path, jst
     }
     if (onload) {
         uint64_t args[2] = {(uint64_t)(uintptr_t)&j.guest_vm, 0};
+        ++t_app_calls;
         jint version = (jint)bridge_call(onload, args, 2);
+        --t_app_calls;
         if ((*env)->ExceptionCheck(env)) return NULL;
         if (version != JNI_VERSION_1_2 && version != JNI_VERSION_1_4 && version != JNI_VERSION_1_6) {
             char text[256];
@@ -617,7 +781,9 @@ static uint64_t invoke(JNIEnv* env, jstring key, jobject self, jlongArray prims,
         c->x[31] = (sp - 8 * ns) & ~(uint64_t)15;
         memcpy((void*)(uintptr_t)c->x[31], stack, 8 * ns);
     }
+    ++t_app_calls;
     bridge_call(fn, NULL, 0);
+    --t_app_calls;
     c->x[31] = sp;
     uint64_t r = c->x[0];
     switch (*result) {

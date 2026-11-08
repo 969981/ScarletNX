@@ -236,6 +236,19 @@ setting Vulkan Video decode
     help 1 = H.264 movies decode on the GPU with Vulkan Video (FFmpeg's Vulkan decoder), where the GPU and its driver
     help have an H.264 decode queue. Experimental and untested. 0 = FFmpeg decodes them on the CPU. VP9 movies always
     help decode on the CPU
+setting Vulkan driver
+    key vulkan_driver
+    label Vulkan driver
+    text 16
+    default auto
+    startup
+    words auto=Auto|moltenvk=MoltenVK|kosmickrisp=KosmicKrisp (experimental)
+    help The Vulkan driver a game runs on, on macOS: auto = KosmicKrisp where the Mac has it and runs it (Apple
+    help silicon, macOS 26 or later), else the MoltenVK the app carries, else the system's loader; moltenvk = a
+    help MoltenVK library; kosmickrisp = Mesa's KosmicKrisp through the Vulkan loader (experimental). The log says
+    help which driver runs and why. On every other system the game runs on the system's driver whatever the value (on
+    help Android, gpu_driver's), and the log says so for moltenvk and kosmickrisp. Any other value stops the game,
+    help saying so
 setting Vertex input dynamic state
     key vertex_input_dynamic_state
     text 16
@@ -243,22 +256,33 @@ setting Vertex input dynamic state
     startup
     words auto=Auto|on=On|off=Off
     help How a draw gives the GPU its vertex layout. auto = as dynamic state (VK_EXT_vertex_input_dynamic_state) where
-    help the GPU's driver has it, but NVIDIA's before 580.119.02 and Intel's Windows driver before 27.20.100.0, which
-    help draw it wrong, and on Android, as Eden; on = as dynamic state wherever the driver has it, those too; off = in
-    help the pipeline. Dynamic,
+    help the GPU's driver has it, but on the drivers known to draw it wrong (the extension bans: NVIDIA's before
+    help 580.119.02, Intel's Windows driver before 27.20.100.0, Arm's Mali before r48, Qualcomm's on Android) and on
+    help Android, as Eden; on = as dynamic state wherever the driver has it, those too; off = in the pipeline. Dynamic,
     help one pipeline serves every layout a program is drawn with, so fewer pipelines are made; in the pipeline, each
     help layout takes one of its own. Any other value stops the game, saying so
+setting Vulkan ban ignore
+    label Ignore driver bans
+    key vulkan_ban_ignore
+    text 512
+    default ""
+    startup
+    help Keys of the extension bans (the drivers known to break a Vulkan extension or feature), separated by commas,
+    help whose bans this run goes over, to test again whether the driver still breaks them: VK_KHR_present_id2 or
+    help VK_KHR_present_id2,shaderFloat16. The log says each with the ban it goes over. Empty: every ban holds. A key
+    help the table has not stops the game, naming the nearest ones it has
 setting ASTC mode
     label ASTC textures
     key astc_mode
-    int 0 1
+    int 0 2
     default 0
     startup
-    words Auto|Exact
-    help Auto = on a GPU that samples BCn but not ASTC (most desktop ones), ASTC textures are decoded and then encoded
-    help again as BC7, in a quarter of RGBA8's memory, close to what the blocks decode to but not always the same.
-    help Exact = they are decoded to RGBA8, exactly as the game's blocks decode, in four times the memory. Where the GPU
-    help samples ASTC it does nothing. It takes the place of astc_bc, whose 1 was Auto
+    words Auto|Exact|BC7
+    help How a GPU that samples BCn but not ASTC (most desktop ones) holds ASTC textures. Auto = Exact where the GPU's
+    help memory budget is 8 GB or more as the game starts, else BC7. Exact = decoded to RGBA8, exactly as the game's
+    help blocks decode, in four times the memory. BC7 = shown at once decoded to RGBA8, then encoded again as BC7 between
+    help frames, a few at a time, into a quarter of RGBA8's memory, close to what the blocks decode to but not always the
+    help same. Where the GPU samples ASTC it does nothing. It takes the place of astc_bc, whose 1 is Auto
 
 table g_performance_ini
 setting FPS limit
@@ -444,8 +468,8 @@ setting Controls scale
     step 10
     shift 50
     help Their size: 0 to 100, for 50% to 150%
-setting Controls opacity
-    key controls_opacity
+setting Controls alpha
+    key controls_alpha
     int 0 100
     default 50
     label Opacity
@@ -820,6 +844,17 @@ setting Vulkan validation layer
     words Off|On
     help 1 = the Vulkan validation layer (VK_LAYER_KHRONOS_validation, the Vulkan SDK's) checks every Vulkan call and
     help logs what it finds. It slows the game down a lot, and a missing layer is only a warning
+setting Vulkan API
+    label Vulkan version
+    key vk_api
+    text 8
+    default auto
+    startup
+    words auto=Auto|1.2=1.2
+    help The Vulkan version the renderer runs at. auto = the device's, up to 1.3: a device with only 1.2 runs the 1.2
+    help way where it has the extensions 1.3 took in. 1.2 = the 1.2 way on a 1.3 device too, to test it: the 1.3
+    help features from those extensions, shaders in SPIR-V 1.5, no Vulkan Video decode. Any other value stops the game,
+    help saying so
 setting Native ASTC
     key native_astc
     int 0 1
@@ -848,6 +883,16 @@ setting Native ETC2
     help 1 = ETC2 and EAC textures are sampled as the game's blocks where the GPU samples ETC2 (most phone and tablet
     help GPUs), in a quarter to an eighth of the memory. 0 = they are decoded on the GPU, as they are on GPUs without
     help ETC2 (most desktop ones), to compare the two. On such a GPU 1 is a warning at start
+setting CPU extensions
+    key cpu_extensions
+    int 0 1
+    default 0
+    startup
+    words Off|On
+    recompile
+    help Experimental: decode LSE atomics, RCpc loads and PAuth branches and signing instructions with authentication disabled by the
+    help emulated system controls. No pointer authentication protection is provided. This is not a complete
+    help newer-console CPU profile. Set the same value for recompilation and each run.
 setting SLP vectorizer
     key slp_vectorizer
     int 0 1
@@ -1087,12 +1132,13 @@ setting NVN storage ordering
     help Deferred records the ordering requirement and emits a Vulkan barrier at the next dependent buffer use.
     help 0 keeps conservative per-draw dependencies for comparisons or command recordings from older builds.
 setting Descriptor buffers
-    key vk_descriptors
+    key vk_descriptors_mode
     int 0 3
     default 3
     startup
     words Sets|Buffers|Heaps|Automatic
-    help 2 and 3 do the same: graphics descriptors in heaps where the device has them, else buffers, else sets.
+    help 3, Automatic, is 2 on a GPU that shares the system's memory (an integrated one, a phone's) and 0 on one with
+    help memory of its own. 2: graphics descriptors in heaps where the device has them, else buffers, else sets.
     help 1 uses descriptor buffers where supported, else sets. A heap draw whose resource cannot be encoded uses
     help buffers or sets. Compute keeps its own descriptor pools. With buffers or heaps in use, the guest's fragment
     help barriers are skipped, which the tracking of targets and buffers orders. 0 = descriptor sets for graphics

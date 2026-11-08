@@ -20,7 +20,9 @@
 #include "nx/gpu/vk/descriptors.h"
 #include "nx/gpu/vk/descriptor_heaps.h"
 #include "nx/gpu/vk/capture.h"
+#include "nx/gpu/vk/lookup_ways.h"
 #include "nx/gpu/vk/pipeline_file.h"
+#include "nx/gpu/vk/pipeline_library.h"
 #include "nx/gpu/vk/internal_spv.h"
 #include "nx/gpu/vk/tess_passthrough.h"
 #include "nx/gpu/renderer.h"
@@ -39,6 +41,7 @@
 
 /* The caches live in shader_cache/ of the game's cache folder (g_cachedir), wherever the runtime was started from */
 static char g_cache_dir[1100], g_pcache_path[1200], g_pcache_tmp[1230];
+static char g_driver_tag[PF_TAG]; /* the driver's, whose files of the cache these are (pf_driver_tag) */
 static int g_pcache_dirty; /* pipelines made since the cache was last written (atomic: it is saved outside vk_lock) */
 static u64 g_pcache_used;  /* plat_ns when a pipeline last went into the cache (atomic) */
 static void pcache_note(void);
@@ -413,17 +416,32 @@ void vk_pipeline_init(void) {
     if (!g_vk_playout) fatal("vulkan: cannot create shader pipeline layout");
     snprintf(g_cache_dir, sizeof g_cache_dir, "%sshader_cache", g_cachedir);
     plat_mkdir(g_cache_dir);
-    snprintf(g_pcache_path, sizeof g_pcache_path, "%s/vk_pipelines.bin", g_cache_dir);
+    /* each driver's files apart: a game run with the system's driver, then a package's (gpu_driver), then the
+       system's again keeps the first one's */
+    pf_driver_tag(g_driver_tag, sizeof g_driver_tag, g_vk.driver_id, g_vk.props.vendorID, g_vk.props.deviceID,
+                  g_settings.gpu_driver);
+    pf_driver_path(g_pcache_path, sizeof g_pcache_path, g_cache_dir, "vk_pipelines", g_driver_tag, ".bin");
     snx_path_native(g_pcache_path);
     /* the temporary name is the process's own: two games running at once would otherwise write the same file */
     snprintf(g_pcache_tmp, sizeof g_pcache_tmp, "%s.%u.tmp", g_pcache_path, pf_pid());
-    /* the driver's compiled pipelines from earlier runs; it ignores data from another device or driver version */
+    /* the driver's compiled pipelines from earlier runs; it ignores data from another device or driver version.
+       Without a file of this driver's, the one every driver wrote before each had its own, left where it is */
     VkPipelineCacheCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     PFileMap data;
-    if (!plat_file_map(&data, g_pcache_path) && data.data) {
+    char* legacy = snx_format("%s/vk_pipelines.bin", g_cache_dir);
+    if (legacy) snx_path_native(legacy);
+    int mapped = !plat_file_map(&data, g_pcache_path) && data.data;
+    if (!mapped && legacy && !plat_file_map(&data, legacy) && data.data) {
+        mapped = 1;
+        LOG("vulkan: %s, the file every driver shared before each had its own, stays where it is, read as the start "
+            "of %s, which is not there yet\n",
+            legacy, g_pcache_path);
+    }
+    if (mapped) {
         ci.initialDataSize = (size_t)data.size;
         ci.pInitialData = data.data;
     }
+    free(legacy);
     if (!VK_OK(vkCreatePipelineCache(g_vk.dev, &ci, NULL, &g_pcache)) && ci.initialDataSize) {
         ci.initialDataSize = 0;
         ci.pInitialData = NULL;
@@ -448,8 +466,8 @@ void vk_pipeline_init(void) {
 /* ------------------------------------------------------------ shaders */
 
 static VkSh* g_shh[1024];
-/* the shader last found for an address and key, two per set. It is checked against memory once per submit: unchanged
-   by write tracking since then, or else by the hash of its code */
+/* the shader last found for an address and key, VK_SHA_WAYS per set (lookup_ways.h). It is checked against memory
+   once per submit: unchanged by write tracking since then, or else by the hash of its code */
 typedef struct {
     u64 gva, gva_a, gw;
     u64 shader_generation;
@@ -457,7 +475,7 @@ typedef struct {
     int stage;
     VkSh* s;
 } ShA;
-static ShA g_sha[4096];
+static ShA g_sha[VK_SHA_WAYS << VK_SHA_SET_BITS];
 
 /* the program's own bytes: what the GPU holds beside them on their pages stays there */
 static int code_hash(u64 gva, u32 len, u64* hash) {
@@ -676,13 +694,11 @@ VkSh* vk_shader_get_ex(const DsState* ds, u64 gva, u64 gva_a, int stage, u64 int
     if (stage == ST_GS) mix ^= (u32)vk_hash(mask + 12, 8 * sizeof(u32));
     if (stage != ST_GS && rect) mix ^= (u32)vk_hash(mask + 12, 2 * sizeof(u32));
     if (queried) mix ^= (u32)vk_hash(mask + 14, SH_QUERY_WORDS * sizeof(u32));
-    /* the set from every bit of the key, mixed by multiplying: programs are 256-byte aligned, and a shift and xor of
-       their addresses left most sets unused */
     u64 hk = (gva * 0x9E3779B97F4A7C15ull) ^ (gva_a * 0xC2B2AE3D27D4EB4Full) ^ ((u64)mix << 24) ^ (u64)stage;
-    ShA* set = &g_sha[(u32)((hk * 0x9E3779B97F4A7C15ull) >> 52) & 4094];
+    ShA* set = &g_sha[vk_sha_set(hk) * VK_SHA_WAYS];
     ShA* ca = NULL;
     u32 epoch = vk_ww_epoch(); /* before the code is checked or read */
-    for (int w = 0; w < 2 && !ca; w++)
+    for (int w = 0; w < VK_SHA_WAYS && !ca; w++)
         if (set[w].s && set[w].gva == gva && set[w].gva_a == gva_a && set[w].stage == stage &&
             !memcmp(set[w].mask, mask, 20 * sizeof *mask) && !memcmp(set[w].mask + 21, mask + 21, 5 * sizeof *mask))
             ca = &set[w];
@@ -697,8 +713,11 @@ VkSh* vk_shader_get_ex(const DsState* ds, u64 gva, u64 gva_a, int stage, u64 int
             ca->gw = gpu_mem_generation();
         }
         if (same && vk_cb_reads_hold(&s->cbr, sh_cb_read)) return s;
-    } else /* the way used longest ago */
-        ca = !set[0].s || (set[1].s && (i32)(set[0].epoch - set[1].epoch) <= 0) ? &set[0] : &set[1];
+    } else { /* an empty way, else the one used longest ago */
+        ca = &set[0];
+        for (int w = 1; w < VK_SHA_WAYS && ca->s; w++)
+            if (!set[w].s || (i32)(set[w].epoch - ca->epoch) < 0) ca = &set[w];
+    }
     u32 wseen = vk_ww_now();
     u64 gw = gpu_mem_generation();
     u8* code = malloc(SH_CODE);
@@ -829,21 +848,46 @@ static VkShaderModule null_fs(void) {
    shaders do, left
    one game's menus over a black backdrop and its loading screen without its map whenever their one draw was
    skipped, and failed 190 of edenprobe's cases: a draw is never skipped for its pipeline. What a worker needs that is
-   made lazily, the layout and the empty fragment shader, is made on the GPU thread first */
+   made lazily, the layout and the empty fragment shader, is made on the GPU thread first.
+   With pipeline libraries (g_vk.has_gpl) a draw's new pipeline is linked from four parts instead: its vertex input,
+   its programs before rasterization, its fragment program and its fragment output, each a library a worker makes
+   once for every pipeline that shares it (a program drawn with several targets or blend states is compiled once).
+   The draw binds the link, and a worker makes the pipeline whole after the draws' and the file's pipelines; that one
+   replaces the link at the next bind (pipe_now), as DXVK does */
 typedef struct Pipe {
-    PipeKey k;
+    PipeKey k; /* a library's: only the fields of its part (lib_key), the rest zero */
     u64 h;
-    VkPipeline p; /* once ready */
+    VkPipeline p; /* once ready: the pipeline made whole, or a library */
     int ready;    /* set by the worker after p, with release order */
     VkPipelineLayout layout;
     VkShaderModule fs; /* k.fs, or the empty fragment shader */
     int prewarm;       /* one of the file's, made before a draw asked for it */
-    int queued;        /* in the workers' queue (g_pj_lock): 1 a draw's, 2 the file's */
+    int queued;        /* in the workers' queue (g_pj_lock): 1 a draw's, 2 the file's, 3 to be made whole */
     u32 standin;       /* its index + 1 in the stand-ins' table (vk_pipeline_get_deferred), 0 for none yet */
+    u32 part;          /* a library: the VK_GRAPHICS_PIPELINE_LIBRARY_*_BIT_EXT of its part; 0 a pipeline */
+    int asked;         /* a library: queued once (the GPU thread's) */
+    /* a pipeline linked from libraries: its parts (vertex input, before rasterization, fragment program, fragment
+       output), all NULL for one only made whole; fast, the link, set before linked (release): NULL if it failed */
+    struct Pipe* lib[4];
+    VkPipeline fast;
+    int linked;
+    int linking; /* claimed by the thread that links it (pipe_link_now) */
     struct Pipe *next, *job;
 } Pipe;
 #define PIPEH 4096
 static Pipe* g_pipeh[PIPEH];
+#define PART_VI  VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT
+#define PART_PR  VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT
+#define PART_FS  VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT
+#define PART_FO  VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT
+#define PART_ALL (PART_VI | PART_PR | PART_FS | PART_FO)
+static const u32 g_parts[4] = {PART_VI, PART_PR, PART_FS, PART_FO};
+/* the libraries by part and key (the GPU thread's, under vk_lock). Like pipelines, never freed */
+#define LIBH 1024
+static Pipe* g_libh[LIBH];
+/* added atomically by the workers: parts made and their ns, links and theirs, linked pipelines made whole and theirs,
+   and those queued to be made whole */
+static u64 g_gpl_parts, g_gpl_part_ns, g_gpl_links, g_gpl_link_ns, g_gpl_whole, g_gpl_whole_ns, g_gpl_whole_left;
 
 /* The shaders and pipelines of earlier runs (pipeline_file.c), so that each run doesn't translate the same shaders
    and make the same pipelines again as views come into sight: one game made 440 pipelines and 500 shaders
@@ -900,8 +944,12 @@ static struct {
 } g_pf;
 static void pf_pipe_record(const PipeKey* k);
 
-static VkPipeline pipe_create(const Pipe* e) {
+/* e's pipeline made whole (parts PART_ALL), or the library of one part (pipeline libraries): the same states either
+   way, each in the part the extension gives it, so that the four parts linked are the pipeline made whole. NULL when
+   the driver refuses it */
+static VkPipeline pipe_create(const Pipe* e, u32 parts) {
     const PipeKey* k = &e->k;
+    const int whole = parts == PART_ALL;
     VkPipelineShaderStageCreateInfo st[5];
     VkShaderDescriptorSetAndBindingMappingInfoEXT mappings[5];
     VkDescriptorSetAndBindingMappingEXT binding_maps[5][SNX_VKB_END];
@@ -911,11 +959,11 @@ static VkPipeline pipe_create(const Pipe* e) {
                                                   VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_FRAGMENT_BIT};
     VkPipelineTessellationStateCreateInfo ts;
     u32 nst = 0, s;
-    modules[0] = k->vs;
-    modules[1] = k->tcs;
-    modules[2] = k->tes;
-    modules[3] = k->gs;
-    modules[4] = e->fs;
+    modules[0] = parts & PART_PR ? k->vs : VK_NULL_HANDLE;
+    modules[1] = parts & PART_PR ? k->tcs : VK_NULL_HANDLE;
+    modules[2] = parts & PART_PR ? k->tes : VK_NULL_HANDLE;
+    modules[3] = parts & PART_PR ? k->gs : VK_NULL_HANDLE;
+    modules[4] = parts & PART_FS ? e->fs : VK_NULL_HANDLE;
     for (s = 0; s < 5; s++) {
         if (!modules[s]) continue;
         memset(&st[nst], 0, sizeof st[nst]);
@@ -1022,6 +1070,9 @@ static VkPipeline pipe_create(const Pipe* e) {
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     VkPipelineColorBlendAttachmentState cba[8];
     int changed = 0;
+    /* a fragment output library's key has no fragment program, and its masks are cleared already where the pipeline
+       has none (lib_key) */
+    const int writes = k->fs || parts == PART_FO;
     for (u32 i = 0; i < k->ncolor; i++) {
         cba[i] = (VkPipelineColorBlendAttachmentState){.blendEnable = k->blend[i].en,
                                                        .srcColorBlendFactor = (VkBlendFactor)k->blend[i].sc,
@@ -1031,7 +1082,7 @@ static VkPipeline pipe_create(const Pipe* e) {
                                                        .dstAlphaBlendFactor = (VkBlendFactor)k->blend[i].da,
                                                        .alphaBlendOp = (VkBlendOp)k->blend[i].aop,
                                                        /* no fragment shader: its outputs would be undefined */
-                                                       .colorWriteMask = k->fs ? k->blend[i].mask : 0};
+                                                       .colorWriteMask = writes ? k->blend[i].mask : 0};
         if (!g_vk.feat.dualSrcBlend) { /* the second source's factors become the first's */
             VkBlendFactor* f[4] = {&cba[i].srcColorBlendFactor, &cba[i].dstColorBlendFactor,
                                    &cba[i].srcAlphaBlendFactor, &cba[i].dstAlphaBlendFactor};
@@ -1074,34 +1125,22 @@ static VkPipeline pipe_create(const Pipe* e) {
                                               .logicOp = k->logic_op ? (VkLogicOp)(k->logic_op - 1) : VK_LOGIC_OP_COPY,
                                               .attachmentCount = k->ncolor,
                                               .pAttachments = cba};
-    VkDynamicState dyn[21 + 3] = {VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT,
-                                  VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
-                                  VK_DYNAMIC_STATE_CULL_MODE,
-                                  VK_DYNAMIC_STATE_FRONT_FACE,
-                                  VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
-                                  VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
-                                  VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
-                                  VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
-                                  VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE,
-                                  VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
-                                  VK_DYNAMIC_STATE_STENCIL_OP,
-                                  VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
-                                  VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
-                                  VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE,
-                                  VK_DYNAMIC_STATE_LINE_WIDTH,
-                                  VK_DYNAMIC_STATE_DEPTH_BIAS,
-                                  VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-                                  VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
-                                  VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
-                                  VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-                                  VK_DYNAMIC_STATE_DEPTH_BOUNDS};
-    u32 ndyn = 21; /* the states above, which every pipeline has */
+    VkDynamicState dyn[32];
+    u32 ndyn, nall;
+    const u32* all = vk_pipe_dynamic_states(&nall);
+    for (ndyn = 0; ndyn < nall; ndyn++) dyn[ndyn] = (VkDynamicState)all[ndyn];
     /* without the feedback loop's dynamic state, a pipeline enables the loop with a flag (k->feedback) instead */
     if (g_vk.has_feedback_dynamic) dyn[ndyn++] = VK_DYNAMIC_STATE_ATTACHMENT_FEEDBACK_LOOP_ENABLE_EXT;
     /* the stride is set by vkCmdBindVertexBuffers2, which a draw without vertex buffers never calls: a pipeline without
        bindings leaves it out. With dynamic vertex input the draw's layout holds its strides */
     if (l->nbind && g_vk.has_dynamic_stride) dyn[ndyn++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
     if (g_vk.vertex_input_dynamic) dyn[ndyn++] = VK_DYNAMIC_STATE_VERTEX_INPUT_EXT;
+    if (!whole) { /* a library lists the states of its part alone */
+        u32 n = 0;
+        for (u32 i = 0; i < ndyn; i++)
+            if (vk_gpl_dynamic_part((u32)dyn[i]) & parts) dyn[n++] = dyn[i];
+        ndyn = n;
+    }
     VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
                                            .dynamicStateCount = ndyn,
                                            .pDynamicStates = dyn};
@@ -1128,6 +1167,7 @@ static VkPipeline pipe_create(const Pipe* e) {
                                                         .depthStencilAttachmentSamples = k->depth || k->stencil
                                                             ? (VkSampleCountFlagBits)(raster_samples ? raster_samples : 1)
                                                             : 0};
+    /* the attachments' formats are the fragment output's: the other parts take none */
     VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
                                         .pNext = k->coverage.raster_samples    ? (void*)&attachment_samples
                                                  : g_vk.has_vertex_robustness2 ? (void*)&robustness
@@ -1136,26 +1176,42 @@ static VkPipeline pipe_create(const Pipe* e) {
                                         .pColorAttachmentFormats = cf,
                                         .depthAttachmentFormat = (VkFormat)k->depth,
                                         .stencilAttachmentFormat = (VkFormat)k->stencil};
+    VkGraphicsPipelineLibraryCreateInfoEXT library = {.sType =
+                                                          VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+                                                      .pNext = parts & PART_FO               ? (void*)&ri
+                                                               : g_vk.has_vertex_robustness2 ? (void*)&robustness
+                                                                                             : (void*)&fi,
+                                                      .flags = parts};
+    /* A part is bound only until the pipeline made whole replaces it (gpl_whole): made without optimization it takes
+       half the time (a game's 778 pipelines on one thread, RADV: 5.45 s made whole, 3.95 s as optimized parts, 2.54 s
+       as unoptimized ones), which is the draws' wait for their first pipeline */
+    const int quick = !whole && g_vk.gpl_whole;
     VkGraphicsPipelineCreateInfo gi = {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = &ri,
+        .pNext = whole ? (void*)&ri : (void*)&library,
         .flags = (g_vk.has_descriptor_buffers ? VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT : 0) |
-                 (k->feedback ? VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT : 0),
+                 (k->feedback ? VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT : 0) |
+                 (whole ? 0 : VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) |
+                 (quick ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0),
         .stageCount = nst,
         .pStages = st,
-        .pVertexInputState = &vi,
-        .pInputAssemblyState = &ia,
-        .pTessellationState = k->tes ? &ts : NULL,
-        .pViewportState = &vp,
-        .pRasterizationState = &rs,
-        .pMultisampleState = &ms,
-        .pDepthStencilState = &ds,
-        .pColorBlendState = &cb,
+        .pVertexInputState = parts & PART_VI ? &vi : NULL,
+        .pInputAssemblyState = parts & PART_VI ? &ia : NULL,
+        .pTessellationState = parts & PART_PR && k->tes ? &ts : NULL,
+        .pViewportState = parts & PART_PR ? &vp : NULL,
+        .pRasterizationState = parts & PART_PR ? &rs : NULL,
+        .pMultisampleState = parts & PART_FO ? &ms : NULL,
+        .pDepthStencilState = parts & PART_FS ? &ds : NULL,
+        .pColorBlendState = parts & PART_FO ? &cb : NULL,
         .pDynamicState = &dy,
-        .layout = e->layout};
-    VkPipelineCreateFlags2CreateInfo flags2 = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
-        .pNext = gi.pNext, .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT |
-            (k->feedback ? VK_PIPELINE_CREATE_2_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT : 0)};
+        .layout = parts & (PART_PR | PART_FS) ? e->layout : VK_NULL_HANDLE};
+    VkPipelineCreateFlags2CreateInfo flags2 = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
+        .pNext = gi.pNext,
+        .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT |
+                 (k->feedback ? VK_PIPELINE_CREATE_2_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT : 0) |
+                 (whole ? 0 : VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) |
+                 (quick ? VK_PIPELINE_CREATE_2_DISABLE_OPTIMIZATION_BIT_KHR : 0)};
     if (k->heaps) {
         gi.pNext = &flags2;
         gi.flags = 0;
@@ -1163,8 +1219,30 @@ static VkPipeline pipe_create(const Pipe* e) {
     }
     VkPipeline p = VK_NULL_HANDLE;
     VK_OK(vkCreateGraphicsPipelines(g_vk.dev, g_pcache, 1, &gi, NULL, &p));
-    if (made.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)
+    if (whole && (made.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT))
         __atomic_add_fetch(e->prewarm ? &g_pf.hits : &g_pipe_hits, 1, __ATOMIC_RELAXED);
+    return p;
+}
+/* e's four parts linked, without optimizing across them (fast linking): NULL when the driver refuses it */
+static VkPipeline pipe_link(const Pipe* e) {
+    VkPipeline libs[4];
+    for (int i = 0; i < 4; i++) libs[i] = e->lib[i]->p;
+    VkPipelineLibraryCreateInfoKHR li = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, .libraryCount = 4, .pLibraries = libs};
+    VkGraphicsPipelineCreateInfo gi = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .pNext = &li,
+        .flags = g_vk.has_descriptor_buffers ? VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT : 0,
+        .layout = e->k.heaps ? VK_NULL_HANDLE : e->layout};
+    VkPipelineCreateFlags2CreateInfo flags2 = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
+                                               .pNext = &li,
+                                               .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT};
+    if (e->k.heaps) {
+        gi.pNext = &flags2;
+        gi.flags = 0;
+    }
+    VkPipeline p = VK_NULL_HANDLE;
+    VK_OK(vkCreateGraphicsPipelines(g_vk.dev, g_pcache, 1, &gi, NULL, &p));
     return p;
 }
 /* e's pipeline, made here. One a draw asked for is kept in the file (pf_pipe_record): once made when the GPU thread
@@ -1176,7 +1254,7 @@ static VkPipeline pipe_make(const Pipe* e, int record) {
     /* A new-area pipeline can arrive after a long quiet spell. Mark it before entering the driver, so a periodic
        cache snapshot doesn't mistake an in-flight compile for idleness and contend for the driver's cache lock. */
     pcache_note();
-    VkPipeline p = pipe_create(e);
+    VkPipeline p = pipe_create(e, PART_ALL);
     SNX_ZONE_END(z);
     pcache_note();
     if (e->prewarm)
@@ -1189,37 +1267,139 @@ static VkPipeline pipe_make(const Pipe* e, int record) {
 }
 
 /* the workers' queues, and the wait for one pipeline to be ready. The file's pipelines a draw asked for are made first,
-   in the order asked for; the rest of the file's (pf_load_pipe) after */
+   in the order asked for; the rest of the file's (pf_load_pipe) after, then the linked pipelines to make whole */
 static PMutex g_pj_lock = PMUTEX_INIT;
 static PCond g_pj_work, g_pj_done;
-static Pipe *g_pj_head, *g_pj_tail;               /* a draw's */
+static Pipe *g_pj_head, *g_pj_tail;               /* a draw's: pipelines and libraries */
 static Pipe *g_pw_head, *g_pw_tail;               /* the file's */
+static Pipe *g_po_head, *g_po_tail;               /* linked pipelines to make whole */
 static int g_pj_started, g_pj_threads, g_pj_busy; /* g_pj_busy: the workers making a pipeline now */
+/* the workers making a linked pipeline whole, and the most that may: half of them, so that the rest are free for a
+   draw's libraries the moment one is asked for, and the game's threads keep their share of the CPU */
+static int g_po_busy, g_po_max;
+static void pipe_queue(Pipe* e, int queue);
+/* e's pipeline to bind now as it stands: the one made whole once it is, else the link of its parts; NULL with
+   *pending set while either may still come, and NULL alone when neither could be made */
+static VkPipeline pipe_peek(Pipe* e, int* pending) {
+    int ready = __atomic_load_n(&e->ready, __ATOMIC_ACQUIRE);
+    if (ready && e->p) {
+        *pending = 0;
+        return e->p;
+    }
+    if (__atomic_load_n(&e->linked, __ATOMIC_ACQUIRE) && e->fast) {
+        *pending = 0;
+        return e->fast;
+    }
+    *pending = !ready;
+    return VK_NULL_HANDLE;
+}
+/* whether every library of e is made (each one's ready, with release order) */
+static int pipe_parts_ready(Pipe* e) {
+    for (int i = 0; i < 4; i++)
+        if (!__atomic_load_n(&e->lib[i]->ready, __ATOMIC_ACQUIRE)) return 0;
+    return 1;
+}
+/* e's parts linked by the first thread that finds them all made: the thread that binds it, or the GPU thread when
+   it asks for a pipeline whose parts were all made before, never a worker kept waiting for them (a link takes a few
+   microseconds). Then e is queued to be made whole; a part that couldn't be made, or a link the driver refused, has it
+   made whole at the end of the draws' queue instead, as without libraries */
+static void pipe_link_now(Pipe* e) {
+    int unclaimed = 0;
+    if (!e->lib[0] || __atomic_load_n(&e->linked, __ATOMIC_ACQUIRE) || !pipe_parts_ready(e) ||
+        !__atomic_compare_exchange_n(&e->linking, &unclaimed, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return;
+    VkPipeline fast = VK_NULL_HANDLE;
+    int parts = 1;
+    for (int i = 0; i < 4; i++) parts &= e->lib[i]->p != VK_NULL_HANDLE;
+    if (parts) {
+        u64 t0 = plat_ns();
+        fast = pipe_link(e);
+        __atomic_add_fetch(&g_gpl_links, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_gpl_link_ns, plat_ns() - t0, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_pipe_make_ns, plat_ns() - t0, __ATOMIC_RELAXED);
+    }
+    pm_lock(&g_pj_lock);
+    e->fast = fast;
+    __atomic_store_n(&e->linked, 1, __ATOMIC_RELEASE);
+    if (!fast)
+        pipe_queue(e, 1);
+    else if (g_vk.gpl_whole && !g_vk.gpl_hold) {
+        __atomic_add_fetch(&g_gpl_whole_left, 1, __ATOMIC_RELAXED);
+        pipe_queue(e, 3);
+    }
+    pc_broadcast(&g_pj_done);
+    pm_unlock(&g_pj_lock);
+}
+/* e's pipeline to bind now, without waiting for a worker: pipe_peek's, linking its parts here when they are all made */
+static VkPipeline pipe_now(Pipe* e, int* pending) {
+    VkPipeline got = pipe_peek(e, pending);
+    if (got || !*pending || !e->lib[0]) return got;
+    pipe_link_now(e);
+    return pipe_peek(e, pending);
+}
+/* one of e's jobs, on a worker: a library, or a pipeline made whole (a draw's without libraries or whose link failed,
+   the file's, or a linked one: queue 3) */
+static void pipe_job(Pipe* e, int queue) {
+    VkPipeline p;
+    if (e->part) {
+        u64 t0 = plat_ns();
+        pcache_note();
+        p = pipe_create(e, e->part);
+        pcache_note();
+        __atomic_add_fetch(&g_gpl_parts, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_gpl_part_ns, plat_ns() - t0, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_pipe_make_ns, plat_ns() - t0, __ATOMIC_RELAXED);
+    } else if (queue == 3) {
+        u64 t0 = plat_ns();
+        pcache_note();
+        p = pipe_create(e, PART_ALL);
+        pcache_note();
+        __atomic_sub_fetch(&g_gpl_whole_left, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_gpl_whole, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_gpl_whole_ns, plat_ns() - t0, __ATOMIC_RELAXED);
+    } else
+        p = pipe_make(e, 0);
+    pm_lock(&g_pj_lock);
+    e->p = p;
+    __atomic_store_n(&e->ready, 1, __ATOMIC_RELEASE);
+    pc_broadcast(&g_pj_done);
+    pm_unlock(&g_pj_lock);
+}
 static void pipe_worker(void* arg) {
     (void)arg;
     SNX_THREAD_NAME("Vulkan pipelines");
     for (;;) {
         Pipe* e;
-        VkPipeline p;
+        int queue;
         pm_lock(&g_pj_lock);
-        while (!g_pj_head && !g_pw_head) pc_wait(&g_pj_work, &g_pj_lock, -1);
+        while (!g_pj_head && !g_pw_head && !(g_po_head && g_po_busy < g_po_max)) pc_wait(&g_pj_work, &g_pj_lock, -1);
         if (g_pj_head) {
             e = g_pj_head;
             g_pj_head = e->job;
             if (!g_pj_head) g_pj_tail = NULL;
-        } else {
+            queue = 1;
+        } else if (g_pw_head) {
             e = g_pw_head;
             g_pw_head = e->job;
             if (!g_pw_head) g_pw_tail = NULL;
+            queue = 2;
+        } else {
+            e = g_po_head;
+            g_po_head = e->job;
+            if (!g_po_head) g_po_tail = NULL;
+            queue = 3;
+            g_po_busy++;
         }
         e->queued = 0;
         g_pj_busy++;
         pm_unlock(&g_pj_lock);
-        p = pipe_make(e, 0);
+        pipe_job(e, queue);
         pm_lock(&g_pj_lock);
         g_pj_busy--;
-        e->p = p;
-        __atomic_store_n(&e->ready, 1, __ATOMIC_RELEASE);
+        if (queue == 3) {
+            g_po_busy--;
+            pc_signal(&g_pj_work); /* the next to make whole, if one waits */
+        }
         pc_broadcast(&g_pj_done);
         pm_unlock(&g_pj_lock);
     }
@@ -1232,7 +1412,7 @@ void vk_pipeline_quiesce(void) {
         while (!__atomic_load_n(&g_pf.ship_ready, __ATOMIC_ACQUIRE)) plat_sleep_ns(1000000);
     }
     pm_lock(&g_pj_lock);
-    while (g_pj_threads && (g_pj_head || g_pw_head || g_pj_busy)) pc_wait(&g_pj_done, &g_pj_lock, -1);
+    while (g_pj_threads && (g_pj_head || g_pw_head || g_po_head || g_pj_busy)) pc_wait(&g_pj_done, &g_pj_lock, -1);
     pm_unlock(&g_pj_lock);
 }
 /* the workers, started the first time one is needed: how many there are (g_pj_lock) */
@@ -1244,12 +1424,18 @@ static int pipe_workers(void) {
         pc_init(&g_pj_done);
         for (int i = 0; i < n; i++)
             if (!plat_thread(pipe_worker, NULL, (size_t)1 << 20)) g_pj_threads++;
+        g_po_max = g_pj_threads > 1 ? g_pj_threads / 2 : 1;
     }
     return g_pj_threads;
 }
-/* e at the end of a queue (g_pj_lock): 1 a draw's, 2 the file's */
+/* e at the end of a queue (g_pj_lock): 1 a draw's, 2 the file's, 3 the linked pipelines to make whole */
 static void pipe_queue(Pipe* e, int queue) {
-    Pipe **head = queue == 1 ? &g_pj_head : &g_pw_head, **tail = queue == 1 ? &g_pj_tail : &g_pw_tail;
+    Pipe **head = queue == 1   ? &g_pj_head
+                  : queue == 2 ? &g_pw_head
+                               : &g_po_head,
+         **tail = queue == 1   ? &g_pj_tail
+                  : queue == 2 ? &g_pw_tail
+                               : &g_po_tail;
     e->job = NULL;
     if (*tail)
         (*tail)->job = e;
@@ -1277,19 +1463,25 @@ static int pipe_promote(Pipe* e) {
     pm_unlock(&g_pj_lock);
     return moved;
 }
-/* e's pipeline once ready, waiting at most ns for it (a negative ns: until it is) */
+/* e's pipeline once it can be bound (pipe_now: made whole, or linked), waiting at most ns for it (a negative ns: until
+   it can) */
 static VkPipeline pipe_wait(Pipe* e, i64 ns) {
     u64 until = ns < 0 ? 0 : plat_ns() + (u64)ns;
+    int pending;
+    VkPipeline got;
     SNX_ZONE(z, "pipeline wait");
-    pm_lock(&g_pj_lock);
-    while (!e->ready) {
+    while (!(got = pipe_now(e, &pending)) && pending) {
         u64 now = plat_ns();
         if (ns >= 0 && now >= until) break;
-        pc_wait(&g_pj_done, &g_pj_lock, ns < 0 ? -1 : (i64)(until - now));
+        /* asleep only while nothing changed since pipe_now looked: each part, link and pipeline is published under
+           the lock, with a broadcast */
+        pm_lock(&g_pj_lock);
+        if (!pipe_peek(e, &pending) && pending && !(e->lib[0] && !e->linking && pipe_parts_ready(e)))
+            pc_wait(&g_pj_done, &g_pj_lock, ns < 0 ? -1 : (i64)(until - now));
+        pm_unlock(&g_pj_lock);
     }
-    pm_unlock(&g_pj_lock);
     SNX_ZONE_END(z);
-    return __atomic_load_n(&e->ready, __ATOMIC_ACQUIRE) ? e->p : VK_NULL_HANDLE;
+    return got;
 }
 /* Stand-ins for pipelines still being made, which the GPU thread hands the recording thread in their place
    (vk_pipeline_get_deferred): PIPE_STANDIN in the top bits, which no handle has (record.c's REC_STANDIN tells the same
@@ -1351,13 +1543,93 @@ static Pipe* pipe_entry(const PipeKey* k, int* found) {
     recent[recent_next++ & 3] = p;
     return p;
 }
-/* the pipeline for k: made here when new, waited for when one of the file's is still being made */
+/* The library of k's part (PART_*): only the fields that part's state is made of, the rest zero, so that the pipelines
+   that share it find one library. A pipeline without a fragment program writes no color (pipe_create), which its
+   fragment output library holds in its masks */
+static void lib_key(const PipeKey* k, u32 part, PipeKey* out) {
+    /* with descriptor heaps a stage's mapping reads its own set's arrays alone, and no layout holds the others
+       (pipe_create): a part keys on its stages' sets */
+    u32 sets = 0;
+    for (int s = 0; s < 5; s++)
+        if ((s < 4 && part == PART_PR) || (s == 4 && part == PART_FS)) sets |= 1u << shader_vk_set(s);
+    memset(out, 0, sizeof *out);
+    out->heaps = k->heaps; /* every part's flags, which a link's must match */
+    if (part == PART_VI) {
+        out->vi = k->vi;
+        out->topo_class = k->topo_class;
+    } else if (part == PART_PR) {
+        out->vs = k->vs;
+        out->tcs = k->tcs;
+        out->tes = k->tes;
+        out->gs = k->gs;
+        out->patch = k->patch;
+        out->polygon = k->polygon;
+        out->depth_clamp = k->depth_clamp;
+        out->provoking_last = k->provoking_last;
+        out->conservative = k->conservative;
+        out->arrays = k->heaps ? k->arrays & sets : k->arrays;
+    } else if (part == PART_FS) {
+        out->fs = k->fs;
+        out->arrays = k->heaps ? k->arrays & sets : k->arrays;
+    } else {
+        out->ncolor = k->ncolor;
+        memcpy(out->color, k->color, sizeof out->color);
+        out->depth = k->depth;
+        out->stencil = k->stencil;
+        memcpy(out->blend, k->blend, sizeof out->blend);
+        if (!k->fs)
+            for (u32 i = 0; i < 8; i++) out->blend[i].mask = 0;
+        out->advanced = k->advanced;
+        out->logic_op = k->logic_op;
+        out->samples = k->samples;
+        out->coverage = k->coverage;
+        out->sample_locations = k->sample_locations;
+        out->coverage_to_color = k->coverage_to_color;
+        out->sample_off = k->sample_off;
+        out->alpha_to_coverage = k->alpha_to_coverage;
+        out->alpha_to_one = k->alpha_to_one;
+    }
+}
+/* the library of k's part, found or added (NULL with no memory), on the GPU thread */
+static Pipe* lib_entry(const PipeKey* k, u32 part) {
+    PipeKey lk;
+    lib_key(k, part, &lk);
+    u64 h = vk_hash(&lk, sizeof lk) ^ part;
+    u32 b = (u32)(h ^ (h >> 32)) & (LIBH - 1);
+    for (Pipe* q = g_libh[b]; q; q = q->next)
+        if (q->part == part && q->h == h && !memcmp(&q->k, &lk, sizeof lk)) return q;
+    Pipe* q = calloc(1, sizeof *q);
+    if (!q) return NULL;
+    q->k = lk;
+    q->h = h;
+    q->part = part;
+    q->layout = part & (PART_PR | PART_FS) ? vk_playout(lk.arrays) : VK_NULL_HANDLE;
+    q->fs = part == PART_FS ? (lk.fs ? lk.fs : null_fs()) : VK_NULL_HANDLE;
+    q->next = g_libh[b];
+    g_libh[b] = q;
+    return q;
+}
+/* p's four libraries where it is linked from them (with workers to make them), else none. A pipeline that shades
+   every sample would need the fragment program's library to hold the multisample state as well, identical to the
+   fragment output's, and one whose feedback loop is a creation flag (no dynamic state for it) has that flag in no
+   part: both are made whole, as without libraries */
+static void pipe_libs(Pipe* p) {
+    if (!g_vk.has_gpl || p->k.sample_shading || p->k.feedback) return;
+    for (int i = 0; i < 4; i++)
+        if (!(p->lib[i] = lib_entry(&p->k, g_parts[i]))) {
+            memset(p->lib, 0, sizeof p->lib);
+            return;
+        }
+}
+/* the pipeline for k: made here when new, waited for when a worker still makes it */
 VkPipeline vk_pipeline_get(const PipeKey* k) {
     int found;
     Pipe* p = pipe_entry(k, &found);
     if (!p) return VK_NULL_HANDLE;
     if (found) {
-        if (__atomic_load_n(&p->ready, __ATOMIC_ACQUIRE)) return p->p;
+        int pending;
+        VkPipeline now = pipe_now(p, &pending);
+        if (!pending) return now;
         if (p->prewarm) pipe_promote(p);
         return pipe_wait_here(p);
     }
@@ -1379,17 +1651,33 @@ VkPipeline vk_pipeline_get_deferred(const PipeKey* k) {
     Pipe* p = pipe_entry(k, &found);
     if (!p) return VK_NULL_HANDLE;
     if (found) {
-        if (__atomic_load_n(&p->ready, __ATOMIC_ACQUIRE)) return p->p;
+        /* made whole: the handle itself. A linked one is handed as its stand-in, which binds the pipeline made whole
+           once it is (the kept handle of a draw too, render.c's g_draw.pipe) */
+        int pending;
+        VkPipeline now = pipe_now(p, &pending);
+        if (now && __atomic_load_n(&p->ready, __ATOMIC_ACQUIRE)) return now;
+        if (!now && !pending) return VK_NULL_HANDLE;
         if (p->prewarm) pipe_promote(p);
     } else {
-        int queued = 0;
+        int queued = 0, workers;
         pf_pipe_record(&p->k);
         pm_lock(&g_pj_lock);
-        if (pipe_workers()) {
-            pipe_queue(p, 1);
+        workers = pipe_workers();
+        pm_unlock(&g_pj_lock);
+        if (workers) pipe_libs(p);
+        pm_lock(&g_pj_lock);
+        if (workers) {
+            /* its libraries not asked for yet; linked by the first thread that finds them made (pipe_now) */
+            for (int i = 0; i < 4 && p->lib[i]; i++)
+                if (!p->lib[i]->asked) {
+                    p->lib[i]->asked = 1;
+                    pipe_queue(p->lib[i], 1);
+                }
+            if (!p->lib[0]) pipe_queue(p, 1);
             queued = 1;
         }
         pm_unlock(&g_pj_lock);
+        pipe_link_now(p); /* its parts made for other pipelines before */
         if (!queued) { /* no worker: made here */
             u64 t0 = plat_ns();
             p->p = pipe_make(p, 0);
@@ -1408,26 +1696,40 @@ VkPipeline vk_pipeline_resolve(VkPipeline h) {
     if ((v & ~(u64)0xFFFFFFFFull) != PIPE_STANDIN) return h;
     u32 i = (u32)v - 1;
     Pipe* p = g_pstand[i / PSTAND_PAGE][i % PSTAND_PAGE];
-    if (__atomic_load_n(&p->ready, __ATOMIC_ACQUIRE)) return p->p;
+    int pending;
+    VkPipeline now = pipe_now(p, &pending);
+    if (!pending) return now;
     u64 t0 = plat_ns();
     VkPipeline got = pipe_wait(p, -1);
     __atomic_add_fetch(&g_pipe_wait_ns, plat_ns() - t0, __ATOMIC_RELAXED);
     return got;
 }
-/* the pipeline a handle from vk_pipeline_get_deferred names once it is ready, else the handle: without waiting */
+/* the pipeline a handle from vk_pipeline_get_deferred names once it is ready (made whole), else the handle: without
+   waiting */
 VkPipeline vk_pipeline_ready(VkPipeline h) {
     u64 v = (u64)(uintptr_t)h;
     if ((v & ~(u64)0xFFFFFFFFull) != PIPE_STANDIN) return h;
     u32 i = (u32)v - 1;
     Pipe* p = g_pstand[i / PSTAND_PAGE][i % PSTAND_PAGE];
-    return __atomic_load_n(&p->ready, __ATOMIC_ACQUIRE) ? p->p : h;
+    return __atomic_load_n(&p->ready, __ATOMIC_ACQUIRE) && p->p ? p->p : h;
 }
 /* the pipeline h names without waiting for it: VK_NULL_HANDLE with *pending set while a worker still makes it, and
    VK_NULL_HANDLE alone when it couldn't be made */
 VkPipeline vk_pipeline_now(VkPipeline h, int* pending) {
-    VkPipeline p = vk_pipeline_ready(h);
-    *pending = (((u64)(uintptr_t)p) & ~(u64)0xFFFFFFFFull) == PIPE_STANDIN;
-    return *pending ? VK_NULL_HANDLE : p;
+    u64 v = (u64)(uintptr_t)h;
+    *pending = 0;
+    if ((v & ~(u64)0xFFFFFFFFull) != PIPE_STANDIN) return h;
+    u32 i = (u32)v - 1;
+    return pipe_now(g_pstand[i / PSTAND_PAGE][i % PSTAND_PAGE], pending);
+}
+void vk_pipeline_library_stats(VkGplStats* s) {
+    s->parts = __atomic_load_n(&g_gpl_parts, __ATOMIC_RELAXED);
+    s->part_ms = __atomic_load_n(&g_gpl_part_ns, __ATOMIC_RELAXED) / 1000000;
+    s->links = __atomic_load_n(&g_gpl_links, __ATOMIC_RELAXED);
+    s->link_ms = __atomic_load_n(&g_gpl_link_ns, __ATOMIC_RELAXED) / 1000000;
+    s->whole = __atomic_load_n(&g_gpl_whole, __ATOMIC_RELAXED);
+    s->whole_ms = __atomic_load_n(&g_gpl_whole_ns, __ATOMIC_RELAXED) / 1000000;
+    s->whole_left = __atomic_load_n(&g_gpl_whole_left, __ATOMIC_RELAXED);
 }
 void vk_pipeline_stats(u64* pipes, u64* hits, u64* make_ms, u64* wait_ms, u64* shaders, u64* shader_ms) {
     *pipes = g_pipes_new;
@@ -2184,13 +2486,21 @@ static void pf_load(void* arg) {
     g_pf.ship.max = SHIP_MAX;
     g_pf.ship.pack = g_settings.compress_prepared_shaders ? PF_PACK_SHADERS : 0;
     g_pf.file.pack = g_settings.compress_shader_cache ? PF_PACK_UNITS : 0;
+    {
+        FILE* there = fopen(g_pf.path, "rb");
+        if (there)
+            fclose(there);
+        else
+            LOG("vulkan: no shader cache of %s (driver %s) yet: %s is made\n", g_vk.driver_name, g_driver_tag,
+                g_pf.path);
+    }
     pf_open_mapped(&g_pf.ship, g_pf.ship_path, key, pf_ship_rec, NULL);
     pf_open(&g_pf.file, g_pf.path, key, guest, &load, loaded);
-    LOG("vulkan: %u shaders and %u pipelines of earlier runs loaded from %s in %llu ms, the pipelines to be made in "
-        "the background, and %u compute pipelines made (%u could not be); %u shaders of the game's own programs in "
-        "%s\n",
-        g_pf.nsh, g_pf.npipe, g_pf.path, (unsigned long long)((plat_ns() - t0) / 1000000), g_pf.ncs, g_pf.ncs_failed,
-        g_pf.nidx, g_pf.ship_path);
+    LOG("vulkan: %u shaders and %u pipelines of earlier runs with %s (driver %s) loaded from %s in %llu ms, the "
+        "pipelines to be made in the background, and %u compute pipelines made (%u could not be); %u shaders of the "
+        "game's own programs in %s\n",
+        g_pf.nsh, g_pf.npipe, g_vk.driver_name, g_driver_tag, g_pf.path,
+        (unsigned long long)((plat_ns() - t0) / 1000000), g_pf.ncs, g_pf.ncs_failed, g_pf.nidx, g_pf.ship_path);
     __atomic_store_n(&g_pf.shaders_total, g_pf.nsh, __ATOMIC_RELAXED);
     __atomic_store_n(&g_pf.pipes_total, g_pf.npipe, __ATOMIC_RELAXED);
     pm_lock(&g_pf.lock);
@@ -2220,12 +2530,32 @@ static void pf_start_load(void) {
     }
     g_pf.on = 1;
     null_fs(); /* made here, before the reading thread uses it */
-    snprintf(g_pf.path, sizeof g_pf.path, "%s/%s.vkshaders", g_cache_dir, g_exename);
-    snprintf(g_pf.ship_path, sizeof g_pf.ship_path, "%s/%s.vkshipped", g_cache_dir, g_exename);
+    pf_driver_path(g_pf.path, sizeof g_pf.path, g_cache_dir, g_exename, g_driver_tag, ".vkshaders");
+    pf_driver_path(g_pf.ship_path, sizeof g_pf.ship_path, g_cache_dir, g_exename, g_driver_tag, ".vkshipped");
     snprintf(g_pf.scan_path, sizeof g_pf.scan_path, "%s/%s.vkscan", g_cache_dir, g_exename);
     snx_path_native(g_pf.path);
     snx_path_native(g_pf.ship_path);
     snx_path_native(g_pf.scan_path);
+    /* the files every driver shared before each had its own: a copy, the first time this driver runs, which its
+       driver's next run finds as its own, and another starts over. Both, as the main file's records point into the
+       shipped one by where its records start */
+    for (int k = 0; k < 2; k++) {
+        const char* path = k ? g_pf.ship_path : g_pf.path;
+        char* legacy = snx_format("%s/%s%s", g_cache_dir, g_exename, k ? ".vkshipped" : ".vkshaders");
+        char why[256];
+        u64 bytes;
+        if (!legacy) continue;
+        snx_path_native(legacy);
+        int r = pf_adopt(path, legacy, &bytes, why, sizeof why);
+        if (r > 0)
+            LOG("vulkan: %s, the file every driver shared before each had its own, stays where it is, copied (%llu "
+                "KB) as the start of %s, which was not there\n",
+                legacy, (unsigned long long)(bytes >> 10), path);
+        else if (r < 0)
+            WARN("vulkan: cannot copy %s to %s (%s): %s of %s starts empty\n", legacy, path, why,
+                 k ? "the shaders of the game's own programs" : "the shader cache", g_vk.driver_name);
+        free(legacy);
+    }
     if (g_settings.prepare_shaders) ship_snapshot(); /* before the game's first thread writes its data */
     /* the translator's recursion wants the GPU thread's stack */
     if (plat_thread(pf_load_thread, &g_pf, (size_t)16 << 20)) pf_load(NULL); /* no thread: read here */

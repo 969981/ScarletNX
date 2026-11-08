@@ -10,8 +10,10 @@
 #include "nx/gpu/maxwell/draw_state.h"
 #include "nx/gpu/renderer.h"
 #include "common/gpu/vk/vk_common.h"
+#include "common/utilities/spirv_emit.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/descriptors.h"
+#include "nx/gpu/vk/extension_bans.h"
 #include "nx/gpu/shader/shader.h"
 #include "nx/gpu/maxwell/kepler_compute_regs.h"
 #include "nx/gpu/maxwell/engines_int.h"
@@ -55,6 +57,21 @@
    may not be done; without it the result is GPU-owned, and the read lands it by itself (as #690 has it) */
 static void guest_done(u64 cpu, u64 len) {
     if (vk_uma()) vk_uma_mem_need_cpu(cpu, len);
+}
+/* the BC7 encoder's frames (vk_tex_later_frame) until every ASTC texture held as BC7 is, or until a frame does nothing
+   (a texture whose load failed waits for it): the images a check compares are BC7 then. The frames it took */
+static u32 later_drain(void) {
+    VkLaterStats a, b;
+    u32 frames = 0;
+    for (vk_tex_later_stats(&a); a.waiting; a = b) {
+        vk_lock();
+        vk_tex_later_frame();
+        vk_unlock();
+        frames++;
+        vk_tex_later_stats(&b);
+        if (b.blocks == a.blocks && b.made == a.made && b.waiting == a.waiting) break;
+    }
+    return frames;
 }
 
 /* The fatal path of a lost device runs on the recording thread: record.c's submit_run calls fatal(), whose window
@@ -862,6 +879,11 @@ static VkViewport viewport_of(const u32* r, u32 index) {
     mx_draw_viewports(r, &v);
     return vk_viewport_from(&d, &v, index);
 }
+static u32 swizzle_key_of(const u32* r) {
+    DsViewports v;
+    mx_draw_viewports(r, &v);
+    return vk_viewport_swizzle_key(&v);
+}
 static VkFrontFace front_face_of(const u32* r) {
     DsDynamic d;
     mx_draw_dynamic(r, &d);
@@ -884,6 +906,36 @@ static int check_viewport_orientation(void) {
     vp = viewport_of(r, 0);
     CHECK(vp.y == 54 && vp.height == -34 && vp.y + vp.height == 20);
     CHECK(front_face_of(r) == VK_FRONT_FACE_CLOCKWISE);
+    CHECK(!swizzle_key_of(r));
+    /* Any other swizzle is the last stage's, keyed with it, and the viewport keeps the transform's sign: a swap of x
+       and y, and one with NegativeY in it. The bits between the fields are none of theirs */
+    const u32 others[3] = {0x6402, 0x6413, 0xE4AA};
+    for (u32 i = 0; i < 3; i++) {
+        r[0x286] = others[i];
+        vp = viewport_of(r, 0);
+        CHECK(vp.y == 20 && vp.height == 34);
+        CHECK(swizzle_key_of(r) == (SNX_SH_SWIZZLE | (others[i] & DS_SWIZZLE_MASK) << SNX_SH_SWIZZLE_SHIFT));
+    }
+    r[0x286] = 0x6420 | 0x8888;
+    CHECK(!swizzle_key_of(r));
+    /* A program that selects viewport 1 draws it with viewport 0's swizzle when that is the last stage's, and with its
+       own when it is NegativeY and viewport 0's the viewport's too: other than that, the identity */
+    {
+        DsViewports v;
+        r[0x286] = 0x6402;
+        r[0x28e] = 0x6420;
+        mx_draw_viewports(r, &v);
+        CHECK(vk_viewport_swizzle_drawn(&v, 0) == 0x6402 && vk_viewport_swizzle_drawn(&v, 1) == 0x6402);
+        r[0x286] = 0x6420;
+        r[0x28e] = 0x6430;
+        mx_draw_viewports(r, &v);
+        CHECK(vk_viewport_swizzle_drawn(&v, 1) == 0x6430);
+        r[0x28e] = 0x6402;
+        mx_draw_viewports(r, &v);
+        CHECK(vk_viewport_swizzle_drawn(&v, 1) == 0x6420);
+        r[0x28e] = 0;
+    }
+    r[0x286] = 0x6430;
     /* Negative scale and negative coordinate swizzle cancel in the viewport. */
     transform[1] = -17;
     memcpy(&r[0x280], transform, sizeof transform);
@@ -943,6 +995,9 @@ static int check_viewport_orientation(void) {
         vp = viewport_of(r, i);
         CHECK(vp.x == 0 && vp.y == 0 && vp.width == 64 && vp.height == 48 && vp.minDepth == 0 && vp.maxDepth == 1);
     }
+    r[0x286] = 0x6402;
+    CHECK(!swizzle_key_of(r));
+    r[0x286] = 0x6430;
     r[0x4eb] = 1;
     vp = viewport_of(r, 0);
     CHECK(vp.x == 0 && vp.y == 48 && vp.width == 64 && vp.height == -48);
@@ -990,17 +1045,23 @@ static int gpu_unpack(const VkFmt* f, const u32* src, u32 n, u32* depth, u8* ste
     return 0;
 }
 
-/* astc_mode: Auto (0, the default) gives an ASTC texture a BC7 image where the GPU samples BCn but not ASTC, Exact (1)
-   an RGBA8 one; where the GPU samples ASTC, both keep the game's blocks */
+/* astc_mode: where the GPU samples BCn but not ASTC, an ASTC texture is held as BC7 by BC7 (2), as RGBA8 by Exact (1),
+   and by Auto (0, the default) as the budget at start said (device.c astc_choose: BC7 under 8 GiB); where the GPU
+   samples ASTC, all three keep the game's blocks */
 static int check_astc_mode(void) {
-    for (int mode = 0; mode < 2; mode++) {
+    u64 usage, budget;
+    vk_mem_use(&usage, &budget);
+    for (int mode = 0; mode < 3; mode++) {
         g_settings.astc_mode = mode;
-        const VkFormat want = g_vk.feat.textureCompressionASTC_LDR      ? VK_FORMAT_ASTC_4x4_UNORM_BLOCK
-                              : g_vk.feat.textureCompressionBC && !mode ? VK_FORMAT_BC7_UNORM_BLOCK
-                                                                        : VK_FORMAT_R8G8B8A8_UNORM;
-        CHECK(vk_tic_format(0x40, 0).vk == want);
+        const int bc7 = mode == 2 || (mode == 0 && g_vk.astc_auto_bc7);
+        const VkFormat want = g_vk.feat.textureCompressionASTC_LDR    ? VK_FORMAT_ASTC_4x4_UNORM_BLOCK
+                              : g_vk.feat.textureCompressionBC && bc7 ? VK_FORMAT_BC7_UNORM_BLOCK
+                                                                      : VK_FORMAT_R8G8B8A8_UNORM;
+        CHECK(vk_tic_format(0x40, 0).vk == want && vk_astc_bc7() == bc7);
     }
     g_settings.astc_mode = 0;
+    printf("astc_mode: Auto holds ASTC textures as %s here (a budget of %llu MB now), Exact as RGBA8, BC7 as BC7\n",
+           g_vk.astc_auto_bc7 ? "BC7" : "RGBA8", (unsigned long long)(budget >> 20));
     return 0;
 }
 
@@ -2220,6 +2281,7 @@ static Surf* sv_frame(const u32* tic) {
     vk_lock();
     Surf* t = vk_tex_from_tic(tic);
     vk_unlock();
+    later_drain(); /* and the encoder's frames: a texture held as BC7 is */
     return t;
 }
 /* one way in: after it, the next frame's texture is the one made, all of it is memory's, and it loaded at most most
@@ -3181,7 +3243,7 @@ static int check_sparse_pieces_batched(void) {
    mapped tiles and mip tails alone */
 #define RS_TILE 0x10000u
 /* the format such a texture is made in: NVN's, its tile's texels across and down, and its image's blocks (texels
-   across and bytes): RGBA8, or ASTC 4x4 held as BC7 (astc_mode=0, Auto), whose image is compared with the same texture made
+   across and bytes): RGBA8, or ASTC 4x4 held as BC7 (astc_mode=2), whose image is compared with the same texture made
    whole, not with memory */
 typedef struct {
     const char* name;
@@ -3471,6 +3533,7 @@ static int resident_texture(const RsFmt* as, u32 size, u32 layers, u64 gva, u64 
     Surf* whole2 = vk_tex_from_tic(ref2.tic);
     g_vk.resident = had_resident;
     vk_unlock();
+    later_drain(); /* the ASTC ones made whole are BC7 between frames */
     CHECK(t && whole && whole2 && t->levels == r.levels && t->layers == layers);
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(g_vk.dev, t->img, &req);
@@ -3559,12 +3622,12 @@ static int check_resident_texture(void) {
                             most, n));
     return 0;
 }
-/* the same for an ASTC 4x4 texture held as BC7 (astc_mode=0, Auto), whose tiles of 64x64 blocks are BC7's 256x256 texels:
+/* the same for an ASTC 4x4 texture held as BC7 (astc_mode=2), whose tiles of 64x64 blocks are BC7's 256x256 texels:
    its bound tiles are decoded where they lie, its image the same texture's made whole there and zeros elsewhere */
 static int check_resident_astc(void) {
     const int had = g_settings.astc_mode;
     RsTex probe;
-    g_settings.astc_mode = 0;
+    g_settings.astc_mode = 2;
     rs_make(&probe, &RS_ASTC4, 256, 1, 0xA10000000ull);
     const VkFmt f = vk_tic_format(probe.tic[0], 0);
     if (f.conv != VKC_ASTC || f.vk != VK_FORMAT_BC7_UNORM_BLOCK) {
@@ -3573,14 +3636,15 @@ static int check_resident_astc(void) {
         g_settings.astc_mode = had;
         return 0;
     }
-    /* the decoder's buffers made first, by a texture of its own mapped whole: what the textures below allocate is
-       counted without them */
+    /* the decoder's and the encoder's buffers made first, by a texture of its own mapped whole, made BC7 between
+       frames: what the textures below allocate is counted without them */
     CHECK(mem_map(HEAP_BASE + 0x1200000, probe.lay.size, MS_NORMAL, PERM_RW) == 0);
     gmmu_map(probe.tex.gpu, HEAP_BASE + 0x1200000, probe.lay.size);
     vk_lock();
     CHECK(vk_tex_from_tic(probe.tic));
     vk_finish();
     vk_unlock();
+    later_drain();
     gmmu_space_unmap(probe.tex.gpu, probe.lay.size);
     CHECK(mem_unmap(HEAP_BASE + 0x1200000, probe.lay.size) == 0);
     /* 2048x2048, 12 levels, levels 0 to 3 in tiles: two tiles of level 0, one of level 1 and of level 3, the mip tail;
@@ -3601,11 +3665,12 @@ static int check_resident_astc(void) {
 
 /* An ASTC array is uploaded a level at a time over all its layers (vk_astc_upload_layers): a layer and level at a time,
    each layer's encoder dispatch waited for the one before, and one game's arrays of 118 layers of 128x128 in 8 levels
-   took 667 ms of an RX 6700 XT as BC7 (docs/ASTC.md). The encoder runs once a level, and each layer's image is the one
-   its memory makes as a 2D texture on its own, as BC7 and as RGBA8 */
+   took 667 ms of an RX 6700 XT as BC7 (docs/ASTC.md). Held as BC7 (astc_mode 2), the encoder makes its BC7 image
+   between frames a level at a time too, all the layers in one dispatch; and each layer's image is the one its memory
+   makes as a 2D texture on its own, as BC7 and as RGBA8 (astc_mode 1) */
 static int astc_array_levels(int mode) {
     static const RsFmt as_rgba8 = {"ASTC 4x4 as RGBA8", NVN_FORMAT_RGBA_ASTC_4x4, 256, 1, 4, 1};
-    const RsFmt* as = mode ? &as_rgba8 : &RS_ASTC4;
+    const RsFmt* as = mode == 1 ? &as_rgba8 : &RS_ASTC4;
     const u32 layers = 8; /* 7 levels each: rs_image's 64 regions */
     const u64 cpu = HEAP_BASE + 0x1E000000 + (u64)mode * 0x100000;
     RsTex arr;
@@ -3615,7 +3680,7 @@ static int astc_array_levels(int mode) {
     nvn_tex_layout(&arr.tex.d, &arr.lay);
     nvn_tic_encode(&arr.tex, NULL, 0, 0, arr.tic);
     const VkFmt f = vk_tic_format(arr.tic[0], 0);
-    if (f.conv != VKC_ASTC || f.vk != (mode ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_BC7_UNORM_BLOCK)) {
+    if (f.conv != VKC_ASTC || f.vk != (mode == 1 ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_BC7_UNORM_BLOCK)) {
         printf("ASTC array levels, %s: the GPU %s, skipped\n", as->name,
                f.conv != VKC_ASTC ? "samples ASTC as it is" : "holds no such image");
         return 0;
@@ -3624,16 +3689,20 @@ static int astc_array_levels(int mode) {
     CHECK(mem_map(cpu, size, MS_NORMAL, PERM_RW) == 0);
     for (u64 k = 0; k < size / RS_TILE; k++) rs_fill(&arr, GP(cpu + k * RS_TILE), (u32)k + 3); /* a color a block */
     gmmu_map(arr.tex.gpu, cpu, size);
+    later_drain(); /* what the checks before left to the encoder */
     const u64 before = vk_astc_dispatches();
     vk_lock();
     Surf* t = vk_tex_from_tic(arr.tic);
     vk_finish();
     vk_unlock();
+    const u32 frames = later_drain();
     const u64 dispatches = vk_astc_dispatches() - before;
     CHECK(t && t->layers == layers && t->levels == arr.levels);
-    if (dispatches != (mode ? 0 : arr.levels)) {
-        fprintf(stderr, "ASTC array of %u layers in %u levels, %s: %llu encoder dispatches, not %u\n", layers,
-                arr.levels, as->name, (unsigned long long)dispatches, mode ? 0 : arr.levels);
+    if (dispatches != (mode == 1 ? 0 : arr.levels) || frames != (mode == 1 ? 0u : 1u)) {
+        fprintf(stderr,
+                "ASTC array of %u layers in %u levels, %s: %llu encoder dispatches in %u frames, not %u in %u\n",
+                layers, arr.levels, as->name, (unsigned long long)dispatches, frames, mode == 1 ? 0 : arr.levels,
+                mode == 1 ? 0u : 1u);
         return 1;
     }
     u8* image = rs_image(t, &arr);
@@ -3648,6 +3717,7 @@ static int astc_array_levels(int mode) {
         vk_lock();
         Surf* o = vk_tex_from_tic(one.tic);
         vk_unlock();
+        later_drain();
         u8* alone = o ? rs_image(o, &one) : NULL;
         const u64 bytes = rs_bytes(&one);
         if (!alone || memcmp(alone, image + at, (size_t)bytes)) {
@@ -3667,7 +3737,7 @@ static int astc_array_levels(int mode) {
 }
 static int check_astc_array_levels(void) {
     const int had = g_settings.astc_mode;
-    int failed = astc_array_levels(0) || astc_array_levels(1);
+    int failed = astc_array_levels(2) || astc_array_levels(1);
     g_settings.astc_mode = had;
     return failed;
 }
@@ -3734,6 +3804,7 @@ static int resident_in_flight(const RsFmt* as, u64 gva, u64 ref_gva, u64 cpu) {
         g_vk.feat.sparseResidencyImage2D = had2d;
     }
     vk_unlock();
+    later_drain(); /* the ASTC one made whole is BC7 between frames */
     CHECK(t && t->bricks && (!as->astc || (whole && !whole->bricks)));
     CHECK(rs_want(&r, whole, xa, want[0]) && rs_want(&r, whole, xb, want[1]));
     vk_lock();
@@ -3847,7 +3918,7 @@ static int resident_in_flight(const RsFmt* as, u64 gva, u64 ref_gva, u64 cpu) {
 static int check_resident_texture_in_flight(void) {
     const int had = g_settings.astc_mode;
     CHECK(!resident_in_flight(&RS_RGBA8, 0x960000000ull, 0, HEAP_BASE + 0x1300000));
-    g_settings.astc_mode = 0; /* held as BC7 where the GPU samples BCn and not ASTC; rs_device_can skips it elsewhere */
+    g_settings.astc_mode = 2; /* held as BC7 where the GPU samples BCn and not ASTC; rs_device_can skips it elsewhere */
     int failed = resident_in_flight(&RS_ASTC4, 0xA70000000ull, 0xA80000000ull, HEAP_BASE + 0x1300000);
     g_settings.astc_mode = had;
     return failed;
@@ -5067,6 +5138,7 @@ static int check_uma_page_changes(void) {
 #include "vulkan_msaa.inc"
 #include "vulkan_cross_stage_alias.inc"
 #include "vulkan_draw_texture.inc"
+#include "vulkan_lone_lane.inc"
 #include "vulkan_descriptor_heaps.inc"
 #include "vulkan_sample_raster.inc"
 #include "vulkan_mixed_coverage.inc"
@@ -5077,9 +5149,11 @@ static int check_uma_page_changes(void) {
 #include "vulkan_uma_imports.inc"
 #include "vulkan_write_tracking.inc"
 #include "vulkan_tex_partial.inc"
+#include "vulkan_astc_later.inc"
 
 #include "vulkan_descriptor_bench.inc"
 #include "vulkan_pipeline_probe.inc"
+#include "vulkan_pipeline_library.inc"
 #include "vulkan_indexed_map_bench.inc"
 #include "vulkan_nvn_storage.inc"
 #include "vulkan_nvn_compat.inc"
@@ -5087,6 +5161,7 @@ static int check_uma_page_changes(void) {
 #include "vulkan_nvn_copy_conversions.inc"
 #include "vulkan_nvn_xfb.inc"
 #include "vulkan_nvn_state.inc"
+#include "vulkan_maxwell_fixed.inc"
 #include "vulkan_nvn_events.inc"
 #include "vulkan_nvn_subroutines.inc"
 #include "vulkan_nvn_savestate.inc"
@@ -5146,6 +5221,90 @@ static int check_map_lands_covered(void) {
     return 0;
 }
 
+/* the ban lines check_vk12_way's stand-in device takes, as the log would say them */
+static void vk12_ban_say(const char* line, int warn) { printf("%s%s\n", warn ? "warning: " : "", line); }
+/* The version the renderer runs at, and on a 1.2 device (vk_api=1.2 makes one of a newer device, as the .ini
+   --settings-ini gives says) the 1.3 commands under their extensions' names and shaders in SPIR-V 1.5: the checks
+   after this one then run the 1.2 way, and the validation layer, given that version, flags any 1.3 use left. What a
+   1.2 device lacks keeps it out, named; a vk_api the renderer takes not is named with the ones it takes */
+static int check_vk12_way(void) {
+    SpvEmitter e;
+    spv_emit_init(&e, 0);
+    u32 version = e.version;
+    spv_emit_destroy(&e);
+    u32 cap = 1;
+    char why[64] = "";
+    CHECK(vk_api_setting("auto", &cap, why, sizeof why) && cap == 0);
+    CHECK(vk_api_setting("1.2", &cap, why, sizeof why) && cap == VK_API_VERSION_1_2);
+    CHECK(!vk_api_setting("1.3", &cap, why, sizeof why) && !strcmp(why, "vk_api=1.3 is not auto or 1.2"));
+    CHECK(!g_vk.api_cap == !strcmp(g_settings.vulkan_api, "auto"));
+    if (g_vk.api_cap) {
+        CHECK(!strcmp(g_settings.vulkan_api, "1.2"));
+        CHECK(g_vk.api < VK_API_VERSION_1_3 && g_vk.api >= VK_API_VERSION_1_2);
+        CHECK(version == 0x00010500u);
+        CHECK(vkCmdPipelineBarrier2 == vkCmdPipelineBarrier2KHR && vkQueueSubmit2 == vkQueueSubmit2KHR);
+        CHECK(vkCmdBeginRendering == vkCmdBeginRenderingKHR && vkCmdSetCullMode == vkCmdSetCullModeEXT);
+        CHECK(vkCmdSetPrimitiveRestartEnable == vkCmdSetPrimitiveRestartEnableEXT);
+        CHECK(vkGetDeviceImageMemoryRequirements == vkGetDeviceImageMemoryRequirementsKHR);
+        CHECK(g_vk.video_family == ~0u && !g_vk.feat12.pNext && g_vk.feat13.synchronization2 &&
+              g_vk.feat13.dynamicRendering && g_vk.feat13.maintenance4);
+    } else {
+        CHECK(g_vk.api >= VK_API_VERSION_1_3 && version == 0x00010600u && g_vk.feat12.pNext == &g_vk.feat13);
+    }
+    /* a device with all of them but dynamic rendering, its store op NONE from the EXT */
+    VkExtensionProperties list[16] = {{0}};
+    static const char* const have[] = {
+        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,          VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME,
+        VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME,   VK_KHR_MAINTENANCE_4_EXTENSION_NAME,
+        VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME,     VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME,
+        VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME, VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME};
+    u32 n = sizeof have / sizeof *have;
+    for (u32 i = 0; i < n; i++) snprintf(list[i].extensionName, sizeof list[i].extensionName, "%s", have[i]);
+    SnxVkExtensions ext = {list, n};
+    char names[256];
+    CHECK(vk_1_2_missing(&ext, names, sizeof names) == 1 && !strcmp(names, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME));
+    snprintf(list[n].extensionName, sizeof list[n].extensionName, "%s", VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+    ext.count = n + 1;
+    CHECK(vk_1_2_missing(&ext, names, sizeof names) == 0 && !names[0]);
+    /* and without a store op NONE, two named */
+    ext.list = list + 1;
+    snprintf(list[n - 1].extensionName, sizeof list[n - 1].extensionName, "VK_EXT_not_this");
+    CHECK(vk_1_2_missing(&ext, names, sizeof names) == 2 &&
+          !strcmp(names, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME ", " VK_KHR_LOAD_STORE_OP_NONE_EXTENSION_NAME));
+    /* all of them on a driver the bans keep from dynamic rendering: the filter create_device runs first takes it out,
+       and the device lacks it by name. The table and the device are put back after */
+    ext.list = list;
+    ext.count = n + 1;
+    snprintf(list[n - 1].extensionName, sizeof list[n - 1].extensionName, "%s",
+             VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME);
+    char err[512];
+    CHECK(vk_bans_load("key | action | driver | versions | system | devices | breaks | source | retest | checked | "
+                       "override\n" VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME
+                       " | off | qualcomm | * | any | * | draws nothing | a test | headless: | never | -\n",
+                       err, sizeof err));
+    VkBanDevice banned = {"Adreno (TM) 640",
+                          "Qualcomm Technologies Inc. Adreno Vulkan Driver",
+                          "",
+                          VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
+                          VK_MAKE_VERSION(512, 530, 0),
+                          0x6040001,
+                          SNX_VK_BAN_ANDROID};
+    vk_bans_device(&banned);
+    CHECK(vk_bans_filter(&ext, vk12_ban_say) == 1 && vk_1_2_missing(&ext, names, sizeof names) == 1 &&
+          !strcmp(names, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME));
+    VkPhysicalDeviceDriverProperties driver = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                                              .pNext = &driver};
+    vkGetPhysicalDeviceProperties2(g_vk.phys, &properties);
+    VkBanDevice running = {g_vk.props.deviceName,    driver.driverName,   driver.driverInfo, (uint32_t)driver.driverID,
+                           g_vk.props.driverVersion, g_vk.props.deviceID, vk_ban_system()};
+    CHECK(vk_bans_load(snx_vk_extension_bans_text, err, sizeof err));
+    vk_bans_device(&running);
+    printf("PASS the Vulkan %u.%u way: SPIR-V %u.%u, what a 1.2 device lacks named\n", VK_API_VERSION_MAJOR(g_vk.api),
+           VK_API_VERSION_MINOR(g_vk.api), version >> 16, (version >> 8) & 0xff);
+    return 0;
+}
+
 static int run_headless(int argc, char** argv) {
     nvn_init();
     const u32 w = 32, h = 16;
@@ -5161,6 +5320,21 @@ static int run_headless(int argc, char** argv) {
     u32 benchmark_passes = 0;
     const char* pipeline_probe = NULL;
     int pipeline_probe_disable = 0;
+    /* a game's .ini, opened as a run opens it, before the settings given here go over its values: a copy of it, which
+       ini_open writes again, in a folder of its own (--settings-ini=FILE) */
+    char* ini_dir = NULL;
+    for (int i = 1; i < argc; i++)
+        if (!strncmp(argv[i], "--settings-ini=", 15)) {
+            size_t size;
+            unsigned char* text = snx_read_file(argv[i] + 15, &size);
+            ini_dir = snx_temp_dir(NULL);
+            CHECK(text && ini_dir);
+            char* copy = snx_path_join(ini_dir, "game.ini");
+            CHECK(!snx_write_file(copy, text, size));
+            ini_open(copy);
+            free(copy);
+            free(text);
+        }
     /* the runtime's startup flags (-H), its settings as it takes them (--vk_memory=2, --memory_traps=2,
        --vertex_input_dynamic_state=off), and the benchmarks'. Any other argument stops the run: one dropped unsaid ran
        the checks without it */
@@ -5174,6 +5348,7 @@ static int run_headless(int argc, char** argv) {
             pipeline_probe = argv[i] + 17;
             continue;
         }
+        if (!strncmp(argv[i], "--settings-ini=", 15)) continue; /* read before the others (above) */
         if (!strncmp(argv[i], "--pipeline-probe-disable-opt=", 29)) {
             CHECK(!strcmp(argv[i] + 29, "0") || !strcmp(argv[i] + 29, "1"));
             pipeline_probe_disable = argv[i][29] - '0';
@@ -5232,14 +5407,13 @@ static int run_headless(int argc, char** argv) {
             o = setting_row(key);
         }
         if (!o) {
-            fprintf(
-                stderr,
-                "snx-test-vulkan: %s is not an option it takes: -H, --KEY=VALUE of the runtime's settings, "
-                "--bench-descriptors=N, --descriptor-images=N, --descriptor-indexed=N, --descriptor-count=N, "
-                "--bench-sparse-volume, --bench-sparse-texture, --bench-storage-lookup, --bench-storage-image, "
-                "--bench-storage-buffer, --bench-pass-breaks=N, --nvn-draw-bench=N, --bench-indexed-map=N, "
-                "--pipeline-probe=FILE, --pipeline-probe-disable-opt=0|1\n",
-                argv[i]);
+            fprintf(stderr,
+                    "snx-test-vulkan: %s is not an option it takes: -H, --KEY=VALUE of the runtime's settings, "
+                    "--bench-descriptors=N, --descriptor-images=N, --descriptor-indexed=N, --descriptor-count=N, "
+                    "--bench-sparse-volume, --bench-sparse-texture, --bench-storage-lookup, --bench-storage-image, "
+                    "--bench-storage-buffer, --bench-pass-breaks=N, --nvn-draw-bench=N, --bench-indexed-map=N, "
+                    "--pipeline-probe=FILE, --pipeline-probe-disable-opt=0|1, --settings-ini=FILE\n",
+                    argv[i]);
             return 2;
         }
         ini_read(o, eq + 1);
@@ -5258,6 +5432,7 @@ static int run_headless(int argc, char** argv) {
     g_settings.vulkan_video_decode = 1; /* a Vulkan Video decode queue where the device has one (lavapipe has none) */
     video_init("Headless Vulkan fixture", "");
     CHECK(g_opt_headless && g_renderer_up && g_vk.dev && !g_vk.surface && !g_vk.swapchain && !g_vk.sc_count);
+    CHECK(!check_vk12_way());
     if (pipeline_probe) {
         int result = probe_pipeline_compile(pipeline_probe, pipeline_probe_disable);
         vk_pipeline_quiesce();
@@ -5274,6 +5449,28 @@ static int run_headless(int argc, char** argv) {
     }
     CHECK(!check_recorder_self_sync());
     viw_install();
+    /* every check with each draw binding the pipeline linked from its parts and never the one made whole
+       (SNX_TEST_GPL=linked), or with each pipeline made whole as on a device without pipeline libraries (whole) */
+    if (getenv("SNX_TEST_GPL")) {
+        const char* gpl = getenv("SNX_TEST_GPL");
+        if (!strcmp(gpl, "linked")) {
+            if (!g_vk.has_gpl) {
+                puts("SKIP pipelines linked from parts: the device doesn't link them");
+                vk_pipeline_quiesce();
+                CHECK(!snx_remove_tree(root));
+                free(root);
+                free(shot);
+                free(ppm);
+                return 77;
+            }
+            g_vk.gpl_hold = 1;
+        } else if (!strcmp(gpl, "whole"))
+            g_vk.has_gpl = 0;
+        else {
+            fprintf(stderr, "SNX_TEST_GPL=%s is not linked or whole\n", gpl);
+            return 2;
+        }
+    }
     if ((g_settings.descriptor_buffers == 1 && !g_vk.has_descriptor_buffers) ||
         (g_settings.descriptor_buffers == 2 && !g_vk.has_descriptor_heaps)) {
         puts("SKIP selected descriptor backend: the device does not support this path");
@@ -5405,6 +5602,8 @@ static int run_headless(int argc, char** argv) {
             result = check_texture_half_rounding();
         else if (!strcmp(name, "cross_stage_alias"))
             result = check_cross_stage_image_alias();
+        else if (!strcmp(name, "lone_lane"))
+            result = check_lone_lane();
         else if (!strcmp(name, "cross_stage_blend"))
             result = check_cross_stage_blend_snapshots();
         else if (!strcmp(name, "txd_uniform"))
@@ -5555,6 +5754,7 @@ static int run_headless(int argc, char** argv) {
         return 0;
     }
     CHECK(!check_hash_copy());
+    CHECK(!check_pipeline_library());
     CHECK(!check_tex_view_refusal());
     CHECK(!check_staging_overflow()); /* first: it counts the staging blocks of a fresh device */
     CHECK(!check_rings_without_present());
@@ -5588,6 +5788,9 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_nvn_stencil_masks());
     CHECK(!check_nvn_xfb());
     CHECK(!check_nvn_fixed_state());
+    CHECK(!check_maxwell_point_size());
+    CHECK(!check_maxwell_depth_bounds());
+    CHECK(!check_maxwell_viewport_swizzle());
     CHECK(!check_nvn_default_tessellation());
     CHECK(!check_nvn_advanced_blend());
     CHECK(!check_nvn_coverage());
@@ -5630,6 +5833,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_index_draws());
     CHECK(!check_pass_breaks());
     CHECK(!check_mesh_inputs());
+    CHECK(!check_lone_lane());
     CHECK(!check_frag_coord_origin());
     CHECK(!check_vertex_restride());
     CHECK(!check_vertex_input_layouts());
@@ -5675,6 +5879,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_resident_texture());
     CHECK(!check_resident_astc());
     CHECK(!check_astc_array_levels());
+    CHECK(!check_astc_later());
     CHECK(!check_resident_texture_in_flight());
     CHECK(!check_sparse_pieces_batched());
     CHECK(!check_dma_untracked_source());
@@ -5774,6 +5979,8 @@ static int run_headless(int argc, char** argv) {
     vk_pipeline_quiesce();
     CHECK(!viw_report());
     CHECK(!snx_remove_tree(root));
+    CHECK(!ini_dir || !snx_remove_tree(ini_dir));
+    free(ini_dir);
     free(root);
     free(shot);
     free(ppm);

@@ -117,12 +117,18 @@ static inline void ds_depth_bias(const DsDynamic* d, float scale, float out[3]) 
     out[2] = d->bias_slope * scale;
 }
 
+/* DsViewports.swizzle: each of x, y, z and w takes the component its code names, PositiveX 0, NegativeX 1,
+   PositiveY 2 and so on to NegativeW 7 (the 3D engine's ViewportSwizzle) */
+#define DS_SWIZZLE_MASK       0x7777u
+#define DS_SWIZZLE_IDENTITY   0x6420u
+#define DS_SWIZZLE_NEGATIVE_Y 0x6430u /* y negated, the rest as they are */
+
 /* The viewports, struct of arrays (a program that writes the viewport index selects among them) */
 typedef struct {
     u32 transform_on; /* the guest's viewport transform enable: off, positions are pixels of the surface clip */
     u32 scissor_on;   /* bit j: viewport j's scissor */
     float scale[DS_VIEWPORTS_MAX][3], translate[DS_VIEWPORTS_MAX][3];
-    u32 swizzle[DS_VIEWPORTS_MAX]; /* a 3-bit code per component at bits 0, 4, 8, 12 (x, y, z, w): y's 3 negates y */
+    u32 swizzle[DS_VIEWPORTS_MAX]; /* a 3-bit code per component at bits 0, 4, 8, 12 (x, y, z, w): DS_SWIZZLE_ */
     u32 clip_x[DS_VIEWPORTS_MAX], clip_y[DS_VIEWPORTS_MAX]; /* start in bits 0-15, extent in 16-31 */
     float z_near[DS_VIEWPORTS_MAX], z_far[DS_VIEWPORTS_MAX];
     u32 scissor_x[DS_VIEWPORTS_MAX], scissor_y[DS_VIEWPORTS_MAX]; /* min in bits 0-15, max in 16-31 */
@@ -273,8 +279,9 @@ typedef struct {
     /* an indirect draw's record values that the vertex program reads where NVN's driver writes them in constant buffer
        0 (shader.h SH_CB0_): bit 0 the base vertex, bit 1 the base instance (SH_PUSH_GPU_). 0 for none */
     u32 params;
-    /* Fixed-function NVN state that accompanies a draw, outside the serialized DsState ABI. Zero flags keep the
-       existing Maxwell/default behavior. Tessellation levels are outer[4], then inner[2]. */
+    /* Fixed-function state that accompanies a draw, outside the serialized DsState ABI: the NVN path's, and what the
+       3D engine's path reads from its registers for it (maxwell/draw_state.h mx_draw_fixed). Zero flags draw points 1
+       pixel wide and test no depth bounds. Tessellation levels are outer[4], then inner[2]. */
     u32 state_flags;
     float point_size, depth_bounds[2], tess_levels[6];
     u32 raster_samples, coverage_mode, coverage_table_enable;

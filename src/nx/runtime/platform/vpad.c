@@ -438,12 +438,14 @@ void vpad_edit(int on) {
 int vpad_editing(void) { return g_edit; }
 int vpad_shown(void) { return g_settings.show_controls || g_edit; }
 
-/* the pressed D-pad (dpad, DPAD_ bits): one direction is the up sprite turned, two the up-left one */
+/* the D-pad, and pressed (dpad, DPAD_ bits) its pressed look over it: one direction is the up sprite turned, two the
+   up-left one. The pressed drawables are a dark cross, which alone sank into a dark game, its middle first */
 static void dpad_draw(SnxUiList* l, const float r[4], u32 alpha, u32 dpad) {
     static const u32 one[4] = {DPAD_UP, DPAD_RIGHT, DPAD_DOWN, DPAD_LEFT};
     static const u32 two[4] = {DPAD_UP | DPAD_LEFT, DPAD_UP | DPAD_RIGHT, DPAD_DOWN | DPAD_RIGHT,
                                DPAD_DOWN | DPAD_LEFT};
     int t;
+    ui_sprite(l, SNX_SPRITE_DPAD, r[0], r[1], r[2], r[3], alpha, 0);
     for (t = 0; t < 4; ++t) {
         if (dpad == one[t]) {
             ui_sprite(l, SNX_SPRITE_DPAD_UP, r[0], r[1], r[2], r[3], alpha, t);
@@ -454,7 +456,6 @@ static void dpad_draw(SnxUiList* l, const float r[4], u32 alpha, u32 dpad) {
             return;
         }
     }
-    ui_sprite(l, SNX_SPRITE_DPAD, r[0], r[1], r[2], r[3], alpha, 0);
 }
 /* a stick's ring on r, its knob ax, ay (-1 to 1 right and down) from the middle, the pressed one when pressed */
 static void knob_draw(SnxUiList* l, const float r[4], float ax, float ay, int pressed, u32 alpha) {
@@ -480,7 +481,10 @@ static void skin_draw(SnxUiList* l, const SnxSkinControl* k, const float r[4], u
                   0x00FFFFFFu | (u32)a << 24);
     }
 }
-static void stick_draw(SnxUiList* l, int c, float r[4], const int safe[4], u32 alpha) {
+/* a built-in control's alpha at percent (0 to 100) of controls_alpha: SNX_VPAD_BUILTIN_CURVE's, 153 at 50 */
+static u32 builtin_alpha(int percent) { return (u32)(pow(percent / 100.0, SNX_VPAD_BUILTIN_CURVE) * 255 + 0.5); }
+/* alpha a skin's control's, builtin the built-in look's */
+static void stick_draw(SnxUiList* l, int c, float r[4], const int safe[4], u32 alpha, u32 builtin) {
     const SnxSkinControl* k = vpad_skin(c);
     int s = stick_of(c), held = g_held >> c & 1;
     if (held && !g_edit) { /* the ring where the finger landed, the knob where it is */
@@ -489,11 +493,11 @@ static void stick_draw(SnxUiList* l, int c, float r[4], const int safe[4], u32 a
         if (k)
             skin_draw(l, k, r, SNX_SKIN_LIT_HELD, g_axis[s][0], g_axis[s][1], alpha);
         else
-            knob_draw(l, r, g_axis[s][0], g_axis[s][1], 1, alpha);
+            knob_draw(l, r, g_axis[s][0], g_axis[s][1], 1, builtin);
     } else if (k)
         skin_draw(l, k, r, 0, 0, 0, alpha);
     else
-        knob_draw(l, r, 0, 0, 0, alpha);
+        knob_draw(l, r, 0, 0, 0, builtin);
 }
 static void outline(SnxUiList* l, const float r[4], float t, u32 rgba) {
     ui_fill(l, r[0] - t, r[1] - t, r[2] + 2 * t, t, rgba);
@@ -532,11 +536,14 @@ static void edit_draw(SnxUiList* l, const int safe[4]) {
 void vpad_draw(SnxUiList* l, const int safe[4]) {
     int c;
     float r[4];
-    u32 alpha;
+    u32 alpha, builtin;
+    int percent;
     placed();
     if (!g_settings.show_controls && !g_edit) return;
     /* in edit mode even a clear pad shows where its controls are */
-    alpha = (u32)(clampi(g_edit && g_settings.controls_opacity < 50 ? 50 : g_settings.controls_opacity, 0, 100) * 255 / 100);
+    percent = clampi(g_edit && g_settings.controls_alpha < 50 ? 50 : g_settings.controls_alpha, 0, 100);
+    alpha = (u32)percent * 255 / 100;
+    builtin = builtin_alpha(percent);
     if (g_edit) edit_draw(l, safe);
     for (c = 0; c < SNX_VPAD_COUNT; ++c) {
         const SnxSkinControl* k = vpad_skin(c);
@@ -546,11 +553,11 @@ void vpad_draw(SnxUiList* l, const int safe[4]) {
         if (k && INFO[c].kind != KIND_STICK)
             skin_draw(l, k, r, INFO[c].kind == KIND_DPAD ? g_dpad | held : held, 0, 0, alpha);
         else if (INFO[c].kind == KIND_DPAD)
-            dpad_draw(l, r, alpha, g_dpad);
+            dpad_draw(l, r, builtin, g_dpad);
         else if (INFO[c].kind == KIND_STICK)
-            stick_draw(l, c, r, safe, alpha);
+            stick_draw(l, c, r, safe, alpha, builtin);
         else
-            ui_sprite(l, INFO[c].sprite + (int)(g_held >> c & 1), r[0], r[1], r[2], r[3], alpha, 0);
+            ui_sprite(l, INFO[c].sprite + (int)(g_held >> c & 1), r[0], r[1], r[2], r[3], builtin, 0);
     }
 }
 
@@ -624,7 +631,7 @@ int vpad_showcase_box(const int safe[4], float box[4]) {
     return corner;
 }
 void vpad_showcase_draw(SnxUiList* l, const int safe[4], int fps) {
-    const u32 alpha = 230;
+    const u32 alpha = 138; /* 230 on rEden's drawables, 0.6 opaque at most, which the built-in art makes opaque */
     float box[4], x0, y0, w, h, r[4];
     int c, scale;
     char text[24];

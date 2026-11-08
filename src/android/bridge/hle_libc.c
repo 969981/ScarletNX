@@ -237,7 +237,13 @@ static void zero(CPU* c, void* data) {
 static _Thread_local struct {
     /* the guest comparator of this thread's sort or search: saved and restored, so a comparator can sort too */
     uint64_t compare;
-    int error; /* the guest's errno, where it is not the host's (hle_impl.h) */
+    int error;              /* the guest's errno, where it is not the host's (hle_impl.h) */
+    char unknown_error[32]; /* strerror's text of a number bionic has no text for */
+    uint64_t locale;        /* the guest's uselocale, 0 before its first: bionic's LC_GLOBAL_LOCALE */
+#ifndef _WIN32
+    unsigned guest_calls; /* the host calls into guest code under way (hle_locale_enter) */
+    locale_t host_locale; /* the thread's locale before the first of them */
+#endif
 } t_hle_libc;
 
 static int compare_guest(const void* a, const void* b) {
@@ -316,10 +322,157 @@ static void errno_location(CPU* c, void* data) {
     (void)data;
     X(0) = (uint64_t)(uintptr_t)hle_errno_location();
 }
-/* the functions that take an errno: the guest's (Linux's) number as the host's */
+/* bionic's texts of the errno numbers, Linux's, by number (its libc/private/bionic_errdefs.h, the kernel headers'
+   words): the host C library's are other words, and in the user's language */
+static const char* const error_texts[] = {
+    [0] = "Success",
+    [1] = "Operation not permitted",
+    [2] = "No such file or directory",
+    [3] = "No such process",
+    [4] = "Interrupted system call",
+    [5] = "I/O error",
+    [6] = "No such device or address",
+    [7] = "Argument list too long",
+    [8] = "Exec format error",
+    [9] = "Bad file descriptor",
+    [10] = "No child processes",
+    [11] = "Try again",
+    [12] = "Out of memory",
+    [13] = "Permission denied",
+    [14] = "Bad address",
+    [15] = "Block device required",
+    [16] = "Device or resource busy",
+    [17] = "File exists",
+    [18] = "Cross-device link",
+    [19] = "No such device",
+    [20] = "Not a directory",
+    [21] = "Is a directory",
+    [22] = "Invalid argument",
+    [23] = "File table overflow",
+    [24] = "Too many open files",
+    [25] = "Inappropriate ioctl for device",
+    [26] = "Text file busy",
+    [27] = "File too large",
+    [28] = "No space left on device",
+    [29] = "Illegal seek",
+    [30] = "Read-only file system",
+    [31] = "Too many links",
+    [32] = "Broken pipe",
+    [33] = "Math argument out of domain of func",
+    [34] = "Math result not representable",
+    [35] = "Resource deadlock would occur",
+    [36] = "File name too long",
+    [37] = "No record locks available",
+    [38] = "Function not implemented",
+    [39] = "Directory not empty",
+    [40] = "Too many symbolic links encountered",
+    [42] = "No message of desired type",
+    [43] = "Identifier removed",
+    [44] = "Channel number out of range",
+    [45] = "Level 2 not synchronized",
+    [46] = "Level 3 halted",
+    [47] = "Level 3 reset",
+    [48] = "Link number out of range",
+    [49] = "Protocol driver not attached",
+    [50] = "No CSI structure available",
+    [51] = "Level 2 halted",
+    [52] = "Invalid exchange",
+    [53] = "Invalid request descriptor",
+    [54] = "Exchange full",
+    [55] = "No anode",
+    [56] = "Invalid request code",
+    [57] = "Invalid slot",
+    [59] = "Bad font file format",
+    [60] = "Device not a stream",
+    [61] = "No data available",
+    [62] = "Timer expired",
+    [63] = "Out of streams resources",
+    [64] = "Machine is not on the network",
+    [65] = "Package not installed",
+    [66] = "Object is remote",
+    [67] = "Link has been severed",
+    [68] = "Advertise error",
+    [69] = "Srmount error",
+    [70] = "Communication error on send",
+    [71] = "Protocol error",
+    [72] = "Multihop attempted",
+    [73] = "RFS specific error",
+    [74] = "Not a data message",
+    [75] = "Value too large for defined data type",
+    [76] = "Name not unique on network",
+    [77] = "File descriptor in bad state",
+    [78] = "Remote address changed",
+    [79] = "Can not access a needed shared library",
+    [80] = "Accessing a corrupted shared library",
+    [81] = ".lib section in a.out corrupted",
+    [82] = "Attempting to link in too many shared libraries",
+    [83] = "Cannot exec a shared library directly",
+    [84] = "Illegal byte sequence",
+    [85] = "Interrupted system call should be restarted",
+    [86] = "Streams pipe error",
+    [87] = "Too many users",
+    [88] = "Socket operation on non-socket",
+    [89] = "Destination address required",
+    [90] = "Message too long",
+    [91] = "Protocol wrong type for socket",
+    [92] = "Protocol not available",
+    [93] = "Protocol not supported",
+    [94] = "Socket type not supported",
+    [95] = "Operation not supported on transport endpoint",
+    [96] = "Protocol family not supported",
+    [97] = "Address family not supported by protocol",
+    [98] = "Address already in use",
+    [99] = "Cannot assign requested address",
+    [100] = "Network is down",
+    [101] = "Network is unreachable",
+    [102] = "Network dropped connection because of reset",
+    [103] = "Software caused connection abort",
+    [104] = "Connection reset by peer",
+    [105] = "No buffer space available",
+    [106] = "Transport endpoint is already connected",
+    [107] = "Transport endpoint is not connected",
+    [108] = "Cannot send after transport endpoint shutdown",
+    [109] = "Too many references: cannot splice",
+    [110] = "Connection timed out",
+    [111] = "Connection refused",
+    [112] = "Host is down",
+    [113] = "No route to host",
+    [114] = "Operation already in progress",
+    [115] = "Operation now in progress",
+    [116] = "Stale NFS file handle",
+    [117] = "Structure needs cleaning",
+    [118] = "Not a XENIX named type file",
+    [119] = "No XENIX semaphores available",
+    [120] = "Is a named type file",
+    [121] = "Remote I/O error",
+    [122] = "Quota exceeded",
+    [123] = "No medium found",
+    [124] = "Wrong medium type",
+    [125] = "Operation Canceled",
+    [126] = "Required key not available",
+    [127] = "Key has expired",
+    [128] = "Key has been revoked",
+    [129] = "Key was rejected by service",
+    [130] = "Owner died",
+    [131] = "State not recoverable",
+    [132] = "Operation not possible due to RF-kill",
+    [133] = "Memory page has hardware error",
+};
+const char* hle_error_text(int error, char* buffer, size_t size) {
+    if (error >= 0 && error < (int)(sizeof error_texts / sizeof *error_texts) && error_texts[error])
+        return error_texts[error];
+    snprintf(buffer, size, "Unknown error %d", error);
+    return buffer;
+}
 static void g_strerror(CPU* c, void* data) {
     (void)data;
-    X(0) = (uint64_t)(uintptr_t)strerror(gnu_errno_to_host((int)X(0)));
+    X(0) = (uint64_t)(uintptr_t)hle_error_text((int)X(0), t_hle_libc.unknown_error, sizeof t_hle_libc.unknown_error);
+}
+/* __gnu_strerror_r(error, buffer, size), GNU's strerror_r: the text cut to the buffer, which it returns */
+static void gnu_strerror_r(CPU* c, void* data) {
+    (void)data;
+    hle_strerror_r((int)X(0), PTR(1), (size_t)X(2));
+    X(0) = X(1);
 }
 
 /* ---- the fortified functions (_FORTIFY_SOURCE): the plain function, with bionic's check of the size ---- */
@@ -513,9 +666,52 @@ static void g_syslog(CPU* c, void* data) {
 
 /* the scanf family: every argument after the format is a pointer, so the host's takes them as they are */
 typedef int (*Scan)(const char*, const char*, ...);
+enum { SCAN_MOST = 24 };
+/* the pointers a scanf format stores through: one for each conversion but %% and the suppressed (%*d), %n's too, or
+   the highest of their positions (%2$d). Only those are read: the guest's stack can end right after the last one */
+static unsigned scan_count(const char* f) {
+    unsigned count = 0, highest = 0;
+    while (*f) {
+        if (*f++ != '%') continue;
+        if (*f == '%') {
+            ++f;
+            continue;
+        }
+        const char* digits = f;
+        unsigned position = 0;
+        while (*f >= '0' && *f <= '9') ++f;
+        if (*f == '$' && f > digits) {
+            position = (unsigned)strtoul(digits, NULL, 10);
+            ++f;
+        } else
+            f = digits;
+        bool stores = *f != '*';
+        if (!stores) ++f;
+        while (*f >= '0' && *f <= '9') ++f;
+        while (*f && strchr("hlLjztqm", *f)) ++f;
+        if (*f == '[') { /* a set, which can hold ']' first and '%' anywhere */
+            ++f;
+            if (*f == '^') ++f;
+            if (*f == ']') ++f;
+            while (*f && *f != ']') ++f;
+        }
+        if (*f) ++f;
+        if (stores && !position) ++count;
+        if (stores && position > highest) highest = position;
+    }
+    return count > highest ? count : highest;
+}
 static int scan_pointers(const char* in, const char* format, GuestArgs* a) {
-    uint64_t p[24];
-    for (int i = 0; i < 24; ++i) p[i] = args_int(a);
+    unsigned count = scan_count(format);
+    if (count > SCAN_MOST) {
+        fprintf(stderr,
+                "scarletnx-android: a scanf format stores through %u pointers, the bridge passes %d at most: "
+                "it returns -1 (EOF) for \"%s\"\n",
+                count, SCAN_MOST, format);
+        return EOF;
+    }
+    uint64_t p[SCAN_MOST] = {0};
+    for (unsigned i = 0; i < count; ++i) p[i] = args_int(a);
     return sscanf(in, format, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13],
                   p[14], p[15], p[16], p[17], p[18], p[19], p[20], p[21], p[22], p[23]);
 }
@@ -577,9 +773,132 @@ static const unsigned char* ctype_pointer = ctype_table;
 CTYPE_L(CTYPE_L_ADAPTER)
 #define CTYPE_L_ENTRY(name, ascii) {#name "_l", g_##name##_l, NULL},
 
+/* ---- bionic's locales: the C locale alone, its multibyte characters UTF-8 whatever the locale's name. A name only
+   sets MB_CUR_MAX, 4 for UTF-8's and 1 for the others, and a locale_t is bionic's struct of it. The host's locale, the
+   user's, is neither read nor set ---- */
+
+/* bionic's LC_GLOBAL_LOCALE, and its LC_ALL_MASK: each category's bit, LC_CTYPE (0) to LC_IDENTIFICATION (12), but
+   LC_ALL's (6) */
+#define BIONIC_GLOBAL_LOCALE ((uint64_t)-1)
+enum { BIONIC_LC_ALL = 6, BIONIC_LC_LAST = 12, BIONIC_LC_ALL_MASK = 0x1fbf };
+typedef struct {
+    uint64_t mb_cur_max; /* bionic's struct __locale_t: a size_t */
+} BionicLocale;
+static struct {
+    int ascii; /* setlocale's last name was not UTF-8's: MB_CUR_MAX 1. bionic starts in C.UTF-8 */
+#ifndef _WIN32
+    /* the host's C locale that the guest's calls run in (hle_locale_enter), made once */
+    pthread_once_t once;
+    locale_t c;
+#endif
+} g_locale = {
+    .ascii = 0,
+#ifndef _WIN32
+    .once = PTHREAD_ONCE_INIT,
+#endif
+};
+
+static bool locale_known(const char* name) {
+    return !strcmp(name, "") || !strcmp(name, "C") || !strcmp(name, "C.UTF-8") || !strcmp(name, "en_US.UTF-8") ||
+           !strcmp(name, "POSIX");
+}
+static bool locale_utf8(const char* name) { return !name[0] || strstr(name, "UTF-8"); }
+static uint64_t mb_cur_max_of(uint64_t locale) {
+    if (locale == BIONIC_GLOBAL_LOCALE) return __atomic_load_n(&g_locale.ascii, __ATOMIC_RELAXED) ? 1 : 4;
+    return ((const BionicLocale*)(uintptr_t)locale)->mb_cur_max;
+}
+static uint64_t current_locale(void) { return t_hle_libc.locale ? t_hle_libc.locale : BIONIC_GLOBAL_LOCALE; }
+static uint64_t new_locale(uint64_t mb_cur_max) {
+    BionicLocale* l = malloc(sizeof *l);
+    if (!l) {
+        hle_set_errno(GNU_ENOMEM);
+        return 0;
+    }
+    l->mb_cur_max = mb_cur_max;
+    return (uint64_t)(uintptr_t)l;
+}
+/* setlocale(category, name): "C.UTF-8" or "C"; NULL and ENOENT for a locale bionic lacks */
+static void g_setlocale(CPU* c, void* data) {
+    (void)data;
+    int category = (int)X(0);
+    if (category < 0 || category > BIONIC_LC_LAST) {
+        hle_set_errno(GNU_EINVAL);
+        X(0) = 0;
+        return;
+    }
+    if (X(1) && !locale_known(STR(1))) {
+        hle_set_errno(GNU_ENOENT);
+        X(0) = 0;
+        return;
+    }
+    if (X(1)) __atomic_store_n(&g_locale.ascii, !locale_utf8(STR(1)), __ATOMIC_RELAXED);
+    X(0) = (uint64_t)(uintptr_t)(__atomic_load_n(&g_locale.ascii, __ATOMIC_RELAXED) ? "C" : "C.UTF-8");
+}
+/* newlocale(mask, name, base): base is left as it is, as bionic's leaves it */
+static void g_newlocale(CPU* c, void* data) {
+    (void)data;
+    if (((int)X(0) & ~BIONIC_LC_ALL_MASK) || !X(1)) {
+        hle_set_errno(GNU_EINVAL);
+        X(0) = 0;
+        return;
+    }
+    if (!locale_known(STR(1))) {
+        hle_set_errno(GNU_ENOENT);
+        X(0) = 0;
+        return;
+    }
+    X(0) = new_locale(locale_utf8(STR(1)) ? 4 : 1);
+}
+static void g_duplocale(CPU* c, void* data) {
+    (void)data;
+    X(0) = new_locale(mb_cur_max_of(X(0)));
+}
+static void g_freelocale(CPU* c, void* data) {
+    (void)data;
+    if (X(0) != BIONIC_GLOBAL_LOCALE) free(PTR(0));
+}
+/* uselocale(locale): the thread's locale before, LC_GLOBAL_LOCALE before the first; 0 only asks */
+static void g_uselocale(CPU* c, void* data) {
+    (void)data;
+    uint64_t old = current_locale();
+    if (X(0)) t_hle_libc.locale = X(0);
+    X(0) = old;
+}
 static void ctype_get_mb_cur_max(CPU* c, void* data) {
     (void)data;
-    X(0) = 4; /* UTF-8, bionic's only multibyte encoding */
+    X(0) = mb_cur_max_of(current_locale());
+}
+
+/* The host's C library takes the user's locale (the JVM sets the process's from the environment), with a decimal
+   comma, other names of days and months, and other words. The guest's calls into it run in the C locale: the thread
+   takes it from the first host call into guest code until that one returns. On Linux it is C.UTF-8, whose multibyte
+   functions are the guest's (PASS). Windows' C runtime keeps the C locale, as no part of the process sets another */
+#ifndef _WIN32
+static void make_guest_locale(void) {
+#if defined(__linux__)
+    g_locale.c = newlocale(LC_ALL_MASK, "C.UTF-8", (locale_t)0);
+    if (!g_locale.c)
+        fprintf(stderr, "scarletnx-android: the host has no C.UTF-8 locale: the guest's multibyte functions take the "
+                        "C locale's ASCII alone\n");
+#endif
+    if (!g_locale.c) g_locale.c = newlocale(LC_ALL_MASK, "C", (locale_t)0);
+    if (!g_locale.c)
+        fprintf(stderr, "scarletnx-android: no C locale (newlocale: %s): the guest's C library takes the user's\n",
+                strerror(errno));
+}
+#endif
+void hle_locale_enter(void) {
+#ifndef _WIN32
+    if (t_hle_libc.guest_calls++) return;
+    pthread_once(&g_locale.once, make_guest_locale);
+    t_hle_libc.host_locale = uselocale(g_locale.c);
+#endif
+}
+void hle_locale_leave(void) {
+#ifndef _WIN32
+    if (--t_hle_libc.guest_calls) return;
+    uselocale(t_hle_libc.host_locale);
+#endif
 }
 
 /* ---- the system properties ---- */
@@ -668,15 +987,10 @@ size_t hle_strlcpy(char* dst, const char* src, size_t size) {
     }
     return n;
 }
-/* POSIX's strerror_r, which returns an error number: glibc's of that form is __xpg_strerror_r */
+/* POSIX's strerror_r, which returns an error number (Linux's) */
 int hle_strerror_r(int error, char* buffer, size_t size) {
-    const char* text = strerror(gnu_errno_to_host(error));
-    size_t n = strlen(text);
-    if (!size) return ERANGE;
-    size_t copy = n < size - 1 ? n : size - 1;
-    memcpy(buffer, text, copy);
-    buffer[copy] = 0;
-    return copy < n ? ERANGE : 0;
+    char unknown[32];
+    return hle_strlcpy(buffer, hle_error_text(error, unknown, sizeof unknown), size) >= size ? GNU_ERANGE : 0;
 }
 /* bionic's basename leaves its argument as it is, as GNU's does, but drops trailing slashes as POSIX's */
 char* hle_basename(const char* path) {
@@ -866,6 +1180,12 @@ static void g_mbsrtowcs(CPU* c, void* data) {
     (void)data;
     X(0) = decode_string(X(0), X(1), SIZE_MAX, X(2));
 }
+/* mbstowcs(dst, src, n): mbsrtowcs of a pointer of its own */
+static void g_mbstowcs(CPU* c, void* data) {
+    (void)data;
+    uint64_t src = X(1);
+    X(0) = decode_string(X(0), (uint64_t)(uintptr_t)&src, SIZE_MAX, X(2));
+}
 static void g_wcrtomb(CPU* c, void* data) {
     (void)data;
     unsigned char out[4];
@@ -913,6 +1233,14 @@ static void g_wcsnrtombs(CPU* c, void* data) {
     }
     X(0) = bytes;
 }
+/* wcstombs(dst, src, n): wcsnrtombs of every character of a pointer of its own, at most n bytes */
+static void g_wcstombs(CPU* c, void* data) {
+    uint64_t src = X(1);
+    X(3) = X(2);
+    X(2) = SIZE_MAX;
+    X(1) = (uint64_t)(uintptr_t)&src;
+    g_wcsnrtombs(c, data);
+}
 /* the case of ASCII and Latin-1, as the C locale of bionic's has it */
 static void g_towlower(CPU* c, void* data) {
     (void)data;
@@ -925,8 +1253,9 @@ static void g_iswlower_l(CPU* c, void* data) {
     X(0) = (w >= 'a' && w <= 'z') || (w >= 0xdf && w <= 0xff && w != 0xf7);
 }
 #define WIDE_FUNCTIONS(F)                                                                                              \
-    F(wcslen) F(wmemchr) F(wmemcmp) F(wmemcpy) F(mbrlen) F(mbrtowc) F(mbsnrtowcs) F(mbsrtowcs) F(mbtowc) F(wcrtomb)   \
-    F(wcsnrtombs) F(towlower) F(iswlower_l)
+    F(wcslen)                                                                                                          \
+    F(wmemchr) F(wmemcmp) F(wmemcpy) F(mbrlen) F(mbrtowc) F(mbsnrtowcs) F(mbsrtowcs) F(mbtowc) F(wcrtomb)              \
+        F(wcsnrtombs) F(towlower) F(iswlower_l) F(mbstowcs) F(wcstombs)
 #define WIDE_ENTRY(name) {#name, g_##name, NULL},
 #endif
 
@@ -952,8 +1281,6 @@ static void g_malloc_usable_size(CPU* c, void* data) {
 #ifdef _WIN32
 /* ---- Windows: what its C runtime has in another form ---- */
 
-/* the C locale, the only one bionic has: newlocale and uselocale give a locale_t that names it */
-
 /* The CRT's free() takes malloc's blocks alone, and malloc aligns to 16. A block aligned past that is malloc'd
    larger, and its address kept with the block's in a table that free(), realloc() and malloc_usable_size() look in
    first */
@@ -964,12 +1291,7 @@ static struct {
         size_t size;
     } * items;
     size_t count, capacity;
-    unsigned char locale; /* the locale_t that newlocale and uselocale give: the C locale */
-} g_win = {PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0, 0};
-static void c_locale(CPU* c, void* data) {
-    (void)data;
-    X(0) = (uint64_t)(uintptr_t)&g_win.locale;
-}
+} g_win = {PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0};
 
 /* the table's entry of p, removed: its block, or NULL for a block malloc gave */
 static void* aligned_take(void* p, size_t* size) {
@@ -1112,6 +1434,29 @@ static void g_srandom(CPU* c, void* data) {
     pthread_mutex_unlock(&g_random_state.lock);
 }
 
+/* the bridge's own forms of bionic's functions (above), each called with its own type: hle_pass calls through a type
+   of eight integers, which only the host C library's functions, built without -fsanitize=function, can take */
+static void g_strlcpy(CPU* c, void* data) {
+    (void)data;
+    X(0) = hle_strlcpy(PTR(0), STR(1), (size_t)X(2));
+}
+static void g_strerror_r(CPU* c, void* data) {
+    (void)data;
+    X(0) = (uint64_t)(int64_t)hle_strerror_r((int)X(0), PTR(1), (size_t)X(2));
+}
+static void g_basename(CPU* c, void* data) {
+    (void)data;
+    X(0) = (uint64_t)(uintptr_t)hle_basename(STR(0));
+}
+static void g_strsep(CPU* c, void* data) {
+    (void)data;
+    X(0) = (uint64_t)(uintptr_t)hle_strsep(PTR(0), STR(1));
+}
+static void g_strtok_r(CPU* c, void* data) {
+    (void)data;
+    X(0) = (uint64_t)(uintptr_t)hle_strtok_r(PTR(0), STR(1), PTR(2));
+}
+
 /* the host functions that PASS calls: GNU C takes a function's address as a data pointer */
 #define P(name)          {#name, hle_pass, (void*)name}
 #define PH(name, host)   {#name, hle_pass, (void*)host}
@@ -1191,32 +1536,30 @@ const HleSymbol hle_libc[] = {
     /* strings */
     P(memchr), P(memcmp), P(memcpy), P(memmove), P(memset), P(strcasecmp), P(strcat), P(strchr), P(strcmp),
     P(strcoll), P(strcpy), P(strcspn), P(strdup), P(strlen), {"strerror", g_strerror, NULL}, P(strncasecmp), P(strncat), P(strncmp),
+    {"strerror_l", g_strerror, NULL}, {"__gnu_strerror_r", gnu_strerror_r, NULL},
     P(strncpy), P(strpbrk), P(strrchr), P(strspn), P(strstr), P(strtok),
     P(strtoll), P(strtoull), P(atoi), P(atoll),
-    PH(strlcpy, hle_strlcpy), PH(strerror_r, hle_strerror_r), PH(basename, hle_basename), PH(strsep, hle_strsep),
-    PH(strtok_r, hle_strtok_r),
+    {"strlcpy", g_strlcpy, NULL}, {"strerror_r", g_strerror_r, NULL}, {"basename", g_basename, NULL},
+    {"strsep", g_strsep, NULL}, {"strtok_r", g_strtok_r, NULL},
 #ifdef _WIN32
     /* long is 32 bits on Windows, 64 in bionic */
     PH(strtol, strtoll), PH(strtoul, strtoull), PH(atol, atoll), PH(strtoll_l, strtoll), PH(strtoull_l, strtoull),
 #else
-    P(strtol), P(strtoul), P(atol), P(strtoll_l), P(strtoull_l),
+    P(strtol), P(strtoul), P(atol), PH(strtoll_l, strtoll), PH(strtoull_l, strtoull), /* a locale_t is bionic's */
 #endif
 #if defined(__linux__)
     P(wcslen), P(wmemchr), P(wmemcmp), P(wmemcpy), P(mbrlen), P(mbrtowc), P(mbsnrtowcs), P(mbsrtowcs), P(mbtowc),
-    P(wcrtomb), P(wcsnrtombs), P(towlower), P(iswlower_l),
+    P(wcrtomb), P(wcsnrtombs), P(towlower), PH(iswlower_l, iswlower), P(mbstowcs), P(wcstombs),
 #else
     WIDE_FUNCTIONS(WIDE_ENTRY)
 #endif
-    /* locales: the host's C locale, the only one bionic has */
-    P(setlocale), P(localeconv),
-#ifdef _WIN32
-    {"newlocale", c_locale, NULL}, {"uselocale", c_locale, NULL}, {"freelocale", nothing, NULL},
-#else
-    P(newlocale), P(freelocale), P(uselocale),
-#endif
+    /* locales: bionic's, the C locale alone */
+    {"setlocale", g_setlocale, NULL}, {"newlocale", g_newlocale, NULL}, {"duplocale", g_duplocale, NULL},
+    {"freelocale", g_freelocale, NULL}, {"uselocale", g_uselocale, NULL}, P(localeconv),
     /* math */
     T(acos, d_d), T(asin, d_d), T(atan, d_d), T(cos, d_d), T(cosh, d_d), T(exp, d_d), T(exp2, d_d), T(log, d_d),
     T(log10, d_d), T(log2, d_d), T(sin, d_d), T(sinh, d_d), T(sqrt, d_d), T(tan, d_d), T(tanh, d_d),
+    T(cbrt, d_d), T(expm1, d_d), T(log1p, d_d), T(cbrtf, f_f), T(expm1f, f_f), T(log1pf, f_f),
     T(atan2, d_dd), T(fmod, d_dd), T(hypot, d_dd), T(pow, d_dd),
     T(acosf, f_f), T(asinf, f_f), T(atanf, f_f), T(cosf, f_f), T(expf, f_f), T(exp2f, f_f), T(logf, f_f),
     T(log10f, f_f), T(log2f, f_f), T(sinf, f_f), T(sqrtf, f_f), T(tanf, f_f),

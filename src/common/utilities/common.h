@@ -91,8 +91,45 @@ int snx_symlink(const char* target, const char* link);
    MoltenVK beside it (a game's runtime copy), the app bundle's Frameworks, or the framework in an iOS app. NULL
    elsewhere, and when its folders have none (the system's loader, which the app's own bundle finds by itself) */
 char* snx_vulkan_driver(const char* program);
-/* put the Vulkan driver program carries in folder, beside the program a game runs there: its copy of the runtime is
-   outside the app's bundle, where neither SDL's search nor a system's loader reaches the library. 0, or 1 with the
+/* the KosmicKrisp ICD JSON that a program's folders carry, beside the driver and the Vulkan loader it names (an app
+   built with SNX_KOSMICKRISP, or a game's runtime copy of it). NULL when it carries none */
+char* snx_vulkan_kosmickrisp_icd(const char* program);
+/* the Vulkan driver a macOS run picks (the vulkan_driver setting of a game): the library to load, and the ICD JSON
+   when the Vulkan loader must choose the driver for it */
+typedef struct {
+    char* library;    /* the library to load: the driver's, or the loader's that takes icd; NULL for the system's */
+    char* icd;        /* the ICD JSON for the loader (VK_DRIVER_FILES), NULL when library is the driver itself */
+    const char* name; /* "MoltenVK", "KosmicKrisp", or "the system's", for the log */
+    int instead;      /* 1 when it plays in place of the driver asked for, which the Mac has not */
+} SnxVulkanDriver;
+/* where a pick's files are looked for: this system's folders (snx_vulkan_driver_choose), or a test's */
+typedef struct {
+    const char* program;        /* beside it and in its app's Frameworks: what the app carries; NULL for none */
+    const char* prefixes[2];    /* each with lib/ and share/vulkan/icd.d: Homebrew's /opt/homebrew, /usr/local */
+    const char* sdks;           /* the folder of the LunarG Vulkan SDKs, $HOME/VulkanSDK; NULL for none */
+    const char* no_kosmickrisp; /* why KosmicKrisp cannot run on this system, NULL where it can */
+    const char* system_driver;  /* the driver every run takes on a system that is not a Mac's, which the setting does
+                                   not change, as the log names it; NULL on a Mac */
+    const char* driver_files;   /* the Vulkan loader's variable that names a driver, as NAME=value (VK_DRIVER_FILES,
+                                   else VK_ICD_FILENAMES); NULL where the environment names none */
+} SnxVulkanPlaces;
+/* The pick's files, found in at's folders. auto is the driver the environment names (driver_files) through the Vulkan
+   loader, else KosmicKrisp where the Mac has it and can run it (the program's, else an installed one), else the
+   MoltenVK the program's folders carry, else the system's loader; moltenvk and kosmickrisp are that one driver,
+   carried or installed on the Mac. 1 with the driver in out and reason naming it and why, for the log; where the Mac
+   has not the one asked for, auto's plays instead, with instead set and reason saying why and what plays; on another
+   system, the system's driver, which moltenvk and kosmickrisp also take, said as for a driver the Mac has not, and
+   auto said nothing of. 0 for a value that is no driver, with the reason */
+int snx_vulkan_driver_find(const SnxVulkanPlaces* at, const char* pick, SnxVulkanDriver* out, char* reason,
+                           size_t reason_size);
+/* 1 where KosmicKrisp runs on a Mac whose kernel is darwin (uname's release: 25.0.0 is macOS 26), else 0 with why */
+int snx_vulkan_kosmickrisp_runs(const char* darwin, char* why, size_t why_size);
+/* snx_vulkan_driver_find in this system's folders, for the program that runs */
+int snx_vulkan_driver_choose(const char* program, const char* pick, SnxVulkanDriver* out, char* reason,
+                             size_t reason_size);
+void snx_vulkan_driver_free(SnxVulkanDriver* driver);
+/* put the Vulkan drivers program carries in folder, beside the program a game runs there: its copy of the runtime is
+   outside the app's bundle, where neither SDL's search nor a system's loader reaches the libraries. 0, or 1 with the
    reason said. Nothing to do, and 0, where the system's loader serves or the program carries none */
 int snx_deploy_vulkan_driver(const char* program, const char* folder);
 int snx_path_within(const char* path, const char* parent);

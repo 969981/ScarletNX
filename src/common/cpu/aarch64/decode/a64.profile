@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright 2026 the ScarletNX contributors
-# The profile of a64.decode that tools/a64dec reads with it: every name of the .decode files has one line here, and a
+# The profile of a64.decode that tools/decodetree reads with it: every name of the .decode files has one line here, and a
 # name they lack is an error.
 #
 #   NAME FLOW [nop] [PREDICATE...] FEATURE...
@@ -42,6 +42,9 @@ target switch v8.0 FEAT_CRC32 FEAT_AES FEAT_PMULL FEAT_SHA1 FEAT_SHA256
 # half precision, the dot product and LRCPC, and without pointer authentication. On a CPU without FEAT_PAuth the
 # PACIASP and AUTIASP of the HINT space are NOPs, as the libraries built for every arm64 phone expect
 target android v8.0 FEAT_CRC32 FEAT_AES FEAT_PMULL FEAT_SHA1 FEAT_SHA256 FEAT_LSE FEAT_RDM FEAT_FP16 FEAT_DotProd FEAT_LRCPC
+# Experimental HLE profile: LSE atomics, RCpc loads and PAuth instructions with SCTLR_EL1.EnIA/EnIB/EnDA/EnDB clear.
+# This is not a complete CPU profile for newer consoles.
+target switch_extended v8.0 FEAT_CRC32 FEAT_AES FEAT_PMULL FEAT_SHA1 FEAT_SHA256 FEAT_LSE FEAT_LRCPC FEAT_PAuth
 # every feature the decoder knows
 target max *
 

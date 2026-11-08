@@ -118,10 +118,14 @@ snx_component(shader gpu/shader/shader.c gpu/shader/decode.c gpu/shader/corpus.c
 # the opcode enum and decoder, generated from gpu/shader/maxwell_opcodes.def
 include("${PROJECT_SOURCE_DIR}/cmake/shaderdec.cmake")
 snx_shaderdec(snx_shader)
+# the drivers known to break an extension or feature, compiled in from gpu/vk/extension_bans.txt
+include("${PROJECT_SOURCE_DIR}/cmake/vk_extension_bans.cmake")
 snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/descriptors.c gpu/vk/descriptor_heaps.c gpu/vk/descriptor_objects.c gpu/vk/cmd.c gpu/vk/record.c gpu/vk/format.c gpu/vk/surface.c gpu/vk/texture.c
                  gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/xfb.c gpu/vk/display.c gpu/vk/compute.c
                  gpu/vk/pending_pages.c gpu/vk/checkpoints.c gpu/vk/image_out.c gpu/vk/depth_pack.c gpu/vk/memory.c gpu/vk/resource_stats.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/blocklinear.c gpu/vk/texconv.c gpu/vk/owned.c gpu/vk/nvdec.c gpu/vk/dma.c gpu/vk/blit.c gpu/vk/msaa.c gpu/vk/ui.c gpu/texture/blocklinear.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/vma.cpp gpu/vk/gpuprof.c gpu/vk/uma.c
-                 gpu/vk/ftz_probe.c gpu/vk/vertex_input.c gpu/vk/draw_texture.c gpu/vk/draw_texture_shader.c gpu/vk/tess_passthrough.c gpu/vk/present_quad.c gpu/vk/capture.c gpu/vk/depth_shadow.c
+                 gpu/vk/ftz_probe.c gpu/vk/vertex_input.c gpu/vk/extension_bans.c gpu/vk/pipeline_library.c
+                 "${PROJECT_BINARY_DIR}/generated/vk_extension_bans_text.c"
+                 gpu/vk/draw_texture.c gpu/vk/draw_texture_shader.c gpu/vk/tess_passthrough.c gpu/vk/present_quad.c gpu/vk/capture.c gpu/vk/depth_shadow.c
                  "${volk_SOURCE_DIR}/volk.c")
 # the ASTC decoder's, the block linear deswizzle and swizzle's, the texture conversions', the VIC composition's and
 # the render enable predicates' SPIR-V, compiled from their GLSL at build time (cmake/glsl.cmake). The VIC shader is
@@ -333,13 +337,17 @@ endif()
 
 # Opt-in because normal unit-test runs need neither an ICD nor a GPU. All rendering uses the real runtime.
 if(BUILD_TESTING AND SNX_TEST_VULKAN)
+    # the BC7 encoder run on the CPU (tests/glsl/bc7_cpu.cpp): what the encoder's blocks between frames are held to
+    # (tests/vulkan_astc_later.inc)
     add_executable(snx-test-vulkan "${PROJECT_SOURCE_DIR}/tests/vulkan_headless.c"
         "${PROJECT_SOURCE_DIR}/tests/spirv_emitter_fixture.c" "${PROJECT_SOURCE_DIR}/tests/support/nvdec_ref.c"
         "${PROJECT_SOURCE_DIR}/tests/support/vic_ref.c" "${PROJECT_SOURCE_DIR}/tests/support/dma_ref.c"
-        "${PROJECT_SOURCE_DIR}/tests/support/fermi2d_ref.c" "${PROJECT_SOURCE_DIR}/tests/support/half.c")
+        "${PROJECT_SOURCE_DIR}/tests/support/fermi2d_ref.c" "${PROJECT_SOURCE_DIR}/tests/support/half.c"
+        "${PROJECT_SOURCE_DIR}/tests/glsl/bc7_cpu.cpp")
     target_link_libraries(snx-test-vulkan PRIVATE snx_nx_flags ${components} snx_driver FFmpeg::avutil Threads::Threads
                                                   ${CMAKE_DL_LIBS})
-    target_include_directories(snx-test-vulkan PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/hookgen/snx_gpu")
+    target_include_directories(snx-test-vulkan PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/hookgen/snx_gpu"
+                                                       "${PROJECT_SOURCE_DIR}/tests/glsl")
     set_target_properties(snx-test-vulkan PROPERTIES LINKER_LANGUAGE CXX)
     if(WIN32)
         target_link_libraries(snx-test-vulkan PRIVATE user32)
@@ -370,20 +378,45 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     add_test(NAME vulkan_storage_buffer_keep COMMAND snx-test-vulkan -H --vk_memory=1)
     set_tests_properties(vulkan_storage_buffer_keep PROPERTIES TIMEOUT 60 ENVIRONMENT "SNX_TEST_BUFFER_KEEP_ONLY=1"
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
-    # every check again with graphics descriptors in descriptor buffers (gpu/vk/descriptors.c, vk_descriptors), also
-    # with guest memory read in place, under the validation layer when it is installed. A device without
+    # every check again with graphics descriptors in descriptor buffers (gpu/vk/descriptors.c, vk_descriptors_mode),
+    # also with guest memory read in place, under the validation layer when it is installed. A device without
     # VK_EXT_descriptor_buffer skips them (77). The layer reports errors only: the targetless-stores check draws with
     # a fragment output and no color target, as the console does, which the layer warns about with sets too
-    add_test(NAME vulkan_headless_descriptor_buffers COMMAND snx-test-vulkan -H --vk_descriptors=1 --vk_validation=1)
+    add_test(NAME vulkan_headless_descriptor_buffers
+        COMMAND snx-test-vulkan -H --vk_descriptors_mode=1 --vk_validation=1)
     add_test(NAME vulkan_headless_descriptor_buffers_uma
-        COMMAND snx-test-vulkan -H --vk_descriptors=1 --vk_memory=2 --vk_validation=1)
+        COMMAND snx-test-vulkan -H --vk_descriptors_mode=1 --vk_memory=2 --vk_validation=1)
     set_tests_properties(vulkan_headless_descriptor_buffers vulkan_headless_descriptor_buffers_uma PROPERTIES
         TIMEOUT 120 SKIP_RETURN_CODE 77 ENVIRONMENT "VK_KHRONOS_VALIDATION_REPORT_FLAGS=error"
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
+    # every check again with graphics descriptors in heaps (vk_descriptors_mode=2), which the default, Automatic, takes
+    # only on a GPU that shares the system's memory: a discrete GPU runs the default with sets. A device without
+    # VK_EXT_descriptor_heap runs buffers or sets again
+    add_test(NAME vulkan_headless_descriptor_heaps COMMAND snx-test-vulkan -H --vk_descriptors_mode=2)
+    set_tests_properties(vulkan_headless_descriptor_heaps PROPERTIES TIMEOUT 120
+        FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
+    # every check again the Vulkan 1.2 way on a newer device, as a game's .ini with vk_api=1.2 asks (gpu/vk/device.c
+    # vk12_extensions): the 1.3 commands by their extensions' names, shaders in SPIR-V 1.5, under the validation layer
+    # when it is installed, which takes the instance's 1.2 as the version and flags any 1.3 use left
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/vulkan_headless_vk12.ini" "[Debug]\nvk_api=1.2\n")
+    add_test(NAME vulkan_headless_vk12 COMMAND snx-test-vulkan -H
+        "--settings-ini=${CMAKE_CURRENT_BINARY_DIR}/vulkan_headless_vk12.ini" --vk_validation=1)
+    set_tests_properties(vulkan_headless_vk12 PROPERTIES TIMEOUT 120
+        ENVIRONMENT "VK_KHRONOS_VALIDATION_REPORT_FLAGS=error" FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     # every check again with each vertex layout in its pipeline: the default run sets it as dynamic state where the
     # device has VK_EXT_vertex_input_dynamic_state (gpu/vk/vertex_input.c), and both find each draw's own layout
     add_test(NAME vulkan_headless_vertex_input_off COMMAND snx-test-vulkan -H --vertex_input_dynamic_state=off)
     set_tests_properties(vulkan_headless_vertex_input_off PROPERTIES TIMEOUT 60
+        FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
+    # every check again with each draw binding the pipeline linked from its parts, never the one made whole, under the
+    # validation layer when it is installed (gpu/vk/pipeline.c, VK_EXT_graphics_pipeline_library; a device that
+    # doesn't link them skips, 77); and with each pipeline made whole, as a device without them makes it
+    add_test(NAME vulkan_headless_pipeline_library_linked COMMAND snx-test-vulkan -H --vk_validation=1)
+    add_test(NAME vulkan_headless_pipeline_library_whole COMMAND snx-test-vulkan -H)
+    set_tests_properties(vulkan_headless_pipeline_library_linked PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        ENVIRONMENT "SNX_TEST_GPL=linked;VK_KHRONOS_VALIDATION_REPORT_FLAGS=error"
+        FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
+    set_tests_properties(vulkan_headless_pipeline_library_whole PROPERTIES TIMEOUT 60 ENVIRONMENT "SNX_TEST_GPL=whole"
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     # every check again with guest memory read in place where the device can import it (gpu/vk/uma.c)
     add_test(NAME vulkan_headless_uma COMMAND snx-test-vulkan -H --vk_memory=2)

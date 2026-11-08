@@ -19,6 +19,7 @@
 #include "android/bridge/host.h"
 #include "android/bridge/hle_proc.h"
 #include "common/network/net_host.h"
+#include "common/utilities/ascii.h"
 #include "common/utilities/common.h"
 #include "common/utilities/endian.h"
 #include "gnuabi/abi/errno/errno.h"
@@ -174,6 +175,11 @@ void hle_posix_init(void) {
 #endif
     read_timezone();
     read_zone_names();
+#ifdef _WIN32
+    /* Winsock before any socket call: a descriptor the guest got from elsewhere then has Winsock's own errors */
+    int e = snx_net_init();
+    if (e) fprintf(stderr, "scarletnx-android: Winsock does not start (%d): the guest's sockets fail\n", e);
+#endif
 }
 
 FILE* hle_file(uint64_t guest) {
@@ -201,18 +207,17 @@ static void file_pass(CPU* c, void* data) {
 }
 #ifdef _WIN32
 /* long is 32 bits on Windows, off_t and bionic's long are 64: the 64-bit seeks */
-static int file_seek(FILE* f, int64_t offset, int whence) {
-    return _fseeki64(f, offset, whence);
+static void g_fseek(CPU* c, void* data) {
+    (void)data;
+    X(0) = (uint64_t)(int64_t)_fseeki64(hle_file(X(0)), (int64_t)X(1), (int)X(2));
 }
-static int64_t file_tell(FILE* f) {
-    return _ftelli64(f);
+static void g_ftell(CPU* c, void* data) {
+    (void)data;
+    X(0) = (uint64_t)_ftelli64(hle_file(X(0)));
 }
-#undef fseeko
-#undef ftello
-#define fseek  file_seek
-#define fseeko file_seek
-#define ftell  file_tell
-#define ftello file_tell
+#define SEEK_FILE_CALLS(F)
+#else
+#define SEEK_FILE_CALLS(F) F(fseek, 0) F(fseeko, 0) F(ftell, 0) F(ftello, 0)
 #endif
 /* the wide character ones only where wchar_t is bionic's 32 bits */
 #ifdef _WIN32
@@ -222,8 +227,8 @@ static int64_t file_tell(FILE* f) {
 #endif
 #define FILE_CALLS(F)                                                                                                  \
     F(fclose, 0) F(feof, 0) F(ferror, 0) F(clearerr, 0) F(fflush, 0) F(fgets, 2) F(fileno, 0) F(fputc, 1) F(fputs, 1)  \
-    F(fread, 3) F(fwrite, 3) F(fseek, 0) F(fseeko, 0) F(ftell, 0) F(ftello, 0) F(getc, 0) F(ungetc, 1) F(rewind, 0)   \
-    F(setbuf, 0) F(freopen, 2) F(pclose, 0) WIDE_FILE_CALLS(F)
+    F(fread, 3) F(fwrite, 3) F(getc, 0) F(ungetc, 1) F(rewind, 0) F(setbuf, 0) F(freopen, 2) F(pclose, 0)             \
+    SEEK_FILE_CALLS(F) WIDE_FILE_CALLS(F)
 #define FILE_CALL_OBJECT(name, k) static const FileCall fc_##name = {(void*)name, k};
 FILE_CALLS(FILE_CALL_OBJECT)
 #define FILE_CALL_ENTRY(name, k) {#name, file_pass, (void*)&fc_##name},
@@ -248,6 +253,42 @@ static void g_fwrite_chk(CPU* c, void* data) {
         abort();
     }
     X(0) = fwrite(PTR(0), X(1), X(2), hle_file(X(3)));
+}
+
+/* getdelim(line, size, delimiter, file) and getline(line, size, file), POSIX's, on every host (Windows' C runtime has
+   neither): the bytes up to the delimiter and it into *line, which realloc grows (*size its room): their count, or
+   -1 at the end of the file before a byte, and on an error */
+static int64_t read_delimited(char** line, size_t* size, int delimiter, FILE* f) {
+    if (!line || !size || !f) {
+        hle_set_errno(GNU_EINVAL);
+        return -1;
+    }
+    size_t room = *line ? *size : 0, n = 0;
+    for (int ch; (ch = getc(f)) != EOF;) {
+        if (n + 2 > room) {
+            size_t grown = room < 64 ? 128 : room * 2;
+            char* p = realloc(*line, grown);
+            if (!p) {
+                hle_set_errno(GNU_ENOMEM);
+                return -1;
+            }
+            *line = p;
+            *size = room = grown;
+        }
+        (*line)[n++] = (char)ch;
+        if (ch == (unsigned char)delimiter) break;
+    }
+    if (!n) return -1;
+    (*line)[n] = 0;
+    return (int64_t)n;
+}
+static void g_getdelim(CPU* c, void* data) {
+    (void)data;
+    X(0) = (uint64_t)read_delimited(PTR(0), PTR(1), (int)X(2), hle_file(X(3)));
+}
+static void g_getline(CPU* c, void* data) {
+    (void)data;
+    X(0) = (uint64_t)read_delimited(PTR(0), PTR(1), '\n', hle_file(X(2)));
 }
 
 /* setvbuf(f, buffer, mode, size): bionic's modes (_IOFBF 0, _IOLBF 1, _IONBF 2) as the host's */
@@ -304,10 +345,13 @@ static void g_puts(CPU* c, void* data) {
     (void)data;
     X(0) = wide_int(puts(STR(0)));
 }
+/* bionic's: "message: " when there is one, then strerror's text */
 static void g_perror(CPU* c, void* data) {
     (void)data;
-    errno = gnu_errno_to_host(*hle_errno_location());
-    perror(STR(0));
+    char unknown[32];
+    const char* text = hle_error_text(*hle_errno_location(), unknown, sizeof unknown);
+    bool message = X(0) && STR(0)[0];
+    fprintf(stderr, "%s%s%s\n", message ? STR(0) : "", message ? ": " : "", text);
 }
 /* a process the app would start: none, as an app's sandbox mostly refuses */
 static void g_popen(CPU* c, void* data) {
@@ -1037,8 +1081,15 @@ static bool reachable(const void* address, snx_socklen size) {
     static const uint8_t loopback6[16] = {[15] = 1};
     return a.family == SNX_AF_INET6 && !memcmp(a.addr, loopback6, 16);
 }
+/* localhost, whose case a hosts file's lookup ignores */
+static bool is_localhost(const char* name) {
+    static const char localhost[] = "localhost";
+    for (size_t i = 0; i < sizeof localhost; ++i)
+        if (snx_to_lower((unsigned char)name[i]) != localhost[i]) return false;
+    return true;
+}
 static bool local_name(const char* name) {
-    return !name || !strcmp(name, "localhost") || !strncmp(name, "127.", 4) || !strcmp(name, "::1");
+    return !name || is_localhost(name) || !strncmp(name, "127.", 4) || !strcmp(name, "::1");
 }
 
 /* -1 and the socket call's error: Winsock's own, errno elsewhere */
@@ -1473,6 +1524,39 @@ static void g_sendto(CPU* c, void* data) {
     socket_result(c, sendto((int)X(0), PTR(1), (int)X(2), msg_flags(X(3)), X(4) ? (struct sockaddr*)&a : NULL, n));
 #endif
 }
+/* the FORTIFY forms (_FORTIFY_SOURCE, which the NDK turns on): the plain call after bionic's check that the buffer
+   holds the length. __sendto_chk(fd, buffer, length, buffer_size, flags, address, address_length), which send() is
+   too, __recvfrom_chk(fd, buffer, length, buffer_size, flags, address, address_length), which recv() is too, and
+   __readlink_chk(path, buffer, size, buffer_size) */
+static void fortify_check(uint64_t length, uint64_t room, const char* what) {
+    if (length <= room) return;
+    fprintf(stderr, "scarletnx-android: FORTIFY: %s: a length of %llu bytes, its buffer %llu\n", what,
+            (unsigned long long)length, (unsigned long long)room);
+    abort();
+}
+static void g_sendto_chk(CPU* c, void* data) {
+    fortify_check(X(2), X(3), "sendto");
+    X(3) = X(4);
+    X(4) = X(5);
+    X(5) = X(6);
+    g_sendto(c, data);
+}
+static void g_recvfrom_chk(CPU* c, void* data) {
+    fortify_check(X(2), X(3), "recvfrom");
+    X(3) = X(4);
+    X(4) = X(5);
+    X(5) = X(6);
+#if defined(__linux__)
+    hle_pass(c, (void*)recvfrom);
+    (void)data;
+#else
+    g_recvfrom(c, data);
+#endif
+}
+static void g_readlink_chk(CPU* c, void* data) {
+    fortify_check(X(2), X(3), "readlink");
+    g_readlink_proc(c, data);
+}
 #if defined(__linux__)
 static void g_sendmsg(CPU* c, void* data) {
     (void)data;
@@ -1526,10 +1610,24 @@ static void g_getaddrinfo(CPU* c, void* data) {
         hints.socktype = h->socktype;
         hints.protocol = h->protocol;
     }
-    /* offline, a name that isn't this machine's doesn't resolve: no DNS server is asked */
-    int r = local_name(STR(0)) || g_posix.online ? snx_net_getaddrinfo(STR(0), STR(1), h ? &hints : NULL, &result)
-                                                 : SNX_EAI_AGAIN;
+    /* Android's hosts file has localhost once, at 127.0.0.1 (::1 is ip6-localhost), where the host's may list ::1 too
+       and give 127.0.0.1 for both lines: the address of IPv4 and of any family is that one alone */
+    const char* node = STR(0);
+    bool localhost = node && is_localhost(node) && (!h || h->family == SNX_AF_UNSPEC || h->family == SNX_AF_INET);
+    if (localhost) {
+        node = "127.0.0.1";
+        hints.flags |= SNX_AI_NUMERICHOST;
+    }
+    /* offline, a name that isn't this machine's doesn't resolve: no DNS server is asked, and the answer is Android's
+       without a network, "No address associated with hostname" */
+    int r = local_name(node) || g_posix.online
+                ? snx_net_getaddrinfo(node, STR(1), h || localhost ? &hints : NULL, &result)
+                : SNX_EAI_NODATA;
     GuestAddrinfo* out = r ? NULL : to_guest(result);
+    if (out && localhost && (hints.flags & SNX_AI_CANONNAME)) { /* the hosts file's name */
+        free(out->canonname);
+        out->canonname = snx_strdup("localhost");
+    }
     snx_net_freeaddrinfo(result);
     memcpy(PTR(3), &out, sizeof out);
     X(0) = (uint64_t)(int64_t)r;
@@ -1862,6 +1960,15 @@ static void g_sigdelset(CPU* c, void* data) {
     (void)data;
     set_bit(c, false);
 }
+static void g_sigismember(CPU* c, void* data) {
+    (void)data;
+    int sig = (int)X(1);
+    if (sig < 1 || sig > 64) {
+        fail_errno(c, GNU_EINVAL);
+        return;
+    }
+    X(0) = snx_ld_le64(PTR(0)) >> (sig - 1) & 1;
+}
 #if defined(__linux__)
 static void host_set(uint64_t guest, sigset_t* out) {
     sigemptyset(out);
@@ -1969,7 +2076,7 @@ const HleSymbol hle_posix[] = {
     {"stderr", NULL, &g_posix.guest_stderr},
     {"environ", NULL, &g_posix.environment},
     FILE_CALLS(FILE_CALL_ENTRY)
-    A(__fread_chk, g_fread_chk), A(__fwrite_chk, g_fwrite_chk),
+    A(__fread_chk, g_fread_chk), A(__fwrite_chk, g_fwrite_chk), A(getdelim, g_getdelim), A(getline, g_getline),
     A(fopen, g_fopen), A(fdopen, g_fdopen), A(rename, g_rename), A(setvbuf, g_setvbuf), P(tmpfile), P(remove),
     A(tmpnam, refused), A(putchar, g_putchar), A(puts, g_puts), A(perror, g_perror), A(popen, g_popen),
     A(open, g_open), A(__open_2, g_open_2), A(fcntl, g_fcntl), A(ioctl, g_ioctl),
@@ -1978,6 +2085,7 @@ const HleSymbol hle_posix[] = {
     /* the process's working folder, which the JVM's relative paths share, as Android's do */
     P(chdir),
 #if defined(_WIN32)
+    A(fseek, g_fseek), A(fseeko, g_fseek), A(ftell, g_ftell), A(ftello, g_ftell),
     A(statfs, g_statfs), A(access, g_access_proc), A(fchmod, refused), A(flock, g_flock), A(fsync, g_fsync),
     A(ftruncate, g_ftruncate), A(lseek, g_lseek), A(lseek64, g_lseek), A(mkdir, g_mkdir), A(pipe, g_pipe),
     A(pread, g_pread), A(read, g_read), A(readlink, g_readlink_proc), A(realpath, g_realpath), A(truncate, g_truncate),
@@ -2021,6 +2129,7 @@ const HleSymbol hle_posix[] = {
 #endif
 #endif
     A(connect, g_connect), A(sendto, g_sendto), A(sendmsg, g_sendmsg), A(gethostbyname, g_gethostbyname),
+    A(__sendto_chk, g_sendto_chk), A(__recvfrom_chk, g_recvfrom_chk), A(__readlink_chk, g_readlink_chk),
     A(getaddrinfo, g_getaddrinfo), A(freeaddrinfo, g_freeaddrinfo), A(getifaddrs, g_getifaddrs),
     A(freeifaddrs, g_freeifaddrs), A(gai_strerror, g_gai_strerror),
     A(getnameinfo, g_getnameinfo), P(gethostname), P(inet_addr), P(inet_ntoa), P(if_nametoindex),
@@ -2031,7 +2140,7 @@ const HleSymbol hle_posix[] = {
     A(mktime, g_mktime), A(strftime, g_strftime), A(strftime_l, g_strftime), A(alarm, refused),
     A(setenv, g_setenv), A(openlog, nothing), A(closelog, nothing),
 #else
-    P(gmtime), P(gmtime_r), P(localtime), P(localtime_r), P(mktime), P(strftime), P(strftime_l), P(alarm),
+    P(gmtime), P(gmtime_r), P(localtime), P(localtime_r), P(mktime), P(strftime), PH(strftime_l, strftime), P(alarm),
     P(setenv), P(openlog), P(closelog),
 #endif
     K(getpid, 172), K(getppid, 173), K(gettid, 178), K(getuid, 174), K(geteuid, 175), K(getgid, 176),
@@ -2048,7 +2157,10 @@ const HleSymbol hle_posix[] = {
     A(arc4random, g_arc4random), A(arc4random_buf, g_arc4random_buf),
     A(fork, refused), A(execl, refused), A(system, refused), A(waitpid, refused), A(ptrace, g_ptrace),
     A(sigemptyset, g_sigemptyset), A(sigfillset, g_sigfillset), A(sigaddset, g_sigaddset),
-    A(sigdelset, g_sigdelset),
+    A(sigdelset, g_sigdelset), A(sigismember, g_sigismember),
+    /* sigset64_t is sigset_t on LP64 */
+    A(sigemptyset64, g_sigemptyset), A(sigfillset64, g_sigfillset), A(sigaddset64, g_sigaddset),
+    A(sigdelset64, g_sigdelset), A(sigismember64, g_sigismember),
 #if defined(__linux__)
     A(signalfd, g_signalfd),
 #else

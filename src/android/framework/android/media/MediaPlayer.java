@@ -11,6 +11,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.view.SurfaceHolder;
 import java.io.FileDescriptor;
+import java.io.FileInputStream;
 import java.io.IOException;
 
 /**
@@ -74,8 +75,28 @@ public class MediaPlayer {
         state = INITIALIZED;
     }
 
-    public void setDataSource(Context context, Uri uri) throws IOException { source(); }
-    public void setDataSource(String path) throws IOException { source(); }
+    public void setDataSource(Context context, Uri uri) throws IOException {
+        if ("file".equals(uri.getScheme())) setDataSource(uri.getPath());
+        else source();
+    }
+
+    /**
+     * A path, or a file: URI, is opened as Android opens it before its decoder sees it, so a missing file is
+     * FileNotFoundException; another scheme (http, rtsp) is taken as it is. A drive's path ("C:\..." or "C:/...") is
+     * a path, not a URI of scheme "C": the app's files have such paths on a Windows host
+     */
+    public void setDataSource(String path) throws IOException {
+        String scheme = Uri.parse(path).getScheme();
+        boolean drive = path.length() > 2 && (path.charAt(0) | 0x20) >= 'a' && (path.charAt(0) | 0x20) <= 'z'
+            && path.charAt(1) == ':' && (path.charAt(2) == '\\' || path.charAt(2) == '/');
+        if (scheme == null || drive || scheme.equals("file")) {
+            try (FileInputStream in = new FileInputStream(scheme == null || drive ? path : Uri.parse(path).getPath())) {
+                source();
+            }
+        } else {
+            source();
+        }
+    }
     public void setDataSource(FileDescriptor fd) throws IOException { source(); }
     public void setDataSource(FileDescriptor fd, long offset, long length) throws IOException { source(); }
     public void setDataSource(android.content.res.AssetFileDescriptor afd) throws IOException { source(); }

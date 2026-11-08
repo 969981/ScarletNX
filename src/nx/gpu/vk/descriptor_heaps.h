@@ -49,6 +49,13 @@ static inline void vk_descriptor_heap_write_index_run(void* destination, uint32_
     for (uint32_t i = 0; i < count; i++) snx_st_le32(bytes + (size_t)i * 4, value);
 }
 
+/* The resource heap bytes a frame slot asks for. An open world's heaviest frames (one game on RADV, 2026-11-07)
+   wrote 3,900 tables a frame: 2.1 MB of indices and descriptors. A slot of 1 MiB ran out of room once or twice in
+   such a frame, and each time the frame moved on to the other slot (vk_descriptors_room), whose GPU work the GPU
+   thread then waited for. The device's maxResourceHeapSize and allocation limit cut it down
+   (vk_descriptor_heap_memory_plan_fit) */
+#define VK_DESCRIPTOR_HEAP_RESOURCE_FRAME (8ull << 20)
+
 typedef struct {
     VkDeviceSize frame_size, reserved_offset, reserved_size, range_size, allocation_size, alignment;
 } VkDescriptorHeapMemoryPlan;
@@ -272,6 +279,12 @@ static inline int vk_descriptor_heap_binding_mapping(VkDescriptorSetAndBindingMa
 }
 
 /* What keeps a device from descriptor heaps, for the log: the first piece missing, NULL when none is */
+/* the vk_descriptors_mode setting a device takes: 3, Automatic, is 2 (heaps, else buffers, else sets) on a GPU that
+   shares the system's memory (uma: vk_common.h's SNX_VK_UMA, an integrated GPU, a CPU's, a phone's) and 0 (sets) on one
+   with memory of its own. On a discrete RX 6700 XT, heaps wrote each draw's descriptors on the GPU thread, 0.75 ms
+   a frame more than sets, whose recording thread writes them, and one open world's frames went from release to
+   present 1.2 to 1.6 ms later. Every other value is taken as it is */
+static inline int vk_descriptors_auto(int setting, int uma) { return setting == 3 ? (uma ? 2 : 0) : setting; }
 static inline const char* vk_descriptor_heap_missing(int extension, int feature, int addresses, int flags) {
     return !extension   ? "no VK_EXT_descriptor_heap"
            : !feature   ? "its descriptorHeap feature is off"

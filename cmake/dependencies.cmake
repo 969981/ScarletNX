@@ -66,6 +66,19 @@ add_library(snx_yyjson STATIC "${yyjson_SOURCE_DIR}/src/yyjson.c")
 target_include_directories(snx_yyjson PUBLIC "${yyjson_SOURCE_DIR}/src")
 snx_quiet(snx_yyjson)
 
+# cgltf (MIT) for the Mii parts a glTF 2.0 model gives (src/common/utilities/mii_gltf.c): its implementation in a
+# target of ours, built quiet
+CPMAddPackage(NAME cgltf VERSION 1.15
+              URL https://github.com/jkuhlmann/cgltf/archive/refs/tags/v1.15.tar.gz
+              URL_HASH SHA256=84e352092e5cd6aab7f66de62ddb66beb5e6f18d412ca9d12950d7a55bfef25a
+              DOWNLOAD_ONLY YES)
+file(CONFIGURE OUTPUT "${PROJECT_BINARY_DIR}/generated/cgltf.c" CONTENT "#define CGLTF_IMPLEMENTATION
+#include \"cgltf.h\"
+")
+add_library(snx_cgltf STATIC "${PROJECT_BINARY_DIR}/generated/cgltf.c")
+target_include_directories(snx_cgltf SYSTEM PUBLIC "${cgltf_SOURCE_DIR}")
+snx_quiet(snx_cgltf)
+
 # xxHash (BSD-2-Clause) for the renderer's content hashes (src/nx/gpu/vk/cmd.c's vk_hash): XXH3, about three times
 # XXH64's speed. src/nx/gpu/vk/xxh3.c builds the dispatcher on x86 (the CPU's SSE2, AVX2 or AVX-512 loop, chosen at
 # run time) and xxhash.c on every other architecture, by the compiler's own macros
@@ -221,12 +234,8 @@ if((SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY) OR SNX_BUILD_3DS OR snx_vita_runtime OR
                   DOWNLOAD_ONLY YES)
     # the 3DS system archives' open stand-ins (cmake/ctr_system_archives.cmake): the RomFS images
     # B3n30/citra_system_archives makes (GPL-2.0-or-later), as the C arrays Azahar's source holds them in, each at the
-    # commit that last changed it
+    # commit that last changed it. The Mii data is ours (src/common/utilities/mii_model.c), made when a game opens it
     if(SNX_BUILD_3DS)
-        CPMAddPackage(NAME AzaharMiiData VERSION 2019
-                      URL https://raw.githubusercontent.com/azahar-emu/azahar/36ae10f555f73fb4e8d05cb676583efc67ecacef/externals/open_source_archives/include/mii.app.romfs.h
-                      URL_HASH SHA256=4538bb4964ce4449732adc0bbf0faf69d7c054a0eee6d5f1dafce17bad409ad1
-                      DOWNLOAD_ONLY YES DOWNLOAD_NO_EXTRACT YES)
         CPMAddPackage(NAME AzaharCountryList VERSION 2019
                       URL https://raw.githubusercontent.com/azahar-emu/azahar/a1517612d37f17e673849e04673a0f3c146d6208/externals/open_source_archives/include/country_list.app.romfs.h
                       URL_HASH SHA256=bd1c384c9788f99ed2cf9157727820c4c0000f6bbc01843ff8642a32e6f90651

@@ -438,7 +438,53 @@ static void renderer_failed(const char* what) {
     if (why && why[0]) fatal("%s: %s.", what, why);
     fatal("%s (see the log). ScarletNX needs a GPU and driver with Vulkan 1.3.", what);
 }
+/* The Vulkan driver this run picked (the game's vulkan_driver, docs/APPLE.md): on a Mac the library SDL loads, and for
+   KosmicKrisp the ICD the Vulkan loader takes; elsewhere the system's, which moltenvk and kosmickrisp also take, said.
+   Once a run, before SDL opens the window or the headless renderer its loader */
+static const SnxVulkanDriver* vulkan_driver(void) {
+    static SnxVulkanDriver pick;
+    static int picked;
+    if (picked) return &pick;
+    picked = 1;
+    const char* asked = g_settings.vulkan_driver;
+#ifdef __APPLE__
+    /* a library SDL already names (SDL_VULKAN_LIBRARY) is the one auto takes, as before the setting: a checkout's test */
+    const char* named = SDL_GetHint(SDL_HINT_VULKAN_LIBRARY);
+    if (named && named[0] && (!asked[0] || !strcmp(asked, "auto"))) {
+        pick.library = snx_strdup(named);
+        pick.name = "SDL_VULKAN_LIBRARY's";
+        LOG("vulkan: the Vulkan library SDL_VULKAN_LIBRARY names, %s (vulkan_driver=auto leaves it)\n", named);
+        return &pick;
+    }
+#endif
+    char reason[4096] = "";
+    char* self = snx_executable(NULL);
+    int found = snx_vulkan_driver_choose(self, asked, &pick, reason, sizeof reason);
+    free(self);
+    /* A value that is no driver stops, as a menu that shows no other would hide the mistake. A driver the system has
+       not plays auto's in its place, so that a game still starts, and the warning names it */
+    if (!found) fatal("%s", reason);
+    if (pick.instead)
+        WARN("vulkan: vulkan_driver=%s: %s\n", asked, reason);
+    else if (reason[0])
+        LOG("vulkan: %s\n", reason);
+#ifdef __APPLE__
+    /* the loader takes the driver its ICD names, and no other */
+    if (pick.icd && setenv("VK_DRIVER_FILES", pick.icd, 1)) {
+        char error[256];
+        LOG("vulkan: VK_DRIVER_FILES=%s could not be set: %s\n", pick.icd, snx_os_error(error, sizeof error));
+        fatal("vulkan: VK_DRIVER_FILES could not be set for KosmicKrisp's ICD (see the log)");
+    }
+    /* the setting's driver over a library SDL_VULKAN_LIBRARY names, which only auto leaves */
+    if (pick.library) SDL_SetHintWithPriority(SDL_HINT_VULKAN_LIBRARY, pick.library, SDL_HINT_OVERRIDE);
+#endif
+    return &pick;
+}
+
 void video_init(const char* title, const char* addons) {
+    /* MoltenVK's library or the KosmicKrisp loader, before SDL opens the window and loads one of its own, or the
+       headless renderer one (docs/APPLE.md); and the setting checked on every system */
+    vulkan_driver();
     if (g_opt_headless) {
         /* No SDL video subsystem: this also works without DISPLAY, WAYLAND_DISPLAY or a seat. */
         unattended_start();
@@ -454,18 +500,6 @@ void video_init(const char* title, const char* addons) {
     SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
     SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
     SDL_SetHint(SDL_HINT_PEN_MOUSE_EVENTS, "0");
-#ifdef __APPLE__
-    { /* the app's MoltenVK, or the copy deployed beside a game's runtime, which is outside the bundle: SDL's own search
-         finds neither there, and the system may have no loader (docs/APPLE.md). Elsewhere the system's loader */
-        char* self = snx_executable(NULL), *driver = self ? snx_vulkan_driver(self) : NULL;
-        if (driver && !SDL_GetHint(SDL_HINT_VULKAN_LIBRARY)) {
-            SDL_SetHint(SDL_HINT_VULKAN_LIBRARY, driver);
-            LOG("vulkan: the Vulkan driver at %s\n", driver);
-        }
-        free(self);
-        free(driver);
-    }
-#endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) fatal("SDL could not start its video: %s", SDL_GetError());
     gamepad_scan();
     /* SDL subsystem initialization belongs to the main thread, before the guest can open audout sessions. */
@@ -519,18 +553,15 @@ void* backend_vk_driver(void) {
     void* own = gpu_driver_open();
     if (own) return own;
 #ifdef __APPLE__
-    /* The library the program's folders carry (snx_vulkan_driver), for a run with no window: SDL's own search of the
-       bundle needs its video subsystem, and a game's runtime copy is outside the bundle. It stays loaded for the run,
-       as SDL's does */
+    /* The library this run picked (vulkan_driver), for a run with no window: SDL's own search of the bundle needs its
+       video subsystem, and a game's runtime copy is outside the bundle. It stays loaded for the run, as SDL's does */
     static void* module;
     static int looked;
     if (!looked) {
-        char* self = snx_executable(NULL), *driver = self ? snx_vulkan_driver(self) : NULL;
+        const SnxVulkanDriver* pick = vulkan_driver();
         looked = 1;
-        if (driver && (module = dlopen(driver, RTLD_NOW | RTLD_LOCAL)) != NULL)
-            LOG("vulkan: the Vulkan driver at %s\n", driver);
-        free(self);
-        free(driver);
+        if (pick->library && (module = dlopen(pick->library, RTLD_NOW | RTLD_LOCAL)) != NULL)
+            LOG("vulkan: the Vulkan driver at %s\n", pick->library);
     }
     return module ? (void*)dlsym(module, "vkGetInstanceProcAddr") : NULL;
 #else

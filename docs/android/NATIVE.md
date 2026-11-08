@@ -280,14 +280,22 @@ builds for FreeBSD, macOS and Windows x64, where they differ:
   and `host_dontneed` maps fresh zero pages over the recorded parts (a new anonymous `MAP_FIXED` mapping, or a decommit
   and commit on Windows). Linux keeps its own advice.
 - **errno**: on Linux the guest's errno is the host's. Elsewhere it is the guest's own, and each HLE call sets it
-  from the host's in Linux's numbers (`gnu_host_errno`, `gnuabi/kernel/errno.c`, which also gives them back for
-  `strerror`).
+  from the host's in Linux's numbers (`gnu_host_errno`, `gnuabi/kernel/errno.c`). `strerror`, `strerror_r`, `perror`
+  and `%m` give bionic's texts (`hle_error_text`): the host C library's are other words, in the user's language.
+- **The locale**: bionic's C library has the C locale alone, its multibyte characters UTF-8 whatever the name.
+  `setlocale`, `newlocale` and `uselocale` are bionic's (`hle_libc.c`): a name only sets `MB_CUR_MAX`, 4 or 1, a
+  `locale_t` is bionic's struct of it, and the host's locale is never set. The host's is the user's, which the JVM
+  sets for the process (a decimal comma, other names of days, other words), so a host call into guest code
+  (`bridge_call`) runs its thread in the C locale until it returns: C.UTF-8 on Linux, whose multibyte functions
+  serve the guest's. Windows' C runtime keeps the C locale, as no part of the process sets another.
 - **Constants and layouts** convert by the GNU ABI's tables and the network stack's: `gnuabi/abi/linux_file.h`
   (struct stat, the open flags), `gnuabi/abi/linux_net.h` (families, flags, options, `sockaddr_in` and `sockaddr_in6`)
   and `common/network/net_host.h` (the stack's constants as the host's). The adapters in `hle_posix.c` also convert
   the mmap and msync flags, fcntl's commands and `struct flock`, the requests of ioctl, `struct dirent`, `struct
   statfs` and the poll events. `getaddrinfo`, `getnameinfo` and `gethostbyname` are the stack's on every host, whose
-  flags and errors are bionic's.
+  flags and errors are bionic's. Offline (the Network setting), another machine's name is `EAI_NODATA`, as Android
+  answers without a network. localhost is 127.0.0.1 alone, once, as Android's hosts file has it (`::1` is
+  ip6-localhost there).
 - **Threads**: FreeBSD's, macOS's and winpthreads' objects differ in size or in their static initializer, so a
   guest mutex, condition variable, rwlock and semaphore keep a host object's address at offset 8, made at the first
   use, and the attributes are bionic's own layout (`hle_thread.c`).
@@ -327,8 +335,12 @@ compile with `clang --target=x86_64-w64-mingw32 -fsyntax-only` and the mingw-w64
 - JNI: the guest's `JNIEnv` and `JavaVM` are tables of exports over the host JVM's functions, called through one
   adapter (`hle_call`) that passes `x0` to `x5` and `v0` to `v7` as the host's integer and floating registers, which
   AAPCS64 and the System V ABI fill in the same order. The calls with variable arguments read them by the signature
-  that `GetMethodID` recorded. `FindClass` falls back to the app's class loader, as Android's uses the loader of the
-  class that loaded the library. `RegisterNatives` records the guest's functions.
+  that `GetMethodID` recorded. `FindClass` falls back to the app's class loader within the app's native methods and
+  the loads of its libraries, as Android's uses the loader of the class whose native method runs; on a thread with
+  none (one the app attached) it has the system class loader alone, and an app's class is a ClassNotFoundException,
+  as on ART. `GetVersion` is Android's JNI 1.6, not the host JDK's. The string functions' modified UTF-8 is ART's:
+  a supplementary character is UTF-8's 4 bytes both ways, where HotSpot's CESU-8 has 6 (and its `NewStringUTF` ends
+  the string at a 4-byte sequence). `RegisterNatives` records the guest's functions.
 - The translator gives each `native` method a body that calls `NativeBridge.invoke*` with its key, the object and its
   parameters (primitives as bits in a `long[]`, references in an `Object[]`). The bridge finds the function by
   `RegisterNatives` or by its JNI name, and passes the parameters as AAPCS64 does.
