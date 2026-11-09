@@ -1,0 +1,5 @@
+# Ignore the hosted lavapipe/Vulkan loader's one-time global allocation.
+# The reported 128-byte loss is allocated through libvulkan.so at
+# vkEnumeratePhysicalDevices; none of ScarletNX's own allocators are hidden.
+# Keep LeakSanitizer enabled for all other application allocations.
+leak:vkEnumeratePhysicalDevices
