@@ -101,6 +101,7 @@ int gmem_read(u64 gva, void* dst, u64 size) {
 /* one thread adds commands here, so record.c's drain has no other producer to keep out (device.c's vk_lock) */
 void vk_lock(void) {}
 void vk_unlock(void) {}
+int vk_lock_held(void) { return 1; } /* cmd.c's wait for the next frame slot then waits under the lock, as before */
 /* record.c resolves stand-ins for pipelines still being made (pipeline.c, not here): the test binds real ones */
 VkPipeline vk_pipeline_resolve(VkPipeline h) { return h; }
 VkPipeline vk_pipeline_now(VkPipeline h, int* pending) {
@@ -119,6 +120,16 @@ void vk_gpuprof_waited(u64 value, int kind) {
     (void)value;
     (void)kind;
 }
+/* and record.c's dispatches and copies, which it would time */
+void vk_gpuprof_tag(u64 key) { (void)key; }
+int vk_gpuprof_dispatch_begin(VkCommandBuffer cb) { return (void)cb, 0; }
+void vk_gpuprof_dispatch_end(VkCommandBuffer cb) { (void)cb; }
+int vk_gpuprof_profiled(VkCommandBuffer cb) { return (void)cb, 0; }
+int vk_gpuprof_op_begin(VkCommandBuffer cb, u32 kind, u64 key, u64 bytes) {
+    return (void)cb, (void)kind, (void)key, (void)bytes, 0;
+}
+void vk_gpuprof_op_end(VkCommandBuffer cb) { (void)cb; }
+const void* vk_gpuprof_base(void) { return NULL; }
 /* record.c's presents tell display.c they were made, which isn't here (nor are presents) */
 void vk_display_made(u64 id, VkResult r) {
     (void)id;

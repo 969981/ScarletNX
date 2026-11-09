@@ -246,6 +246,7 @@ void vk_lock(void);
 void vk_unlock(void);
 int vk_trylock(void);    /* vk_lock unless another thread holds it: 1 when taken */
 u32 vk_lock_owner(void); /* the thread (plat_tid) holding vk_lock, 0 when none */
+int vk_lock_held(void);  /* this thread holds vk_lock */
 
 /* memory.c. vk_mem_init once the device exists, before the allocator (VMA's blocks are kept within the cap):
    sparse_queue is whether the graphics queue's family can bind sparse memory */
@@ -483,6 +484,11 @@ void vk_wait_submit(u64 value); /* until the GPU has done that submission (any t
 /* Flush recorded work without frame recycling or guest result callbacks, under
    vk_lock, before an ownership readback uses the graphics queue directly. */
 void vk_submit_for_readback(void);
+/* the same without waiting for the recording thread: the commands being recorded, if any, handed to it (vk_lock) */
+void vk_submit_open(void);
+/* the renderer's ready (renderer.h): the GPU's work on the slot the next frame records in, waited for without vk_lock
+   (none when this thread holds it) */
+void vk_frame_ready(void);
 void vk_land_through(u64 value); /* the results of the submissions up to value, done, into guest memory (vk_lock) */
 void vk_barrier(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect, VkPipelineStageFlags2 src_stage,
                 VkAccessFlags2 src_access, VkImageLayout from, VkPipelineStageFlags2 dst_stage,
@@ -909,6 +915,7 @@ void vk_gfx_image_report(void);
 u64 vk_gfx_image_after(Surf* s, u32 size);
 int vk_gfx_image_unrecorded(const Surf* s); /* s has a write-back whose copy isn't recorded: a draw's writes join it */
 void vk_gfx_image_mem_need(u64 gva, u64 size);
+void vk_gfx_image_guest_need(u64 cpu, u64 size); /* by guest memory (size ~0: all of it) */
 int vk_gfx_image_pending(u64 gva, u64 size);
 void vk_gfx_image_land(void);
 /* at a release: the storage images' write-backs recorded, to land once their submit is done (vk_lock) */
@@ -1521,6 +1528,8 @@ void vk_buf_stats(u32* count, u64* bytes);
    their output's fill), their results' bytes copied back from the GPU to land, and the results landed by comparing
    them with their original bytes. buffer_copy_stats LOGs them every 600 presents */
 void vk_buf_writable_stats(u64* copied, u64* read_back, u64* merged);
+/* temporary writeback diagnosis: bytes compared (memcmp) and bytes actually changed and written back */
+void vk_writeback_diag(u64* cmp, u64* chg);
 /* guest memory checked by its contents so far: compared with a pending result's original bytes, hashed whole, and
    sampled (tests count them: write tracking's answers stand in for them) */
 void vk_buf_checks(u64* compares, u64* hashes, u64* samples);
@@ -2020,6 +2029,20 @@ enum { VK_SUB_OTHER, VK_SUB_PRESENT, VK_SUB_FINISH, VK_SUB_PERIODIC, VK_SUB_READ
    (a release's gate, a result's landing: vk_wait_submit) */
 enum { VK_WAIT_FINISH, VK_WAIT_RECYCLE, VK_WAIT_SUBMIT, VK_WAIT_N };
 extern u64 g_vk_wait_ns[VK_WAIT_N], g_vk_waits[VK_WAIT_N]; /* cmd.c: the GPU thread's waits, by kind */
+/* Each dispatch recorded into the frame's command buffer, timed (record.c's rec_CmdDispatch): begin before it, 1 when
+   it is timed, end after it. tag names the next one: a compute program's key, or a VK_PROF_* constant; untagged it is
+   one of the renderer's own */
+int vk_gpuprof_dispatch_begin(VkCommandBuffer cb);
+void vk_gpuprof_dispatch_end(VkCommandBuffer cb);
+void vk_gpuprof_tag(u64 key);
+/* any operation the same way: kind VK_OP_*, key what it is (a copy's: where it was recorded, from vk_gpuprof_base) */
+enum { VK_OP_DISPATCH, VK_OP_COPY, VK_OP_TO_IMAGE, VK_OP_TO_BUFFER, VK_OP_IMAGE, VK_OP_N };
+int vk_gpuprof_op_begin(VkCommandBuffer cb, u32 kind, u64 key, u64 bytes);
+void vk_gpuprof_op_end(VkCommandBuffer cb);
+const void* vk_gpuprof_base(void);
+int vk_gpuprof_profiled(VkCommandBuffer cb); /* cb is the frame's command buffer the profile times */
+#define VK_PROF_ASTC 1                       /* the ASTC decode (astc.comp) */
+#define VK_PROF_BC7  2                       /* its BC7 encode (bc7.comp) */
 void vk_gpuprof_cb_begin(VkCommandBuffer cb);
 void vk_gpuprof_cb_end(VkCommandBuffer cb, int why, u64 value);
 void vk_gpuprof_waited(u64 value, int kind);

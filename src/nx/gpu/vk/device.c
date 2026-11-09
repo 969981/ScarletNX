@@ -57,6 +57,7 @@ int vk_trylock(void) {
     return 1;
 }
 u32 vk_lock_owner(void) { return __atomic_load_n(&g_vk_owner, __ATOMIC_RELAXED); }
+int vk_lock_held(void) { return t_vkdepth > 0; }
 
 /* What held the memory at an out-of-memory, at the first ones: each heap as VMA counts it, and the descriptor pools,
    which MoltenVK backs with Metal memory that VMA's blocks do not hold (cmd.c). The heap's use less its blocks is
@@ -173,6 +174,7 @@ static int create_instance(void) {
                               .extension_count = next,
                               .api_version = g_vk.api_cap,
                               .validation = g_settings.vulkan_validation_layer != 0,
+                              .gpu_assisted = g_settings.vulkan_validation_layer == 2,
                               .portability = true,
                               .debug = debug_cb};
     SnxVkInstance made;
