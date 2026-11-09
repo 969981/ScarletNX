@@ -29,10 +29,11 @@ jobs:
     # a push to the repository's own pull request, or another label, has nothing for it. Nor has a Build a newer push
     # cancelled: waiting in the group below, it would take the place of the one before it that built
     if: >-
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion != 'cancelled') ||
+      github.repository != '969981/ScarletNX' &&
+      ((github.event_name == 'workflow_run' && github.event.workflow_run.conclusion != 'cancelled') ||
       github.event.action == 'closed' ||
       (github.event.action == 'labeled' && github.event.label.name == 'publish builds') ||
-      (github.event.action == 'synchronize' && github.event.pull_request.head.repo.full_name != github.repository)
+      (github.event.action == 'synchronize' && github.event.pull_request.head.repo.full_name != github.repository))
     # One at a time for main's nightlies, each version and each pull request: the nightlies are counted. A group holds
     # one waiting job, which a newer one replaces: the newer build is the one to publish (a fork's pull request, which
     # its run cannot name, goes by its commit). On the job, not the workflow: an event the job skips never waits, so
