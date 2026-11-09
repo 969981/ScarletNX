@@ -8,8 +8,10 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* program stages; the values index tables and are stored in the corpus */
-enum { ST_VS = 0, ST_TCS = 1, ST_TES = 2, ST_GS = 3, ST_FS = 4, ST_CS = 5 };
+/* program stages; the values index tables and are stored in the corpus. ST_TS and ST_MS are the task and mesh
+   programs of an Ounce game (sm86.h), which only the SM86 translator takes: NVN's control section gives these stages,
+   as the SPH cannot */
+enum { ST_VS = 0, ST_TCS = 1, ST_TES = 2, ST_GS = 3, ST_FS = 4, ST_CS = 5, ST_TS = 6, ST_MS = 7 };
 #define SH_MAXTEX          64 /* texture slots per program */
 #define SH_INDEXED_TABLES  10 /* indexed texture tables per program */
 /* A 1D texture is bound as a 2D image, and a buffer texture longer than a row of one as rows of 2^SH_TEXEL_ROW_SHIFT
@@ -28,12 +30,15 @@ typedef struct {
     u8 flags;    /* bit 0 raw integer surface load, bit 1 multisample fetch, bit 2 SNX_TEX_INDEXED; bits 4-7 the
                     indexed table's stride shift */
     u32 bl2_off; /* the second read's offset, in words */
+    /* an indexed table whose elements aren't a power of two apart (an Ounce's, by IMAD): the bytes between them, and
+       how many there are. 0: the shift in flags, and SNX_TEX_ARRAY */
+    u16 stride, count;
 } ShTex;
 #define SH_HANDLE_IMM 255 /* ShTex.bl2_cbuf of a handle's half that is a constant (the sampler's, from a MOV32I) */
 /* whether two indexed slots read the same handle table the same way */
 static inline int shader_same_indexed_table(const ShTex* a, const ShTex* b) {
     return a->bl_cbuf == b->bl_cbuf && a->cbuf_off == b->cbuf_off && a->flags == b->flags && a->type == b->type &&
-           a->array == b->array && a->shadow == b->shadow;
+           a->array == b->array && a->shadow == b->shadow && a->stride == b->stride && a->count == b->count;
 }
 /* Whether two indexed slots view their elements as the same kind of image, with the integer and signed integer
    texture masks. Each kind has its own SPIR-V array, all of them on SNX_VKB_TEXARRAY (and the shadow kinds' also on
@@ -62,6 +67,16 @@ typedef struct {
     u16 stride[4];
     u8 stream[4]; /* geometry output stream for each capture buffer, 0..3 */
 } ShXfb;
+/* The key of a task or mesh program (ShaderInfo.mesh): the fields of its NVN control section (nvn/nvn_section.h,
+   NvnSectionMesh) and its per-primitive outputs' header, which a draw gives and the SPH does not (sm86.h) */
+typedef struct {
+    u16 threads;                      /* the invocations of a workgroup (section 0x58), 1 to 32 */
+    u16 payload;                      /* the task payload's bytes, its 16-byte header included (0x5a) */
+    u16 max_vertices, max_primitives; /* a mesh program's (0x60, 0x62) */
+    u8 has_task, primitive_vertices;  /* a mesh program's: after a task program (0x5e), and 3 (0x5f) */
+    u16 reserved;                     /* 0 */
+    u32 prim_sph[20];                 /* the per-primitive SPH's first 80 bytes (0x64, 0x68), all 0 for none */
+} ShMesh;
 /* A program's key state (set by the renderer before translating) and what translation found. The corpus stores it
    whole, so a corpus file only loads into a build where this struct has the same size. */
 typedef struct {
@@ -76,6 +91,7 @@ typedef struct {
     u32 sph[20];             /* the shader program header, 80 bytes */
     u32 cbuf_mask;           /* constant buffers read */
     u32 cbuf_max[18];        /* bytes read of each, so only those are bound */
+    u32 root_max;            /* bytes read of the root tables (SNX_VKB_ROOT), 0 for none */
     ShTex tex[SH_MAXTEX];
     int ntex;
     u32 in_mask;       /* generic attributes 0-31 read */
@@ -96,6 +112,14 @@ typedef struct {
     u32 cs_local[3];
     int shared_size;
     u32 gbuf_wmask; /* global buffers the program writes */
+    u32 gbuf_rmask; /* global buffers the program reads (a load or atomic: its input must be copied for them) */
+    /* The program's write log (SNX_VKB_WPAGES, SH_WLOG_*): every store and atomic of a compute program to global
+       buffer i records the bytes it writes in the log's part gbuf_mark[i] - 1 (0: none), parts numbered in the order
+       the program's first store to each buffer was translated, nmarks of them. gbuf_marks has bit i set when
+       gbuf_mark[i] is */
+    u32 gbuf_marks;
+    u8 gbuf_mark[16];
+    u8 nmarks;
     struct {
         u32 cbuf_off;
         u8 type, bindless, bl_cbuf, kind; /* kind: 1 raw R32ui load/atomic; formatted: 0 float, 2 uint, 3 sint */
@@ -151,6 +175,11 @@ typedef struct {
     u32 late_depth; /* key: ordered GPU depth/stencil shadow operations after guest fragment code */
     u32 capture_outputs; /* key: capture validity location2..7; zero retains the original location1 interface */
     int primitive_split_safe; /* proof: vertex values do not depend on subgroup/lane/clock invocation groups */
+    ShMesh mesh; /* key (task and mesh programs) */
+    /* the generics that go to the fragment program per primitive: of a mesh program, the per-primitive outputs that
+       translation found (in out_mask too); and key (fragment programs), the inputs that the draw's mesh program
+       writes per primitive, which the module declares PerPrimitiveEXT */
+    u32 prim_mask;
 } ShaderInfo;
 /* The graphics cache packs these explicit fragment-only fields above its eight image-format bits. */
 enum { SH_FS_LATE_DEPTH = 1u, SH_FS_CAPTURE_SHIFT = 1, SH_FS_CONFIG_MASK = 15u };
@@ -185,7 +214,24 @@ static inline void shader_query_hint_unpack(const u32 words[SH_QUERY_WORDS], u8 
 #define SNX_VKB_RS       (SNX_VKB_IMG + 8)         /* fragment: 1 / the resolution scale (SNX_RS) */
 #define SNX_VKB_FMT      (SNX_VKB_RS + 1)          /* compute: the images' format classes (SNX_FMT) */
 #define SNX_VKB_SMAP     (SNX_VKB_FMT + 1)         /* graphics: storage buffer page indices for aliased bindings */
-#define SNX_VKB_IMGBUF   (SNX_VKB_SMAP + 1)        /* 8 buffer images (compute, vertex, fragment) */
+/* compute, the same binding, which no compute program reads otherwise: the write log the program's stores record their
+   bytes in (gbuf_mark, SH_WLOG_*). With the GPU mirror, a pass after the dispatch puts the log's bits in the mirror's
+   mask (vk/mirror.c vk_mirror_fold) */
+#define SNX_VKB_WPAGES   SNX_VKB_SMAP
+/* compute, the fragment program's binding, which no compute program has: the mask's bases and the buffers' lengths, a
+   uniform buffer of 16 bases then 16 lengths, 4 a vec4 (the GPU mirror's, mirror.c; the write log has its bases in the
+   program: gbuf_mark) */
+#define SNX_VKB_MBASE    SNX_VKB_RS
+/* The write log: for each logged global buffer (ShaderInfo.gbuf_mark), a part of SH_WLOG_PART words. Its first
+   SH_WPAGE_SLOT words are flags, word j set to 1 by any store to the 4 KiB window j of the binding; then a bit for each
+   byte of each window, SH_WLOG_MASK words a window, bit b of word k of window j standing for byte j * 4096 + k * 32 +
+   b, set by the store that writes that byte. A store past the windows sets no bit. The flags are an index, so that
+   reading and clearing the log costs the windows written, not the windows bound */
+#define SH_WPAGE_SLOT    4096u /* the windows of a global buffer: 16 MiB, the most vk_gbuf_desc binds */
+#define SH_WLOG_MASK     128u  /* the mask words of a window: a bit for each of its 4096 bytes */
+#define SH_WLOG_PART     (SH_WPAGE_SLOT * (1u + SH_WLOG_MASK))
+#define SNX_VKB_ROOT     (SNX_VKB_SMAP + 1)        /* an Ounce program's root tables, banks 24 to 31 (SH_ROOT_BYTES) */
+#define SNX_VKB_IMGBUF   (SNX_VKB_ROOT + 1)        /* 8 buffer images (compute, vertex, fragment) */
 #define SNX_VKB_BLEND    SNX_VKB_IMG            /* fragment: ordered blend uses IMG+nimg, after the guest images */
 #define SNX_VKB_CAPTURE  (SNX_VKB_IMGBUF + 8)   /* fragment: sparse capture tile flags and dispatch list */
 #define SNX_VKB_TEXARRAY (SNX_VKB_CAPTURE + 1)  /* up to SNX_TEX_ARRAY distinct indexed handles */
@@ -202,6 +248,12 @@ static inline void shader_query_hint_unpack(const u32 words[SH_QUERY_WORDS], u8 
 /* An indexed texture loads its handle with an LDC whose address has a register in it: one of SNX_TEX_ARRAY handles
    from cbuf_off on, each (1 << shift) bytes after the last, with the shift in bits 4-7 of ShTex.flags. */
 #define SNX_TEX_ARRAY    256
+/* An Ounce program reads its root tables (push constants) as banks 24 to 31: 8 tables of 256 bytes, which the
+   renderer binds as one uniform buffer, table t at 256 t */
+#define SH_ROOT_BANK     24
+#define SH_ROOT_TABLES   8
+#define SH_ROOT_TABLE    256
+#define SH_ROOT_BYTES    (SH_ROOT_TABLES * SH_ROOT_TABLE)
 #define SNX_TEX_INDEXED  4
 /* Device capabilities the renderer sets before translating: */
 /* sampled image arrays indexed per invocation (non-uniform indexing) */
@@ -244,6 +296,19 @@ extern int g_shader_xfb_stores;
 #define SH_PUSH_GPU_BASE_INSTANCE 2u
 /* quad operations in fragment programs (the subgroup's QUAD bit): SHFL within a quad reads its helper lanes. 1 offline */
 extern int g_shader_quad;
+/* quad operations in compute programs (the QUAD bit, compute among the subgroup stages): an SM86 HMMA reads its A
+   fragments from the lane's own quad with them, a DPP move on AMD where a shuffle goes through LDS. 1 offline */
+extern int g_shader_quad_compute;
+/* VK_VALVE_shader_mixed_float_dot_product's shaderMixedFloatDotProductFloat16AccFloat32, with shaderFloat16: an SM86
+   HMMA sums each pair of f16 products into its f32 accumulator with one OpFDot2MixAcc32VALVE (v_dot2_f32_f16 on AMD)
+   instead of unpacking both pairs to f32. 0 offline */
+extern int g_shader_mixed_dot;
+/* VK_KHR_cooperative_matrix's 16x16x16 product of f16 A and B into an f32 accumulator in subgroup scope, in compute,
+   with the Vulkan memory model (vulkanMemoryModel, vulkanMemoryModelDeviceScope) and compute subgroups of 32 that a
+   pipeline can require: the device's maxComputeSharedMemorySize, else 0. An SM86 compute program's HMMAs are then each
+   one OpCooperativeMatrixMulAddKHR on fragments staged in shared memory after the program's (sm86_translate.c's
+   hmma_coop), where the two fit in that size. 0 offline */
+extern int g_shader_hmma_coop;
 /* the Tessellation capability, which also gives a fragment program PrimitiveId without Geometry */
 extern int g_shader_tessellation;
 /* VK_KHR_shader_clock's scopes: bit 0 subgroup, bit 1 device */
@@ -291,6 +356,11 @@ int shader_shared_fit(const u8* code, u32 max_bytes, const u32 local[3], u32 shm
 /* reads word off (bytes) of constant buffer idx for jump tables, into *out as a host number: 1 when it could. Set by
    whoever translates, NULL offline */
 extern int (*g_shader_cb_read)(u32 idx, u32 off, u32* out);
+/* The programs are SM86 (sm86.h), not Maxwell: an Ounce game's. nvn_direct sets it once, from the game's NVN API
+   version, before the game's first draw */
+extern int g_shader_sm86;
+/* a folder that sm86_debug_dump writes refused SM86 programs to (the sm86_dump setting), NULL for none */
+extern const char* g_shader_sm86_dump;
 /* the targets of the BRX at word index from its jump table, at most max_targets, or -1 */
 int shader_brx_targets(const u64* words, u32 index, u32 count, u32* targets, int max_targets);
 /* the program's hash, and its length in bytes in out_len */

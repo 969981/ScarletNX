@@ -268,7 +268,13 @@ typedef struct GfxOut {
     u64 off;
     VmaAllocation mem;
     u8* ptr;
+    /* the bytes it started from, which landing compares it with; NULL for a logged result, whose writers' write logs
+       give the bytes they wrote (logs) */
     u8* org;
+    int org_alloc; /* org allocated on its own: taken when a writer that logs nothing joined a logged result */
+    /* the writer binds a buffer the program writes but never reads: its input was not copied in, so its staging's
+       bytes are not guest memory and a reader must compose, not read it in place */
+    int no_input;
     /* GPU-owned input snapshotted before shader writes, read only at the frame fence. */
     u8* initial;
     VmaAllocation initial_mem;
@@ -285,9 +291,38 @@ typedef struct GfxOut {
     u64 keep_off;
     u32 wseen; /* the write tracking clock before org was read (vk_ww_now): copyable_span skips comparing pages since */
     u64 seq;   /* its place in g_out's order: higher is later (g_outx.seq when it went to the end) */
+    /* of a logged result, its writers' logs, each holding a reference: part of log gives the bytes that writer wrote
+       of [at, at + len) */
+    struct OutLog {
+        VkWriteLog* log;
+        u32 part, at, len;
+    }* logs;
+    u32 nlogs, caplogs;
     struct GfxOut* next;
+    /* being set up to be written back on the GPU once its dispatch is recorded (back_record), never pending */
+    int back;
 } GfxOut;
 static GfxOut *g_prep, *g_prep_tail, *g_out, *g_out_tail;
+/* The writers being bound that log their writes (vk_buf_copy_writable_logged): each result they write gets a
+   reference to their log at vk_buf_writable_commit, once their work is recorded, and none when it is abandoned. The
+   GPU thread's */
+static struct {
+    GfxOut* o;
+    VkWriteLog* log;
+    u32 part, at, len;
+} g_pw[32];
+static u32 g_npw;
+static VkWriteLog* g_bind_log; /* the log of the writer vk_buf_copy_writable is binding, NULL when it logs nothing */
+static int g_bind_no_read; /* the writer binds a buffer the program writes but never reads: its input is not copied */
+static u32 g_bind_part;
+/* the dispatches' own references to their logs, dropped once the submit that recorded them is done */
+static struct {
+    VkWriteLog* log;
+    u64 submit;
+}* g_retire;
+static u32 g_nretire, g_capretire;
+/* gfx_gpu_src's result taken in place for writing, when it answers 1 */
+static GfxOut* g_src_match;
 /* The results in g_out by the pages they cover, so a binding or a read compares (out_meets) the results over its range
    alone, not each of the hundreds a frame keeps pending until it is done. Each run of a result's guest pages [lo, hi]
    is an entry, in order of lo, as surface.c keeps the live render targets by address (g_rts); a search starts as far
@@ -434,8 +469,8 @@ static void out_list_sort(OutList* l) {
     g_outx.inspected += n;
 }
 u64 vk_buf_pending_inspected(void) { return g_outx.inspected; }
-/* where and how pending results were written: shader stores, copies, and transform feedback's captures when the device
-   has it (its flags are invalid without the extension) */
+/* where and how pending results were written: shader stores (an Ounce's task and mesh programs' too), copies, and
+   transform feedback's captures when the device has it (its flags are invalid without the extension) */
 static VkPipelineStageFlags2 out_stages(void) {
     return VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT |
@@ -443,6 +478,8 @@ static VkPipelineStageFlags2 out_stages(void) {
                                         VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT
                                   : 0) |
            (g_shader_geometry ? VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT : 0) |
+           (g_vk.has_mesh ? VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT : 0) |
+           (g_vk.has_task ? VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT : 0) |
            (g_vk.has_xfb ? VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT : 0);
 }
 static VkAccessFlags2 out_access(void) {
@@ -547,23 +584,66 @@ static _Thread_local struct {
     WwStage* wstage; /* the running scan's, for ww_note */
 } t_buffer;
 
+static void out_free(GfxOut* o);
+static int back_record(GfxOut* o);
 void vk_buf_writable_abort(void) {
+    g_npw = 0;
     vk_uma_writes_abort();
     g_buffer.order.reused_write = 0;
     while (g_prep) {
         GfxOut* o = g_prep;
         g_prep = o->next;
         if (o->keep) vk_own_res_unref(o->keep); /* a made owner stays published: it holds memory's bytes */
-        free(o);
+        out_free(o);
     }
     g_prep_tail = NULL;
 }
+/* a reference to log for o, from a writer whose work was recorded: a result that compares (org) takes none, as its
+   landing finds what changed without one */
+static void out_add_log(GfxOut* o, VkWriteLog* log, u32 part, u32 at, u32 len) {
+    if (o->org) return;
+    if (o->nlogs == o->caplogs) {
+        u32 cap = o->caplogs ? o->caplogs * 2 : 4;
+        struct OutLog* grown = realloc(o->logs, (size_t)cap * sizeof *grown);
+        if (!grown) fatal("Out of memory recording a storage result's writers");
+        o->logs = grown;
+        o->caplogs = cap;
+    }
+    o->logs[o->nlogs++] = (struct OutLog){log, part, at, len};
+    vk_wlog_ref(log);
+}
+void vk_buf_log_retire(VkWriteLog* l) {
+    if (g_nretire == g_capretire) {
+        u32 cap = g_capretire ? g_capretire * 2 : 64;
+        void* grown = realloc(g_retire, (size_t)cap * sizeof *g_retire);
+        if (!grown) fatal("Out of memory keeping a write log");
+        g_retire = grown;
+        g_capretire = cap;
+    }
+    g_retire[g_nretire].log = l;
+    g_retire[g_nretire++].submit = vk_submit_number();
+}
 void vk_buf_writable_commit(void) {
     vk_uma_writes_commit();
+    for (u32 i = 0; i < g_npw; i++) out_add_log(g_pw[i].o, g_pw[i].log, g_pw[i].part, g_pw[i].at, g_pw[i].len);
+    g_npw = 0;
     /* Reusing an output writes its existing buffer without adding another pending result. Count that write
        too, but only after the draw or dispatch was recorded. An abandoned setup must not invent writes. */
     if (g_prep || g_buffer.order.reused_write) g_buffer.order.writes++;
     g_buffer.order.reused_write = 0;
+    /* the results written back on the GPU after the work just recorded go, never pending; one that can't be is
+       pending as any other */
+    for (GfxOut **pp = &g_prep, *o; (o = *pp) != NULL;) {
+        if (o->back && back_record(o)) {
+            *pp = o->next;
+            out_free(o);
+        } else {
+            o->back = 0;
+            pp = &o->next;
+        }
+    }
+    g_prep_tail = NULL;
+    for (GfxOut* o = g_prep; o; o = o->next) g_prep_tail = o;
     if (!g_prep) return;
     for (GfxOut* o = g_prep; o; o = o->next) {
         o->written = g_buffer.order.writes;
@@ -602,9 +682,7 @@ static int pages_meet(const GfxOut* a, const GfxOut* b) {
    merged: found by the landing itself, which compares them already (vk_write_changed_runs). Rebasing every later composed result compared all of the landed
    result's bytes again for each of them. One game landed 20,000 results in 10 s that changed 4 MB of their 590, and
    the rebases read 42 GB, most of the release thread, under vk_lock, which the GPU thread waits for */
-typedef struct {
-    u32 from, to;
-} ChgRun;
+typedef VkRun ChgRun;
 static ChgRun g_chg_first[64]; /* where the runs start, so even a failed allocation has room for one */
 static ChgRun* g_chg = g_chg_first;
 static u32 g_nchg, g_capchg = 64;
@@ -617,6 +695,7 @@ static void chg_add(void* user, u32 from, u32 to) {
         u32 cap = g_capchg * 2;
         ChgRun* b = g_chg == g_chg_first ? malloc((size_t)cap * sizeof *b) : realloc(g_chg, (size_t)cap * sizeof *b);
         if (!b) {
+            if (!e->org) fatal("Out of memory landing a storage result"); /* a logged one lands its runs alone */
             g_chg[0] = (ChgRun){0, e->size};
             g_nchg = 1;
             return;
@@ -666,7 +745,11 @@ static void rebase_span(void* user, u64 at, u64 from, u64 n) {
     }
     for (u32 i = lo; i < g_nchg && g_chg[i].from < from + n; i++) {
         u64 a = g_chg[i].from > from ? g_chg[i].from : from, b = g_chg[i].to < from + n ? g_chg[i].to : from + n;
-        rebase_bytes(user, at + (a - from), a, b - a);
+        const Rebase* r = user;
+        if (!r->e->org) /* a logged result's runs are the bytes its writers wrote, every one */
+            memcpy(r->o->org + at + (a - from), r->e->ptr + a, b - a);
+        else
+            rebase_bytes(user, at + (a - from), a, b - a);
     }
 }
 static void out_rebase(const GfxOut* e, GfxOut* o) {
@@ -679,7 +762,7 @@ static void out_rebase_later(const GfxOut* e, GfxOut* rest) {
     OutList l;
     if (!g_nchg) return; /* it changed nothing: memory has what every later one took as original */
     for (GfxOut* o = rest; o; o = o->next)
-        if (o->composed && pages_meet(e, o)) out_rebase(e, o);
+        if (o->composed && o->org && pages_meet(e, o)) out_rebase(e, o); /* a logged one compares nothing */
     out_list_init(&l);
     for (u32 i = 0, j; i < e->npages && e->pages[i] != ~0ull; i = j) {
         j = out_run_end(e, i);
@@ -687,12 +770,59 @@ static void out_rebase_later(const GfxOut* e, GfxOut* rest) {
     }
     out_list_sort(&l);
     for (u32 i = 0; i < l.n; i++)
-        if (l.v[i]->composed && pages_meet(e, l.v[i])) out_rebase(e, l.v[i]);
+        if (l.v[i]->composed && l.v[i]->org && pages_meet(e, l.v[i])) out_rebase(e, l.v[i]);
     out_list_free(&l);
     for (GfxOut* o = g_prep; o; o = o->next)
-        if (o->composed && pages_meet(e, o)) out_rebase(e, o);
+        if (o->composed && o->org && pages_meet(e, o)) out_rebase(e, o);
 }
 
+static int run_cmp(const void* a, const void* b) {
+    u32 x = ((const ChgRun*)a)->from, y = ((const ChgRun*)b)->from;
+    return (x > y) - (x < y);
+}
+typedef struct {
+    const GfxOut* o;
+    u32 at;
+} LogRuns;
+static void log_run(void* user, u32 from, u32 to) {
+    const LogRuns* r = user;
+    u32 a = r->at + from, b = r->at + to;
+    if (a < r->o->size) chg_add((void*)r->o, a, b < r->o->size ? b : r->o->size);
+}
+static u64 g_wb_logged, g_wb_logged_bytes, g_wb_logged_windows, g_wb_logged_conflicts;
+/* o, a logged result: the bytes its writers' logs give, every one of them and no other, from where its shader wrote
+   them, their runs in g_chg for the later results that compose it (out_rebase_later). A byte no writer wrote holds what
+   o started from, or a byte of an earlier result composed into it (gfx_overlay), which that one lands */
+static void land_logged(GfxOut* o) {
+    u32 windows = 0;
+    for (u32 k = 0; k < o->nlogs; k++) {
+        LogRuns r = {o, o->logs[k].at};
+        windows += vk_wlog_runs(o->logs[k].log, o->logs[k].part, o->logs[k].len, log_run, &r);
+    }
+    if (o->nlogs > 1 && g_nchg > 1) { /* each writer's runs in order: all of them sorted, and those that meet joined */
+        qsort(g_chg, g_nchg, sizeof *g_chg, run_cmp);
+        u32 n = 0;
+        for (u32 i = 0; i < g_nchg; i++)
+            if (n && g_chg[i].from <= g_chg[n - 1].to) {
+                if (g_chg[i].to > g_chg[n - 1].to) g_chg[n - 1].to = g_chg[i].to;
+            } else
+                g_chg[n++] = g_chg[i];
+        g_nchg = n;
+    }
+    u32 conflicts = vk_write_runs(o->addr, o->ptr, g_chg, g_nchg, o->wseen);
+    if (copy_stats_on()) {
+        g_wb_logged++;
+        g_wb_logged_windows += windows;
+        g_wb_logged_conflicts += conflicts;
+        for (u32 i = 0; i < g_nchg; i++) g_wb_logged_bytes += g_chg[i].to - g_chg[i].from;
+    }
+}
+static void out_free(GfxOut* o) {
+    for (u32 k = 0; k < o->nlogs; k++) vk_wlog_unref(o->logs[k].log);
+    free(o->logs);
+    if (o->org_alloc) free(o->org);
+    free(o);
+}
 /* The frame fence has signaled. Its stage allocations still exist here; cmd.c frees them only after this call. */
 void vk_buf_frame_done(u64 frame) {
     GfxOut *done = NULL, *done_tail = NULL;
@@ -738,7 +868,10 @@ void vk_buf_frame_done(u64 frame) {
             o->initial = NULL;
         }
         g_nchg = 0;
-        vk_write_changed_runs(o->addr, o->ptr, o->org, o->size, chg_add, o);
+        if (!o->org)
+            land_logged(o);
+        else
+            vk_write_changed_runs(o->addr, o->ptr, o->org, o->size, chg_add, o);
         g_buffer.wstat.merged++;
         out_pages(o, -1);
         out_rebase_later(o, done);
@@ -746,33 +879,49 @@ void vk_buf_frame_done(u64 frame) {
             g_wb_outputs++;
             g_wb_bytes += o->size;
         }
-        free(o);
+        out_free(o);
     }
     t_buffer.out_landing--;
+    /* the dispatches' references to their logs, of the submits done (the results' own, just dropped, came first) */
+    u32 kept = 0;
+    for (u32 i = 0; i < g_nretire; i++)
+        if (g_retire[i].submit <= frame)
+            vk_wlog_unref(g_retire[i].log);
+        else
+            g_retire[kept++] = g_retire[i];
+    g_nretire = kept;
+    vk_mirror_done(frame);
     g_gfx_any = g_out != NULL;
     vk_uma_frame_done(frame);
 }
 /* At the frame's submit: its storage results are copied into host-cached memory (vk_stage_back), where landing them
-   compares bytes quickly. A result whose copy can't be allocated is read where the shader wrote it. A kept one stays
-   in its owner */
+   compares bytes quickly. A result whose copy can't be allocated is read where the shader wrote it, as a logged one
+   is. A kept one stays in its owner */
 void vk_buf_host_barrier(VkCommandBuffer cb, u64 frame) {
     vk_uma_host_barrier(cb, frame);
+    vk_mirror_harvest(cb, frame); /* the pages the submit's programs wrote in the GPU mirror */
     GfxOut* first = g_out;
     while (first && (first->frame != frame || first->keep)) first = first->next;
-    if (!first) return;
+    /* the write logs of the submit's dispatches are read by the host too, results of theirs pending or not (the
+       retire list is in submit order) */
+    int logs = g_nretire && g_retire[g_nretire - 1].submit == frame;
+    if (!first && !logs) return;
     VkMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                           .srcStageMask = out_stages(),
                           .srcAccessMask = out_access(),
                           .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
                           .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
     VkDependencyInfo d = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &b};
-    rec_CmdPipelineBarrier2(cb, &d);
+    if (first) rec_CmdPipelineBarrier2(cb, &d);
     /* consecutive results usually share both buffers: one copy command each run */
     VkBufferCopy regions[64];
     u32 n = 0;
     VkBuffer src = VK_NULL_HANDLE, dst = VK_NULL_HANDLE;
     for (GfxOut* o = first; o; o = o->next) {
         if (o->frame != frame || o->keep) continue;
+        /* a logged result is read where its shader wrote it: only the bytes its writers logged, a few windows of a
+           binding of up to 16 MiB, which copying whole crossed PCIe for every dispatch */
+        if (!o->org) continue;
         VkBuffer back;
         u64 at;
         VmaAllocation mem;
@@ -1056,6 +1205,27 @@ static int keep_intact(const GfxOut* o) {
     return own_lookup(o->cpu, o->size, r, 2) == 1 && r[0].res == o->keep && r[0].addr == o->cpu &&
            r[0].size == o->size && r[0].res_off == o->keep_off;
 }
+/* whether n bytes of guest memory (host, as write tracking watches them; untracked, the same read without a trap) still
+   hold org, written answering vk_written_since since a snapshot: 0, all of them; 1, those of the pages it saw written
+   alone, as the others do; -1 (no tracking), all compared. A storage range of an Ounce program is all of the memory
+   mapped from its address, up to 16 MiB, and one page written in it had every byte compared: a tenth of one game's
+   CPU time */
+typedef struct {
+    const u8 *untracked, *org;
+    int same;
+} OrgRuns;
+static void org_run(void* user, u64 at, u64 n) {
+    OrgRuns* r = user;
+    if (r->same && memcmp(r->untracked + at, r->org + at, n)) r->same = 0;
+}
+static int org_holds(const u8* host, const u8* untracked, const u8* org, u64 n, u32 since, int written) {
+    if (!written) return 1;
+    if (!untracked) return 0;
+    if (written < 0) return !memcmp(untracked, org, n);
+    OrgRuns r = {untracked, org, 1};
+    vk_written_runs(host, n, since, org_run, &r);
+    return r.same;
+}
 /* a pending result can be copied over guest memory on the GPU: this frame's staging or the last one's still holds
    it, and the guest hasn't written the bytes it covers in [lo, hi) since it was snapshotted (a kept one: its owner
    still holds them) */
@@ -1063,11 +1233,12 @@ static int out_copyable(const GfxOut* o, u64 lo, u64 hi) {
     if (o->keep) return keep_intact(o);
     const u8* host = gmem_host(lo, hi - lo);
     if (o->frame_id + 1 < vk_frame_id() || !host) return 0;
-    if (vk_written_since(host, hi - lo, o->wseen) == 0) return 1;
-    if (o->initial) return 0; /* the baseline is still being produced by the GPU */
-    host = gmem_ptr_untracked(lo, hi - lo);
-    if (host) g_checks.compares++;
-    return host && !memcmp(host, o->org + (lo - o->addr), hi - lo);
+    int written = vk_written_since(host, hi - lo, o->wseen);
+    if (written == 0) return 1;
+    if (o->initial || !o->org) return 0; /* the baseline is still being produced by the GPU, or there is none */
+    const u8* untracked = gmem_ptr_untracked(lo, hi - lo);
+    if (untracked) g_checks.compares++;
+    return org_holds(host, untracked, o->org + (lo - o->addr), hi - lo, o->wseen, written);
 }
 /* the same for each run of o's bytes in [gva, gva + len), through whichever GPU address maps them (out_spans) */
 typedef struct {
@@ -1086,14 +1257,15 @@ static void copyable_span(void* user, u64 at, u64 from, u64 n) {
         c->ok = 0;
         return;
     }
-    if (vk_written_since(host, n, c->o->wseen) == 0) return;
-    if (c->o->initial) {
+    int written = vk_written_since(host, n, c->o->wseen);
+    if (written == 0) return;
+    if (c->o->initial || !c->o->org) { /* no original bytes to tell the guest's writes by: it lands first */
         c->ok = 0;
         return;
     }
-    host = gmem_ptr_untracked(c->gva + at, n);
-    if (host) g_checks.compares++;
-    if (!host || memcmp(host, c->o->org + from, n)) c->ok = 0;
+    const u8* untracked = gmem_ptr_untracked(c->gva + at, n);
+    if (untracked) g_checks.compares++;
+    if (!org_holds(host, untracked, c->o->org + from, n, c->o->wseen, written)) c->ok = 0;
 }
 /* A composition takes each byte from the newest pending result over it: that result was made over the ones before it
    (composed, or over guest memory they hadn't touched) and its draw ran after theirs, so its buffer holds the byte as
@@ -1348,6 +1520,10 @@ static int gfx_gpu_src(u64 gva, u64 len, VkBuffer* buf, u64* off, int writable, 
     if (before) vk_frame_hold(vk_frame_id() - 1);
     if (count == 1 && gva >= match->addr && gva + len <= match->addr + match->size &&
         !((match->off + (gva - match->addr)) & (align - 1)) &&
+        /* a logged result, whose original bytes are gone, is written in place only by a writer that logs too: one
+           that doesn't composes a result of its own over it. One whose input was not copied (a write-only binding)
+           has no guest memory in its staging either, so a reader of it composes too */
+        (match->org || !match->no_input) && (!writable || match->org || g_bind_log) &&
         (!writable || match->frame == vk_submit_number() || out_take_into_submit(match))) {
         /* Maxwell bindings retain conservative read/write ordering. NVN permits overlapping draws and supplies
            storage dependencies through explicit barriers; a writable view alone does not create a dependency.
@@ -1383,6 +1559,7 @@ static int gfx_gpu_src(u64 gva, u64 len, VkBuffer* buf, u64* off, int writable, 
             match->written = g_buffer.order.writes + 1;
             g_buffer.order.reused_write = 1;
             if (match->keep) vk_own_res_wrote(match->keep); /* a landing waits for this submission's draw */
+            g_src_match = match;
         } else {
             /* A later in-place writer must wait for this read at the front end's execution-order point.
                An abandoned setup may leave the flag set, which only adds a conservative barrier. */
@@ -2033,6 +2210,14 @@ static int written_since_gva(u64 gva, u64 len, u32 since);
 static int writable_owned(GfxOut* o, u64 gva, u32 len, VkBuffer buf, u64 off) {
     VkBuffer back;
     u64 at;
+    if (!o->org) { /* logged: only its input, on the GPU */
+        vk_render_end();
+        vk_guest_read(gva, len, o->ptr, buf, off);
+        copy_barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+        return 1;
+    }
     o->initial = vk_stage_back(len, &back, &at, &o->initial_mem);
     if (!o->initial) return 0;
     vk_render_end();
@@ -2118,6 +2303,159 @@ static int keep_new(u64 gva, u32 len, u64 align, VkBuffer* buf, u64* off) {
     return 1;
 }
 
+/* Unified memory: a logged result written back on the GPU right after the dispatch that wrote it, in stream order, and
+   never pending. On unified memory a storage binding is written in place (vk_uma_write), but not where another
+   resource holds some of its bytes (GPU-owned: a storage image's publish) or where no import can hold them (pages
+   the driver refuses: amdgpu's user pointers take no alias-pool page, which every trapped span becomes, and a whole
+   2 MiB window goes with one such page). Such a binding was a result in staging, landed by the CPU after its
+   work: one game binds 16 MiB windows of a tensor pool, the last of which reaches 185 KB into its decoded movie
+   frame's GPU-owned span, and the next dispatch reading that window couldn't tell whether the CPU wrote it since
+   (the import's pages aren't write-tracked, and a logged result has no original bytes to compare), so it landed it
+   with a vk_finish: 72 ms each time, about twice a frame. Pending longer, it would have made the windows written in
+   place over it compose in staging instead. Here the bytes the program's write log marks (and no others, as the
+   CPU's landing writes them: land_logged) are merged on the GPU (vk_wlog_merge) where the range's bytes are kept, a
+   part at a time:
+   - an import's part, in place, a write pending until its submit is done like a shader's (vk_uma_gpu_wrote);
+   - an owner's part, into that owner, which a landing then waits for (vk_own_res_wrote), as a draw writing a kept
+     owner (keep_new);
+   - whole pages that neither holds, into an owner made for them from memory, published over them GPU-owned
+     (vk_own_publish) unless an import can be made there.
+   Ownership holds as for any producer: a CPU access to an owner's part traps and lands it after this submission,
+   the in-place part reaches the CPU when its submit is done (the release waits for it: vk_uma_bound, and the
+   runtime's own reads wait for the write), and what reads the bytes on the GPU next is recorded after the merge's
+   barrier. A CPU write racing the dispatch keeps the bytes the program didn't write, as with the landing */
+enum { BACK_IMPORT, BACK_OWNER, BACK_NEW };
+typedef struct {
+    u64 cpu, len; /* guest memory [cpu, cpu + len) */
+    int kind;
+    VkOwnRes* res; /* BACK_OWNER: the owner holding it there (no reference); BACK_NEW: one made for it (one) */
+    u64 res_off;   /* where the part's first byte is in res */
+    VkBuffer buf;  /* BACK_IMPORT: the import holding it, and the part's first byte's offset in it */
+    u64 off;
+} BackPart;
+#define BACK_PARTS 16
+static u64 g_back_results, g_back_bytes, g_back_owners;
+/* guest memory [cpu, cpu + len) a part at a time into p (*n of them): an import's where one holds the bytes, an
+   owner's where one does, and where neither does an import made now (make) or else whole pages that an owner made
+   for them can take, as keep_new's (a page shared with the CPU's bytes would trap at each of their writes). 0 when
+   a part can't be any of these, isn't at a multiple of 4 bytes (wlog_merge.comp's words) or there are more parts */
+static int back_parts(u64 cpu, u64 len, int make, BackPart* p, u32* n) {
+    u32 k = 0;
+    for (u64 c = cpu, e = cpu + len; c < e;) {
+        int held;
+        u64 part = vk_uma_import_part(c, e - c, &held);
+        if (!part) return 0;
+        if (held) {
+            if (k == BACK_PARTS) return 0;
+            p[k++] = (BackPart){.cpu = c, .len = part, .kind = BACK_IMPORT};
+            c += part;
+            continue;
+        }
+        OwnRange r[BACK_PARTS];
+        u32 owners = own_any() ? own_lookup(c, part, r, BACK_PARTS) : 0, i;
+        if (owners > BACK_PARTS) return 0;
+        u64 from = c;
+        for (i = 0; i <= owners; i++) {
+            u64 to = i < owners ? r[i].addr : c + part;
+            if (to > from) {
+                if (k == BACK_PARTS) return 0;
+                p[k++] = (BackPart){.cpu = from, .len = to - from, .kind = BACK_NEW};
+            }
+            if (i == owners) break;
+            if (((r[i].addr | r[i].size | r[i].res_off) & 3) || k == BACK_PARTS) return 0;
+            p[k++] = (BackPart){.cpu = r[i].addr,
+                                .len = r[i].size,
+                                .kind = BACK_OWNER,
+                                .res = (VkOwnRes*)r[i].res,
+                                .res_off = r[i].res_off};
+            from = r[i].addr + r[i].size;
+        }
+        c += part;
+    }
+    for (u32 i = 0; i < k; i++) {
+        if (p[i].kind != BACK_NEW) continue;
+        if (make && vk_uma_gpu_write(p[i].cpu, p[i].len, &p[i].buf, &p[i].off)) {
+            p[i].kind = BACK_IMPORT;
+            continue;
+        }
+        if (((p[i].cpu | p[i].len) & 0xFFF) || !own_traps() || vk_own_cpu_read(p[i].cpu, p[i].len, KEEP_CPU_PRESENTS))
+            return 0;
+    }
+    *n = k;
+    return 1;
+}
+/* whether a logged writable binding of [gva, gva + len) can be written back on the GPU (back_record): nothing else
+   the renderer holds over it to land first (gmem_need, which the binding then skips: the writes in place pending
+   there are ordered before the merge by its barrier, not waited for) */
+static int back_can(u64 gva, u64 len) {
+    BackPart p[BACK_PARTS];
+    u64 cpu = 0;
+    u32 n;
+    return vk_uma() && len && !((gva | len) & 3) && gmmu_run(gva, len, &cpu) == len &&
+           !(g_cs_any && vk_compute_pending(gva, len)) && !(g_gfx_img_any && vk_gfx_image_pending(gva, len)) &&
+           !vk_release_pending(gva, len) && !vk_mirror_pending(gva, len) && back_parts(cpu, len, 0, p, &n);
+}
+static void back_unref(BackPart* p, u32 n) {
+    for (u32 i = 0; i < n; i++)
+        if (p[i].kind == BACK_NEW && p[i].res) {
+            vk_own_res_unref(p[i].res);
+            p[i].res = NULL;
+        }
+}
+/* o, a logged result of one writer that its dispatch, just recorded, wrote: written back on the GPU. 0 with nothing
+   published when it can't be (it stays pending, landed as before) */
+static int back_record(GfxOut* o) {
+    BackPart p[BACK_PARTS];
+    u32 n = 0, i;
+    const struct OutLog* w = o->logs;
+    if (o->nlogs != 1 || w->at || w->len != o->size || o->cpu == ~0ull || !back_parts(o->cpu, o->size, 1, p, &n))
+        return 0;
+    for (i = 0; i < n; i++)
+        if (p[i].kind == BACK_IMPORT && !p[i].buf && !vk_uma_gpu_write(p[i].cpu, p[i].len, &p[i].buf, &p[i].off))
+            return 0; /* nothing recorded yet */
+    for (i = 0; i < n; i++) {
+        if (p[i].kind != BACK_NEW) continue;
+        /* the bytes memory has there, the program's merged over them below */
+        if (!(p[i].res = vk_own_res_new(p[i].len)) ||
+            !vk_guest_read_device(o->addr + (p[i].cpu - o->cpu), p[i].len, p[i].res->buf, 0)) {
+            back_unref(p, n);
+            return 0;
+        }
+    }
+    vk_render_end();
+    VkCommandBuffer cb = vk_cmd();
+    vk_all_barrier(cb); /* the program's writes, and what read or wrote the bytes before it, first */
+    int ok = 1;
+    for (i = 0; i < n && ok; i++) {
+        u32 from = (u32)(p[i].cpu - o->cpu), to = from + (u32)p[i].len;
+        if (p[i].kind == BACK_IMPORT)
+            ok = vk_wlog_merge(w->log, w->part, from, to, o->buf, o->off, p[i].buf, p[i].off);
+        else
+            ok = vk_wlog_merge(w->log, w->part, from, to, o->buf, o->off, p[i].res->buf, p[i].res_off);
+    }
+    vk_all_barrier(cb); /* and what reads or writes them next, after it */
+    if (!ok) {          /* out of descriptors: the bytes merged so far are the ones its landing writes there too */
+        back_unref(p, n);
+        return 0;
+    }
+    for (i = 0; i < n; i++)
+        if (p[i].kind == BACK_IMPORT)
+            vk_uma_gpu_wrote(p[i].cpu, p[i].len);
+        else if (p[i].kind == BACK_OWNER) {
+            vk_own_res_wrote(p[i].res);
+            gpu_mem_written_cpu(p[i].cpu, p[i].len); /* what is built from the bytes takes the new ones */
+        } else {
+            vk_own_publish(p[i].cpu, p[i].len, p[i].res, 0);
+            vk_own_res_unref(p[i].res);
+            if (copy_stats_on()) g_back_owners++;
+        }
+    if (copy_stats_on()) {
+        g_back_results++;
+        g_back_bytes += o->size;
+    }
+    return 1;
+}
+
 typedef struct {
     const u8* src;
 } GapCopy;
@@ -2127,15 +2465,38 @@ static void gap_copy(void* user, u8* to, u64 a, u64 b) {
     g_buffer.wstat.copied += b - a;
 }
 /* Each writable binding keeps its original bytes until its draw's frame completes. The guest can keep writing RAM:
-   vk_write_changed resolves those writes against the GPU result at the fence. */
-int vk_buf_copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered) {
+   vk_write_changed resolves those writes against the GPU result at the fence. A writer that logs its writes
+   (vk_buf_copy_writable_logged) makes a logged result instead, with no original bytes: it lands the bytes logged */
+/* o is written at [at, at + len) by the writer being bound: its log, when it logs, goes to o at the commit */
+static void writer_of(GfxOut* o, u64 at, u32 len) {
+    if (!g_bind_log) return;
+    if (g_npw == sizeof g_pw / sizeof *g_pw) fatal("vulkan: more logged storage bindings than a dispatch has");
+    g_pw[g_npw].o = o;
+    g_pw[g_npw].log = g_bind_log;
+    g_pw[g_npw].part = g_bind_part;
+    g_pw[g_npw].at = (u32)at;
+    g_pw[g_npw++].len = len;
+}
+/* a writer that logs nothing joins o, a logged result being set up: its original bytes are taken now, which its
+   input still is, as no work of it has been recorded (an earlier result composed into it is copied on the GPU, and
+   guest memory has the bytes without it, as a composed result's original bytes are). It compares from then on */
+static int out_take_org(GfxOut* o) {
+    o->org = malloc(o->size ? o->size : 1);
+    if (!o->org) return 0;
+    o->org_alloc = 1;
+    read_untracked(o->addr, o->org, o->size);
+    return 1;
+}
+static int copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered) {
     GfxOut* o;
     if (!gva) return vk_buf_copy(0, len, buf, off);
     /* Repeated bindings of one writable range in the same draw must name the same storage. */
     for (GfxOut* p = g_prep; p; p = p->next)
         if (p->addr == gva && p->size == len) {
+            if (!p->org && !g_bind_log && !out_take_org(p)) return 0;
             *buf = p->buf;
             *off = p->off;
+            writer_of(p, 0, len);
             return 1;
         }
     /* bound as a storage buffer, a storage texel buffer (a compute buffer image) or a transform feedback buffer (a
@@ -2144,8 +2505,12 @@ int vk_buf_copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered)
     if (bind_align < g_vk.props.limits.minTexelBufferOffsetAlignment)
         bind_align = g_vk.props.limits.minTexelBufferOffsetAlignment;
     if (bind_align < 4) bind_align = 4;
+    g_src_match = NULL;
     int pending = gfx_gpu_src(gva, len, buf, off, 1, bind_align, ordered);
-    if (pending == 1) return 1;
+    if (pending == 1) {
+        if (g_src_match) writer_of(g_src_match, gva - g_src_match->addr, len);
+        return 1;
+    }
     /* with unified memory the shader writes guest memory where it is, with nothing to land: not over bytes the GPU
        holds elsewhere (owned, a compute or storage image result, a queued release), which land first as before. Its
        barriers go by page (uma.c's order) whether or not the front end gives its own (ordered 0): more than NVN asks
@@ -2154,15 +2519,23 @@ int vk_buf_copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered)
         !(g_gfx_img_any && vk_gfx_image_pending(gva, len)) && !vk_release_pending(gva, len) &&
         vk_uma_write(gva, len, bind_align, buf, off))
         return 1;
-    if (!pending) gmem_need(gva, len);
-    if (!pending && keep_new(gva, len, bind_align, buf, off)) return 1;
+    /* a logged result has no original bytes: its input goes straight into the buffer the shader writes */
+    int logged = g_bind_log != NULL;
+    /* where in place couldn't be, a logged one is written back on the GPU after its dispatch (back_record). Its input
+       needs no landing or wait here: a write-only one has none, and another's is copied on the GPU (writable_owned)
+       or read as below */
+    int back = !pending && logged && back_can(gva, len);
+    if (!pending && !back) gmem_need(gva, len);
+    if (!pending && !back && keep_new(gva, len, bind_align, buf, off)) return 1;
     int owned = !pending && range_owned(gva, len);
     if (owned) (void)written_since_gva(gva, len, 0); /* establish the CPU-write baseline before the GPU copy */
-    o = gfx_out_new((u32)(((gva & 0xFFF) + len + 0xFFF) >> 12), len);
+    o = gfx_out_new((u32)(((gva & 0xFFF) + len + 0xFFF) >> 12), logged ? 0 : len);
     if (!o) return 0;
-    if (pending == 2) { /* guest memory's bytes, with the earlier results copied over them below (out_rebase) */
+    o->back = back;
+    if (logged)
+        o->org = NULL;
+    else if (pending == 2) { /* guest memory's bytes, with the earlier results copied over them below (out_rebase) */
         read_untracked(gva, o->org, len);
-        o->composed = 1;
         g_buffer.wstat.copied += len;
     } else if (!owned) {
         const u8* src = guest_bytes(gva, len);
@@ -2173,6 +2546,7 @@ int vk_buf_copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered)
         memcpy(o->org, src, len);
         g_buffer.wstat.copied += len;
     }
+    o->composed = pending == 2;
     out_map(o, gva);
     u64 align = vk_stage_align();
     if (align < g_vk.props.limits.nonCoherentAtomSize) align = g_vk.props.limits.nonCoherentAtomSize;
@@ -2181,14 +2555,35 @@ int vk_buf_copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered)
         free(o);
         return 0;
     }
-    if (owned) {
+    if (owned && !(back && g_bind_no_read)) {
         if (!writable_owned(o, gva, len, *buf, *off)) {
             free(o);
             return 0;
         }
     } else if (pending == 2) {
-        GapCopy g = {o->org};
-        (void)gfx_overlay(gva, len, *buf, *off, o->ptr, gap_copy, &g); /* in place: nothing to stage */
+        if (logged) { /* the gaps from guest memory, as a read's composition takes them */
+            GapRead g = {gva};
+            (void)gfx_overlay(gva, len, *buf, *off, o->ptr, gap_read, &g);
+        } else {
+            GapCopy g = {o->org};
+            (void)gfx_overlay(gva, len, *buf, *off, o->ptr, gap_copy, &g); /* in place: nothing to stage */
+        }
+    } else if (logged) {
+        if (!g_bind_no_read) { /* the program reads the buffer: its bytes are the input */
+            const u8* src = guest_bytes(gva, len);
+            if (!src) {
+                free(o);
+                return 0;
+            }
+            memcpy(o->ptr, src, len);
+            g_buffer.wstat.copied += len;
+        } else {
+            /* write-only: the program only writes it, its bytes (if any) land from the log. But its stores are
+               partial, and the GPU's read-modify-write of the surrounding cache line reads the staging it would
+               have written over: give it zeros, not uninitialized ring memory, which can hang the GPU */
+            memset(o->ptr, 0, len);
+            o->no_input = 1;
+        }
     } else {
         memcpy(o->ptr, o->org, len);
         g_buffer.wstat.copied += len;
@@ -2204,8 +2599,23 @@ int vk_buf_copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered)
     else
         g_prep = o;
     g_prep_tail = o;
+    writer_of(o, 0, len);
     copy_note(gva, len);
     return 1;
+}
+int vk_buf_copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered) {
+    g_bind_log = NULL;
+    g_bind_no_read = 0;
+    return copy_writable(gva, len, buf, off, ordered);
+}
+int vk_buf_copy_writable_logged(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered, VkWriteLog* l, u32 part,
+                                int no_read) {
+    g_bind_log = l;
+    g_bind_part = part;
+    g_bind_no_read = no_read;
+    int ok = copy_writable(gva, len, buf, off, ordered);
+    g_bind_log = NULL;
+    return ok;
 }
 
 typedef struct {
@@ -2787,6 +3197,37 @@ static int buf_get(u64 gva, u64 len, VkBuffer* buf, u64* off, int strict, u64 al
     u32 i = 0, epoch = vk_ww_epoch(); /* before anything is checked or read */
     Vb* e = NULL;
     if (!len || len > 0xFFFFFFFFull) return 0; /* no buffer the GPU reads is 4 GB */
+    /* over writes of the GPU mirror's programs that haven't landed: read in the mirror, which has them, after them. At
+       an offset the use can't bind (a draw's constants or vertices, a few bytes at any address, where a uniform
+       buffer binds at 64), the bytes are copied on the GPU from the mirror into device memory that it can: landing
+       them took a submit and a wait for the GPU, 150 a second in one game's menus */
+    /* So with those it owns, landed only where the CPU touched them: read elsewhere, the CPU's bytes between them were
+       copied again for every draw, 16 MiB a binding, about half of one game's GPU thread */
+    if (vk_mirror_pending(gva, len) || vk_mirror_holds(gva, len)) {
+        u64 cpu = 0, a = align ? align : 1;
+        VkBuffer mb;
+        u64 mo;
+        if (gmmu_run(gva, len, &cpu) == len && vk_mirror_slice(gva, len, &mb, &mo)) {
+            vk_render_end();
+            if (!(cpu & (a - 1))) {
+                copy_barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                             VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT);
+                *buf = mb;
+                *off = mo;
+                return 1;
+            }
+            if (vk_stage_device(len, a > vk_stage_align() ? a : vk_stage_align(), buf, off)) {
+                copy_barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                             VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+                VkBufferCopy r = {mo, *off, len};
+                rec_CmdCopyBuffer(vk_cmd(), mb, *buf, 1, &r);
+                copy_barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                             VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT);
+                return 1;
+            }
+        }
+        vk_mirror_mem_need(gva, len); /* where it can't be: landed first */
+    }
     if (g_vbi) {
         u32 sl = vb_slot(gva, (u32)len);
         if ((i = g_vbi[sl].idx)) e = &g_vb[i];
@@ -3113,6 +3554,7 @@ void vk_buf_writable_stats(u64* copied, u64* read_back, u64* merged) {
 static void buf_frame(void) {
     vk_uma_frame();
     if (g_vk_present % 4) return;
+    vk_wlog_trim();
     if (copy_stats_on() && g_vk_present % 600 == 0) {
         LOG("vulkan: buffer bytes over 600 presents: uncached=%llu zero=%llu calls=%llu peak=%llu staged=%llu owned=%llu bound=%llu owner_bound=%llu writeback=%llu/%llu waits=%llu/%llums reused=%llu\n",
             (unsigned long long)g_copy_uncached, (unsigned long long)g_copy_zero, (unsigned long long)g_copy_calls,
@@ -3120,6 +3562,32 @@ static void buf_frame(void) {
             (unsigned long long)g_read_bound, (unsigned long long)g_owned_bound, (unsigned long long)g_wb_outputs,
             (unsigned long long)g_wb_bytes, (unsigned long long)g_wb_waits,
             (unsigned long long)(g_wb_wait_ns / 1000000), (unsigned long long)g_wb_reuses);
+        LOG("vulkan: logged storage results over 600 presents: %llu landed, %llu windows written, %llu bytes "
+            "landed, %llu runs the CPU wrote over while pending (the GPU's bytes taken)\n",
+            (unsigned long long)g_wb_logged, (unsigned long long)g_wb_logged_windows,
+            (unsigned long long)g_wb_logged_bytes, (unsigned long long)g_wb_logged_conflicts);
+        LOG("vulkan: logged storage results written back on the GPU over 600 presents: %llu (%llu MB bound), %llu "
+            "owners made for memory no import holds\n",
+            (unsigned long long)g_back_results, (unsigned long long)(g_back_bytes >> 20),
+            (unsigned long long)g_back_owners);
+        g_back_results = g_back_bytes = g_back_owners = 0;
+        {
+            u64 logs, bytes, in_use, windows;
+            vk_wlog_stats(&logs, &bytes, &in_use, &windows);
+            LOG("vulkan: write logs: %llu made, %llu MB kept, %llu in use\n", (unsigned long long)logs,
+                (unsigned long long)(bytes >> 20), (unsigned long long)in_use);
+        }
+        g_wb_logged = g_wb_logged_windows = g_wb_logged_bytes = g_wb_logged_conflicts = 0;
+        {
+            u64 gr, hv, pg, ld, ov;
+            u32 room;
+            vk_mirror_stats(&gr, &hv, &pg, &ld, &ov, &room);
+            if (gr)
+                LOG("vulkan: GPU mirror: %llu MB bound, %llu harvests, %llu pages written, %llu bytes landed, %llu "
+                    "harvests past their room (now %u pages)\n",
+                    (unsigned long long)(gr * 2), (unsigned long long)hv, (unsigned long long)pg,
+                    (unsigned long long)ld, (unsigned long long)ov, room);
+        }
         LOG("vulkan: buffer dependencies: %llu barriers, %llu consumer barriers avoided, %llu parallel writes, %llu explicit barriers\n",
             (unsigned long long)g_buffer.order.barriers, (unsigned long long)g_buffer.order.read_reuses,
             (unsigned long long)g_buffer.order.parallel_writes, (unsigned long long)g_buffer.order.explicit_barriers);

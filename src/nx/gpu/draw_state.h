@@ -15,14 +15,17 @@
 #define DS_ATTRS         32
 #define DS_STREAMS       32
 #define DS_TARGETS_MAX   8
-#define DS_GFX_STAGES    5  /* VS, TCS, TES, GS, FS: shader_vk_set's order */
-#define DS_CBUFS         18 /* constant buffer slots of a stage */
+#define DS_GFX_STAGES    7     /* VS, TCS, TES, GS, FS (shader_vk_set's order), then DS_TASK and DS_MESH */
+#define DS_TASK          5     /* the bindings of an Ounce's task programs, which NVN binds apart from the others */
+#define DS_MESH          6     /* and of its mesh programs */
+#define DS_CBUFS         18    /* constant buffer slots of a stage */
 /* the bytes of the inline constant buffer blocks (DsInline), as NVN's driver lays out its banks: bank 0 holds the
-   storage buffer tables (from 0x110 for the vertex stage, 0x310 compute, 0x510 fragment, 16 bytes an entry), the
-   largest point size at 0x610 and the base instance at 0x644; bank 2 the handles of textures from 0x20, images from
+   storage buffer tables (from 0x110 for the vertex stage, 0x310 compute, 0x510 fragment, 0x670 an Ounce's task stage
+   and 0x770 its mesh stage, 16 bytes an entry), the largest point size at 0x610 and the base instance at 0x644; bank 2 the handles of textures from 0x20, images from
    0x120, separate textures from 0x168 and separate samplers from 0x568 + 8 r, up to 0x968 */
-#define DS_INLINE_BANK0  0x650
+#define DS_INLINE_BANK0  0x870
 #define DS_INLINE_BANK2  0xA00
+#define DS_ROOT_BYTES    SH_ROOT_BYTES /* an Ounce engine's root tables, as its programs read them */
 
 /* VkPolygonMode, VkCullModeFlags, VkCompareOp, VkStencilOp, VkBlendOp, VkBlendFactor */
 enum { DS_POLYGON_FILL, DS_POLYGON_LINE, DS_POLYGON_POINT };
@@ -134,6 +137,17 @@ typedef struct {
     u32 scissor_x[DS_VIEWPORTS_MAX], scissor_y[DS_VIEWPORTS_MAX]; /* min in bits 0-15, max in 16-31 */
 } DsViewports;
 
+/* The fields of an Ounce's task and mesh programs that their NVN control sections give (gpu/nvn/nvn_section.h), and
+   that key their translation (ShaderInfo.mesh): the task program's, and the mesh program's with the offset of its
+   per-primitive SPH from its code, after its own SPH (0 for none). All zero where a program has no such stage */
+typedef struct {
+    u16 task_threads, task_payload;
+    u16 mesh_threads, mesh_payload, max_vertices, max_primitives;
+    u8 has_task, primitive_vertices;
+    u16 pad;
+    u32 prim_sph;
+} DsMeshKey;
+
 /* The programs and what keys their translation */
 typedef struct {
     u64 code[DS_PROGRAM_SLOTS]; /* each slot's program address */
@@ -144,6 +158,11 @@ typedef struct {
     u8 early_z;                 /* fragment tests run before the fragment program */
     u8 xfb_on;                  /* transform feedback asked for (its layout: the front end's) */
     u8 pad[2];
+    /* an Ounce's mesh pipeline, which its mesh draws (DrawCall.mesh) take in place of the slots above but the
+       fragment program's: its task and mesh programs' addresses (0 for none) and their translation's key */
+    u64 task, mesh;
+    DsMeshKey mesh_key;
+    u32 pad_mesh;
 } DsPrograms;
 
 /* The vertex attributes and streams, struct of arrays. Formats are the 3D engine's codes (vk/'s attr_format) */
@@ -279,6 +298,10 @@ typedef struct {
     /* an indirect draw's record values that the vertex program reads where NVN's driver writes them in constant buffer
        0 (shader.h SH_CB0_): bit 0 the base vertex, bit 1 the base instance (SH_PUSH_GPU_). 0 for none */
     u32 params;
+    /* 1: an Ounce's mesh draw (DrawMeshTasks), count workgroups of DsPrograms' task program (of its mesh program when
+       it has none) from workgroup first, instances 1. No vertex or index is read, and topology is 4, the triangles a
+       mesh program writes */
+    u32 mesh;
     /* Fixed-function state that accompanies a draw, outside the serialized DsState ABI: the NVN path's, and what the
        3D engine's path reads from its registers for it (maxwell/draw_state.h mx_draw_fixed). Zero flags draw points 1
        pixel wide and test no depth bounds. Tessellation levels are outer[4], then inner[2]. */
@@ -334,9 +357,11 @@ typedef struct {
     } xfb[4];
 } DsBindings;
 
-/* Constant buffer blocks a front end gives inline (DsBindings.cb_inline): each graphics stage's two */
+/* Constant buffer blocks a front end gives inline (DsBindings.cb_inline): each graphics stage's two, and the 3D
+   engine's root tables, which every graphics stage reads */
 typedef struct {
     u8 bank0[DS_GFX_STAGES][DS_INLINE_BANK0], bank2[DS_GFX_STAGES][DS_INLINE_BANK2];
+    u8 root[DS_ROOT_BYTES];
 } DsInline;
 
 /* Everything a draw reads but its arguments, written by its owner's front end (a GPU channel's 3D engine registers,
@@ -388,6 +413,7 @@ static inline DsCbBlock ds_cb_inline(const DsState* ds, int stage, u32 bank) {
 #define DX_CBUFS 8 /* constant buffer slots of a dispatch */
 typedef struct {
     u64 code;               /* the program's GPU VA */
+    u32 code_bytes;         /* its code's bytes as its control section gives them (rounded up), 0 when not known */
     u32 grid[3];            /* blocks, x y z */
     u32 block[3];           /* threads of a block, x y z */
     u32 shared;             /* shared memory bytes */
@@ -400,6 +426,7 @@ typedef struct {
     u32 smp_mode;           /* the sampler index mode (0: the handle's sampler index) */
     u32 tex_bank;           /* the constant buffer bound textures' and images' handles are read from */
     u8 bank0[DS_INLINE_BANK0], bank2[DS_INLINE_BANK2]; /* the inline blocks, as DsInline's for a stage */
+    u8 root[DS_ROOT_BYTES];                            /* the compute engine's root tables */
     /* an indirect dispatch: the GPU reads the grid, three 32-bit counts, at this GPU address (grid is ignored), and
        puts them in the inline bank 0 at 0x200 too, where NVN's programs read the dispatch size. 0: grid */
     u64 indirect;

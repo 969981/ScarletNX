@@ -9,6 +9,7 @@
 /* the SVC dispatch: each SVC's registers in the 64-bit ABI (and the 32-bit one's, through snx_svc32), the thread's
    entry and exit (its core, pausing), and the SVCs that aren't memory or synchronization */
 #include "nx/hle/kernel/kernel_int.h"
+#include "nx/hle/services/nvdrv.h"
 #include "nx/hle/hle.h"
 #include "nx/runtime/arm.h"
 #include "nx/runtime/clock.h"
@@ -105,6 +106,7 @@ static void svc_leave(KThread* t) {
     core_enter(t);
     core_preempt(t);
     sync_owner_runs(t);
+    __atomic_store_n(&g_host.thread.svc_ns[kt_ix(t) - 1], plat_ns(), __ATOMIC_RELAXED);
     __atomic_store_n(&t->in_svc, 0, __ATOMIC_SEQ_CST);
     if (pause_point(t, 2)) core_enter(t);
     if (kthread_hold_point(t, PARK_RUN)) core_enter(t);
@@ -148,8 +150,11 @@ static u32 create_thread(u64 entry, u64 arg, u64 stack_top, i32 prio, i32 core, 
     if (core == -2) core = g_hle.thread.default_core;
     R_UNLESS(core >= 0 && core < NCORES && ((g_hle.svcmem.core_mask >> core) & 1), SNX_RC_SVC_INVALID_CORE_ID);
     R_UNLESS(valid_prio(prio), SNX_RC_SVC_INVALID_PRIORITY);
+    u32 rc;
     t = kthread_create(entry, arg, stack_top, prio, core);
-    return give_handle(&t->o, out);
+    rc = give_handle(&t->o, out);
+    if (!rc) kthread_set_own_handle(t, *out);
+    return rc;
 }
 static u32 start_thread(u32 h) {
     KThread* t = thread_of(h);
@@ -381,11 +386,16 @@ static u32 create_event(u32* wh, u32* rh) {
     R_SUCCEED();
 }
 static u32 signal_event(u32 h) {
-    KWEvent* w = (KWEvent*)h_get_ref(h, KO_WEVENT);
-    R_UNLESS(w, SNX_RC_SVC_INVALID_HANDLE);
-    kevent_signal((KEvent*)kobj_at(w->r));
-    kobj_unref(&w->o);
-    R_SUCCEED();
+    KObj* o = h_get_ref(h, 0);
+    u32 r = SNX_RC_SVC_INVALID_HANDLE;
+    if (o && o->type == KO_WEVENT) {
+        kevent_signal((KEvent*)kobj_at(((KWEvent*)o)->r));
+        r = 0;
+    } else if (o && o->type == KO_EVENT && gsv_syncpoint_request(kobj_id(o))) {
+        r = 0; /* the end a service gave the game to signal it with: the service's work is done by then */
+    }
+    kobj_unref(o);
+    return r;
 }
 /* ClearEvent takes either end; ResetSignal the readable end (or the process), and fails on one that isn't signaled */
 static u32 clear_event(u32 h, int reset) {
@@ -608,6 +618,9 @@ static u32 svc_SetHeapSize(u64* out_address, u64 size) {
 static u32 svc_SetMemoryPermission(u64 address, u64 size, u32 perm) { return svc_set_mem_perm(address, size, perm); }
 static u32 svc_SetMemoryAttribute(u64 address, u64 size, u32 mask, u32 attr) {
     return svc_set_mem_attr(address, size, mask, attr);
+}
+static u32 svc_SetGpuMemoryAttribute(u64 address, u64 size, u32 mask, u32 attr) {
+    return svc_set_gpu_mem_attr(address, size, mask, attr);
 }
 static u32 svc_MapMemory(u64 dst_address, u64 src_address, u64 size) {
     mem_change_off_core();

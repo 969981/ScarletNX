@@ -68,6 +68,7 @@ void svc_core_init(void) {
     svc_register("ro:1", new_ro1);
     nn_audio_detail_IAudioRendererManager_register(new_audren);
     nn_audio_detail_IAudioOutManager_register(new_audout);
+    nn_audio_detail_INativeAudioManager_register(new_aud);
     nn_codec_detail_IHardwareOpusDecoderManager_register(new_hwopus);
 
     /* bsd:u and bsd:a are the application's and the applets' sessions, bsd:s the system's (bsd.c) */
@@ -85,6 +86,8 @@ void svc_core_init(void) {
     nn_lm_ILogService_register(new_lm);
     nn_pctl_detail_ipc_IParentalControlServiceFactory_register(new_pctl);
     nn_friends_detail_ipc_IServiceCreator_register(new_friend);
+    nn_chat_IUserService_register(new_chat);
+    nn_streamplay_IUserService_register(new_stpl);
     nn_ns_detail_IServiceGetterInterface_register(new_ns);
     nn_prepo_detail_ipc_IPrepoService_register(new_prepo);
     nn_capsrv_sf_IAlbumApplicationService_register(new_caps);

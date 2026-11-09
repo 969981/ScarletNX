@@ -253,7 +253,7 @@ static void replay(void* ctx, u32 op, u64 payload, u32 size) {
                and then reports a timestamp over it */
             const NvnPReportCounter* r = NVN_OBJ(const NvnPReportCounter, payload);
             u8 v[16];
-            u64 ticks = guest_ticks();
+            u64 ticks = guest_gpu_ticks();
             if (r->type == NVN_COUNTER_TYPE_SAMPLES_PASSED && nvn_draw_samples(&q->d, r->address, ticks)) break;
             snx_st_le64(v, r->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1000 : 0);
             snx_st_le64(v + 8, ticks);
@@ -267,8 +267,8 @@ static void replay(void* ctx, u32 op, u64 payload, u32 size) {
         }
         default:
             if (!nvn_draw_record(&q->d, op, payload, size) && !nvn_copy_record(op, payload, size, q->stride) &&
-                !(g_nvn.replay.unknown >> op & 1)) {
-                g_nvn.replay.unknown |= 1ull << op; /* each once */
+                op < 128 && !(g_nvn.replay.unknown[op / 64] >> op % 64 & 1)) {
+                g_nvn.replay.unknown[op / 64] |= 1ull << op % 64; /* each once */
                 LOG("nvn: records of op %u aren't replayed yet\n", op);
             }
             break;

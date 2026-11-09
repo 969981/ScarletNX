@@ -52,6 +52,7 @@ extern const u64 g_user_id[2];
 void am_init(void); /* the applet events, and the messages queued at startup */
 SvcObj* new_appletoe(void);
 SvcObj* new_appletae(void);
+SvcObj* new_gsv_session(void); /* the TIPC graphics supervisor session that am returns */
 
 /* ---- users.c: the console's users (common/utilities/users.h) */
 void snx_users_init(void); /* snx_users_load of the data folder's users/, the game stopped if it says no */
@@ -83,6 +84,8 @@ void audio_init(void); /* the renderer's event, before the audio clock runs */
 void audio_clock(void* arg);
 SvcObj* new_audren(void);
 SvcObj* new_audout(void);
+SvcObj* new_audin(void); /* audin:u: no microphone to open */
+SvcObj* new_aud(void);   /* aud:u, the Ounce native audio manager */
 SvcObj* new_hwopus(void);
 
 /* ---- misc.c: the small services */
@@ -90,6 +93,8 @@ SvcObj* new_apm(void);
 SvcObj* new_lm(void);
 SvcObj* new_pctl(void);
 SvcObj* new_friend(void);
+SvcObj* new_chat(void);
+SvcObj* new_stpl(void);
 SvcObj* new_ns(void);
 SvcObj* new_prepo(void);
 SvcObj* new_psm(void);
@@ -108,7 +113,6 @@ SvcObj* new_mii(void);
 SvcObj* new_ectx(void);
 SvcObj* new_spl(void);
 SvcObj* new_btmu(void);
-SvcObj* new_audin(void);
 u32 apm_configuration(u32 mode); /* apm's performance configuration of a mode, Normal (0) or Boost */
 void apm_set_configuration(u32 mode, u32 config);
 void apm_cpu_boost(u32 boost); /* am's SetCpuBoostMode: Boost mode's configuration for it */
@@ -339,6 +343,7 @@ typedef struct {
     AudOut* outs;        /* every open audio out, for the clock */
     float device_volume; /* the output device's, as SetAudioDeviceOutputVolume set it */
     u8 auto_tune;        /* the output volume's auto-tune mode, for its getter: what plays keeps its volume */
+    u32 hwopus_live;     /* decoders open, across every hwopus session */
     AudOut outs_pool[AUDOUT_MAX];
     AudRen rens[SNX_AUDREN_MAX];
     AudDevice devices[AUDDEV_MAX];

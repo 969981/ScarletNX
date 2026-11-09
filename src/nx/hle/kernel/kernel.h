@@ -10,7 +10,7 @@
 
 /* the one application process's id, which IPC PID descriptors carry too */
 #define K_PROCESS_ID 0x51ull
-#define NCORES       4 /* guest CPU cores */
+#define NCORES       6 /* Ounce applications may use guest cores 0 through 5 */
 #define THREAD_MAX   96   /* the application's ThreadCountMax: creating one more answers SNX_RC_SVC_LIMIT_REACHED */
 #define H_MAX        1024 /* handles: the most the console's handle table holds */
 
@@ -214,6 +214,11 @@ void kernel_dump_threads(void);
 u64 kernel_thread_name(u32 ix, char* out, int n);
 /* how long threads waited for their cores and how busy each core was, logged at exit */
 void kernel_core_report(void);
+/* host thread tid (plat_tid's) waits in a fault on memory the GPU holds: its guest thread lets go of its emulated
+   core until it runs again (plat_trap_waiting) */
+void kthread_fault_lend(u32 tid);
+/* the frontend's tick: a line for each core whose holder keeps it 250 ms after a waiter of better priority came */
+void kernel_core_watch(void);
 void mem_report(char* out, int n);
 
 /* g_klock, the kernel lock, is g_host.kernel.klock (hle.h): every list a waiter or signaller touches is under it */

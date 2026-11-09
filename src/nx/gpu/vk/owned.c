@@ -79,9 +79,23 @@ VkOwnRes* vk_own_res_new(u64 size) {
     return r;
 }
 static void res_retain(void* res) { __atomic_add_fetch(&((VkOwnRes*)res)->refs, 1, __ATOMIC_RELAXED); }
+VkOwnRes* vk_own_res_borrow(VkBuffer buf) {
+    VkOwnRes* r = (VkOwnRes*)calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->buf = buf;
+    r->size = ~0ull;
+    r->refs = 1;
+    r->borrowed = 1;
+    r->serial = __atomic_add_fetch(&g_owned.serial, 1, __ATOMIC_RELAXED);
+    return r;
+}
 static void res_release(void* res) {
     VkOwnRes* r = (VkOwnRes*)res;
     if (__atomic_sub_fetch(&r->refs, 1, __ATOMIC_ACQ_REL)) return;
+    if (r->borrowed) {
+        free(r);
+        return;
+    }
     vk_lock();
     vk_defer_buffer(r->buf, r->mem); /* the frame recording may still copy from it */
     vk_unlock();
@@ -258,6 +272,12 @@ static void own_land(const OwnRange* r, u8* const* dst, u32 n) {
 }
 
 static u32 lock_owner(void) { return vk_lock_owner(); }
+/* a landing's bytes: the write tracking takes them as they were left, and the GPU mirror lets go of its copy's
+   shadow */
+static void own_landed(u64 addr, u64 size, const u8* bytes) {
+    vk_ww_landed(addr, size, bytes);
+    vk_mirror_landed(addr, size);
+}
 
 int vk_own_init(void) {
     /* vk_lock and vk_unlock themselves, not g_vklock: the outermost unlock also signals what the hold's releases
@@ -268,7 +288,7 @@ int vk_own_init(void) {
                   .busy_tid = lock_owner,
                   .lock = vk_lock,
                   .unlock = vk_unlock,
-                  .landed = vk_ww_landed};
+                  .landed = own_landed};
     g_owned.traps = !own_init(&h);
     return g_owned.traps ? 0 : -1;
 }
@@ -282,7 +302,11 @@ static void own_publish(u64 cpu, u64 size, VkOwnRes* r, u64 off, int in_place) {
     OwnRange o;
     u8* d;
     if (!size) return;
-    vk_own_res_wrote(r); /* every producer records its writes before it publishes them */
+    if (in_place >= 0)
+        vk_own_res_wrote(r); /* every producer records its writes before it publishes them */
+    else
+        __atomic_store_n(&r->serial, __atomic_add_fetch(&g_owned.serial, 1, __ATOMIC_RELAXED), __ATOMIC_RELEASE);
+    in_place = in_place > 0;
     vk_rt_before_write_cpu(cpu, size);
     gpu_mem_written_cpu(cpu, size); /* what is built from the bytes (textures, buffers) takes the new ones */
     /* Unified memory, over memory an import holds: the result is copied there on the GPU, in stream order, with no
@@ -308,6 +332,7 @@ static void own_publish(u64 cpu, u64 size, VkOwnRes* r, u64 off, int in_place) {
 }
 void vk_own_publish(u64 cpu, u64 size, VkOwnRes* r, u64 off) { own_publish(cpu, size, r, off, 1); }
 void vk_own_publish_owned(u64 cpu, u64 size, VkOwnRes* r, u64 off) { own_publish(cpu, size, r, off, 0); }
+void vk_own_publish_submitted(u64 cpu, u64 size, VkOwnRes* r, u64 off) { own_publish(cpu, size, r, off, -1); }
 
 /* ---------------------------------------------------------------- reading guest memory without landing it */
 /* GPU writes before reading what they wrote (before), the reads' copies before what consumes them (after) */
@@ -360,6 +385,16 @@ void vk_cpu_read(u64 cpu, u64 size, u8* host, VkBuffer buf, u64 at) {
     cpu_read(cpu, size, host, buf, at, &any);
     if (any) read_barrier(vk_cmd(), 0);
 }
+/* A run of guest memory [cpu, cpu + n) with writes in place pending (uma.c) that no one import holds whole: its first
+   part, up to an import's edge, so that each part is copied from its import on the GPU after the write, or read as
+   before where no import is, with nothing to wait for. A logged result written back across an import's edge
+   (buffer.c's write-back) left such runs, and waiting for its submit there took all the work recorded before it */
+static u64 inplace_part(u64 cpu, u64 n) {
+    int held;
+    if (!vk_uma_pending_cpu(cpu, n) || vk_uma_held(cpu, n)) return n;
+    u64 part = vk_uma_import_part(cpu, n, &held);
+    return part ? part : n;
+}
 void vk_guest_read(u64 gva, u64 size, u8* host, VkBuffer buf, u64 at) {
     u64 o = 0;
     int any = 0;
@@ -373,8 +408,10 @@ void vk_guest_read(u64 gva, u64 size, u8* host, VkBuffer buf, u64 at) {
             n = 0x1000 - ((gva + o) & 0xFFF);
             if (n > size - o) n = size - o;
             memset(host + o, 0, (size_t)n);
-        } else
+        } else {
+            n = inplace_part(cpu, n);
             cpu_read(cpu, n, host + o, buf, at + o, &any);
+        }
         o += n;
     }
     if (any) read_barrier(vk_cmd(), 0);
@@ -461,8 +498,9 @@ static int guest_read(u64 gva, u64 size, VkBuffer buf, u64 at, int ahead) {
         OwnRange r[16];
         u32 k, i;
         VkBuffer ib;
+        if (n) n = inplace_part(cpu, n);
         /* written in place (uma.c) by a submit not done yet: copied from the import on the GPU, after the write, or
-           waited for where it spans imports */
+           waited for where no import holds it */
         int inplace = n && vk_uma_copy_pending(cpu, n, &ib, &io);
         if (n && !inplace) vk_uma_mem_need_cpu(cpu, n);
         if (inplace) {

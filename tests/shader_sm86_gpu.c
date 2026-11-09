@@ -1,0 +1,1315 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright 2026 the ScarletNX contributors */
+/* The SM86 translator (src/nx/gpu/shader/sm86_translate.c) on a Vulkan device against the CPU reference
+   (tests/support/sm86_ref.c): three synthetic compute programs, the integer, float and control flow instructions of
+   the captured compute programs, run on 64 invocations of chosen inputs, every output word compared. It takes a CPU
+   device (lavapipe) when the loader has one, else the first device; the warp's matrix instructions, which need
+   subgroups of 32 lanes or more, the first device that has them. Opt-in with SNX_TEST_VULKAN, as vulkan_headless.
+   No word here comes from a game. */
+#include "nx/gpu/shader/sm86.h"
+#include "support/sm86_ref.h"
+#include <volk.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define LOCAL       32u
+#define GROUPS      2u
+#define INVOCATIONS (LOCAL * GROUPS)
+#define MAX_OUT     32u
+#define VA_IN       0x100000000ull
+#define VA_OUT      0x200001000ull
+#define FILL        0xdeadbeefu
+
+/* ---- the programs ---- */
+
+typedef struct {
+    u8 code[16 * 256];
+    u32 n;
+    u32 outputs;     /* words each invocation writes */
+    u32 approx_from; /* the outputs from here on are MUFU's, which a tolerance compares */
+    u32 denorm_mask; /* the outputs of float instructions without FTZ, which a subnormal input makes the device's
+                        own (the module declares no DenormPreserve, as spirv_translate.c's do not) */
+} Prog;
+static u32 emit(Prog* p, Sm86Word w) {
+    sm86_put(p->code, p->n, w);
+    return p->n++;
+}
+static Sm86Word alu(u32 op9, u32 form, u32 dst, u32 a) { return sm86_alu(op9, form, dst, a); }
+static void f(Sm86Word* w, unsigned lo, unsigned n, u64 v) { sm86_set(w, lo, n, v); }
+/* the second source: a register at 32 (form 1) */
+static Sm86Word rr(u32 op9, u32 dst, u32 a, u32 b) {
+    Sm86Word w = alu(op9, 1, dst, a);
+    f(&w, 32, 8, b);
+    f(&w, 64, 8, 255);
+    return w;
+}
+/* an immediate second source (form 4), c a register at 64 */
+static Sm86Word ri(u32 op9, u32 dst, u32 a, u32 imm, u32 c) {
+    Sm86Word w = alu(op9, 4, dst, a);
+    f(&w, 32, 32, imm);
+    f(&w, 64, 8, c);
+    return w;
+}
+/* R0 = TID.X, R1 = CTAID.X, R2 = the invocation, UR4:UR5 and UR6:UR7 the buffers' addresses from c[0][0x20] and
+   c[0][0x28], R4:R5 = the invocation's two input words, R6 = the byte offset of its outputs */
+static void prologue(Prog* p) {
+    Sm86Word w = sm86_fix(0x919);
+    f(&w, 72, 8, 0x21);
+    emit(p, w);
+    w = sm86_fix(0x919);
+    f(&w, 16, 8, 1);
+    f(&w, 72, 8, 0x25);
+    emit(p, w);
+    emit(p, ri(0x024, 2, 1, LOCAL, 0)); /* IMAD R2, R1, 32, R0 */
+    for (u32 k = 0; k < 2; k++) {
+        w = sm86_fix(0xab9); /* ULDC.64 */
+        f(&w, 16, 6, 4 + 2 * k);
+        sm86_cbuf(&w, 0, 0x20 + 8 * k);
+        f(&w, 73, 3, 5);
+        emit(p, w);
+    }
+    w = rr(0x011, 3, 2, 255); /* LEA R3, R2, RZ, 3 */
+    f(&w, 75, 5, 3);
+    f(&w, 81, 3, 7);
+    emit(p, w);
+    w = sm86_fix(0x981); /* LDG.E.64 R4, [R3.U32 + UR4] */
+    f(&w, 16, 8, 4);
+    f(&w, 24, 8, 3);
+    f(&w, 32, 6, 4);
+    f(&w, 72, 1, 1);
+    f(&w, 73, 3, 5);
+    f(&w, 81, 3, 7);
+    f(&w, 84, 3, 1);
+    f(&w, 91, 1, 1);
+    emit(p, w);
+    emit(p, ri(0x024, 6, 2, p->outputs * 4, 255)); /* IMAD R6, R2, outputs * 4, RZ */
+}
+static void store(Prog* p, u32 k, u32 reg) {
+    Sm86Word w = sm86_fix(0x986); /* STG.E [R6.U32 + UR6 + 4k], reg */
+    f(&w, 24, 8, 6);
+    f(&w, 32, 8, reg);
+    f(&w, 40, 24, 4 * k);
+    f(&w, 64, 6, 6);
+    f(&w, 72, 1, 1);
+    f(&w, 73, 3, 4);
+    f(&w, 84, 3, 1);
+    f(&w, 91, 1, 1);
+    emit(p, w);
+}
+/* STG.E of mem_type type (0 a byte, 2 a halfword, 4 a word, 5 two, 6 four) at byte off of the invocation's outputs */
+static void store_typed(Prog* p, u32 off, u32 reg, u32 type) {
+    Sm86Word w = sm86_fix(0x986); /* STG.E [R6.U32 + UR6 + off], reg */
+    f(&w, 24, 8, 6);
+    f(&w, 32, 8, reg);
+    f(&w, 40, 24, off);
+    f(&w, 64, 6, 6);
+    f(&w, 72, 1, 1);
+    f(&w, 73, 3, type);
+    f(&w, 84, 3, 1);
+    f(&w, 91, 1, 1);
+    emit(p, w);
+}
+static void epilogue(Prog* p) {
+    emit(p, sm86_exit());
+    emit(p, sm86_bra(p->n, p->n, 7, 0));
+}
+/* the integer instructions: IADD3 (negated, carries, .X), IMAD, LOP3, SHF, LEA.HI, IMNMX, ISETP, SEL, IABS, R2P,
+   PLOP3 */
+static void integer_program(Prog* p) {
+    p->outputs = 15;
+    p->approx_from = 15;
+    prologue(p);
+    Sm86Word w = alu(0x010, 2, 8, 4); /* IADD3 R8, R4, -R5, 0x1234 */
+    f(&w, 64, 8, 5);
+    f(&w, 75, 1, 1);
+    f(&w, 32, 32, 0x1234);
+    f(&w, 81, 6, 0x3f);
+    f(&w, 87, 4, 0xf);
+    f(&w, 77, 4, 0xf);
+    emit(p, w);
+    w = rr(0x010, 9, 4, 5); /* IADD3 R9, P0, P1, R4, R5, R5 */
+    f(&w, 64, 8, 5);
+    f(&w, 81, 3, 0);
+    f(&w, 84, 3, 1);
+    f(&w, 87, 4, 0xf);
+    f(&w, 77, 4, 0xf);
+    emit(p, w);
+    w = rr(0x010, 10, 255, 255); /* IADD3.X R10, RZ, RZ, RZ, P0, P1 */
+    f(&w, 74, 1, 1);
+    f(&w, 87, 4, 0);
+    f(&w, 77, 4, 1);
+    f(&w, 81, 6, 0x3f);
+    emit(p, w);
+    w = rr(0x024, 11, 4, 5); /* IMAD R11, R4, R5, R4 */
+    f(&w, 64, 8, 4);
+    emit(p, w);
+    for (u32 k = 0; k < 2; k++) { /* LOP3.LUT R12, R4, R5, imm, 0x96 (xor3) and 0xe8 (majority) */
+        w = alu(0x012, 2, 12 + k, 4);
+        f(&w, 64, 8, 5);
+        f(&w, 32, 32, k ? 0x00ff00ffu : 0x0f0f0f0fu);
+        f(&w, 72, 8, k ? 0xe8 : 0x96);
+        f(&w, 81, 3, 7);
+        f(&w, 87, 4, 0xf);
+        emit(p, w);
+    }
+    w = rr(0x019, 14, 4, 5); /* SHF.L.W.U32 R14, R4, R5, RZ */
+    f(&w, 73, 2, 3);
+    f(&w, 75, 1, 1);
+    emit(p, w);
+    w = ri(0x019, 15, 255, 5, 4); /* SHF.R.S32.HI R15, RZ, 5, R4 */
+    f(&w, 73, 2, 2);
+    f(&w, 76, 1, 1);
+    f(&w, 80, 1, 1);
+    emit(p, w);
+    w = rr(0x011, 16, 4, 5); /* LEA.HI R16, R4, R5, R5, 4 */
+    f(&w, 64, 8, 5);
+    f(&w, 75, 5, 4);
+    f(&w, 80, 1, 1);
+    f(&w, 81, 3, 7);
+    emit(p, w);
+    w = rr(0x017, 17, 4, 5); /* IMNMX R17, R4, R5, PT (signed min) */
+    f(&w, 73, 1, 1);
+    f(&w, 87, 4, 7);
+    emit(p, w);
+    w = rr(0x017, 18, 4, 5); /* IMNMX.U32 R18, R4, R5, !PT (max) */
+    f(&w, 87, 4, 0xf);
+    emit(p, w);
+    w = rr(0x00c, 0, 4, 5); /* ISETP.LT.AND P2, PT, R4, R5, PT */
+    f(&w, 73, 1, 1);
+    f(&w, 76, 3, 1);
+    f(&w, 81, 3, 2);
+    f(&w, 84, 3, 7);
+    f(&w, 87, 4, 7);
+    f(&w, 68, 4, 7);
+    emit(p, w);
+    w = rr(0x007, 19, 4, 5); /* SEL R19, R4, R5, P2 */
+    f(&w, 87, 4, 2);
+    emit(p, w);
+    emit(p, rr(0x013, 20, 255, 4)); /* IABS R20, R4 */
+    w = ri(0x004, 0, 5, 0x7f, 255); /* R2P PR, R5.B1, 0x7f */
+    f(&w, 76, 2, 1);
+    emit(p, w);
+    w = ri(0x007, 21, 4, 0x44, 255); /* SEL R21, R4, 0x44, P3 */
+    f(&w, 87, 4, 3);
+    emit(p, w);
+    w = sm86_fix(0x81c); /* PLOP3.LUT P5, PT, P0, P1, P6, 0xe8, 0 */
+    f(&w, 87, 4, 0);
+    f(&w, 77, 4, 1);
+    f(&w, 68, 4, 6);
+    f(&w, 64, 3, 0xe8 & 7);
+    f(&w, 72, 5, 0xe8 >> 3);
+    f(&w, 16, 8, 0);
+    f(&w, 81, 3, 5);
+    f(&w, 84, 3, 7);
+    emit(p, w);
+    w = rr(0x007, 22, 5, 4); /* SEL R22, R5, R4, P5 */
+    f(&w, 87, 4, 5);
+    emit(p, w);
+    for (u32 k = 0; k < p->outputs; k++) store(p, k, 8 + k);
+    epilogue(p);
+}
+/* the float instructions: FADD, FMUL and FFMA with the modifiers, the rounding modes, FTZ, .SAT and .D2, FMNMX,
+   FSETP, FSEL, FSET, F2I, I2FP, FRND, then MUFU */
+static void float_program(Prog* p) {
+    p->outputs = 26;
+    p->approx_from = 20;
+    p->denorm_mask = 0x3ffffffu & ~(7u << 15) & ~(3u << 8); /* not I2FP, FADD.FTZ or FMUL.FTZ */
+    prologue(p);
+    Sm86Word w = rr(0x021, 8, 4, 5); /* FADD R8, R4, -|R5| */
+    f(&w, 62, 2, 3);
+    emit(p, w);
+    static const u8 modes[3] = {3, 1, 2}; /* FADD.RZ, .RM, .RP */
+    for (u32 k = 0; k < 3; k++) {
+        w = rr(0x021, 9 + k, 4, 5);
+        f(&w, 78, 2, modes[k]);
+        emit(p, w);
+    }
+    w = rr(0x020, 12, 4, 5); /* FMUL.RZ R12, R4, R5 */
+    f(&w, 78, 2, 3);
+    f(&w, 84, 3, 4);
+    emit(p, w);
+    w = rr(0x020, 13, 4, 5); /* FMUL.D2 R13, R4, R5 */
+    f(&w, 84, 3, 3);
+    emit(p, w);
+    w = alu(0x023, 2, 14, 4); /* FFMA R14, R4, R5, 1.0 */
+    f(&w, 64, 8, 5);
+    f(&w, 32, 32, 0x3f800000u);
+    emit(p, w);
+    w = rr(0x023, 15, 4, 5); /* FFMA.RP R15, R4, R5, R4 */
+    f(&w, 64, 8, 4);
+    f(&w, 78, 2, 2);
+    emit(p, w);
+    w = rr(0x021, 16, 4, 5); /* FADD.FTZ R16, R4, R5 */
+    f(&w, 80, 1, 1);
+    emit(p, w);
+    w = rr(0x020, 17, 4, 5); /* FMUL.FTZ.SAT R17, R4, R5 */
+    f(&w, 77, 1, 1);
+    f(&w, 80, 1, 1);
+    f(&w, 84, 3, 4);
+    emit(p, w);
+    w = rr(0x009, 18, 4, 5); /* FMNMX R18, R4, R5, PT */
+    f(&w, 87, 4, 7);
+    emit(p, w);
+    w = rr(0x00b, 0, 4, 5); /* FSETP.GTU.AND P0, PT, R4, R5, PT */
+    f(&w, 76, 4, 12);
+    f(&w, 81, 3, 0);
+    f(&w, 84, 3, 7);
+    f(&w, 87, 4, 7);
+    emit(p, w);
+    w = rr(0x008, 19, 4, 5); /* FSEL R19, R4, R5, P0 */
+    f(&w, 87, 4, 0);
+    emit(p, w);
+    w = rr(0x00a, 20, 4, 5); /* FSET.BF.LT.AND R20, R4, R5, PT */
+    f(&w, 76, 4, 1);
+    f(&w, 87, 4, 7);
+    emit(p, w);
+    for (u32 k = 0; k < 2; k++) { /* F2I.TRUNC (signed), F2I.U32.FLOOR */
+        w = rr(0x105, 21 + k, 255, 4);
+        f(&w, 72, 1, k ? 0 : 1);
+        f(&w, 75, 2, 2);
+        f(&w, 78, 2, k ? 1 : 3);
+        f(&w, 84, 2, 2);
+        emit(p, w);
+    }
+    static const u8 i2f_signed[3] = {1, 0, 1}, i2f_mode[3] = {0, 3, 2}; /* .S32, .U32.RZ, .S32.RP */
+    for (u32 k = 0; k < 3; k++) {
+        w = rr(0x045, 23 + k, 255, 5);
+        f(&w, 74, 1, i2f_signed[k]);
+        f(&w, 75, 2, 2);
+        f(&w, 78, 2, i2f_mode[k]);
+        f(&w, 84, 2, 2);
+        emit(p, w);
+    }
+    for (u32 k = 0; k < 2; k++) { /* FRND.FLOOR, FRND */
+        w = rr(0x107, 26 + k, 255, 4);
+        f(&w, 75, 2, 2);
+        f(&w, 78, 2, k ? 0 : 1);
+        f(&w, 84, 2, 2);
+        emit(p, w);
+    }
+    /* MUFU: RCP R5, SQRT |R4|, RSQ |R4|, EX2 R4, LG2 |R5|, and SIN of R4 clamped to half a turn */
+    static const u8 fn[5] = {4, 8, 5, 2, 3}, src_reg[5] = {5, 4, 4, 4, 5}, abs_bit[5] = {0, 1, 1, 0, 1};
+    for (u32 k = 0; k < 5; k++) {
+        w = rr(0x108, 28 + k, 255, src_reg[k]);
+        f(&w, 62, 1, abs_bit[k]);
+        f(&w, 74, 6, fn[k]);
+        emit(p, w);
+    }
+    w = ri(0x009, 33, 4, 0x3f000000u, 255); /* FMNMX R33, R4, 0.5, PT */
+    f(&w, 87, 4, 7);
+    emit(p, w);
+    w = ri(0x009, 33, 33, 0xbf000000u, 255); /* FMNMX R33, R33, -0.5, !PT */
+    f(&w, 87, 4, 0xf);
+    emit(p, w);
+    w = rr(0x108, 34, 255, 33); /* MUFU.SIN R34, R33 */
+    f(&w, 74, 6, 1);
+    emit(p, w);
+    for (u32 k = 0; k < 20; k++) store(p, k, 8 + k);
+    for (u32 k = 20; k < 26; k++) store(p, k, 28 + (k - 20) + (k == 25)); /* R28-R32, then R34 */
+    epilogue(p);
+}
+/* control flow: a loop that BRA closes, a BSSY and BSYNC around an if, CS2R, shared memory through STS and LDS with
+   a scaled offset, and an EXIT that some invocations take */
+static void flow_program(Prog* p) {
+    p->outputs = 3;
+    p->approx_from = 3;
+    prologue(p);
+    Sm86Word w = ri(0x012, 7, 4, 15, 255); /* LOP3 R7 = R4 & 15 (0xc0) */
+    f(&w, 72, 8, 0xc0);
+    f(&w, 81, 3, 7);
+    f(&w, 87, 4, 0xf);
+    emit(p, w);
+    w = sm86_fix(0x805); /* CS2R R8, SRZ */
+    f(&w, 16, 8, 8);
+    f(&w, 72, 8, 0xff);
+    emit(p, w);
+    w = ri(0x002, 9, 255, 0, 255); /* MOV R9, 0 */
+    f(&w, 72, 4, 0xf);
+    emit(p, w);
+    u32 head = p->n;
+    w = rr(0x00c, 0, 9, 7); /* ISETP.GE.U32.AND P0, PT, R9, R7, PT */
+    f(&w, 76, 3, 6);
+    f(&w, 81, 3, 0);
+    f(&w, 84, 3, 7);
+    f(&w, 87, 4, 7);
+    f(&w, 68, 4, 7);
+    emit(p, w);
+    u32 exit_branch = emit(p, sm86_fix(0x918)); /* @P0 BRA past the loop, patched below */
+    w = rr(0x024, 8, 9, 5);                     /* IMAD R8, R9, R5, R8 */
+    f(&w, 64, 8, 8);
+    emit(p, w);
+    w = ri(0x010, 9, 9, 1, 255); /* IADD3 R9, R9, 1, RZ */
+    f(&w, 81, 6, 0x3f);
+    f(&w, 87, 4, 0xf);
+    f(&w, 77, 4, 0xf);
+    emit(p, w);
+    emit(p, sm86_bra(p->n, head, 7, 0));
+    sm86_put(p->code, exit_branch, sm86_bra(exit_branch, p->n, 0, 0));
+    store(p, 0, 8);
+    u32 bssy = emit(p, sm86_fix(0x918)); /* BSSY B0 to the BSYNC, patched below */
+    w = ri(0x012, 10, 5, 1, 255);        /* LOP3 P1, R10 = R5 & 1 */
+    f(&w, 72, 8, 0xc0);
+    f(&w, 81, 3, 1);
+    f(&w, 87, 4, 0xf);
+    emit(p, w);
+    u32 skip = emit(p, sm86_fix(0x918)); /* @!P1 BRA to the BSYNC, patched below */
+    w = ri(0x010, 8, 8, 0x100, 255);     /* IADD3 R8, R8, 0x100, RZ */
+    f(&w, 81, 6, 0x3f);
+    f(&w, 87, 4, 0xf);
+    f(&w, 77, 4, 0xf);
+    emit(p, w);
+    w = sm86_fix(0x941); /* BSYNC B0 */
+    f(&w, 87, 3, 7);
+    u32 bsync = emit(p, w);
+    sm86_put(p->code, skip, sm86_bra(skip, bsync, 1, 1));
+    w = sm86_fix(0x945);
+    f(&w, 34, 30, (u64)(bsync - bssy - 1) * 4);
+    f(&w, 87, 3, 7);
+    sm86_put(p->code, bssy, w);
+    w = sm86_fix(0x388); /* STS [R0.X4], R8 */
+    f(&w, 32, 8, 8);
+    f(&w, 73, 3, 4);
+    f(&w, 78, 2, 1);
+    emit(p, w);
+    w = sm86_fix(0x984); /* LDS R11, [R0.X4 + URZ] */
+    f(&w, 16, 8, 11);
+    f(&w, 32, 6, 63);
+    f(&w, 73, 3, 4);
+    f(&w, 78, 2, 1);
+    f(&w, 91, 1, 1);
+    emit(p, w);
+    store(p, 1, 11);
+    w = ri(0x012, 12, 5, 2, 255); /* LOP3 P2, R12 = R5 & 2 */
+    f(&w, 72, 8, 0xc0);
+    f(&w, 81, 3, 2);
+    f(&w, 87, 4, 0xf);
+    emit(p, w);
+    w = sm86_exit(); /* @P2 EXIT */
+    f(&w, 12, 3, 2);
+    emit(p, w);
+    store(p, 2, 4);
+    epilogue(p);
+}
+
+/* stores of every size the write log takes: 16, 8 and 4 bytes, a halfword and a byte, at offsets 0, 16, 24, 28 and
+   31 of each invocation's 32 bytes; byte 30 is written by none, and must not be logged */
+static void stores_program(Prog* p) {
+    p->outputs = 8;
+    prologue(p);
+    for (u32 k = 0; k < 6; k++) /* IMAD R12+k = R2 * c + R4 */
+        emit(p, ri(0x024, 12 + k, 2, 0x01020300u + 7 * k + 3, 4));
+    store_typed(p, 0, 12, 6);
+    store_typed(p, 16, 16, 5);
+    store_typed(p, 24, 13, 4);
+    store_typed(p, 28, 14, 2);
+    store_typed(p, 31, 15, 0);
+    epilogue(p);
+}
+
+/* global memory through register pairs, as the game's compute programs address it: MOV of the buffers' addresses
+   from c[0], IMAD.WIDE to the invocation's words, LDG and STG without a uniform register, and IMAD.HI, SGXT and
+   PRMT on the words */
+static void wide_program(Prog* p) {
+    p->outputs = 3;
+    p->approx_from = 3;
+    Sm86Word w = sm86_fix(0x919);
+    f(&w, 72, 8, 0x21);
+    emit(p, w);
+    w = sm86_fix(0x919);
+    f(&w, 16, 8, 1);
+    f(&w, 72, 8, 0x25);
+    emit(p, w);
+    emit(p, ri(0x024, 2, 1, LOCAL, 0)); /* IMAD R2, R1, 32, R0 */
+    for (u32 k = 0; k < 4; k++) {       /* MOV R8, R9, R18, R19 = c[0][0x20], [0x24], [0x28], [0x2c] */
+        w = alu(0x002, 5, k < 2 ? 8 + k : 16 + k, 255);
+        sm86_cbuf(&w, 0, 0x20 + 4 * k);
+        f(&w, 72, 4, 0xf);
+        emit(p, w);
+    }
+    emit(p, ri(0x025, 10, 2, 8, 8)); /* IMAD.WIDE.U32 R10, R2, 8, R8 */
+    w = sm86_fix(0x381);             /* LDG.E.64 R12, [R10.64] */
+    f(&w, 16, 8, 12);
+    f(&w, 24, 8, 10);
+    f(&w, 72, 1, 1);
+    f(&w, 73, 3, 5);
+    f(&w, 81, 3, 7);
+    f(&w, 84, 3, 1);
+    emit(p, w);
+    emit(p, rr(0x027, 14, 12, 13)); /* IMAD.HI.U32 R14, R12, R13, RZ */
+    w = ri(0x01a, 15, 12, 12, 255); /* SGXT R15, R12, 12 */
+    f(&w, 73, 1, 1);
+    emit(p, w);
+    emit(p, ri(0x016, 16, 12, 0x7051, 13));        /* PRMT R16, R12, 0x7051, R13 */
+    emit(p, ri(0x025, 20, 2, p->outputs * 4, 18)); /* IMAD.WIDE.U32 R20, R2, 12, R18 */
+    for (u32 k = 0; k < 3; k++) {
+        w = sm86_fix(0x386); /* STG.E [R20.64 + 4k], R14 + k */
+        f(&w, 24, 8, 20);
+        f(&w, 32, 8, 14 + k);
+        f(&w, 40, 24, 4 * k);
+        f(&w, 72, 1, 1);
+        f(&w, 73, 3, 4);
+        f(&w, 84, 3, 1);
+        emit(p, w);
+    }
+    epilogue(p);
+}
+
+/* ---- the inputs and the comparison ---- */
+
+static void inputs(u32* in) {
+    static const u32 special[] = {
+        0x00000000u, 0x00000001u, 0xffffffffu, 0x7fffffffu, 0x80000000u, 0x3f800000u, 0xbf800000u, 0x40200000u,
+        0x00800000u, 0x007fffffu, 0x00000010u, 0x80000000u, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0x7f7fffffu,
+        0x3dcccccdu, 0x3eaaaaabu, 0x4b800001u, 0xcf000000u, 0x4f800000u, 0x12345678u, 0x80000001u, 0x3effffffu,
+        0x00000003u, 0x0000000fu, 0x00010000u, 0x447a0000u, 0xc2c80000u, 0x3a83126fu, 0x5f000000u, 0x2f800000u};
+    u32 count = (u32)(sizeof special / sizeof *special), seed = 0x9e3779b9u;
+    for (u32 i = 0; i < 2 * INVOCATIONS; i++) {
+        seed = seed * 1664525u + 1013904223u;
+        u32 a = special[(i / 2 + i * 7) % count];
+        /* pairs of specials, pairs of nearby floats, and random words */
+        in[i] = i < 2 * count ? a : i < 3 * count ? 0x3f800000u + (seed >> 9) : seed;
+    }
+}
+static int is_nan(u32 v) { return (v & 0x7f800000u) == 0x7f800000u && (v & 0x7fffffu); }
+static int is_subnormal(u32 v) { return !(v & 0x7f800000u) && (v & 0x7fffffu); }
+static int close_enough(u32 got, u32 want) {
+    float g, w;
+    memcpy(&g, &got, 4);
+    memcpy(&w, &want, 4);
+    if (got == want || (isnan(g) && isnan(w))) return 1;
+    if (isinf(w) || fabsf(w) > 1e37f) return (isinf(g) || fabsf(g) > 1e37f) && signbit(g) == signbit(w);
+    if (fabsf(w) < 1e-30f) return fabsf(g) < 1e-30f;
+    /* Vulkan's bounds for these: 2.5 ULP for 1/x, 2 for inversesqrt, 3 + 2|x| for exp2, 2^-21 absolute for log2
+       near 1. The bound here takes all of them */
+    return fabsf(g - w) <= fabsf(w) * 1e-4f + 1e-5f;
+}
+static int close_sin(u32 got, u32 want) {
+    float g, w;
+    memcpy(&g, &got, 4);
+    memcpy(&w, &want, 4);
+    return (isnan(g) && isnan(w)) || fabsf(g - w) <= 1.0f / 2048.0f; /* Vulkan's sin bound, 2^-11 absolute */
+}
+
+/* ---- Vulkan ---- */
+
+typedef struct {
+    VkInstance instance;
+    VkPhysicalDevice phys;
+    VkDevice device;
+    VkQueue queue;
+    u32 family;
+    VkPhysicalDeviceMemoryProperties mem;
+    char name[256];
+    u32 subgroup;  /* the compute stage's subgroup size, 0 without shuffles there */
+    int quad;      /* quad operations in compute */
+    int float16;   /* shaderFloat16, enabled */
+    int mixed_dot; /* VK_VALVE_shader_mixed_float_dot_product's Float16AccFloat32, enabled */
+    int warp32;    /* compute pipelines can require subgroups of 32, whole, as vk/compute.c's do (enabled) */
+    int coop; /* VK_KHR_cooperative_matrix's 16x16x16 f16 product into f32 in subgroup scope, with the Vulkan memory
+                 model, enabled: the device's maxComputeSharedMemorySize, for g_shader_hmma_coop, else 0 */
+} Gpu;
+/* the subgroups of a device's compute stage: their size where they have shuffles, else 0, and *quad whether they
+   have quad operations */
+static u32 compute_subgroups(VkPhysicalDevice phys, int* quad) {
+    VkPhysicalDeviceSubgroupProperties sp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sp};
+    vkGetPhysicalDeviceProperties2(phys, &p2);
+    int compute = (sp.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+    *quad = compute && (sp.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT);
+    return compute && (sp.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT) ? sp.subgroupSize : 0;
+}
+/* whether the device multiplies 16x16x16 f16 A and B into an f32 accumulator in subgroup scope in compute, as
+   vk/device.c asks for g_shader_hmma_coop */
+static int coop_shape(VkPhysicalDevice phys) {
+    VkPhysicalDeviceCooperativeMatrixPropertiesKHR cp = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR};
+    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &cp};
+    vkGetPhysicalDeviceProperties2(phys, &p2);
+    if (!(cp.cooperativeMatrixSupportedStages & VK_SHADER_STAGE_COMPUTE_BIT) ||
+        !vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+        return 0;
+    VkCooperativeMatrixPropertiesKHR props[64];
+    u32 n = 64;
+    for (u32 i = 0; i < n; i++)
+        props[i] = (VkCooperativeMatrixPropertiesKHR){.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR};
+    if (vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(phys, &n, props) < 0) return 0;
+    for (u32 i = 0; i < n; i++)
+        if (props[i].MSize == 16 && props[i].NSize == 16 && props[i].KSize == 16 &&
+            props[i].AType == VK_COMPONENT_TYPE_FLOAT16_KHR && props[i].BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+            props[i].CType == VK_COMPONENT_TYPE_FLOAT32_KHR && props[i].ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+            !props[i].saturatingAccumulation && props[i].scope == VK_SCOPE_SUBGROUP_KHR)
+            return 1;
+    return 0;
+}
+static int has_device_extension(VkPhysicalDevice phys, const char* name) {
+    u32 n = 0;
+    vkEnumerateDeviceExtensionProperties(phys, NULL, &n, NULL);
+    VkExtensionProperties* e = n ? malloc(sizeof *e * n) : NULL;
+    int found = 0;
+    if (e && vkEnumerateDeviceExtensionProperties(phys, NULL, &n, e) == VK_SUCCESS)
+        for (u32 i = 0; i < n && !found; i++) found = !strcmp(e[i].extensionName, name);
+    free(e);
+    return found;
+}
+/* warp: a device for the warp's instructions, which need subgroups of 32 lanes or more in compute, which lavapipe
+   hasn't: the first device that has them. Otherwise lavapipe where the loader has it, else the first device */
+static int gpu_open(Gpu* g, int warp) {
+    if (volkInitialize() != VK_SUCCESS) return 0;
+    VkApplicationInfo app = {
+        VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "snx-test-shader-sm86-gpu", 1, NULL, 0, VK_API_VERSION_1_3};
+    VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, 0, NULL};
+    if (vkCreateInstance(&ici, NULL, &g->instance) != VK_SUCCESS) return 0;
+    volkLoadInstance(g->instance);
+    u32 count = 0;
+    vkEnumeratePhysicalDevices(g->instance, &count, NULL);
+    VkPhysicalDevice devices[16];
+    if (count > 16) count = 16;
+    vkEnumeratePhysicalDevices(g->instance, &count, devices);
+    if (!count) return 0;
+    g->phys = devices[0];
+    for (u32 i = 0; i < count; i++) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(devices[i], &props);
+        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) g->phys = devices[i];
+    }
+    if (warp) {
+        int quad;
+        g->phys = VK_NULL_HANDLE;
+        for (u32 i = 0; i < count && !g->phys; i++)
+            if (compute_subgroups(devices[i], &quad) >= 32) g->phys = devices[i];
+        if (!g->phys) return 0;
+    }
+    g->subgroup = compute_subgroups(g->phys, &g->quad);
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(g->phys, &props);
+    snprintf(g->name, sizeof g->name, "%s", props.deviceName);
+    if (props.apiVersion < VK_API_VERSION_1_3) return 0;
+    vkGetPhysicalDeviceMemoryProperties(g->phys, &g->mem);
+    VkQueueFamilyProperties families[16];
+    u32 nf = 16;
+    vkGetPhysicalDeviceQueueFamilyProperties(g->phys, &nf, families);
+    g->family = 0xffffffffu;
+    for (u32 i = 0; i < nf && g->family == 0xffffffffu; i++)
+        if (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) g->family = i;
+    if (g->family == 0xffffffffu) return 0;
+    VkPhysicalDeviceFeatures features = {0};
+    VkPhysicalDeviceFeatures have;
+    vkGetPhysicalDeviceFeatures(g->phys, &have);
+    features.shaderFloat64 = have.shaderFloat64;
+    features.shaderInt64 = have.shaderInt64;
+    /* shaderFloat16 and the mixed dot product, which the translation of HMMA takes where the device has them */
+    int has_mixed = has_device_extension(g->phys, VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME);
+    VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE mixq = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE};
+    /* and the cooperative matrix product that it takes on the device's matrix unit (g_shader_hmma_coop) */
+    int has_coop = warp && has_device_extension(g->phys, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopq = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR, .pNext = has_mixed ? &mixq : NULL};
+    VkPhysicalDeviceVulkan13Features v13q = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+                                             .pNext = has_coop    ? (void*)&coopq
+                                                      : has_mixed ? (void*)&mixq
+                                                                  : NULL};
+    VkPhysicalDeviceVulkan12Features v12q = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+                                             .pNext = &v13q};
+    VkPhysicalDeviceFeatures2 q2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &v12q};
+    vkGetPhysicalDeviceFeatures2(g->phys, &q2);
+    VkPhysicalDeviceVulkan13Properties p13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+    VkPhysicalDeviceProperties2 pp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &p13};
+    vkGetPhysicalDeviceProperties2(g->phys, &pp2);
+    g->warp32 = v13q.subgroupSizeControl && v13q.computeFullSubgroups && p13.minSubgroupSize <= 32 &&
+                p13.maxSubgroupSize >= 32 && (p13.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT);
+    g->float16 = v12q.shaderFloat16 != 0;
+    g->mixed_dot = has_mixed && mixq.shaderMixedFloatDotProductFloat16AccFloat32 && g->float16;
+    g->coop = has_coop && coopq.cooperativeMatrix && g->float16 && v12q.vulkanMemoryModel &&
+                      v12q.vulkanMemoryModelDeviceScope && g->warp32 && coop_shape(g->phys)
+                  ? (int)pp2.properties.limits.maxComputeSharedMemorySize
+                  : 0;
+    VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE mix = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE,
+        .shaderMixedFloatDotProductFloat16AccFloat32 = VK_TRUE};
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+        .pNext = g->mixed_dot ? &mix : NULL,
+        .cooperativeMatrix = VK_TRUE};
+    VkPhysicalDeviceVulkan12Features v12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+                                            .pNext = g->coop        ? (void*)&coop
+                                                     : g->mixed_dot ? (void*)&mix
+                                                                    : NULL,
+                                            .shaderFloat16 = (VkBool32)g->float16,
+                                            .vulkanMemoryModel = (VkBool32)(g->coop != 0),
+                                            .vulkanMemoryModelDeviceScope = (VkBool32)(g->coop != 0)};
+    const char* exts[2];
+    u32 next = 0;
+    if (g->mixed_dot) exts[next++] = VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME;
+    if (g->coop) exts[next++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
+    VkPhysicalDeviceVulkan13Features v13 = {0};
+    v13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    v13.pNext = &v12;
+    v13.shaderDemoteToHelperInvocation = VK_TRUE;
+    v13.subgroupSizeControl = v13.computeFullSubgroups = (VkBool32)g->warp32;
+    VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v13, features};
+    float priority = 1.0f;
+    VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, g->family, 1, &priority};
+    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qci, 0, NULL, next, exts, NULL};
+    if (vkCreateDevice(g->phys, &dci, NULL, &g->device) != VK_SUCCESS) return 0;
+    volkLoadDevice(g->device);
+    vkGetDeviceQueue(g->device, g->family, 0, &g->queue);
+    return warp || (have.shaderFloat64 && have.shaderInt64);
+}
+typedef struct {
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    void* map;
+    u32 bytes;
+} Buf;
+static int buf_make(Gpu* g, Buf* b, u32 bytes, VkBufferUsageFlags usage) {
+    VkBufferCreateInfo bci = {
+        VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, bytes, usage, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    if (vkCreateBuffer(g->device, &bci, NULL, &b->buffer) != VK_SUCCESS) return 0;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(g->device, b->buffer, &req);
+    u32 type = 0xffffffffu;
+    VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (u32 i = 0; i < g->mem.memoryTypeCount && type == 0xffffffffu; i++)
+        if ((req.memoryTypeBits & (1u << i)) && (g->mem.memoryTypes[i].propertyFlags & want) == want) type = i;
+    if (type == 0xffffffffu) return 0;
+    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, type};
+    if (vkAllocateMemory(g->device, &mai, NULL, &b->memory) != VK_SUCCESS) return 0;
+    vkBindBufferMemory(g->device, b->buffer, b->memory, 0);
+    if (vkMapMemory(g->device, b->memory, 0, VK_WHOLE_SIZE, 0, &b->map) != VK_SUCCESS) return 0;
+    b->bytes = bytes;
+    memset(b->map, 0, bytes);
+    return 1;
+}
+static void buf_free(Gpu* g, Buf* b) {
+    if (b->memory) vkFreeMemory(g->device, b->memory, NULL);
+    if (b->buffer) vkDestroyBuffer(g->device, b->buffer, NULL);
+}
+/* what the last run's stores logged of each global buffer (ShaderInfo.gbuf_mark, SNX_VKB_WPAGES), a bit a byte from
+   its base: the buffer's part of a log of the dispatch's own, as vk/writelog.c's (shader.h's SH_WLOG_*) */
+#define LOG_BYTES (SH_WPAGE_SLOT * 4096u) /* the bytes a part logs: its windows of 4 KiB */
+static u32 g_masks[2][LOG_BYTES / 32];
+/* windows with bytes logged but no flag set: the flags are the index the renderer reads the log by (vk_wlog_runs),
+   which would miss those bytes */
+static u32 g_unflagged;
+/* the workgroups gpu_run dispatches: GROUPS of LOCAL, or one of 2 LOCAL for the warp's instructions in a subgroup of
+   64 */
+static u32 g_groups = GROUPS;
+/* gpu_run's pipeline in subgroups of 32, whole, as vk/compute.c makes those of the programs that read other lanes */
+static int g_warp32;
+/* Runs the module with cbuf 0 and the global buffers that si names (each a buffer of the bytes at in or out): 0 when
+   Vulkan fails */
+static int gpu_run(Gpu* g, const u32* spv, size_t words, const ShaderInfo* si, const u32* cb0, const u32* in,
+                   u32 in_bytes, u32* out, u32 out_bytes) {
+    Buf cb = {0}, gb[2] = {{0}}, marks = {0};
+    int ok = buf_make(g, &cb, 65536, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    if (ok && si->gbuf_marks) /* a part for each buffer the program logs, its bases being in the program */
+        ok = buf_make(g, &marks, (u32)si->nmarks * SH_WLOG_PART * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    if (ok) memcpy(cb.map, cb0, 256);
+    for (int k = 0; k < si->ngbuf && ok; k++) {
+        int is_out = si->gbuf_cbuf_off[k] == 0x28;
+        ok = buf_make(g, &gb[k], is_out ? out_bytes : in_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        if (ok) memcpy(gb[k].map, is_out ? (const void*)out : (const void*)in, is_out ? out_bytes : in_bytes);
+    }
+    VkDescriptorSetLayoutBinding bindings[5];
+    u32 nb = 0;
+    bindings[nb++] = (VkDescriptorSetLayoutBinding){SNX_VKB_CB, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                                                    VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+    for (int k = 0; k < si->ngbuf; k++)
+        bindings[nb++] = (VkDescriptorSetLayoutBinding){SNX_VKB_SSBO + (u32)k, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                                        VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+    if (si->gbuf_marks)
+        bindings[nb++] = (VkDescriptorSetLayoutBinding){SNX_VKB_WPAGES, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                                        VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    VkPipelineLayout pl = VK_NULL_HANDLE;
+    VkShaderModule sm = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkCommandPool cpool = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkDescriptorSetLayoutCreateInfo dlci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, nb, bindings};
+    ok = ok && vkCreateDescriptorSetLayout(g->device, &dlci, NULL, &dsl) == VK_SUCCESS;
+    VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &dsl, 0, NULL};
+    ok = ok && vkCreatePipelineLayout(g->device, &plci, NULL, &pl) == VK_SUCCESS;
+    VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, words * 4, spv};
+    ok = ok && vkCreateShaderModule(g->device, &smci, NULL, &sm) == VK_SUCCESS;
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo warp32 = {
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, NULL, 32};
+    VkComputePipelineCreateInfo cpci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                        NULL,
+                                        0,
+                                        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, g_warp32 ? &warp32 : NULL,
+                                         g_warp32 ? VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT : 0,
+                                         VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", NULL},
+                                        pl,
+                                        VK_NULL_HANDLE,
+                                        0};
+    ok = ok && vkCreateComputePipelines(g->device, VK_NULL_HANDLE, 1, &cpci, NULL, &pipe) == VK_SUCCESS;
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3}};
+    VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 1, 2, sizes};
+    ok = ok && vkCreateDescriptorPool(g->device, &dpci, NULL, &pool) == VK_SUCCESS;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, pool, 1, &dsl};
+    ok = ok && vkAllocateDescriptorSets(g->device, &dsai, &set) == VK_SUCCESS;
+    if (ok) {
+        VkDescriptorBufferInfo infos[5];
+        VkWriteDescriptorSet writes[5];
+        for (u32 k = 0; k < nb; k++) {
+            infos[k] = (VkDescriptorBufferInfo){bindings[k].binding == SNX_VKB_WPAGES ? marks.buffer
+                                                : k                                   ? gb[k - 1].buffer
+                                                                                      : cb.buffer,
+                                                0, VK_WHOLE_SIZE};
+            writes[k] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                               NULL,
+                                               set,
+                                               bindings[k].binding,
+                                               0,
+                                               1,
+                                               bindings[k].descriptorType,
+                                               NULL,
+                                               &infos[k],
+                                               NULL};
+        }
+        vkUpdateDescriptorSets(g->device, nb, writes, 0, NULL);
+    }
+    VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, 0, g->family};
+    ok = ok && vkCreateCommandPool(g->device, &cpi, NULL, &cpool) == VK_SUCCESS;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cbai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, cpool,
+                                        VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+    ok = ok && vkAllocateCommandBuffers(g->device, &cbai, &cmd) == VK_SUCCESS;
+    VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, 0};
+    ok = ok && vkCreateFence(g->device, &fci, NULL, &fence) == VK_SUCCESS;
+    if (ok) {
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
+                                       VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
+        vkBeginCommandBuffer(cmd, &bi);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &set, 0, NULL);
+        vkCmdDispatch(cmd, g_groups, 1, 1);
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT,
+                              VK_ACCESS_HOST_READ_BIT};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL,
+                             0, NULL);
+        vkEndCommandBuffer(cmd);
+        VkSubmitInfo si2 = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cmd, 0, NULL};
+        ok = vkQueueSubmit(g->queue, 1, &si2, fence) == VK_SUCCESS &&
+             vkWaitForFences(g->device, 1, &fence, VK_TRUE, 10000000000ull) == VK_SUCCESS;
+    }
+    for (int k = 0; k < si->ngbuf && ok; k++)
+        if (si->gbuf_cbuf_off[k] == 0x28) memcpy(out, gb[k].map, out_bytes);
+    g_unflagged = 0;
+    for (int k = 0; k < 2; k++) {
+        memset(g_masks[k], 0, sizeof g_masks[k]);
+        if (!marks.map || k >= si->ngbuf || !si->gbuf_mark[k]) continue;
+        const u32* part = (const u32*)marks.map + (size_t)(si->gbuf_mark[k] - 1) * SH_WLOG_PART;
+        for (u32 j = 0; j < SH_WPAGE_SLOT; j++) { /* each window's mask, after the flags */
+            const u32* m = part + SH_WPAGE_SLOT + (size_t)j * SH_WLOG_MASK;
+            u32 any = 0;
+            for (u32 w = 0; w < SH_WLOG_MASK; w++) any |= m[w];
+            if (any && !part[j]) g_unflagged++;
+            memcpy(g_masks[k] + (size_t)j * SH_WLOG_MASK, m, SH_WLOG_MASK * 4);
+        }
+    }
+    buf_free(g, &marks);
+    if (fence) vkDestroyFence(g->device, fence, NULL);
+    if (cpool) vkDestroyCommandPool(g->device, cpool, NULL);
+    if (pool) vkDestroyDescriptorPool(g->device, pool, NULL);
+    if (pipe) vkDestroyPipeline(g->device, pipe, NULL);
+    if (sm) vkDestroyShaderModule(g->device, sm, NULL);
+    if (pl) vkDestroyPipelineLayout(g->device, pl, NULL);
+    if (dsl) vkDestroyDescriptorSetLayout(g->device, dsl, NULL);
+    for (int k = 0; k < 2; k++) buf_free(g, &gb[k]);
+    buf_free(g, &cb);
+    return ok;
+}
+
+static int run_program(Gpu* g, const char* name, void (*build)(Prog*)) {
+    static Prog p;
+    memset(&p, 0, sizeof p);
+    build(&p);
+    static u32 in[2 * INVOCATIONS], ref[INVOCATIONS * MAX_OUT], got[INVOCATIONS * MAX_OUT];
+    inputs(in);
+    u32 out_bytes = INVOCATIONS * p.outputs * 4;
+    for (u32 i = 0; i < INVOCATIONS * p.outputs; i++) ref[i] = got[i] = FILL;
+    u32 cb0[64] = {0};
+    cb0[0x20 / 4] = (u32)VA_IN;
+    cb0[0x24 / 4] = (u32)(VA_IN >> 32);
+    cb0[0x28 / 4] = (u32)VA_OUT;
+    cb0[0x2c / 4] = (u32)(VA_OUT >> 32);
+    /* the reference */
+    Sm86RefEnv env = {0};
+    env.cbuf[0] = cb0;
+    env.cbuf_words[0] = 64;
+    env.global[0] = (u8*)(void*)in;
+    env.global_va[0] = VA_IN;
+    env.global_bytes[0] = sizeof in;
+    env.global[1] = (u8*)(void*)ref;
+    env.global_va[1] = VA_OUT;
+    env.global_bytes[1] = out_bytes;
+    static u8 stored[INVOCATIONS * MAX_OUT * 4];
+    memset(stored, 0, sizeof stored);
+    env.stored[1] = stored;
+    env.local[0] = LOCAL, env.local[1] = env.local[2] = 1;
+    env.groups[0] = GROUPS, env.groups[1] = env.groups[2] = 1;
+    env.shared_bytes = LOCAL * 4;
+    const char* why = sm86_ref_run(p.code, p.n * 16, &env);
+    if (why) {
+        fprintf(stderr, "%s: the reference stops: %s\n", name, why);
+        return 0;
+    }
+    /* the translation */
+    ShaderInfo si = {0};
+    si.cs_local[0] = LOCAL, si.cs_local[1] = si.cs_local[2] = 1;
+    si.shared_size = (int)(LOCAL * 4);
+    size_t words = 0;
+    u32* spv = sm86_to_spirv(p.code, p.n * 16, ST_CS, NULL, &si, &words);
+    if (!spv) {
+        fprintf(stderr, "%s: not translated: %s\n", name, si.first_unsupported);
+        return 0;
+    }
+    int ok = si.ngbuf == 2 && gpu_run(g, spv, words, &si, cb0, in, sizeof in, got, out_bytes);
+    free(spv);
+    if (!ok) {
+        fprintf(stderr, "%s: Vulkan failed\n", name);
+        return 0;
+    }
+    /* the stores logged exactly the bytes the reference stored, and none of the input's */
+    for (int k = 0; k < 2; k++) {
+        int is_out = si.gbuf_cbuf_off[k] == 0x28;
+        u32 wrong = 0, first = ~0u, logged = 0;
+        for (u32 b = 0; b < LOG_BYTES; b++) {
+            int want = is_out && b < out_bytes && stored[b], have = g_masks[k][b / 32] >> (b % 32) & 1;
+            logged += (u32)have;
+            if (want != have && !wrong++) first = b;
+        }
+        if (wrong || g_unflagged || ((si.gbuf_marks >> k & 1) != (u32)is_out)) {
+            fprintf(stderr,
+                    "%s: global buffer %d (%s) logged %u bytes, %u of them or of the bytes stored wrong (the "
+                    "first at %u; in gbuf_marks %u; %u windows logged with no flag)\n",
+                    name, k, is_out ? "the output" : "the input", logged, wrong, first, si.gbuf_marks >> k & 1,
+                    g_unflagged);
+            return 0;
+        }
+    }
+    u32 bad = 0, skipped = 0, nans = 0;
+    for (u32 i = 0; i < INVOCATIONS; i++)
+        for (u32 k = 0; k < p.outputs; k++) {
+            u32 want = ref[i * p.outputs + k], have = got[i * p.outputs + k];
+            if (want != have && is_nan(want) && is_nan(have)) { /* SPIR-V promises no NaN's bits */
+                nans++;
+                continue;
+            }
+            if ((p.denorm_mask >> k & 1) &&
+                (is_subnormal(in[2 * i]) || is_subnormal(in[2 * i + 1]) || is_subnormal(want))) {
+                skipped += want != have;
+                continue;
+            }
+            int same = k < p.approx_from                                 ? have == want
+                       : k == p.outputs - 1 && p.approx_from < p.outputs ? close_sin(have, want)
+                                                                         : close_enough(have, want);
+            if (!same && bad++ < 24)
+                fprintf(stderr, "%s: invocation %u output %u: GPU 0x%08x, reference 0x%08x (inputs 0x%08x 0x%08x)\n",
+                        name, i, k, have, want, in[2 * i], in[2 * i + 1]);
+        }
+    printf("%s: %u instructions, %u outputs x %u invocations, %u differ, %u NaNs of other bits, %u not compared "
+           "(a subnormal input or result without FTZ: they differ)\n",
+           name, p.n, p.outputs, INVOCATIONS, bad, nans, skipped);
+    return bad == 0;
+}
+
+/* ---- the warp's matrix instructions ---- */
+
+/* HMMA.16816 and .1688 (F16 and F32 C and D), LDSM.16.M88.4 and .MT88.4 and MOVM.16.MT88 against matrices that the
+   test multiplies itself, each warp its own A (16x16), B (16x8) and C (16x8). The inputs are the warp's fragments as
+   PTX's mma.sync lays them out (g = lane / 4, t = lane % 4): A's rows g and g + 8 at columns 2t, 2t + 1 and 2t + 8,
+   2t + 9 in four words, B's column g at rows 2t, 2t + 1 and 2t + 8, 2t + 9 in two, C's rows g and g + 8 at columns 2t,
+   2t + 1 in two; the .1688 forms take the first two A words and the first B word, A's columns and B's rows 0 to 7.
+   Lane l stores its four A words as row l of shared memory (16 bytes each), which LDSM reads back as four 8x8
+   matrices, matrix m's row r being lane 8m + r's. Two sets of matrices: elements n / 4 for n in -6..6, so that every
+   product and sum is exact in f16 and f32 and the outputs compare bit for bit; and f16 elements of full mantissas,
+   A's row 3 subnormal, whose sums round, compared with sums in double within an f32 sum's error (and an f16 D's last
+   place). A sum kept in f16, or a subnormal flushed, is far outside that. The mixed dot product's precision is the
+   device's (SPV_VALVE_mixed_float_dot_product: "implementation defined"): RDNA 3.5's v_dot2_f32_f16 is a few f32
+   places off even on the exact sums, within the same bound, so with it every set is held to the bound. So is the
+   cooperative matrix product's (g_shader_hmma_coop), whose sums are the device's too: RDNA 3.5's WMMA is a few f32
+   places off on the exact sums as well */
+#define TENSOR_OUT 33u
+static u16 half_bits(float v) { /* v = n / 4, |n| <= 6 * 6 * 16 + 6: exact */
+    u32 b;
+    memcpy(&b, &v, 4);
+    u32 sign = b >> 16 & 0x8000u, e = b >> 23 & 0xff, m = b & 0x7fffffu;
+    if (!e) return (u16)sign;
+    return (u16)(sign | (e - 112) << 10 | m >> 13);
+}
+/* an f16's value, subnormals too */
+static double half_double(u16 h) {
+    double m = (double)(h & 0x3ffu), v = h >> 10 & 31 ? ldexp(1024.0 + m, (h >> 10 & 31) - 25) : ldexp(m, -24);
+    return h & 0x8000u ? -v : v;
+}
+static u32 fbits(float v) {
+    u32 b;
+    memcpy(&b, &v, 4);
+    return b;
+}
+static float bits_f(u32 b) {
+    float v;
+    memcpy(&v, &b, 4);
+    return v;
+}
+static void tensor_program(Prog* p, u32 local) {
+    p->outputs = TENSOR_OUT;
+    p->approx_from = TENSOR_OUT;
+    Sm86Word w = sm86_fix(0x919); /* S2R R0, TID.X */
+    f(&w, 72, 8, 0x21);
+    emit(p, w);
+    w = sm86_fix(0x919); /* S2R R1, CTAID.X */
+    f(&w, 16, 8, 1);
+    f(&w, 72, 8, 0x25);
+    emit(p, w);
+    emit(p, ri(0x024, 2, 1, local, 0)); /* IMAD R2, R1, local, R0 */
+    for (u32 k = 0; k < 2; k++) {
+        w = sm86_fix(0xab9); /* ULDC.64 */
+        f(&w, 16, 6, 4 + 2 * k);
+        sm86_cbuf(&w, 0, 0x20 + 8 * k);
+        f(&w, 73, 3, 5);
+        emit(p, w);
+    }
+    w = rr(0x011, 3, 2, 255); /* LEA R3, R2, RZ, 5: the invocation's 32 bytes of inputs */
+    f(&w, 75, 5, 5);
+    f(&w, 81, 3, 7);
+    emit(p, w);
+    for (u32 k = 0; k < 2; k++) {
+        w = sm86_fix(0x981); /* LDG.E.128 R8 + 4k, [R3.U32 + UR4 + 16k] */
+        f(&w, 16, 8, 8 + 4 * k);
+        f(&w, 24, 8, 3);
+        f(&w, 32, 6, 4);
+        f(&w, 40, 24, 16 * k);
+        f(&w, 72, 1, 1);
+        f(&w, 73, 3, 6);
+        f(&w, 81, 3, 7);
+        f(&w, 84, 3, 1);
+        f(&w, 91, 1, 1);
+        emit(p, w);
+    }
+    emit(p, ri(0x024, 6, 2, TENSOR_OUT * 4, 255)); /* IMAD R6, R2, outputs * 4, RZ */
+    emit(p, ri(0x024, 7, 0, 16, 255));             /* IMAD R7, R0, 16, RZ */
+    w = sm86_fix(0x388);                           /* STS.128 [R7 + 0x40], R8 */
+    f(&w, 24, 8, 7);
+    f(&w, 32, 8, 8);
+    f(&w, 40, 24, 0x40);
+    f(&w, 73, 3, 6);
+    emit(p, w);
+    emit(p, sm86_fix(0xb1d)); /* BAR.SYNC 0 */
+    /* HMMA.16816.F16 R16, R8, R12, RZ, .F16 R18 with C = R14, .F32 R20 with RZ, .F32 R36 with C = R20; HMMA.1688.F32
+       R40, R8, R12, RZ, .F16 R44 with C = R14, .F16 R46 with RZ and .F32 R48 with C = R40 */
+    static const u32 hmma[8][3] = {{16, 255, 0x08}, {18, 14, 0x08}, {20, 255, 0x18}, {36, 20, 0x18},
+                                   {40, 255, 0x10}, {44, 14, 0x00}, {46, 255, 0x00}, {48, 40, 0x10}};
+    for (u32 k = 0; k < 8; k++) {
+        w = sm86_fix(0x23c);
+        f(&w, 16, 8, hmma[k][0]);
+        f(&w, 24, 8, 8);
+        f(&w, 32, 8, 12);
+        f(&w, 64, 8, hmma[k][1]);
+        f(&w, 72, 19, hmma[k][2]);
+        emit(p, w);
+    }
+    for (u32 k = 0; k < 2; k++) {
+        w = sm86_fix(0x83b); /* LDSM.16.M88.4 R24 and LDSM.16.MT88.4 R28, [R7 + 0x40] */
+        f(&w, 16, 8, 24 + 4 * k);
+        f(&w, 24, 8, 7);
+        f(&w, 40, 24, 0x40);
+        f(&w, 72, 2, 2);
+        f(&w, 78, 1, k);
+        emit(p, w);
+    }
+    w = sm86_fix(0x23a); /* MOVM.16.MT88 R32, R8 */
+    f(&w, 16, 8, 32);
+    f(&w, 24, 8, 8);
+    emit(p, w);
+    for (u32 k = 0; k < 17; k++) store(p, k, 16 + k);
+    for (u32 k = 0; k < 4; k++) store(p, 17 + k, 36 + k);
+    for (u32 k = 0; k < 12; k++) store(p, 21 + k, 40 + k);
+    epilogue(p);
+}
+/* what an output word holds: the bits of an f16 pair, of an f32, or moved bits (LDSM, MOVM) */
+enum { T_PAIR, T_F32, T_BITS };
+static const u8 tensor_kind[TENSOR_OUT] = {T_PAIR, T_PAIR, T_PAIR, T_PAIR, T_F32,  T_F32,  T_F32,  T_F32,  T_BITS,
+                                           T_BITS, T_BITS, T_BITS, T_BITS, T_BITS, T_BITS, T_BITS, T_BITS, T_F32,
+                                           T_F32,  T_F32,  T_F32,  T_F32,  T_F32,  T_F32,  T_F32,  T_PAIR, T_PAIR,
+                                           T_PAIR, T_PAIR, T_F32,  T_F32,  T_F32,  T_F32};
+/* an output's expected value(s) in double and how far from them the device may be (the f32 sum's error): an f32's
+   in [0], a pair's halves in [0] and [1] */
+typedef struct {
+    double v[2], tol[2];
+} Expect;
+/* an f16 element of a warp's matrices: n / 4 for n in -6..6 (exact), or of a full mantissa, subnormal if tiny */
+static u16 tensor_element(u32* seed, int exact, int tiny, int exponent) {
+    *seed = *seed * 1664525u + 1013904223u;
+    if (exact) return half_bits((float)((int)(*seed >> 24) % 13 - 6) / 4.0f);
+    u32 sign = *seed >> 31 << 15, m = *seed >> 8 & 0x3ffu;
+    if (tiny) return (u16)(sign | (m | 1)); /* a subnormal: m 2^-24 */
+    return (u16)(sign | (u32)(15 + exponent - (int)(*seed >> 20 & 1)) << 10 | m);
+}
+/* each warp's matrices, its lanes' fragments (8 words each) into in, and the outputs expected into want (bits) and
+   expect (values) */
+static void tensor_inputs(u32* in, u32* want, Expect* expect, int exact) {
+    u32 seed = exact ? 0x2545f491u : 0x9e3779b9u;
+    for (u32 warp = 0; warp < INVOCATIONS / 32; warp++) {
+        u16 ah[16][16], bh[16][8], ch[16][8];
+        double a[16][16], b[16][8], c[16][8], d[16][8], d8[16][8], m16[16][8], m8[16][8];
+        for (u32 r = 0; r < 16; r++)
+            for (u32 k = 0; k < 16; k++) a[r][k] = half_double(ah[r][k] = tensor_element(&seed, exact, r == 3, 0));
+        for (u32 k = 0; k < 16; k++)
+            for (u32 n = 0; n < 8; n++) b[k][n] = half_double(bh[k][n] = tensor_element(&seed, exact, 0, 0));
+        for (u32 r = 0; r < 16; r++)
+            for (u32 n = 0; n < 8; n++) c[r][n] = half_double(ch[r][n] = tensor_element(&seed, exact, 0, -1));
+        for (u32 r = 0; r < 16; r++)
+            for (u32 n = 0; n < 8; n++) {
+                d[r][n] = d8[r][n] = m16[r][n] = m8[r][n] = 0;
+                for (u32 k = 0; k < 16; k++) {
+                    d[r][n] += a[r][k] * b[k][n];
+                    m16[r][n] += fabs(a[r][k] * b[k][n]);
+                    if (k < 8) {
+                        d8[r][n] += a[r][k] * b[k][n];
+                        m8[r][n] += fabs(a[r][k] * b[k][n]);
+                    }
+                }
+            }
+#define PAIR(x, y)  ((u32)(x) | (u32)(y) << 16)
+#define HPAIR(x, y) PAIR(half_bits((float)(x)), half_bits((float)(y)))
+        u32* frag = in + (size_t)warp * 32 * 8;
+        for (u32 l = 0; l < 32; l++) {
+            u32 g = l / 4, t = l % 4, *q = frag + l * 8;
+            q[0] = PAIR(ah[g][2 * t], ah[g][2 * t + 1]);
+            q[1] = PAIR(ah[g + 8][2 * t], ah[g + 8][2 * t + 1]);
+            q[2] = PAIR(ah[g][2 * t + 8], ah[g][2 * t + 9]);
+            q[3] = PAIR(ah[g + 8][2 * t + 8], ah[g + 8][2 * t + 9]);
+            q[4] = PAIR(bh[2 * t][g], bh[2 * t + 1][g]);
+            q[5] = PAIR(bh[2 * t + 8][g], bh[2 * t + 9][g]);
+            q[6] = PAIR(ch[g][2 * t], ch[g][2 * t + 1]);
+            q[7] = PAIR(ch[g + 8][2 * t], ch[g + 8][2 * t + 1]);
+        }
+        for (u32 l = 0; l < 32; l++) {
+            u32 g = l / 4, t = l % 4, *o = want + ((size_t)warp * 32 + l) * TENSOR_OUT;
+            Expect* e = expect + ((size_t)warp * 32 + l) * TENSOR_OUT;
+            u32 rows[2] = {g, g + 8};
+            /* an f32 sum of n products and C, rounded once for each: n + 1 roundings of what it adds up */
+#define TOL(n, mag) (ldexp((double)(n) + 1, -24) * (mag) + 1e-30)
+            for (u32 i = 0; i < 2; i++)
+                for (u32 j = 0; j < 2; j++) {
+                    u32 r = rows[i], n = 2 * t + j;
+                    double t16 = TOL(16, m16[r][n]), t16c = TOL(17, m16[r][n] + fabs(c[r][n])), t8 = TOL(8, m8[r][n]),
+                           t8c = TOL(9, m8[r][n] + fabs(c[r][n]));
+                    /* an f16 D also within its last place, rounded either way, or a subnormal's */
+                    e[0 + i].v[j] = d[r][n], e[0 + i].tol[j] = t16 + ldexp(fabs(d[r][n]), -10) + ldexp(1, -24);
+                    e[2 + i].v[j] = d[r][n] + c[r][n];
+                    e[2 + i].tol[j] = t16c + ldexp(fabs(d[r][n] + c[r][n]), -10) + ldexp(1, -24);
+                    e[4 + 2 * i + j].v[0] = d[r][n], e[4 + 2 * i + j].tol[0] = t16;
+                    /* C is the device's own A B (R20): its error twice, and the sum's */
+                    e[17 + 2 * i + j].v[0] = 2 * d[r][n], e[17 + 2 * i + j].tol[0] = 3 * t16;
+                    e[21 + 2 * i + j].v[0] = d8[r][n], e[21 + 2 * i + j].tol[0] = t8;
+                    e[25 + i].v[j] = d8[r][n] + c[r][n];
+                    e[25 + i].tol[j] = t8c + ldexp(fabs(d8[r][n] + c[r][n]), -10) + ldexp(1, -24);
+                    e[27 + i].v[j] = d8[r][n], e[27 + i].tol[j] = t8 + ldexp(fabs(d8[r][n]), -10) + ldexp(1, -24);
+                    /* C is the device's own A B of k 8 (R40) */
+                    e[29 + 2 * i + j].v[0] = 2 * d8[r][n], e[29 + 2 * i + j].tol[0] = 3 * t8;
+                }
+#undef TOL
+            if (exact) { /* the sums are exact: their bits */
+                o[0] = HPAIR(d[g][2 * t], d[g][2 * t + 1]);
+                o[1] = HPAIR(d[g + 8][2 * t], d[g + 8][2 * t + 1]);
+                o[2] = HPAIR(d[g][2 * t] + c[g][2 * t], d[g][2 * t + 1] + c[g][2 * t + 1]);
+                o[3] = HPAIR(d[g + 8][2 * t] + c[g + 8][2 * t], d[g + 8][2 * t + 1] + c[g + 8][2 * t + 1]);
+                const double f32d[4] = {d[g][2 * t], d[g][2 * t + 1], d[g + 8][2 * t], d[g + 8][2 * t + 1]};
+                const double f32d8[4] = {d8[g][2 * t], d8[g][2 * t + 1], d8[g + 8][2 * t], d8[g + 8][2 * t + 1]};
+                for (u32 k = 0; k < 4; k++) {
+                    o[4 + k] = fbits((float)f32d[k]);
+                    o[17 + k] = fbits((float)(2 * f32d[k]));
+                    o[21 + k] = fbits((float)f32d8[k]);
+                    o[29 + k] = fbits((float)(2 * f32d8[k]));
+                }
+                o[25] = HPAIR(d8[g][2 * t] + c[g][2 * t], d8[g][2 * t + 1] + c[g][2 * t + 1]);
+                o[26] = HPAIR(d8[g + 8][2 * t] + c[g + 8][2 * t], d8[g + 8][2 * t + 1] + c[g + 8][2 * t + 1]);
+                o[27] = HPAIR(d8[g][2 * t], d8[g][2 * t + 1]);
+                o[28] = HPAIR(d8[g + 8][2 * t], d8[g + 8][2 * t + 1]);
+            }
+            /* shared row r of matrix m: lane 8m + r's A words; element j of it, half j % 2 of word j / 2 */
+            for (u32 m = 0; m < 4; m++) {
+                o[8 + m] = frag[(8 * m + g) * 8 + t];
+                u32 lo = frag[(8 * m + 2 * t) * 8 + g / 2] >> (g % 2 * 16) & 0xffffu;
+                u32 hi = frag[(8 * m + 2 * t + 1) * 8 + g / 2] >> (g % 2 * 16) & 0xffffu;
+                o[12 + m] = lo | hi << 16;
+            }
+            /* MOVM of A's word 0: element (r, j) of the 8x8 matrix is half j % 2 of lane 4r + j / 2's */
+            u32 lo = frag[(8 * t + g / 2) * 8] >> (g % 2 * 16) & 0xffffu;
+            u32 hi = frag[(8 * t + 4 + g / 2) * 8] >> (g % 2 * 16) & 0xffffu;
+            o[16] = lo | hi << 16;
+        }
+#undef HPAIR
+#undef PAIR
+    }
+}
+/* whether output k's word h is what it should be: its bits where they are exact (bits) or it only moves bits, else
+   within its tolerance */
+static int tensor_match(u32 k, u32 h, u32 w, const Expect* e, int bits) {
+    if (bits || tensor_kind[k] == T_BITS) return h == w;
+    if (tensor_kind[k] == T_F32) return fabs((double)bits_f(h) - e->v[0]) <= e->tol[0];
+    for (u32 j = 0; j < 2; j++)
+        if (!(fabs(half_double((u16)(h >> 16 * j)) - e->v[j]) <= e->tol[j])) return 0;
+    return 1;
+}
+/* the program in workgroups of local (32: one warp each, 64: two in a subgroup of 64 where the device runs them so,
+   as RADV does, or in two of 32 with warp32), translated with or without quad operations, the mixed dot product and
+   the device's cooperative matrices (coop, in subgroups of 32 only), on one set of matrices */
+static int run_tensor_with(Gpu* g, u32 local, int warp32, int quad, int mixed, int coop, int exact) {
+    static Prog p;
+    static u32 in[INVOCATIONS * 8], want[INVOCATIONS * TENSOR_OUT], got[INVOCATIONS * TENSOR_OUT];
+    static Expect expect[INVOCATIONS * TENSOR_OUT];
+    static const char* names[TENSOR_OUT] = {"HMMA.F16 d0",
+                                            "HMMA.F16 d1",
+                                            "HMMA.F16+C d0",
+                                            "HMMA.F16+C d1",
+                                            "HMMA.F32 d0",
+                                            "HMMA.F32 d1",
+                                            "HMMA.F32 d2",
+                                            "HMMA.F32 d3",
+                                            "LDSM m0",
+                                            "LDSM m1",
+                                            "LDSM m2",
+                                            "LDSM m3",
+                                            "LDSM.T m0",
+                                            "LDSM.T m1",
+                                            "LDSM.T m2",
+                                            "LDSM.T m3",
+                                            "MOVM",
+                                            "HMMA.F32+C d0",
+                                            "HMMA.F32+C d1",
+                                            "HMMA.F32+C d2",
+                                            "HMMA.F32+C d3",
+                                            "HMMA.1688.F32 d0",
+                                            "HMMA.1688.F32 d1",
+                                            "HMMA.1688.F32 d2",
+                                            "HMMA.1688.F32 d3",
+                                            "HMMA.1688.F16+C d0",
+                                            "HMMA.1688.F16+C d1",
+                                            "HMMA.1688.F16 d0",
+                                            "HMMA.1688.F16 d1",
+                                            "HMMA.1688.F32+C d0",
+                                            "HMMA.1688.F32+C d1",
+                                            "HMMA.1688.F32+C d2",
+                                            "HMMA.1688.F32+C d3"};
+    memset(&p, 0, sizeof p);
+    tensor_program(&p, local);
+    memset(expect, 0, sizeof expect);
+    memset(want, 0, sizeof want);
+    tensor_inputs(in, want, expect, exact);
+    for (u32 i = 0; i < INVOCATIONS * TENSOR_OUT; i++) got[i] = FILL;
+    u32 cb0[64] = {0};
+    cb0[0x20 / 4] = (u32)VA_IN;
+    cb0[0x24 / 4] = (u32)(VA_IN >> 32);
+    cb0[0x28 / 4] = (u32)VA_OUT;
+    cb0[0x2c / 4] = (u32)(VA_OUT >> 32);
+    ShaderInfo si = {0};
+    si.cs_local[0] = (int)local, si.cs_local[1] = si.cs_local[2] = 1;
+    si.shared_size = 2048;
+    size_t words = 0;
+    int quad_was = g_shader_quad_compute, mixed_was = g_shader_mixed_dot, f16_was = g_shader_float16,
+        coop_was = g_shader_hmma_coop;
+    g_shader_quad_compute = quad, g_shader_mixed_dot = mixed, g_shader_float16 = g->float16;
+    g_shader_hmma_coop = coop ? g->coop : 0;
+    u32* spv = sm86_to_spirv(p.code, p.n * 16, ST_CS, NULL, &si, &words);
+    g_shader_quad_compute = quad_was, g_shader_mixed_dot = mixed_was, g_shader_float16 = f16_was;
+    g_shader_hmma_coop = coop_was;
+    const char* how = exact ? "exact" : "rounded";
+    if (!spv) {
+        fprintf(stderr, "tensor: not translated: %s\n", si.first_unsupported);
+        return 0;
+    }
+    g_groups = INVOCATIONS / local, g_warp32 = warp32;
+    int ok = si.ngbuf == 2 && gpu_run(g, spv, words, &si, cb0, in, sizeof in, got, sizeof got);
+    g_groups = GROUPS, g_warp32 = 0;
+    free(spv);
+    if (!ok) {
+        fprintf(stderr, "tensor: Vulkan failed\n");
+        return 0;
+    }
+    u32 bad = 0;
+    for (u32 i = 0; i < INVOCATIONS; i++)
+        for (u32 k = 0; k < TENSOR_OUT; k++) {
+            u32 w = want[i * TENSOR_OUT + k], h = got[i * TENSOR_OUT + k];
+            const Expect* e = &expect[i * TENSOR_OUT + k];
+            if (tensor_match(k, h, w, e, exact && !mixed && !coop)) continue;
+            if (bad++ < 24) {
+                if (tensor_kind[k] == T_PAIR)
+                    fprintf(stderr, "tensor (%s): lane %u %s: GPU %g %g, expected %g %g\n", how, i, names[k],
+                            half_double((u16)h), half_double((u16)(h >> 16)), e->v[0], e->v[1]);
+                else if (tensor_kind[k] == T_F32)
+                    fprintf(stderr, "tensor (%s): lane %u %s: GPU %.9g, expected %.9g within %.3g\n", how, i, names[k],
+                            (double)bits_f(h), e->v[0], e->tol[0]);
+                else
+                    fprintf(stderr, "tensor (%s): lane %u %s: GPU 0x%08x, expected 0x%08x\n", how, i, names[k], h, w);
+            }
+        }
+    const char* products = coop    ? "products by cooperative matrices"
+                           : mixed ? "products by mixed dot products"
+                                   : "products by unpacking to f32";
+    printf("tensor: workgroups of %u, A by %s, %s, %s sums: %u instructions, %u outputs x %u invocations (subgroups "
+           "of %u%s), %u differ\n",
+           local,
+           coop   ? "staging"
+           : quad ? "quad broadcasts"
+                  : "shuffles",
+           products, how, p.n, TENSOR_OUT, INVOCATIONS, warp32 ? 32 : g->subgroup, warp32 ? ", required" : "", bad);
+    return bad == 0;
+}
+/* every way the device can translate them: with what it has, then with neither quads nor the mixed dot product (the
+   fallbacks), each in workgroups of one warp and of two, those also in required subgroups of 32 where it can; and
+   with its cooperative matrices where it has them, in workgroups of one warp and of two in subgroups of 32 */
+static int run_tensor(void) {
+    Gpu g = {0};
+    if (!gpu_open(&g, 1)) {
+        printf("tensor: no device with subgroups of 32 or more lanes and shuffles in compute: skipped\n");
+        return 1;
+    }
+    printf("tensor device: %s (quads in compute %d, shaderFloat16 %d, mixed dot product %d, subgroups of 32 %d, "
+           "cooperative matrices %d)\n",
+           g.name, g.quad, g.float16, g.mixed_dot, g.warp32, g.coop != 0);
+    int ok = 1;
+    for (int fallback = 0; fallback < 2; fallback++)
+        for (u32 run = 0; run < 3; run++) { /* 32, 64, 64 in subgroups of 32 */
+            if (run == 2 && !g.warp32) continue;
+            for (int exact = 1; exact >= 0; exact--)
+                ok &= run_tensor_with(&g, run ? 64 : 32, run == 2, !fallback && g.quad, !fallback && g.mixed_dot, 0,
+                                      exact);
+        }
+    for (u32 run = 0; run < 2 && g.coop; run++)
+        for (int exact = 1; exact >= 0; exact--)
+            ok &= run_tensor_with(&g, run ? 64 : 32, 1, g.quad, g.mixed_dot, 1, exact);
+    vkDestroyDevice(g.device, NULL);
+    vkDestroyInstance(g.instance, NULL);
+    return ok;
+}
+
+int main(void) {
+    Gpu g = {0};
+    if (!gpu_open(&g, 0)) {
+        printf("no Vulkan 1.3 device with shaderFloat64 and shaderInt64: skipped\n");
+        return 77;
+    }
+    printf("device: %s\n", g.name);
+    int ok = run_program(&g, "integer", integer_program);
+    ok &= run_program(&g, "float", float_program);
+    ok &= run_program(&g, "flow", flow_program);
+    ok &= run_program(&g, "wide", wide_program);
+
+    ok &= run_program(&g, "stores", stores_program);
+    vkDestroyDevice(g.device, NULL);
+    vkDestroyInstance(g.instance, NULL);
+    /* on a device of its own, which volk's functions are then loaded for */
+    ok &= run_tensor();
+    return ok ? 0 : 1;
+}

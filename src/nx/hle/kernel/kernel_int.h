@@ -75,6 +75,8 @@ int sleep_nl(KThread* t, i64 timeout);
 int kthread_live_count(void);
 /* a thread with no reference: the first handle takes one, as its host thread does from its start to its exit */
 KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core);
+/* h, the thread's own handle, where an Ounce program's thread finds it in its TLS (thread.c) */
+void kthread_set_own_handle(KThread* t, u32 h);
 void kthread_start(KThread* t);
 void svc_exit_thread(KThread* t);
 void process_exit(int code);
@@ -113,6 +115,7 @@ u32 svc_unmap_physical(u64 addr, u64 size);
 u32 svc_get_info(u32 id0, u32 h, u64 id1, u64* out);
 u32 svc_set_mem_perm(u64 addr, u64 size, u32 perm);
 u32 svc_set_mem_attr(u64 addr, u64 size, u32 mask, u32 attr);
+u32 svc_set_gpu_mem_attr(u64 addr, u64 size, u32 mask, u32 attr);
 /* the new object comes back in *out, for svc.c to make its handle */
 u32 svc_tmem_new(u64 addr, u64 size, u32 perm, KTmem** out);
 u32 svc_codemem_new(u64 addr, u64 size, KObj** out);
@@ -220,6 +223,13 @@ typedef struct {
     /* for kernel_core_report, under core_lk: when each core's holder took it (plat_ns), and per core the time it was
        held and the time threads waited for it */
     u64 core_since[NCORES], core_held_ns[NCORES], core_wait_ns[NCORES];
+    /* how late holders let go for a waiter of better priority, under core_lk: when the waiter flagged core k's holder
+       (plat_ns, 0 for none), and per core the hand-offs over 10 ms late, the latest one and its holder (kt_ix) */
+    u64 preempt_since[NCORES], preempt_late[NCORES], preempt_max_ns[NCORES];
+    u32 preempt_max_by[NCORES];
+    /* kernel_core_watch's, on the frontend's thread: the flag time it last told of per core, and its lines so far */
+    u64 preempt_said[NCORES];
+    u32 preempt_lines;
     /* a save state's load (thread.c): the guest threads' host threads running, retire asking them to end, and the
        service wait each is in (kthread_wait), where it is woken to */
     int nhost, retire;
@@ -234,6 +244,11 @@ typedef struct {
        on a mutex came to it (MWAIT_*) */
     u8 handed[KTHREAD_MAX];
     u8 mwait_how[KTHREAD_MAX];
+    /* for the thread dump, each written by its own thread with relaxed stores: when it last left an SVC (plat_ns),
+       how often its game code called the poll (a waiter flagged its core), and its host thread */
+    u64 svc_ns[KTHREAD_MAX];
+    u32 polls[KTHREAD_MAX];
+    u32 host_tid[KTHREAD_MAX]; /* its host thread (plat_tid), to find it in a debugger */
 } HostThread;
 /* thread's thread state, t_hle.thread (hle.h's) */
 enum { KT_LATER = 16 };

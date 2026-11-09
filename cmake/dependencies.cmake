@@ -44,8 +44,9 @@ function(snx_quiet)
 endfunction()
 
 # LZ4's block decoder for NSO segments (src/nx/loader/loader.c, src/nx/runtime/loader.c) and hactool's NSO
-# extraction. Only lib/lz4.c is built (BSD-2-Clause): the rest of LZ4 is its frame format, the HC compressor and the
-# command-line program, none of which an NSO uses
+# extraction, beside ZBIC (snx_zbic, after zstd below) for the segments an Ounce game compresses so. Only lib/lz4.c
+# is built (BSD-2-Clause): the rest of LZ4 is its frame format, the HC compressor and the command-line program, none
+# of which an NSO uses
 if(SNX_BUILD_NX)
     CPMAddPackage(NAME lz4 VERSION 1.10.0
                   URL https://github.com/lz4/lz4/releases/download/v1.10.0/lz4-1.10.0.tar.gz
@@ -133,6 +134,15 @@ if(SNX_BUILD_NX OR SNX_BUILD_3DS OR BUILD_TESTING)
     target_include_directories(snx_zstd PUBLIC "${zstd_SOURCE_DIR}/lib")
     target_compile_definitions(snx_zstd PRIVATE ZSTD_DISABLE_ASM=1 ZSTD_MULTITHREAD_SUPPORT_DEFAULT=0)
     snx_quiet(snx_zstd)
+    # ZBIC (src/common/utilities/zbic.c), the other compression of an Ounce game's NSO segments: zstd's decoder from
+    # these sources once more, its symbols local or renamed, with ZBIC's magic and FSE table headers. Everything that
+    # decodes NSO segments with snx_lz4 takes both
+    if(TARGET snx_lz4)
+        add_library(snx_zbic STATIC "${PROJECT_SOURCE_DIR}/src/common/utilities/zbic.c")
+        target_include_directories(snx_zbic PRIVATE "${zstd_SOURCE_DIR}/lib")
+        snx_quiet(snx_zbic)
+        target_link_libraries(snx_lz4 INTERFACE snx_zbic)
+    endif()
 endif()
 
 # the Vita driver (src/vita), which the root CMakeLists.txt adds when it is built and the build isn't tools-only: its
@@ -299,6 +309,16 @@ if((SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY) OR SNX_BUILD_3DS OR snx_vita_runtime OR
                   URL https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz
                   URL_HASH SHA256=${snx_ffmpeg_sha256}
                   DOWNLOAD_ONLY YES)
+    # dav1d (BSD-2-Clause) for the Ounce's AV1 movies, which FFmpeg decodes through it: built with meson and ninja,
+    # which cmake/dav1d.cmake runs, before FFmpeg
+    if(SNX_BUILD_NX)
+        set(snx_dav1d_sha256 686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5)
+        CPMAddPackage(NAME dav1d VERSION 1.5.4
+                      URL https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/dav1d-1.5.4.tar.xz
+                      URL_HASH SHA256=${snx_dav1d_sha256}
+                      DOWNLOAD_ONLY YES)
+        include("${PROJECT_SOURCE_DIR}/cmake/dav1d.cmake")
+    endif()
     include("${PROJECT_SOURCE_DIR}/cmake/ffmpeg.cmake")
 endif()
 

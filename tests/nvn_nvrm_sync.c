@@ -36,6 +36,15 @@ int gmem_write(u64 address, const void* data, u64 size) {
     abort();
 }
 void gpu_kick(void) { abort(); }
+/* native memory pools (nvn_object.c's): none here */
+int gsv_native_memory_cpu(u32 memory, u64* cpu, u64* size) {
+    (void)memory, (void)cpu, (void)size;
+    return 0;
+}
+u32 native_video_memory_pitch(u32 memory) {
+    (void)memory;
+    return 0;
+}
 
 /* ---- the driver stub: what it was called with, the sync it saw, and what it answers */
 static struct {
@@ -86,6 +95,10 @@ void kthread_unblock(KThread* t) { (void)t; }
 void core_enter(KThread* t) { (void)t; }
 void core_leave(KThread* t) { (void)t; }
 u64 guest_ticks(void) { return 0; }
+u64 guest_gpu_ticks(void) { return 0; }
+const char* g_shader_sm86_dump; /* shader.c's: no dumps */
+int g_ounce;                    /* main.c's: not an Ounce program */
+int g_gob_native;               /* blocklinear.c's: the Maxwell GOB */
 void loader_segments(LoaderSegEach each, void* ctx) {
     (void)each;
     (void)ctx;
@@ -111,6 +124,10 @@ u64 gmmu_space_alloc(u64 size, u64 align) {
     (void)size;
     (void)align;
     return 0;
+}
+void gmem_read_code(u64 gva, void* dst, u64 size) {
+    (void)gva;
+    memset(dst, 0, size);
 }
 void gmmu_space_map(u64 gva, u64 cpu, u64 size) {
     (void)gva;

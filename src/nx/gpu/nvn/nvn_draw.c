@@ -22,6 +22,7 @@
 #include "nx/gpu/nvn/nvn_tex.h"
 #include "nx/gpu/nvn/nvn_tic.h"
 #include "nx/gpu/nvn/nvn_blend.h"
+#include "nx/runtime/main.h"
 #include "nx/runtime/options.h"
 #include "nx/gpu/renderer.h"
 #include "nx/gpu/shader/shader.h"
@@ -82,11 +83,19 @@ static void viewports_dirty(NvnDraw* d, u32 first, u32 count) {
 }
 
 /* Bytes [p, p + n) within one inline bank written: the renderer's copy takes that bank's dirty span at the next
-   draw. A base vertex change touches four bytes in each stage's bank 0, not the unchanged bytes between stages. */
+   draw. A base vertex change touches four bytes in each stage's bank 0, not the unchanged bytes between stages. The
+   root tables follow the banks and have a span of their own */
 static void inl_wrote(NvnDraw* d, const u8* p, u32 n) {
     uintptr_t at = (uintptr_t)p, base = (uintptr_t)&d->inl;
     if (at < base || at - base >= sizeof d->inl) return; /* compute's blocks */
     u32 off = (u32)(at - base);
+    if (off >= offsetof(DsInline, root)) {
+        u32 first = off - (u32)offsetof(DsInline, root);
+        d->dirty |= D_INLINE;
+        if (first < d->root_lo) d->root_lo = (u16)first;
+        if (first + n > d->root_hi) d->root_hi = (u16)(first + n);
+        return;
+    }
     u32 bank = off >= offsetof(DsInline, bank2);
     u32 bytes = bank ? DS_INLINE_BANK2 : DS_INLINE_BANK0;
     if (bank) off -= offsetof(DsInline, bank2);
@@ -168,10 +177,14 @@ void nvn_draw_init(NvnDraw* d, u32 owner) {
         d->inl_hi[0][s] = DS_INLINE_BANK0;
         d->inl_hi[1][s] = DS_INLINE_BANK2;
     }
+    d->root_lo = 0;
+    d->root_hi = DS_ROOT_BYTES;
 }
 
 /* ---- conversions of NVN's enumerants */
-/* an NVN shader stage's graphics stage (DS_GFX_STAGES' order: VS, TCS, TES, GS, FS), -1 for compute */
+/* an NVN shader stage's graphics stage (DS_GFX_STAGES' order: VS, TCS, TES, GS, FS, task, mesh), -1 for compute. The
+   game's driver binds the task and mesh stages' buffers and handles apart from the others' (constant buffer groups
+   9 and 0xb, and their own handle banks), so they have bindings of their own */
 static int gfx_stage(i32 nvn) {
     switch (nvn) {
         case NVN_SHADER_STAGE_VERTEX: return 0;
@@ -179,6 +192,8 @@ static int gfx_stage(i32 nvn) {
         case NVN_SHADER_STAGE_TESS_EVALUATION: return 2;
         case NVN_SHADER_STAGE_GEOMETRY: return 3;
         case NVN_SHADER_STAGE_FRAGMENT: return 4;
+        case NVN_SHADER_STAGE_TASK: return DS_TASK;
+        case NVN_SHADER_STAGE_MESH: return DS_MESH;
     }
     return -1;
 }
@@ -402,6 +417,9 @@ static void make_programs(NvnDraw* d) {
     p.tess_params = d->tess_params;
     p.clip_enable = 0xff; /* NVN has no clip distance enables: those the program writes clip */
     p.xfb_on = d->tf_on;
+    p.task = d->task;
+    p.mesh = d->mesh;
+    p.mesh_key = d->mesh_key;
     keep(&d->ds.prog, &p, sizeof p, &d->ds.gen[DS_PROGRAMS]);
     keep(&d->ds.xfb, &d->xfb, sizeof d->xfb, &d->ds.gen[DS_XFB]);
 }
@@ -668,6 +686,16 @@ static void sync(NvnDraw* d, i32 base_vertex, u32 base_instance) {
                 d->inl_hi[bank][s] = 0;
             }
         }
+        if (d->root_lo < d->root_hi) {
+            u8* kept = d->ds.inl.root + d->root_lo;
+            const u8* made = d->inl.root + d->root_lo;
+            if (memcmp(kept, made, (u32)(d->root_hi - d->root_lo))) {
+                memcpy(kept, made, (u32)(d->root_hi - d->root_lo));
+                changed = 1;
+            }
+        }
+        d->root_lo = DS_ROOT_BYTES;
+        d->root_hi = 0;
         if (changed) new_gen(&d->ds.gen[DS_INLINE]);
     }
     d->dirty = 0;
@@ -732,6 +760,28 @@ static void draw_arrays(NvnDraw* d, u64 payload, u32 size) {
     if (d->render_off) return;
     draw_fixed_state(d, &dc);
     sync(d, 0, dc.base_instance);
+    if (g_renderer->draw) g_renderer->draw(&d->ds, &dc, &d->own);
+}
+/* An Ounce's mesh draw (OP_DRAW_MESH): the renderer draws it with the task, mesh and fragment programs. An indirect
+   one's records stay where the GPU reads them, as an indirect draw's do */
+static void draw_mesh(NvnDraw* d, u64 payload, u32 size) {
+    NvnPDrawMesh r = {0}; /* past the record's bytes */
+    memcpy(&r, GP(payload), size < sizeof r ? size : sizeof r);
+    DrawCall dc = {0};
+    if (r.ind)
+        indirect(&dc, r.ind, r.mdi_count, r.mdi_max, r.mdi_stride, r.form & NVN_MESH_3D ? 12 : 8);
+    else {
+        if (r.count <= 0 || r.first < 0) return;
+        dc.first = (u32)r.first;
+        dc.count = (u32)r.count;
+        dc.instances = 1;
+    }
+    dc.mesh = 1;
+    dc.params = 0;
+    dc.topology = 4; /* the triangles of a mesh program (ShMesh.primitive_vertices) */
+    if (d->render_off) return;
+    draw_fixed_state(d, &dc);
+    sync(d, 0, 0);
     if (g_renderer->draw) g_renderer->draw(&d->ds, &dc, &d->own);
 }
 /* how far an indirect draw's indices may reach, which NVN doesn't say (DrawElementsIndirect takes the index buffer's
@@ -822,8 +872,10 @@ static void bind_buffer(NvnDraw* d, u32 op, const NvnPBindBuf* r) {
         d->dirty |= D_BIND;
     } else {
         /* Each graphics stage has sixteen 16-byte storage descriptors in bank 0. The tessellation stages use the
-           two tables between vertex and geometry, even when no game in the original trace used them. */
-        static const u32 table[DS_GFX_STAGES] = {0x110, 0x210, 0x310, 0x410, 0x510};
+           two tables between vertex and geometry, even when no game in the original trace used them. An Ounce's
+           task and mesh stages have theirs at 0x670 and 0x770, where its driver writes them (BindStorageBuffer's
+           table, and the programs' reads) */
+        static const u32 table[DS_GFX_STAGES] = {0x110, 0x210, 0x310, 0x410, 0x510, 0x670, 0x770};
         u32 base = table[s];
         u32 at = base + 16 * (u32)r->index;
         put64(d, d->inl.bank0[s], DS_INLINE_BANK0, at, r->address);
@@ -862,13 +914,15 @@ static void tf_buffers(NvnDraw* d) {
     }
     d->dirty |= D_BIND;
 }
-static void bind_program(NvnDraw* d, u64 payload) {
-    NvnPBindProgram r;
+/* size: the record's payload bytes, which stop after the first six stages for a game other than an Ounce one
+   (nvn_cmd.c) */
+static void bind_program(NvnDraw* d, u64 payload, u32 size) {
+    NvnPBindProgram r = {0};
     static const i32 nvn_stage[DS_PROGRAM_SLOTS] = {NVN_SHADER_STAGE_VERTEX,       NVN_SHADER_STAGE_VERTEX,
                                                     NVN_SHADER_STAGE_TESS_CONTROL, NVN_SHADER_STAGE_TESS_EVALUATION,
                                                     NVN_SHADER_STAGE_GEOMETRY,     NVN_SHADER_STAGE_FRAGMENT};
     u32 j;
-    memcpy(&r, GP(payload), sizeof r);
+    memcpy(&r, GP(payload), size < sizeof r ? size : sizeof r);
     for (j = 0; j < DS_PROGRAM_SLOTS; j++) {
         i32 n = nvn_stage[j];
         const NvnStage* st = &r.st[n];
@@ -906,6 +960,27 @@ static void bind_program(NvnDraw* d, u64 payload) {
             d->tess_params = (combined & 0x33) | output << 8;
         }
     }
+    /* an Ounce's task and mesh stages (bits 6 and 7, as the driver's BindProgram reads them): the programs, their
+       constants (bank 1, as the other stages') and their fields. A record of another game has neither stage */
+    for (i32 n = NVN_SHADER_STAGE_TASK; n <= NVN_SHADER_STAGE_MESH; n++) {
+        const NvnStage* st = &r.st[n];
+        int s = gfx_stage(n);
+        if (!((u32)r.stages >> n & 1)) continue;
+        /* the program's, of which each stage takes its own fields */
+        DsMeshKey k = st->data ? nvn_program_mesh(r.serial) : (DsMeshKey){0};
+        if (n == NVN_SHADER_STAGE_TASK) {
+            d->task = st->data ? st->data + st->off : 0;
+            d->mesh_key.task_threads = k.task_threads;
+            d->mesh_key.task_payload = k.task_payload;
+        } else {
+            d->mesh = st->data ? st->data + st->off : 0;
+            k.task_threads = d->mesh_key.task_threads;
+            k.task_payload = d->mesh_key.task_payload;
+            d->mesh_key = k;
+        }
+        d->bind.cb_addr[s][1] = st->data ? st->data + 256 * (u64)st->cb : 0;
+        d->bind.cb_size[s][1] = st->data ? 0x10000 : 0;
+    }
     if ((u32)r.stages & NVN_SHADER_STAGE_FRAGMENT_BIT) {
         d->sample_shading = (u8)(r.sample_shading >> 8); /* as its SetShaders applied it */
         d->dirty |= D_RASTER;
@@ -913,8 +988,12 @@ static void bind_program(NvnDraw* d, u64 payload) {
     if ((u32)r.stages & NVN_SHADER_STAGE_COMPUTE_BIT) {
         const NvnStage* st = &r.st[NVN_SHADER_STAGE_COMPUTE];
         d->dx.code = st->data ? st->data + st->off : 0;
+        /* an Ounce program has no NVN header with its size before its code: its constants' offset in the code area,
+           the code's bytes rounded up to 256, bounds it (a Switch program's header does, compute.c's cs_read_code) */
+        d->dx.code_bytes = g_ounce && st->data ? 256u * st->cb : 0;
         d->dx.block[0] = r.block[0], d->dx.block[1] = r.block[1], d->dx.block[2] = r.block[2];
         d->dx.shared = r.off_a;
+        nvn_program_c0(r.serial, d->c0rec);
         /* bank 1: the program's constants, after its code */
         d->dx.cb_addr[1] = st->data && st->cb_size ? st->data + 256 * (u64)st->cb : 0;
         d->dx.cb_size[1] = 256 * (u32)st->cb_size;
@@ -1058,6 +1137,34 @@ static void clear_texture(NvnDraw* d, u64 payload) {
 }
 
 /* a compute dispatch: its grid (or the GPU's words at ind) in bank 0 at 0x200, and the compute stage's state */
+/* An Ounce compute program's packed c[0] (nvn_program_c0), as the driver's macro 0xeac writes it into x's bank 0 from
+   the tables the binds keep: the buffers in bank 0 from 0x210 and 0x310, the handles in bank 2. A grid the GPU reads
+   (indirect) is not in it yet */
+static void c0_packed(const NvnDraw* d, DispatchState* x) {
+    static const u16 handles[5] = {C2_TEX, C2_SEPTEX, C2_SAMP, C2_IMG, 0}; /* records 11-15; addresses have none */
+    const u8* rec = d->c0rec;
+    u8 c0[DS_INLINE_BANK0] = {0};
+    u32 at = 0x10, size = (u32)rec[18] | (u32)rec[19] << 8;
+    snx_st_le32(c0, (size + 15) & ~15u);
+    for (u32 k = 0; k < 3; k++) snx_st_le32(c0 + 4 + 4 * k, x->grid[k]);
+    for (u32 k = 0; k < NVN_ROOT_TABLES; k++) {
+        u32 n = rec[1 + k]; /* a byte: words of the table, within NVN_ROOT_WORDS */
+        for (u32 w = 0; w < n && w < NVN_ROOT_WORDS && at + 4 * w + 4 <= sizeof c0; w++)
+            memcpy(c0 + at + 4 * w, d->dx.root + 4 * NVN_ROOT_WORDS * k + 4 * w, 4);
+        at += (4 * n + 15) & ~15u;
+    }
+    for (u32 kind = 0; kind < 2; kind++) /* uniform, then storage buffers: {low, high, size, 0} */
+        for (u32 i = 0; i < (rec[9 + kind] & 0x3fu) && i < 16 && at + 16 <= sizeof c0; i++, at += 16)
+            memcpy(c0 + at, d->dx.bank0 + (kind ? 0x310 : 0x210) + 16 * i, 12);
+    for (u32 l = 0; l < 5; l++) {
+        u32 n = rec[11 + l];
+        if (l == 4 && n) LOG_LIMIT(1, "nvn: a compute program's c[0] has %u addresses, which the runtime gives as 0\n", n);
+        for (u32 i = 0; i < n && at + 8 <= sizeof c0; i++, at += 8)
+            if (handles[l] && handles[l] + 8 * i + 4 <= DS_INLINE_BANK2)
+                memcpy(c0 + at, d->dx.bank2 + handles[l] + 8 * i, 4);
+    }
+    memcpy(x->bank0, c0, sizeof c0);
+}
 static void dispatch(NvnDraw* d, u64 payload) {
     const NvnPDispatch* r = NVN_OBJ(const NvnPDispatch, payload);
     u32 g[3];
@@ -1070,6 +1177,12 @@ static void dispatch(NvnDraw* d, u64 payload) {
         snx_st_le32(d->dx.bank0 + 0x200, g[0]);
         snx_st_le32(d->dx.bank0 + 0x204, g[1]);
         snx_st_le32(d->dx.bank0 + 0x208, g[2]);
+    }
+    if (g_shader_sm86 && d->c0rec[0] == 1) {
+        DispatchState x = d->dx;
+        c0_packed(d, &x);
+        g_renderer->dispatch(&x);
+        return;
     }
     g_renderer->dispatch(&d->dx);
 }
@@ -1239,7 +1352,7 @@ int nvn_draw_record(NvnDraw* d, u32 op, u64 payload, u32 size) {
             d->restart = NVN_OBJ(const NvnPPrimRestart, payload)->on != 0;
             d->restart_index = NVN_OBJ(const NvnPPrimRestart, payload)->index;
             return 1;
-        case OP_BIND_PROGRAM: bind_program(d, payload); return 1;
+        case OP_BIND_PROGRAM: bind_program(d, payload, size); return 1;
         case OP_BIND_STATE: bind_state(d, payload); return 1;
         case OP_BIND_VATTR: {
             const NvnPBindVAttr* r = NVN_OBJ(const NvnPBindVAttr, payload);
@@ -1337,6 +1450,15 @@ int nvn_draw_record(NvnDraw* d, u32 op, u64 payload, u32 size) {
             if (r->size && r->size <= (u64)size - sizeof *r) gmem_write(r->dst, GP(payload + sizeof *r), r->size);
             return 1;
         }
+        case OP_PUSH_CONSTANTS: { /* into the root table, cut at its end */
+            const NvnPPush* r = NVN_OBJ(const NvnPPush, payload);
+            u32 bytes = 4 * (r->words + 1u), at = r->offset & ~3u, room = 4 * NVN_ROOT_WORDS - at;
+            if (sizeof *r + (u64)bytes > (u64)size) return 1;
+            u8* to = (r->compute ? d->dx.root : d->inl.root) + 4 * NVN_ROOT_WORDS * r->table + at;
+            memcpy(to, GP(payload + sizeof *r), bytes < room ? bytes : room);
+            if (!r->compute) inl_wrote(d, to, bytes < room ? bytes : room);
+            return 1;
+        }
         case OP_BARRIER: {
             i32 bits;
             memcpy(&bits, GP(payload), 4);
@@ -1394,6 +1516,7 @@ int nvn_draw_record(NvnDraw* d, u32 op, u64 payload, u32 size) {
         case OP_DISPATCH: dispatch(d, payload); return 1;
         case OP_DRAW: draw_arrays(d, payload, size); return 1;
         case OP_DRAW_IDX: draw_elements(d, payload, size); return 1;
+        case OP_DRAW_MESH: draw_mesh(d, payload, size); return 1;
     }
     return 0;
 }

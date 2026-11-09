@@ -38,11 +38,11 @@ endfunction()
 # what the tests reach that this list misses
 if(SNX_TEST_SANITIZERS)
     cmake_language(DEFER DIRECTORY "${PROJECT_SOURCE_DIR}" CALL snx_test_sanitize
-        # the common code: the platform layer, network, filesystems, LZ4 and xxHash, the Vulkan setup the frontends
-        # share, the launcher's HTTPS and the roots it carries, the zip reader of VPKs and APKs, the glTF reader of a
-        # Mii's parts
+        # the common code: the platform layer, network, filesystems, LZ4, ZBIC and xxHash, the Vulkan setup the
+        # frontends share, the launcher's HTTPS and the roots it carries, the zip reader of VPKs and APKs, the glTF
+        # reader of a Mii's parts
         scarletnx-common scarletnx-platform scarletnx-net scarletnx-ldn scarletnx-filesystem snx_demangle snx_lz4
-        snx_xxhash snx_vk_common snx_https snx_cacert snx_zip snx_cgltf
+        snx_zbic snx_xxhash snx_vk_common snx_https snx_cacert snx_zip snx_cgltf
         snx-logscan
         # the recompiler and its backends
         snx_llvm snx_arm_llvm snx_arm_decode scarletnx-recompiler scarletnx-recompiler-shared
@@ -691,6 +691,11 @@ if(SNX_BUILD_3DS)
     add_test(NAME 3ds_uds_delayed_relay COMMAND snx-test-3ds-uds --delay)
     set_tests_properties(3ds_uds_delayed_relay PROPERTIES TIMEOUT 60)
     set_tests_properties(3ds_uds_relay PROPERTIES TIMEOUT 60)
+    # nim:aoc's Initialize answers the no-network error a console gives (tests/3ds_nim_aoc.c)
+    add_executable(snx-test-3ds-nim-aoc 3ds_nim_aoc.c support/3ds_guest.c)
+    snx_test_target(snx-test-3ds-nim-aoc 11)
+    target_link_libraries(snx-test-3ds-nim-aoc PRIVATE snx_ctr_process scarletnx-ldn snx_enet)
+    add_test(NAME 3ds_nim_aoc COMMAND snx-test-3ds-nim-aoc)
     add_executable(snx-test-3ds-uds-offline 3ds_uds_offline.c support/3ds_guest.c)
     snx_test_target(snx-test-3ds-uds-offline 11)
     target_link_libraries(snx-test-3ds-uds-offline PRIVATE snx_ctr_process scarletnx-ldn snx_enet)
@@ -1106,7 +1111,7 @@ snx_hookgen(snx-test-nvn-present-flip SPEC "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn
 add_test(NAME nvn_present_flip COMMAND snx-test-nvn-present-flip)
 # the NvRm sync conversions against the driver's sync layout: what they hand its code and take back
 add_executable(snx-test-nvn-nvrm-sync nvn_nvrm_sync.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_object.c"
-    "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_state.c")
+    "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_state.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/shader/sm86_decode.c")
 snx_test_target(snx-test-nvn-nvrm-sync 11)
 target_include_directories(snx-test-nvn-nvrm-sync PRIVATE "${PROJECT_SOURCE_DIR}/src")
 target_link_libraries(snx-test-nvn-nvrm-sync PRIVATE m)
@@ -1124,7 +1129,8 @@ add_test(NAME nvn_queue_lifetime COMMAND snx-test-nvn-queue-lifetime)
 add_executable(snx-test-nvn-names nvn_names.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_cmd.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_draw.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_object.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_queue.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_tex.c"
-    "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_tic.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_state.c")
+    "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_tic.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_state.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/gpu/shader/sm86_decode.c")
 snx_test_target(snx-test-nvn-names 11)
 target_include_directories(snx-test-nvn-names PRIVATE "${PROJECT_SOURCE_DIR}/src")
 target_link_libraries(snx-test-nvn-names PRIVATE m)
@@ -1132,7 +1138,7 @@ snx_hookgen(snx-test-nvn-names SPEC "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn.ho
 add_test(NAME nvn_names COMMAND snx-test-nvn-names)
 foreach(bad IN ITEMS
         unknown_type 2 "unknown type 'u128'"
-        stack_argument 2 "would be on the stack"
+        stack_buffer 2 "i is on the stack, which a buffer can't be"
         duplicate_symbol 4 "f is hooked on line 2 too"
         handler_mismatch 3 "h takes other arguments on line 2"
         argument_c 2 "'c' can't name an argument"
@@ -1699,6 +1705,12 @@ add_executable(snx-test-hid-touch hid_touch.c "${PROJECT_SOURCE_DIR}/src/nx/runt
 snx_test_target(snx-test-hid-touch 11)
 target_link_libraries(snx-test-hid-touch PRIVATE scarletnx-common)
 add_test(NAME hid_touch COMMAND snx-test-hid-touch)
+
+# the Ounce's native video service: layouts, descriptors and a codec's queues (hle/services/native_video_core.c)
+add_executable(snx-test-native-video native_video.c "${PROJECT_SOURCE_DIR}/src/nx/hle/services/native_video_core.c")
+snx_test_target(snx-test-native-video 99)
+target_link_libraries(snx-test-native-video PRIVATE scarletnx-common)
+add_test(NAME native_video COMMAND snx-test-native-video)
 
 add_executable(snx-test-hid-motion hid_motion.c "${PROJECT_SOURCE_DIR}/src/nx/hle/services/hid_motion.c")
 snx_test_target(snx-test-hid-motion 11)
@@ -2631,7 +2643,8 @@ add_test(NAME astc_decode COMMAND snx-test-astc)
 # console's part list and layout, every part's zlib stream, its textures decoded by the CPU references against what
 # they were drawn from, its shapes' attributes and triangles, each file no bigger than the console's
 add_executable(snx-test-mii-model mii_model.c support/astc.c support/bcn.c
-               "${PROJECT_SOURCE_DIR}/src/common/utilities/mii_db.c")
+               "${PROJECT_SOURCE_DIR}/src/common/utilities/mii_db.c"
+               "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/blocklinear.c")
 snx_test_target(snx-test-mii-model 99)
 target_include_directories(snx-test-mii-model PRIVATE "${PROJECT_SOURCE_DIR}/src")
 target_link_libraries(snx-test-mii-model PRIVATE snx_libdeflate) # mii_model.c deflates the parts, the test inflates
@@ -2747,6 +2760,11 @@ add_executable(snx-test-nvn-control nvn_control.c support/nvn_control.c)
 snx_test_target(snx-test-nvn-control 23)
 add_test(NAME nvn_control COMMAND snx-test-nvn-control)
 
+add_executable(snx-test-nvn-section nvn_section.c)
+snx_test_target(snx-test-nvn-section 99)
+target_include_directories(snx-test-nvn-section PRIVATE "${PROJECT_SOURCE_DIR}/src")
+add_test(NAME nvn_section COMMAND snx-test-nvn-section)
+
 # the shared fonts pl.c hands out when a game folder has none: the stand-ins compiled in (cmake/shared_fonts.cmake)
 if(NOT SNX_TOOLS_ONLY)
     add_executable(snx-test-pl-fonts pl_fonts.c "${PROJECT_SOURCE_DIR}/src/nx/hle/services/pl_font.c" "${PROJECT_BINARY_DIR}/generated/shared_fonts.c")
@@ -2830,7 +2848,7 @@ if(UNIX)
         "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/engines.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/maxwell3d.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/write_pages.c"
         "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/draw_state.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/draw_state.c"
         "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/mme.c"
-        "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/dma.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/dma.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/blocklinear.c"
         support/dma_ref.c own_stub.c)
     snx_test_target(snx-test-gpu-park 23)
     target_link_libraries(snx-test-gpu-park PRIVATE scarletnx-common) # gpu.c says why a thread did not start
@@ -2846,9 +2864,18 @@ add_test(NAME shipped_shaders COMMAND snx-test-shipped-shaders)
 add_executable(snx-test-shipped-pass shipped_pass.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/shipped_pass.c"
                "${PROJECT_SOURCE_DIR}/src/nx/gpu/shader/shipped.c")
 snx_test_target(snx-test-shipped-pass 99)
+target_link_libraries(snx-test-shipped-pass PRIVATE snx_zstd) # an Ounce game's .zs files
 include("${PROJECT_SOURCE_DIR}/cmake/ship_walk.cmake")
 snx_ship_walk("${PROJECT_SOURCE_DIR}/src/nx/gpu/shipped_pass.c")
 add_test(NAME shipped_pass COMMAND snx-test-shipped-pass)
+# ZBIC, the other compression of an Ounce game's NSO segments (common/utilities/zbic.c), on a frame of synthetic text
+if(TARGET snx_zbic)
+    add_executable(snx-test-zbic zbic.c)
+    snx_test_target(snx-test-zbic 99)
+    target_include_directories(snx-test-zbic PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    target_link_libraries(snx-test-zbic PRIVATE snx_zbic snx_zstd)
+    add_test(NAME zbic COMMAND snx-test-zbic)
+endif()
 
 add_executable(snx-test-etc2 etc2_decode.c support/etc2.c)
 snx_test_target(snx-test-etc2 23)
@@ -3148,6 +3175,21 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
         target_link_libraries(snx-test-shader-structure PRIVATE m)
     endif()
     add_test(NAME shader_structure COMMAND snx-test-shader-structure)
+    # the SM86 frontend (gpu/shader/sm86.h): the decoder on words made by NAK's encoding rules, the search for
+    # programs, and small translations, which spirv-val checks when it is on PATH (shader_sm86_test.py, which passes it
+    # each module as an argument: cmd.exe refused the quoted command system() gave it)
+    add_executable(snx-test-shader-sm86 shader_sm86.c support/spv_eval.c)
+    snx_test_target(snx-test-shader-sm86 23)
+    target_link_libraries(snx-test-shader-sm86 PRIVATE snx_shader)
+    if(NOT WIN32)
+        target_link_libraries(snx-test-shader-sm86 PRIVATE m)
+    endif()
+    if(SNX_SPIRV_VAL AND Python3_Interpreter_FOUND)
+        add_test(NAME shader_sm86 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/shader_sm86_test.py"
+                 --test $<TARGET_FILE:snx-test-shader-sm86> --validator "${SNX_SPIRV_VAL}")
+    else()
+        add_test(NAME shader_sm86 COMMAND snx-test-shader-sm86 "${CMAKE_CURRENT_BINARY_DIR}")
+    endif()
     if(NOT CMAKE_CROSSCOMPILING)
         # the SVC registers tools/svcgen lays out from src/nx/hle/svc/hos.svc, in both ABIs
         include("${PROJECT_SOURCE_DIR}/cmake/svcgen.cmake")
@@ -3202,6 +3244,11 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
         snx_test_target(snx-test-vk-pipeline-workers 11)
         target_link_libraries(snx-test-vk-pipeline-workers PRIVATE snx_vk_common)
         add_test(NAME vk_pipeline_workers COMMAND snx-test-vk-pipeline-workers)
+        # the subgroups a compute pipeline asks for: their size, and whole ones
+        add_executable(snx-test-vk-compute-subgroups vk_compute_subgroups.c "${volk_SOURCE_DIR}/volk.c")
+        snx_test_target(snx-test-vk-compute-subgroups 11)
+        target_link_libraries(snx-test-vk-compute-subgroups PRIVATE snx_vk_common)
+        add_test(NAME vk_compute_subgroups COMMAND snx-test-vk-compute-subgroups)
         # the presentation the vsync setting picks, for every frontend's swapchain
         add_executable(snx-test-vk-present-mode vk_present_mode.c "${volk_SOURCE_DIR}/volk.c")
         snx_test_target(snx-test-vk-present-mode 11)

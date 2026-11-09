@@ -43,8 +43,11 @@ struct NvnDraw {
     NvnVertexStream stream[16];
     u32 nstream;
     NVNbufferRange vbuf[16];
+    u8 c0rec[NVN_C0_RECORD]; /* the bound Ounce compute program's c[0] record (nvn_program_c0) */
     u64 code[DS_PROGRAM_SLOTS];
     u32 prog_on;
+    u64 task, mesh;     /* the bound Ounce task and mesh programs (DsPrograms') */
+    DsMeshKey mesh_key; /* their fields (nvn_program_mesh) */
     NvnTessStage tess_stage[2];
     u32 tess_params;
     ShXfb xfb;            /* the bound program's capture layout (zero: none) */
@@ -56,6 +59,7 @@ struct NvnDraw {
     /* The dirty span of each stage's bank 0 and bank 2. Separate spans leave the unchanged banks between writes
        out of the compare and copy at a draw. */
     u16 inl_lo[2][DS_GFX_STAGES], inl_hi[2][DS_GFX_STAGES];
+    u16 root_lo, root_hi; /* and of the root tables, which every graphics stage shares */
     DsState scratch;  /* a texture's clear, as a target of its own (OP_CLEAR_TEX) */
     DispatchState dx; /* the compute stage's program and bindings, a dispatch's state */
 };

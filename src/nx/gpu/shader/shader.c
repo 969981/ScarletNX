@@ -16,6 +16,8 @@
 #define CRS_DEPTH     16    /* static resolution gives up on a deeper stack */
 
 int (*g_shader_cb_read)(u32 idx, u32 off, u32* out);
+int g_shader_sm86;
+const char* g_shader_sm86_dump;
 
 const u64* shader_words(const u8* code, u32 bytes, u64** copy) {
     u32 i, n = bytes / 8;
@@ -28,11 +30,14 @@ const u64* shader_words(const u8* code, u32 bytes, u64** copy) {
 }
 
 /* each stage binds its own constant buffers in its own descriptor set; compute runs alone and shares the vertex
-   stage's number */
+   stage's number. A mesh pipeline has no vertex and no tessellation stage: its mesh program takes the vertex stage's
+   set and its task program the tessellation control stage's. Thus the five sets of the pipeline layouts stay as they
+   are, and the fragment program keeps set 1 in a mesh pipeline too */
 int shader_vk_set(int stage) {
     switch (stage) {
         case ST_FS: return 1;
-        case ST_TCS: return 2;
+        case ST_TCS:
+        case ST_TS: return 2;
         case ST_TES: return 3;
         case ST_GS: return 4;
         default: return 0;

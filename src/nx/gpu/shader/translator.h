@@ -88,4 +88,27 @@ typedef struct {
    block leaders (a byte a word) and its pops' targets: NULL when the graph is irreducible or the structured form
    can't take it. One allocation, freed with free */
 ShStructure* shader_structure(const u64* insn, u32 n, const u8* leader, const u32* pop_targets);
+/* how a block of shader_structure_graph's graph ends: it runs on into the next block, it always branches, it branches
+   on a condition (its target first, then the next block), a jump table (only shader_structure's), the program ends
+   there (an EXIT that always runs), or control runs off the program's last instruction */
+enum { SHT_FALL, SHT_GOTO, SHT_COND, SHT_SWITCH, SHT_EXIT, SHT_END };
+/* The structure of a graph that another frontend made (sm86_translate.c): n instructions in nb blocks, block b from
+   instruction start[b] (start[0] is 0, then increasing) up to the next block's start, ending as term[b] says, with its
+   successor blocks in succ[2 * b] and succ[2 * b + 1]. A SHT_SWITCH block's targets are the blocks sw_targets[sw_first[b]]
+   up to sw_targets[sw_first[b + 1]] (64 at most), and SHS_CASE's b their first instruction. sw_first has nb + 1 entries,
+   and both are NULL without a switch. The SHS_BODY tokens name instruction indices. NULL when the graph is irreducible
+   or the structured form can't take it. One allocation, freed with free */
+ShStructure* shader_structure_graph(u32 n, u32 nb, const u32* start, const u8* term, const u32* succ,
+                                    const u32* sw_first, const u32* sw_targets);
+/* The fixed function's varyings: the front and back colors (0x280-0x2bf), the fog coordinate (0x2e8) and the 10
+   texture coordinates (0x300-0x39f). SPIR-V has none of them, so each group (a color, the fog, a coordinate: 15 of
+   them) takes generic 17 + its index in every stage. Eden and Ryujinx give each one of the generics a program leaves
+   unused, matched to the previous stage's choice; a program here is translated without the other stages, so the
+   choice is fixed, the last 15 generics, and a program that uses one of those itself as well is refused. A group's
+   index, or -1 for an address of none (forms.c). The SM86 translator moves them the same way */
+#define LEGACY_GENERIC 17u
+int shader_legacy_group(u32 addr);
+/* the generic address a legacy varying's moves to, and group g's first address, for messages */
+u32 shader_legacy_address(u32 addr);
+u32 shader_legacy_base(u32 g);
 #endif

@@ -53,6 +53,7 @@ typedef struct {
     u32 memory_size;
     u8 set, pad[3];
     u64 device;
+    u64 primary; /* the Ounce's primary queue (nvnQueueBuilderSetPrimaryQueue), 0 for none */
 } NvnQueueBuilder;
 #define NVN_QB_SET_COMMAND 0x01u
 #define NVN_QB_SET_COMPUTE 0x02u
@@ -72,7 +73,8 @@ NVN_FITS(NvnQueue, 0x1748);
 /* ---- memory pools and buffers ---- */
 typedef struct {
     u64 device, memory, size;
-    u32 flags, pad;
+    u32 flags;
+    u32 native; /* SetNativeHandleNVX's: the pool is that native memory, not memory and size */
 } NvnPoolBuilder;
 NVN_FITS(NvnPoolBuilder, 0x40);
 /* memory: the storage's guest address (0 for a virtual pool, which has none); gpu: its GPU address, the page table
@@ -82,7 +84,8 @@ NVN_FITS(NvnPoolBuilder, 0x40);
 typedef struct {
     u32 magic, flags;
     u64 memory, size, gpu;
-    u32 nvmap, pad;
+    u32 nvmap;
+    u32 linear_pitch; /* a video image's native memory, written pitch linear: a texture on it reads it so */
 } NvnPool;
 NVN_FITS(NvnPool, 0x100);
 
@@ -201,16 +204,103 @@ typedef struct {
 typedef struct {
     u32 value, declared;
 } NvnTessStage;
-/* st: by NVN shader stage (NVN_SHADER_STAGE_*). off_a: a dual vertex program's VertexA (0 for none), or a compute
-   program's shared memory bytes; block: a compute program's workgroup size */
+/* st: by NVN shader stage (NVN_SHADER_STAGE_*, the Ounce's task and mesh stages too). off_a: a dual vertex
+   program's VertexA (0 for none), or a compute program's shared memory bytes; block: a compute program's workgroup
+   size */
 /* sample_shading: SetSampleShading's mode (NVN_SAMPLE_SHADING_*), which the program's draws take */
+#define NVN_STAGES (NVN_SHADER_STAGE_MESH + 1)
 typedef struct {
     u32 magic, off_a;
-    NvnStage st[6];
+    NvnStage st[NVN_STAGES];
     u64 serial;
     u16 block[3], sample_shading;
 } NvnProgram;
-NVN_FITS(NvnProgram, 0x78);
+NVN_FITS(NvnProgram, 0x98);
+/* The Ounce's compute program (API 231) and the driver's record of its c[0], bytes 0xa8-0xbb of its format 11
+   control section, which its macro 0xeac reads: [0] the kind, 1 for the packed c[0] below; [1-8] the words of root
+   table 0-7 (push constants); [9] uniform buffers; [10] storage buffers; [11] textures; [12] separate textures;
+   [13] separate samplers; [14] images; [15] addresses; [17] bit 0: 16 bytes more at the end; [18-19] c[0]'s bytes.
+   The packed c[0]: its bytes rounded up to 16, the grid, the root tables' words (each table padded to 16 bytes),
+   uniform and storage buffers {address, size, 0}, then the handles' low words {handle, 0} in the order above. Kept
+   by the program's SetShaders (nvn_program_c0), not in its object: the Ounce's program object is 0xa0 bytes (the
+   driver's nvnProgramInitialize zeroes that many) and NvnProgram takes 0x98 of them */
+#define NVN_C0_RECORD 0x14
+/* the Ounce's program builder (API 231+): a program is built with this, then nvnProgramInitializeFromBuilder
+   turns it into a program. The shader list is the Ounce shader-data array (0x18-byte entries); its parsing is
+   deferred to the mesh-shader work */
+typedef struct {
+    u64 device;
+    u32 sample_shading;
+    u32 shader_count;
+    u64 shaders;
+    u32 rt_modules;
+    u64 rt_module_ptr;
+    u32 max_callable, max_trace;
+    u32 rt_flags;
+} NvnProgramBuilder;
+NVN_FITS(NvnProgramBuilder, 0x64);
+
+/* ---- the Ounce's DLSS, device command buffers and device messages (API 231). The runtime keeps their state at
+   the offsets of the game's driver, as its setters and getters do */
+/* a {texture, view} pair */
+typedef struct {
+    u64 texture, view;
+} NvnTexturePair;
+typedef struct {
+    u64 device, pool; /* pool: SetTextureIDs's first argument */
+    u64 memory, memory_size;
+    i32 flags, method, preset, width, height, max_entries;
+    u8 ids[0x80]; /* SetTextureIDs's 128 bytes */
+    u64 last;     /* +0xb8, which SetDefaults clears */
+} NvnDlssNetworkBuilder;
+NVN_FITS(NvnDlssNetworkBuilder, 0xc0);
+/* base: the subrectangles' bases (x, y): input color, depth, motion vectors, bias, output. overlay: the debug
+   overlays (debug layer, full screen, show NaNs, jitter) */
+typedef struct {
+    NvnTexturePair input, output, motion, depth, bias;
+    f32 jitter[2], motion_scale[2], pre_exposure, pad;
+    NvnTexturePair exposure;
+    u8 history_reset, pad2[3];
+    i32 evaluation_index;
+    i32 input_size[2], base[5][2], overlay[4];
+    u64 last; /* +0xc0, which SetDefaults clears */
+} NvnDlssParameters;
+NVN_FITS(NvnDlssParameters, 0xc8);
+/* A network (0x258 bytes, which the driver's Initialize clears): the fields the runtime keeps, at the offsets the
+   driver's Initialize and Resize write them. render: the render sizes its GetOptimalSettings answers (optimal, then the
+   two other pairs, taken to be the largest and the smallest as NGX orders them). output: the size Resize sets,
+   output_max the builder's, which Resize may not exceed */
+typedef struct {
+    u8 pad0[8];
+    u64 device; /* +0x08 */
+    u8 pad1[0x20c - 0x10];
+    i32 method;          /* +0x20c */
+    i32 flags;           /* +0x210 */
+    i32 method2, preset; /* +0x214, +0x218 */
+    i32 render[2];       /* +0x21c, the optimal render size */
+    i32 size[2];         /* +0x224, the output size as the driver keeps it a second time */
+    i32 flag22c;         /* +0x22c, a flag bit of the builder's */
+    i32 render_max[2];   /* +0x230 */
+    i32 render_min[2];   /* +0x238 */
+    i32 output[2];       /* +0x240 */
+    i32 output_max[2];   /* +0x248 */
+    i32 builder_flags;   /* +0x250 */
+    u32 pad2;
+} NvnDlssNetwork;
+NVN_FITS(NvnDlssNetwork, 0x258);
+typedef struct {
+    u64 device;
+    u64 memory, offset, size; /* SetStorage's */
+    u64 command_size, compute_size;
+} NvnDeviceCommandBuffer;
+NVN_FITS(NvnDeviceCommandBuffer, 0x30);
+/* the messages' storage, and the begin and end the driver clears at EndMessages */
+typedef struct {
+    u64 device, pool;
+    i32 offset, size;
+    u64 begin, end;
+} NvnDeviceMessageBuffer;
+NVN_FITS(NvnDeviceMessageBuffer, 0x28);
 /* A fenced sync signals when the syncpoint reaches value (0: no syncpoint), the presents' syncpoint reaches shown (0:
    none; nvn_replay_shown_syncpt, a present on the display) and the pacer's clock (plat_ns) reaches ready: its queue's
    work before it replayed and done, and what the queue waited for before it (a window's texture comes free at the
@@ -249,6 +339,16 @@ typedef struct {
     i32 interval;
 } NvnWindowBuilder; /* SDK 5's builder is 0x2c bytes: no device or native window (nvn_queue.c keeps the last one) */
 NVN_FITS(NvnWindowBuilder, 0x2c);
+/* The Ounce's builder (API 231) also has the color space and the HDR metadata, at the offsets of its driver. Only
+   API 231's handlers touch them, past the bytes of the older builder: hdr[0-9] the display's primaries (x, y of red,
+   green, blue, the white point) and its minimum and maximum luminance, hdr[10-11] the content's maximum and average
+   light levels */
+typedef struct {
+    i32 color_space; /* +0x24 in the driver's builder, inside NvnWindowBuilder: kept at +0x2c */
+    f32 hdr[12];     /* +0x30 */
+} NvnWindowBuilderHdr;
+#define NVN_WB_HDR(b) NVN_OBJ(NvnWindowBuilderHdr, (b) + 0x2c)
+NVN_FITS(NvnWindowBuilderHdr, 0x60 - 0x2c);
 /* pace: when the last present was shown on the pacer's clock; available[i]: when texture i can be acquired again,
    its last present's slot plus one period (0: at once); syncpt[i], value[i]: the point the replay reaches once texture
    i is off the display (0: none), the present after its own, or its own while none came yet (shown: those);
@@ -266,6 +366,9 @@ typedef struct {
     u64 native; /* the native window the builder named */
 } NvnWindow;
 NVN_FITS(NvnWindow, 0x148);
+/* the Ounce's window (API 231): the builder's color space and HDR metadata, past NvnWindow */
+#define NVN_WIN_HDR(w) NVN_OBJ(NvnWindowBuilderHdr, (w) + 0x148)
+typedef char nvn_fits_NvnWindowHdr[sizeof(NvnWindowBuilderHdr) <= 0x180 - 0x148 ? 1 : -1];
 
 /* ---- command buffers ---- */
 /* cur: where the next record goes (a guest address). begin: the recording's first record, its handle; last: its last
@@ -349,6 +452,7 @@ typedef struct {
 #define NVN_MS_COV_TO_COLOR 0x02u
 #define NVN_MS_LOCATIONS    0x04u /* SetSampleLocationsEnable */
 #define NVN_MS_GRID         0x08u /* SetSampleLocationsGridEnable */
+#define NVN_MS_COV_TRUNC    0x10u /* the Ounce's SetCoverageTruncationEnable */
 NVN_FITS(NvnMultisample, 0x18);
 static inline NvnMultisample nvn_multisample_defaults(void) {
     NvnMultisample state = {.enable = 1, .flags = NVN_MS_A2C_DITHER};
@@ -437,9 +541,11 @@ enum {
     OP_WAIT_EVENT,
     OP_SUBROUTINES,
     OP_DISCARD,
+    OP_PUSH_CONSTANTS,
+    OP_DRAW_MESH,
     OP_COUNT_
 };
-typedef char NvnOpcodeMaskFits[(OP_COUNT_ <= 64) ? 1 : -1];
+typedef char NvnOpcodeMaskFits[(OP_COUNT_ <= 128) ? 1 : -1]; /* nvn_replay.h's unknown[2] */
 /* Scalar and small-array fixed-function state share one opcode. This leaves opcode space for draw operations. */
 enum {
     NVN_SET_ALPHA_REF,
@@ -517,10 +623,14 @@ typedef struct {
 typedef struct {
     i32 stages;
     u32 off_a;
-    NvnStage st[6];
     u64 serial; /* the program's SetShaders (nvn_program_xfb) */
     u16 block[3], sample_shading;
+    NvnStage st[NVN_STAGES]; /* the Ounce's task and mesh stages last, not recorded for others */
 } NvnPBindProgram;
+/* the stages that a game other than an Ounce one has: its record stops after them */
+#define NVN_PBIND_SWITCH_BYTES (offsetof(NvnPBindProgram, st) + NVN_SHADER_STAGE_TASK * sizeof(NvnStage))
+/* such a record, with its header, fits in the 128 bytes the driver writes (nvn_CommandBufferBindProgram) */
+typedef char nvn_fits_NvnPBindProgram[8 + NVN_PBIND_SWITCH_BYTES <= 128 ? 1 : -1];
 /* kind: 0 blend 1 color 2 channel mask 3 multisample 4 polygon 5 depth-stencil; the object's bytes */
 typedef struct {
     i32 kind;
@@ -569,6 +679,18 @@ typedef struct {
     u64 ind, mdi_count;
     i32 mdi_max, mdi_stride;
 } NvnPDraw;
+/* OP_DRAW_MESH, an Ounce's mesh draw: count workgroups from first (DrawMeshTasks, and DrawMeshTasks3D's x y z, which
+   the hardware draws as that many in a row from 0). An indirect one (ind not 0) has its records at ind, which the GPU
+   reads, mdi_max of them mdi_stride bytes apart, as many as the 32-bit count at mdi_count says when that isn't 0:
+   x, y and z with NVN_MESH_3D, else two words, as the driver gives the GPU (docs/platforms/nx/ounce.md). A direct one
+   stops before ind */
+#define NVN_MESH_3D 1u
+typedef struct {
+    i32 first, count;
+    u64 ind, mdi_count;
+    i32 mdi_max, mdi_stride;
+    u32 form, pad;
+} NvnPDrawMesh;
 typedef struct {
     i32 prim, index_type, count, base_vertex, base_instance, instances;
     u64 index_buffer, ind, mdi_count;
@@ -645,6 +767,13 @@ typedef struct {
 typedef struct {
     u64 dst, size;
 } NvnPUpdateUB;
+/* OP_PUSH_CONSTANTS: an Ounce game's push constants, words of a root table (NVN_ROOT_TABLES of NVN_ROOT_WORDS each,
+   for graphics and for compute) from byte offset on, then the words (one less than words), copied at record time */
+#define NVN_ROOT_TABLES 8
+#define NVN_ROOT_WORDS  64
+typedef struct {
+    u8 compute, table, offset, words;
+} NvnPPush;
 typedef struct {
     u64 src, dst, size;
 } NvnPCopyB2B;

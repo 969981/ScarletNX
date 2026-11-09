@@ -151,6 +151,31 @@ typedef struct {
 } NVNprogram;
 
 typedef struct {
+    char reserved[0x80];
+} NVNprogramBuilder;
+
+/* the Ounce's objects (API 231): the bytes its driver uses */
+typedef struct {
+    char reserved[0xC0];
+} NVNdlssNetworkBuilder;
+
+typedef struct {
+    char reserved[0xC8];
+} NVNdlssParameters;
+
+typedef struct {
+    char reserved[0x258];
+} NVNdlssNetwork;
+
+typedef struct {
+    char reserved[0x30];
+} NVNdeviceCommandBuffer;
+
+typedef struct {
+    char reserved[0x28];
+} NVNdeviceMessageBuffer;
+
+typedef struct {
     NVNbufferAddress data;
     const void* control;
 } NVNshaderData;
@@ -349,6 +374,8 @@ typedef enum {
     NVN_DEVICE_FLAG_DEBUG_ENABLE_LEVEL_4 = 0x10,
     NVN_DEVICE_FLAG_DEFERRED_FIRMWARE_MEMORY_RECLAIM = 0x80,
     NVN_DEVICE_FLAG_ENABLE_SEPARATE_SAMPLER_TEXTURE_SUPPORT = 0x100,
+    /* the Ounce's (API 231): the texture setup keeps the Maxwell GOB (gpu/nvn/nvn_object.c nvn_DeviceInitialize) */
+    NVN_DEVICE_FLAG_MAXWELL_GOB = 0x10000,
 
     NVN_DEVICE_FLAG_LARGE = 0x7FFFFFFF
 } NVNdeviceFlagBits;
@@ -483,6 +510,9 @@ typedef enum {
     NVN_SHADER_STAGE_TESS_CONTROL = 0x3,
     NVN_SHADER_STAGE_TESS_EVALUATION = 0x4,
     NVN_SHADER_STAGE_COMPUTE = 0x5,
+    /* the Ounce's (API 231), as its control sections number them (nvn_section.h) */
+    NVN_SHADER_STAGE_TASK = 0x6,
+    NVN_SHADER_STAGE_MESH = 0x7,
 
     NVN_SHADER_STAGE_LARGE = 0x7FFFFFFF
 } NVNshaderStage;

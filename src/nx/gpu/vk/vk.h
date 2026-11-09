@@ -84,7 +84,7 @@ typedef struct {
        asks for it (experimental): FFmpeg's Vulkan decoder decodes on it (vk/nvdec.c), told of the device by the
        extensions and features enabled */
     u32 video_family;
-    const char* dev_ext[64]; /* create_device enables 61 at most, were every one it can enable there */
+    const char* dev_ext[64]; /* create_device enables 62 at most, were every one it can enable there */
     u32 dev_ext_n;
     VkPhysicalDeviceFeatures2 feat2; /* feat, with the 1.1 to 1.3 features enabled chained (to 1.2 on a 1.2 device) */
     VkPhysicalDeviceVulkan11Features feat11;
@@ -152,6 +152,7 @@ typedef struct {
     int has_shader_draw_parameters; /* shaders take an instance's ID from BaseInstance (spirv_translate.c) */
     int has_draw_indirect_count;    /* drawIndirectCount: an indirect draw's count from the GPU's memory */
     u64 alloc_cap;                  /* the most one device memory allocation may be (memory.c) */
+    u64 max_buffer_size;            /* the biggest buffer the device makes (maintenance4's maxBufferSize) */
     int sparse; /* sparseBinding on the graphics queue: images bigger than alloc_cap are bound in pieces */
     /* sparse residency of 2D or 3D images too, what isn't bound reading as zeros: a texture with holes in its mapping
        has memory only where it is mapped (memory.c vk_resident_shape says for which) */
@@ -170,6 +171,18 @@ typedef struct {
     /* VK_EXT_primitive_topology_list_restart: the guest's restart index restarts lists as it does strips (render.c),
        and patch lists with its patch list feature */
     int has_list_restart, has_patch_list_restart;
+    /* VK_EXT_mesh_shader's meshShader (and taskShader for has_task), with a required subgroup size of 32 in full
+       subgroups for both stages: an Ounce's mesh draws (render.c). mesh_stages: the stage bits that the sets and the
+       push constants of the graphics pipelines' layouts add for them (VK_PUSH_STAGES), 0 without */
+    int has_mesh, has_task;
+    /* compute pipelines can ask for subgroups of 32 (subgroupSizeControl and computeFullSubgroups, 32 within the
+       sizes and compute among requiredSubgroupSizeStages): those of the programs that use other lanes' values do
+       (compute.c's cs_make) */
+    int has_cs_warp32;
+    VkShaderStageFlags mesh_stages;
+    u32 mesh_groups_max; /* the most workgroups a mesh draw launches: maxTaskWorkGroupCount[0], with maxMesh...'s */
+    /* maxMeshOutputMemorySize and the granules that sm86_mesh_output_bytes counts vertices and primitives in */
+    u32 mesh_output_bytes_max, mesh_vertex_granule, mesh_primitive_granule;
     /* VK_EXT_conservative_rasterization: conservative rasterization (CONSERVATIVE_RASTER, 0x452), dilated by at most
        conservative_extra pixels (maxExtraPrimitiveOverestimationSize) */
     int has_conservative;
@@ -316,6 +329,12 @@ int vk_uma_copy_pending(u64 cpu, u64 len, VkBuffer* buf, u64* off);
    (vk_own_publish). 0 elsewhere: then it is published GPU-owned, as without UMA. vk_lock held */
 int vk_uma_publish(u64 cpu, u64 len, VkBuffer src, u64 off);
 int vk_uma_held(u64 cpu, u64 len); /* one import holds guest memory [cpu, cpu + len) now (vk_lock held) */
+/* the first part of guest memory [cpu, cpu + len): up to where the import holding cpu ends (*held 1), or up to where
+   the next import begins when none holds cpu (*held 0). 0 where it can't tell (no unified memory, placed memory).
+   vk_lock held */
+u64 vk_uma_import_part(u64 cpu, u64 len, int* held);
+int vk_uma_gpu_write(u64 cpu, u64 len, VkBuffer* buf, u64* off);
+void vk_uma_gpu_wrote(u64 cpu, u64 len);
 /* placed maps (uma.c): whether the device can map the heap's windows as GPU memory where they are; turning it on
    (returning what it was), which takes the windows the heap and physical memory commit whole from then on; and
    whether one chunk of it holds [cpu, cpu + len) (vk_lock held) */
@@ -557,6 +576,7 @@ void rec_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline 
 void rec_CmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, VkIndexType type);
 void rec_CmdDraw(VkCommandBuffer cb, u32 count, u32 instances, u32 first, u32 first_instance);
 void rec_CmdDrawIndexed(VkCommandBuffer cb, u32 count, u32 instances, u32 first, i32 vertex_offset, u32 first_instance);
+void rec_CmdDrawMeshTasks(VkCommandBuffer cb, u32 groups); /* vkCmdDrawMeshTasksEXT(groups, 1, 1) */
 /* max draws of the arguments at buf + off, stride bytes apart (vkCmdDraw[Indexed]Indirect), or with count_buf, as
    many as the 32-bit count at count_buf + count_off says (their Count forms) */
 void rec_CmdDrawIndirect(VkCommandBuffer cb, int indexed, VkBuffer buf, VkDeviceSize off, VkBuffer count_buf,
@@ -1036,7 +1056,20 @@ typedef struct VkOwnRes {
     u64 serial;  /* new with each write: what its bytes hash as (vk_guest_peek), never its address, a freed one's */
     u64 read;    /* buffer.c's count of reads where it is when a draw or dispatch last read it there (buf_get_owned) */
     u32 refs;    /* the creator's, and one an owned range */
+    u8 borrowed; /* buf is another's (the GPU mirror's): letting go of the last reference frees only this record */
 } VkOwnRes;
+/* a resource whose bytes are in buf, at the guest address of each range it owns (the GPU mirror's): one reference */
+VkOwnRes* vk_own_res_borrow(VkBuffer buf);
+/* r's bytes over [cpu, cpu + size) from off on, published as vk_own_publish_owned does, written by the submission
+   r->written names (submitted already: a landing waits for it and nothing recorded since) */
+void vk_own_publish_submitted(u64 cpu, u64 size, VkOwnRes* r, u64 off);
+/* mirror.c: the pages the mirror took in once their programs were done, published GPU-owned. Where nothing is being
+   recorded (a draw being set up, a submission): at the end of a GPU job or a wait, and before the CPU reads them */
+void vk_mirror_publish(void);
+/* cmd.c: 1 inside a landing, a frame's recycling or a submission, where nothing may be recorded or submitted */
+int vk_rec_unsafe(void);
+/* mirror.c: guest memory [cpu, cpu + size) landed from an owner: the mirror's shadow of its pages goes */
+void vk_mirror_landed(u64 cpu, u64 size);
 int vk_own_init(void);
 /* whether the CPU made GPU-owned bytes of guest memory [cpu, cpu + size) land within the last presents presents, or
    touched them under a draw's storage image kept on the GPU (vk_own_cpu_touched) */
@@ -1381,6 +1414,72 @@ u64 vk_buf_copy_src_read(void);
 /* a copy of len bytes made now (data that changes within a frame), or of zeros when gva is 0 */
 int vk_buf_copy(u64 gva, u64 len, VkBuffer* buf, u64* off);
 /* ordered=0 only for a front end that supplies execution and shader-data barriers explicitly. */
+/* A compute program's write log (writelog.c, shader.h's SH_WLOG_*): host memory the GPU writes, from a pool. get
+   gives a clear one of parts parts with one reference, the caller's; put gives back one no recorded work used; unref
+   drops a reference, and the last, once the work that wrote it is done, clears what was written and gives it back */
+typedef struct VkWriteLog VkWriteLog;
+VkWriteLog* vk_wlog_get(u32 parts);
+VkBuffer vk_wlog_buffer(const VkWriteLog* l);
+u64 vk_wlog_size(const VkWriteLog* l);
+void vk_wlog_ref(VkWriteLog* l);
+void vk_wlog_unref(VkWriteLog* l);
+void vk_wlog_put(VkWriteLog* l);
+/* a run of bytes [from, to) of a range, from its start */
+typedef struct {
+    u32 from, to;
+} VkRun;
+typedef void (*VkRunFn)(void* user, u32 from, u32 to);
+/* the bytes part of l logs for a binding of size bytes, once its work is done: fn gets each run, in order, runs that
+   meet joined. The windows that were written */
+u32 vk_wlog_runs(VkWriteLog* l, u32 part, u32 size, VkRunFn fn, void* user);
+/* the same bytes of [from, to) of the binding written on the GPU, in the command buffer being recorded: from src, where
+   the work wrote the binding from src_off on, into dst, which holds the binding's byte from at dst_off
+   (wlog_merge.comp), every other byte of dst kept. from, to, src_off and dst_off are multiples of 4; the caller orders
+   it after that work and before what uses dst. 0 when it can't be (no descriptor set left), with nothing recorded */
+int vk_wlog_merge(VkWriteLog* l, u32 part, u32 from, u32 to, VkBuffer src, u64 src_off, VkBuffer dst, u64 dst_off);
+void vk_wlog_stats(u64* logs, u64* bytes, u64* in_use, u64* windows);
+void vk_wlog_trim(void); /* the logs the pool hasn't given out for a while go */
+/* The GPU mirror of guest memory (mirror.c): whether it is on, its buffer and its mask (a bit a byte) */
+int vk_mirror_on(void);
+VkBuffer vk_mirror_buffer(void);
+VkBuffer vk_mirror_mask(void);
+/* [gva, gva + len), one run of guest memory, up to date in the mirror for the work recorded next: the mirror in *buf,
+   at *off, which is the guest address of gva. 0 when it can't be (not one run, the mirror off) */
+int vk_mirror_slice(u64 gva, u64 len, VkBuffer* buf, u64* off);
+/* a program recorded now writes [cpu, cpu + len) of the mirror: pending until the submit's harvest lands it */
+void vk_mirror_wrote(u64 cpu, u64 len);
+/* a buffer in the mirror that a dispatch writes: its guest bytes [cpu, cpu + len) and its part of the write log */
+typedef struct {
+    u64 cpu;
+    u32 len, part;
+} VkMirFold;
+/* recorded into cb after a dispatch: the bytes its write log (log, log_size bytes) gives for each of its n buffers in
+   the mirror, set in the mirror's mask (mirror_fold.comp), and their ranges pending (vk_mirror_wrote). The submit's
+   harvest lands those bytes and no others */
+void vk_mirror_fold(VkCommandBuffer cb, VkBuffer log, u64 log_size, const VkMirFold* f, u32 n);
+/* whether pending writes of the mirror are behind [gva, gva + len); a read of guest memory there lands them first */
+int vk_mirror_pending(u64 gva, u64 len);
+/* whether the mirror owns a part of [gva, gva + len), one run of guest memory: written by its programs and landed
+   only as far as the CPU touched it (vk_mirror_publish). The mirror holds the range's bytes then, guest memory not */
+int vk_mirror_holds(u64 gva, u64 len);
+void vk_mirror_mem_need(u64 gva, u64 len);
+/* at a submit, recorded into cb: the pages its programs wrote, copied for landing; and once submissions up to done are,
+   their landing in guest memory */
+void vk_mirror_harvest(VkCommandBuffer cb, u64 submit);
+void vk_mirror_done(u64 done);
+void vk_mirror_stats(u64* granules, u64* harvests, u64* pages, u64* landed, u64* overflows, u32* room);
+/* the bytes of a result at res a writer logged (n sorted runs that don't meet, from addr), into guest memory: as
+   vk_write_changed lands what it finds changed. The runs whose guest pages the CPU wrote since the write tracking
+   clock since, which the GPU's bytes then win over: their count */
+u32 vk_write_runs(u64 addr, const u8* res, const VkRun* runs, u32 n, u32 since);
+/* the writer vk_buf_copy_writable bound last logs its writes in part of l: the result it writes lands those of all of
+   its writers and no other bytes, once its commit gives it a reference to l. A writer that logs nothing (a draw, a
+   Switch program, a buffer image) has its result compared with its original bytes as before */
+int vk_buf_copy_writable_logged(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered, VkWriteLog* l, u32 part,
+                                int no_read); /* no_read: the program writes but never reads it, so its input is not
+                                                 copied */
+/* the dispatch's own reference to l, dropped once the submit being recorded is done */
+void vk_buf_log_retire(VkWriteLog* l);
 int vk_buf_copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered);
 /* Shader-data invalidation needs writes only. Execution order also covers reads before an in-place writer. */
 int vk_buf_order_pending(int writes_only);
@@ -1394,9 +1493,9 @@ typedef struct {
     VkBuffer buf;
     u64 off, range;
 } VkDrawGbuf;
-/* a draw's global memory, by the stage that reads it: vertex, the two tessellation stages, geometry, fragment (ST_VS
-   to ST_FS) */
-#define VK_DRAW_STAGES 5
+/* a draw's global memory, by the bindings of the stage that reads it (DsBindings'): vertex, the two tessellation
+   stages, geometry, fragment (ST_VS to ST_FS), then an Ounce's task and mesh stages (DS_TASK, DS_MESH) */
+#define VK_DRAW_STAGES DS_GFX_STAGES
 typedef struct {
     VkDrawGbuf b[VK_DRAW_STAGES][16];
     int n[VK_DRAW_STAGES];
@@ -1574,7 +1673,10 @@ typedef struct {
     u32 n;
 } VkCbReads;
 typedef int (*VkCbReader)(u32 idx, u32 off, u32* out);
-/* Read/hash a program into a zero-padded128KiB buffer, without cohering unrelated trailing data. Holds vk_lock. */
+/* the window of a program's bytes that vk_shader_get reads from its SPH (pipeline.c says why it is this wide) */
+#define SH_CODE 0x80000u
+/* Read/hash a program into code, SH_CODE bytes zero-padded, without cohering unrelated trailing data. Holds
+   vk_lock. */
 void vk_shader_read_code(u64 gva, u8* code, u32* len, VkCbReader read);
 u32* vk_translate_spirv(const u8* code, u32 max_bytes, int stage, ShaderInfo* si, size_t* words, VkCbReader read,
                         VkCbReads* reads);
@@ -1619,6 +1721,7 @@ void vk_shader_generated_record(VkSh* shader, const u32* spv, size_t words, cons
 extern VkPipelineLayout g_vk_playout;
 VkPipelineLayout vk_playout(u32 arrays); /* arrays: a bit per set (shader_vk_set) that has them */
 int vk_graphics_playout_is(VkPipelineLayout layout);
+VkShaderStageFlags vk_set_stages(int set); /* the stages that see descriptor set set (pipeline.c) */
 extern int g_vk_preserve_infnan;
 extern int g_vk_preserve_infnan64;
 extern int g_vk_flush_denorm;
@@ -1635,10 +1738,12 @@ extern VkDescriptorSetLayout g_vk_dslayout[2][5];
 extern u32 g_vk_stage_sets; /* sets in the pipeline layout: 5, or 2 without the tessellation and geometry stages */
 /* the stages that read the push constants: every graphics stage reads the viewport/depth parameters in pc[0..3]
    (the last one before rasterization applies them); fragment reads the alpha test in pc[4..6] and sprite T flip
-   in pc[7] */
+   in pc[7]. The task and mesh stages, where the device has them (g_vk.mesh_stages), read the first workgroup in
+   pc[0] and the depth fix in pc[1] */
 #define VK_PUSH_STAGES                                                                                                 \
     (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |                                           \
-     VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+     VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |       \
+     g_vk.mesh_stages)
 void vk_pipeline_init(void);
 /* the shader at gva (after a VertexA program at gva_a, or 0). The masks key integer inputs: attributes for the
    vertex stage, textures and render target outputs for the fragment stage. dc_funcs and unfed, the fragment stage's,
@@ -1656,6 +1761,11 @@ VkSh* vk_shader_get_ex(const DsState* ds, u64 gva, u64 gva_a, int stage, u64 int
                        u32 rt_sint, u32 clip, u64 dc_color, u32 dc_funcs, u32 unfed, u64 rect, const ShXfb* xfb,
                        const u8* query_hint, u64 advanced_blend, u32 advanced_mask, u32 img_int, u32 img_sint,
                        u32 fs_config);
+/* An Ounce's task or mesh program at gva (stage ST_TS or ST_MS), with the fields of its key k: vk_shader_get with the
+   fields in the key's words, and the per-primitive SPH that k names read from the program's code area. A fragment
+   program drawn after a mesh program takes the generics that it writes per primitive (ShaderInfo.prim_mask) in the
+   clip word of its key */
+VkSh* vk_shader_mesh(const DsState* ds, u64 gva, int stage, const DsMeshKey* k);
 /* whether the constant buffer words s's translation read still hold in ds's bound buffers (vk_shader_get's check on
    a hit, for a caller that kept s) */
 int vk_shader_cb_hold(const DsState* ds, const VkSh* s);
@@ -1675,6 +1785,10 @@ typedef struct {
     VkShaderModule vs, fs;
     VkShaderModule tcs, tes, gs; /* tessellation control and evaluation, geometry: VK_NULL_HANDLE when off */
     u32 patch;                   /* control points of a patch, with tessellation */
+    /* bit 0: an Ounce's mesh pipeline. vs is its mesh shader and tcs its task shader (VK_NULL_HANDLE for none), and
+       it has no vertex input, input assembly or tessellation state (topo_class and vi stay 0). Bits 1 and 2 (PIPE_
+       MESH_WHOLE): the mesh and the task workgroup are whole subgroups, which the pipeline then requires */
+    u32 mesh;
     /* POINT_LIST, LINE_LIST, TRIANGLE_LIST, their adjacency forms or PATCH_LIST: the topology is dynamic within its
        class */
     u32 topo_class;
@@ -1704,6 +1818,7 @@ typedef struct {
     u32 sample_shading; /* every sample is shaded (sampleRateShading), with several samples */
     u32 conservative;   /* DsRasterKey's (has_conservative): 0 off, else 1 plus the dilation in quarter pixels */
 } PipeKey;
+#define PIPE_MESH_WHOLE(stage) (2u << ((stage) == ST_TS)) /* PipeKey.mesh's bit of a whole stage's workgroup */
 /* the pipeline for k, made when new and waited for while a worker makes it: NULL only when it can't be made */
 VkPipeline vk_pipeline_get(const PipeKey* k);
 /* the key a file of earlier runs' shaders and pipelines must have to be read: the device, the build, and what changes
@@ -1879,6 +1994,7 @@ extern u64 g_vk_drawn, g_vk_skipped; /* draws recorded, and draws skipped (unsup
    this many primitives a draw is skipped instead. Statistics: draws captured, their primitives, the draws skipped */
 #define VK_CAPTURE_PRIMITIVES_MAX 256u
 extern u64 g_vk_capture_draws, g_vk_capture_primitives, g_vk_capture_capped;
+extern u64 g_vk_mesh_draws, g_vk_mesh_drawn; /* of them, an Ounce's mesh draws, and those recorded */
 /* draws that kept the last draw's shaders and pipeline key, and those of them draw_state_check made again to compare */
 extern u64 g_vk_draw_kept, g_vk_draw_checked;
 /* draws, clears and the like that kept the last one's render targets, found again through the surface table before */

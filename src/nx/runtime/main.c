@@ -41,6 +41,8 @@
 #include "nx/runtime/platform/backend.h"
 #include "nx/runtime/platform/hud.h"
 #include "nx/runtime/platform/log.h"
+#include "nx/gpu/shader/shader.h"
+#include "nx/gpu/texture/blocklinear.h"
 #include "nx/runtime/platform/overlay.h"
 #include "nx/runtime/platform/prepare_screen.h"
 #include "nx/runtime/platform/resources.h"
@@ -542,22 +544,29 @@ static void say_old_layout(void) {
    layout has to guarantee for it: what its SDK marshals into an IPC buffer descriptor drops every address bit above
    36, and the 39-bit layout's stack and heap, above 64 GiB, came back as addresses with no memory behind them.
 
-   It also tells an Ounce program (loader/ounce.h), which is g_ounce: the runtime JIT then takes the extended CPU
-   features (guest_jit.c), as the recompiler does from the same NPDM */
+   It also tells an Ounce program (loader/ounce.h), which is g_ounce, and everything that follows from it: the CPU
+   features of the runtime JIT (guest_jit.c), SM86 shaders, the T239's GOB, the 31.25 MHz tick, and the larger heap
+   and application pool, as memory_gb 12 gives (svc_mem.c) */
 static void npdm_layout(void) {
     u64 size = 0;
     unsigned char* d = fs_read_file("exefs/main.npdm", &size);
-    if (!d) return;
-    if (size >= 0x80 && size <= 0x4000 && !memcmp(d, "META", 4)) {
-        unsigned flags = d[0x0c];
-        if (snx_npdm_ounce(d, size)) {
-            g_ounce = 1;
-            LOG("npdm: an Ounce program\n");
-        }
-        if ((flags & 1) && ((flags >> 1) & 7) == 1) {
-            mem_layout36();
-            LOG("npdm: a 36-bit address space: 64 GiB, the code region at a fixed 128 MiB\n");
-        }
+    int meta = d && size >= 0x80 && size <= 0x4000 && !memcmp(d, "META", 4);
+    if (meta && snx_npdm_ounce(d, size)) {
+        g_ounce = g_shader_sm86 = g_gob_native = 1;
+        g_shader_sm86_dump = g_settings.sm86_dump[0] ? g_settings.sm86_dump : NULL;
+        clock_ounce();
+        LOG("npdm: an Ounce program\n");
+    }
+    if (!g_arm_mod && (g_settings.memory_gb >= 12 || g_ounce)) mem_layout_large_heap();
+    if (!g_arm_mod && g_ounce) {
+        mem_layout_ounce_alias();
+        LOG("memory: alias region %#llx, %llu GiB; heap region %#llx; stack region %#llx\n",
+            (unsigned long long)ALIAS_BASE, (unsigned long long)(ALIAS_SIZE >> 30), (unsigned long long)HEAP_BASE,
+            (unsigned long long)STACK_BASE);
+    }
+    if (meta && (d[0x0c] & 1) && ((d[0x0c] >> 1) & 7) == 1) {
+        mem_layout36();
+        LOG("npdm: a 36-bit address space: 64 GiB, the code region at a fixed 128 MiB\n");
     }
     free(d);
 }
@@ -642,14 +651,30 @@ static void write_threads(u64 second) {
 
 /* the host threads blocked on a mutex or waiting on a condition variable: the caller as an offset from pm_lock and the
    mutex as one from pm_wait_base, which the runtime's symbols name (nm, addr2line). The watchdog's own report of a
-   deadlock, where no thread notes what it waits for in game terms */
+   deadlock, where no thread notes what it waits for in game terms. Waits of one mutex and caller that many threads
+   share (the guest threads' kernel waits) are one line with their count, so the few others are not lost in them */
+#define LOCK_WAITS 512
+#define LOCK_WAITS_GROUP 4
 static void report_lock_waits(void) {
-    PmWait w[64];
-    int n = pm_waits(w, 64), i;
-    for (i = 0; i < n; i++)
-        WARN("  host thread %llu %s mutex base%+lld, called from pm_lock%+lld\n", (unsigned long long)w[i].tid,
-             w[i].cond ? "waits on a condition with" : "waits for", (long long)((intptr_t)w[i].m - (intptr_t)pm_wait_base()),
-             (long long)((intptr_t)w[i].at - (intptr_t)pm_lock));
+    PmWait w[LOCK_WAITS]; /* 16 KB of the frontend thread's stack */
+    int n = pm_waits(w, LOCK_WAITS);
+    for (int i = 0; i < n; i++) {
+        int same = 0, first = 1;
+        char who[64];
+        for (int j = 0; j < n; j++)
+            if (w[j].m == w[i].m && w[j].at == w[i].at && w[j].cond == w[i].cond) {
+                same++;
+                if (j < i) first = 0;
+            }
+        if (same > LOCK_WAITS_GROUP && !first) continue;
+        if (same > LOCK_WAITS_GROUP)
+            snprintf(who, sizeof who, "%d host threads %s", same, w[i].cond ? "wait on a condition with" : "wait for");
+        else
+            snprintf(who, sizeof who, "host thread %llu %s", (unsigned long long)w[i].tid,
+                     w[i].cond ? "waits on a condition with" : "waits for");
+        WARN("  %s mutex base%+lld, called from pm_lock%+lld\n", who,
+             (long long)((intptr_t)w[i].m - (intptr_t)pm_wait_base()), (long long)((intptr_t)w[i].at - (intptr_t)pm_lock));
+    }
 }
 void resources_text(char* out, size_t size) {
     size_t n;
@@ -736,6 +761,7 @@ static void frontend_loop(void) {
 #endif
         pause_unattended();
         state_poll();
+        if (!paused) kernel_core_watch();
         /* here and not on the GPU thread, where writing the pipeline cache would hold up every channel */
         if (tick % 300 == 0) {
             save_hints();
@@ -1217,7 +1243,7 @@ int snx_main(int argc, char** argv) {
     snx_ir_branch_profile(g_settings.ir_branch_profile);
 
     fs_init(keys, title_keys); /* the npdm is read through it, and mem_init's layout comes before */
-    npdm_layout(); /* the address space type's layout, before mem_init sizes its blocks in it */
+    npdm_layout(); /* the address space type's layout and the larger heap, before mem_init sizes its blocks in it */
     free(keys);
     free(title_keys);
     keys = title_keys = NULL;
@@ -1230,6 +1256,7 @@ int snx_main(int argc, char** argv) {
         mem_fit(snx_memory_available(&available) && footprint, available, footprint);
     }
     kernel_init();
+    plat_trap_waiting(kthread_fault_lend);
     dispatch_init();
     if (g_arm_mod) arm_dispatch_init();
     load_hints();

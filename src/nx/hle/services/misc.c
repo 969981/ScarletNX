@@ -181,6 +181,55 @@ static int nn_pctl_detail_ipc_IParentalControlService_Unknown1460(SvcObj* self, 
 }
 
 /* ============================================================ friend */
+#define FRIEND_NO_NOTIFICATIONS SNX_RC_ACCOUNT_NO_NOTIFICATIONS /* which friends answers too */
+
+static int nn_chat_IUserService_OpenUserShim(SvcObj* self, SvcObj** shim) {
+    (void)self;
+    *shim = nn_chat_IUserShimScopedObject_new();
+    R_SUCCEED();
+}
+static int nn_chat_IUserShimScopedObject_GetChattingEvent(SvcObj* self, u32* event) {
+    (void)self;
+    return new_event(event, "chat chatting", 0);
+}
+
+/* The console asks its video encoder for these sizes, so they can't be read off its code. Nothing here ever writes to
+   the game's work buffers, so they only have to agree: the SDK divides the memory it is given by the three a guest takes,
+   and aborts if that comes to none */
+#define STPL_WORK_BUFFER_SIZE 0x1000
+#define STPL_HID_SHM_SIZE     0x40000 /* a guess, as big as hid's: no guest ever appears in it */
+
+static int nn_streamplay_IUserService_OpenUserShim(SvcObj* self, u32 version, SvcObj** shim) {
+    (void)self, (void)version;
+    *shim = nn_streamplay_IUserShimScopedObject_new();
+    R_SUCCEED();
+}
+static int nn_streamplay_IUserShimScopedObject_GetRequiredMemorySize(SvcObj* self, u8 type, u8 mode, i32 guests,
+                                                                     u32* size) {
+    (void)self, (void)type, (void)mode;
+    *size = (u32)guests * 3 * STPL_WORK_BUFFER_SIZE;
+    R_SUCCEED();
+}
+static int nn_streamplay_IUserShimScopedObject_GetWorkBufferSizes(SvcObj* self, u8 type, u8 mode, u64* common,
+                                                                  u64* first, u64* second, u64* third) {
+    (void)self, (void)type, (void)mode;
+    *common = 0;
+    *first = *second = *third = STPL_WORK_BUFFER_SIZE;
+    R_SUCCEED();
+}
+static int nn_streamplay_IUserShimScopedObject_GetHidSharedMemory(SvcObj* self,
+                                                                  nn_streamplay_HidSharedMemoryConfig* config,
+                                                                  u32* memory) {
+    const u64 c[2] = {STPL_HID_SHM_SIZE, 0};
+    KShmem* s = kshmem_new(STPL_HID_SHM_SIZE, "stpl hid");
+    (void)self;
+    memcpy(config, c, sizeof c);
+    /* as in new_event: the game's handle is the only reference left */
+    kobj_ref(&s->o);
+    *memory = h_new(&s->o);
+    kobj_unref(&s->o);
+    R_SUCCEED();
+}
 static int nn_friends_detail_ipc_IServiceCreator_CreateFriendService(SvcObj* self, SvcObj** service) {
     (void)self;
     *service = nn_friends_detail_ipc_IFriendService_new();
@@ -1393,31 +1442,6 @@ static int nn_btm_IBtmUserCore_AcquireBleMtuConfigEvent(SvcObj* self, u8* succes
     return btm_event(success, event, "btm BLE MTU config");
 }
 
-/* ============================================================ audin: no microphone to open */
-static int nn_audio_detail_IAudioInManager_OpenAudioIn(SvcObj* self, const nn_audio_AudioInParameter* params,
-                                                      u64 aruid, u32 process, IpcBuf name, IpcBuf name_out,
-                                                      u32* sample_rate, u32* channel_count, u32* sample_format,
-                                                      u32* state, SvcObj** in) {
-    (void)self, (void)params, (void)aruid, (void)process, (void)name, (void)name_out;
-    (void)sample_rate, (void)channel_count, (void)sample_format, (void)state, (void)in;
-    R_THROW(SNX_RC_AUDIO_NOT_FOUND);
-}
-static int nn_audio_detail_IAudioInManager_OpenAudioInAuto(SvcObj* self, const nn_audio_AudioInParameter* params,
-                                                          u64 aruid, u32 process, IpcBuf name, IpcBuf name_out,
-                                                          u32* sample_rate, u32* channel_count, u32* sample_format,
-                                                          u32* state, SvcObj** in) {
-    return nn_audio_detail_IAudioInManager_OpenAudioIn(self, params, aruid, process, name, name_out, sample_rate,
-                                                       channel_count, sample_format, state, in);
-}
-static int nn_audio_detail_IAudioInManager_OpenAudioInProtocolSpecified(
-    SvcObj* self, const nn_audio_AudioInProtocol* protocol, const nn_audio_AudioInParameter* params, u64 aruid,
-    u32 process, IpcBuf name, IpcBuf name_out, u32* sample_rate, u32* channel_count, u32* sample_format, u32* state,
-    SvcObj** in) {
-    (void)protocol;
-    return nn_audio_detail_IAudioInManager_OpenAudioIn(self, params, aruid, process, name, name_out, sample_rate,
-                                                       channel_count, sample_format, state, in);
-}
-
 /* ============================================================ ngc:u and ngct:u: no word lists */
 /* the lists' version: there are none here, and reden answers 1 for its own empty ones */
 #define NGC_CONTENT_VERSION 1u
@@ -1536,6 +1560,8 @@ SvcObj* new_apm(void) { return nn_apm_IManager_new(); }
 SvcObj* new_lm(void) { return nn_lm_ILogService_new(); }
 SvcObj* new_pctl(void) { return nn_pctl_detail_ipc_IParentalControlServiceFactory_new(); }
 SvcObj* new_friend(void) { return nn_friends_detail_ipc_IServiceCreator_new(); }
+SvcObj* new_chat(void) { return nn_chat_IUserService_new(); }
+SvcObj* new_stpl(void) { return nn_streamplay_IUserService_new(); }
 SvcObj* new_ns(void) { return nn_ns_detail_IServiceGetterInterface_new(); }
 SvcObj* new_prepo(void) { return nn_prepo_detail_ipc_IPrepoService_new(); }
 SvcObj* new_psm(void) { return nn_psm_IPsmServer_new(); }
@@ -1554,7 +1580,6 @@ SvcObj* new_mii(void) { return nn_mii_detail_IStaticService_new(); }
 SvcObj* new_ectx(void) { return nn_err_context_IWriterForApplication_new(); }
 SvcObj* new_spl(void) { return nn_spl_detail_IGeneralInterface_new(); }
 SvcObj* new_btmu(void) { return nn_btm_IBtmUser_new(); }
-SvcObj* new_audin(void) { return nn_audio_detail_IAudioInManager_new(); }
 SvcObj* new_ngc(void) { return nn_ngc_detail_IService_new(); }
 SvcObj* new_ngct(void) { return nn_ngct_detail_IService_new(); }
 SvcObj* new_olsc(void) { return nn_olsc_srv_IOlscServiceForApplication_new(); }

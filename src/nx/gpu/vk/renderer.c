@@ -63,6 +63,7 @@ static int vkr_mem_pending(u64 gva, u64 size) {
     return hit;
 }
 static void vkr_gfx_mem_need(u64 gva, u64 size) {
+    vk_mirror_mem_need(gva, size); /* the GPU mirror's programs' writes there landed */
     vk_buf_mem_need(gva, size);
     vk_uma_mem_need(gva, size); /* the in-place writes there done */
     vk_gfx_image_mem_need(gva, size);
@@ -81,6 +82,7 @@ static void vkr_mapping_begin(u64 gva, u64 size, int full) {
            wait for all of the GPU's work, and one game's memory thread waited so with its core held */
         int hit = pend_hit_guest(&g_pend_any, gva, size);
         if (hit) vk_buf_land_map();
+        if (hit) vk_mirror_mem_need(0, ~0ull); /* the GPU mirror's programs' writes, all of them */
         vk_gfx_image_land();
         if (hit) vk_compute_land();
         /* last, as the landings may submit: mem.c's change of guest memory [gva, gva + size), whose in-place readers
@@ -88,6 +90,7 @@ static void vkr_mapping_begin(u64 gva, u64 size, int full) {
         vk_uma_mapping_begin(gva, size);
     } else {
         vk_buf_mem_need_map(gva, size);
+        vk_mirror_mem_need(gva, size);
         vk_gfx_image_mem_need(gva, size);
         vk_compute_mem_need_map(gva, size);
         /* Images still describe the old backing until the page table changes. */
@@ -622,12 +625,14 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game, u64 release
         if (g_vk_present % 600 == 0) {
             char cs_why[256];
             u64 cs_skipped = vk_cs_skipped(cs_why, sizeof cs_why);
-            LOG("vulkan: %llu draws, %llu skipped; %llu dispatches in %llu batches (%llu ms waiting), %llu skipped%s; "
+            LOG("vulkan: %llu draws, %llu skipped (%llu mesh draws, %llu skipped); %llu dispatches in %llu batches "
+                "(%llu ms waiting), %llu skipped%s; "
                 "%llu finishes (%llu ms); %llu reads past queued releases (%llu samples counts written on the GPU); "
                 "%llu descriptor sets written, %llu reused (%u descriptor pools, %llu sets with texture arrays taken "
                 "from them); "
                 "%llu draws kept the last one's shaders and pipeline (%llu checked), %llu its targets\n",
-                (unsigned long long)g_vk_drawn, (unsigned long long)g_vk_skipped, (unsigned long long)g_vk_dispatches,
+                (unsigned long long)g_vk_drawn, (unsigned long long)g_vk_skipped, (unsigned long long)g_vk_mesh_draws,
+                (unsigned long long)(g_vk_mesh_draws - g_vk_mesh_drawn), (unsigned long long)g_vk_dispatches,
                 (unsigned long long)g_vk_cs_batches,
                 (unsigned long long)(__atomic_load_n(&g_vk_cs_wait_ns, __ATOMIC_RELAXED) / 1000000),
                 (unsigned long long)cs_skipped, cs_why, (unsigned long long)g_vk_finishes,

@@ -19,7 +19,13 @@
 #include "nx/gpu/nvn/nvn_driver.h"
 #include "nx/gpu/nvn/nvn_tex.h"
 #include "nx/gpu/nvn/nvn_tic.h"
+#include "nx/gpu/nvn/nvn_section.h"
+#include "nx/gpu/texture/blocklinear.h"
+#include "nx/runtime/main.h"
+#include "nx/gpu/gpu.h"
+#include "nx/gpu/shader/sm86.h"
 #include "nx/hle/services/nvdrv.h"
+#include "nx/hle/services/native_video.h"
 #include "nx/runtime/clock.h"
 #include "nx/hle/kernel/kernel.h"
 #include "nx/runtime/arm.h"
@@ -28,6 +34,8 @@
 #include "nx/runtime/platform/plat.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 u64 nvn_serial(void) { return __atomic_add_fetch(&g_nvn.object.serial, 1, __ATOMIC_RELAXED); }
 
@@ -105,6 +113,13 @@ int nvn_DeviceInitialize(CPU* c, u64 d, u64 b) {
     __atomic_store_n(&g_nvn.object.device, d, __ATOMIC_RELAXED);
     nvn_draw_device(o.origin, o.depth_mode);
     LOG("nvn: device %llx initialized, flags %#x\n", (unsigned long long)d, o.flags);
+    /* An Ounce game's device with flag 0x10000 keeps the Maxwell GOB: the game's driver hands its texture setup
+       !(flags & 0x10000), and one game's textures, written as the older console lays them out, read right only with
+       the Maxwell GOB (gpu/texture/blocklinear.h). Before any surface */
+    if (g_ounce && (o.flags & NVN_DEVICE_FLAG_MAXWELL_GOB) && g_gob_native) {
+        g_gob_native = 0;
+        LOG("nvn: the device's flag 0x10000 keeps the Maxwell GOB for this Ounce game's surfaces\n");
+    }
     return 1;
 }
 void nvn_DeviceFinalize(CPU* c, u64 d) {
@@ -242,7 +257,7 @@ void nvn_DeviceGetInteger(CPU* c, u64 d, i32 what, u64 out) {
     i32 v = w < NVN_DEVICE_INFO_ITEMS ? info[w] : 0;
     (void)c;
     (void)d;
-    if (w >= NVN_DEVICE_INFO_ITEMS || w == 0x62)
+    if (w >= NVN_DEVICE_INFO_ITEMS || (!v && (w == 0x62 || w >= 0x69)))
         LOG_LIMIT(16, "nvn: nvnDeviceGetInteger of item %#x, which the driver reads from state nobody measured: 0\n",
                   w);
     gw32(out, (u32)v);
@@ -313,6 +328,24 @@ int nvn_DeviceRegisterFastClearDepth(CPU* c, u64 d, f32 depth) {
     (void)depth;
     return 1;
 }
+int nvn_DeviceRegisterFastClearStencil(CPU* c, u64 d, i32 stencil) {
+    (void)c;
+    (void)d;
+    (void)stencil;
+    return 1;
+}
+/* No ray tracing yet. These sizes are made up, for a game that sizes its structures at boot: the driver works them out
+   from info, and nothing has measured that */
+void nvn_DeviceCalculateAccelerationStructureMemoryRequirements(CPU* c, u64 d, u64 info, u64 size, u64 scratch,
+                                                                u64 update_scratch) {
+    (void)c;
+    (void)d;
+    (void)info;
+    LOG_LIMIT(1, "nvn: an acceleration structure's sizes asked for, and made up: no ray tracing yet\n");
+    gw64(size, 0x10000);
+    gw64(scratch, 0x10000);
+    gw64(update_scratch, 0x10000);
+}
 
 /* ============================================================ memory pools */
 void nvn_MemoryPoolBuilderSetDefaults(CPU* c, u64 b) {
@@ -328,6 +361,16 @@ void nvn_MemoryPoolBuilderSetStorage(CPU* c, u64 b, u64 memory, u64 size) {
     (void)c;
     o->memory = memory;
     o->size = size;
+    o->native = 0;
+}
+/* The SDK's nvnNativeImageInitialize builds a pool over a native image's memory with this: as the driver, it clears the
+   storage, and the other way round in SetStorage */
+void nvn_MemoryPoolBuilderSetNativeHandleNVX(CPU* c, u64 b, i32 handle) {
+    NvnPoolBuilder* o = NVN_OBJ(NvnPoolBuilder, b);
+    (void)c;
+    o->memory = 0;
+    o->size = 0;
+    o->native = (u32)handle;
 }
 void nvn_MemoryPoolBuilderSetFlags(CPU* c, u64 b, i32 flags) {
     (void)c;
@@ -352,6 +395,13 @@ int nvn_MemoryPoolInitialize(CPU* c, u64 p, u64 b) {
     o.flags = s->flags;
     o.memory = s->memory;
     o.size = s->size;
+    if (s->native) {
+        int bound = gsv_native_memory_cpu(s->native, &o.memory, &o.size);
+        LOG_LIMIT(8, "nvn: memory pool %llx over native memory %u: %s %llx, %llx bytes\n", (unsigned long long)p,
+                  s->native, bound ? "bound at" : "NOT bound", (unsigned long long)o.memory,
+                  (unsigned long long)o.size);
+        o.linear_pitch = native_video_memory_pitch(s->native);
+    }
     if (!o.memory && !(o.flags & NVN_POOL_VIRTUAL))
         LOG_LIMIT(8, "nvn: memory pool %llx has no storage (flags %#x)\n", (unsigned long long)p, o.flags);
     lead = o.memory & 0xfff;
@@ -457,6 +507,63 @@ int nvn_MemoryPoolMapVirtual(CPU* c, u64 p, i32 n, u64 requests) {
     int ok = map_virtual(p, n, requests);
     nvn_wait_end();
     return ok;
+}
+/* ---- the Ounce's device command buffers and device messages (API 231), at the offsets of the game's driver */
+#define DCB(b) NVN_OBJ(NvnDeviceCommandBuffer, b)
+#define DMB(b) NVN_OBJ(NvnDeviceMessageBuffer, b)
+/* A uniform buffer's handle, as the game's driver makes it: the address in 16-byte units in the low bits, and the
+   size in 16-byte units, rounded up, from bit 45 */
+u64 nvn_DeviceGetUniformBufferHandle(CPU* c, u64 d, u64 address, u64 size) {
+    (void)c;
+    (void)d;
+    return ((0x1e0000000000ull + (size << 41)) & 0xffffe00000000000ull) | address >> 4;
+}
+void nvn_DeviceCommandBufferSetDefaults(CPU* c, u64 b) {
+    NvnDeviceCommandBuffer* o = DCB(b);
+    (void)c;
+    u64 d = o->device; /* the driver keeps the device */
+    *o = (NvnDeviceCommandBuffer){0};
+    o->device = d;
+}
+void nvn_DeviceCommandBufferSetDevice(CPU* c, u64 b, u64 d) {
+    (void)c;
+    DCB(b)->device = d;
+}
+void nvn_DeviceCommandBufferSetStorage(CPU* c, u64 b, u64 pool, i64 offset, u64 size) {
+    (void)c;
+    DCB(b)->memory = pool;
+    DCB(b)->offset = (u64)offset;
+    DCB(b)->size = size;
+}
+void nvn_DeviceCommandBufferSetCommandMemorySize(CPU* c, u64 b, u64 size) {
+    (void)c;
+    DCB(b)->command_size = size;
+}
+void nvn_DeviceCommandBufferSetComputeMemorySize(CPU* c, u64 b, u64 size) {
+    (void)c;
+    DCB(b)->compute_size = size;
+}
+void nvn_DeviceMessageBufferSetDefaults(CPU* c, u64 b) {
+    NvnDeviceMessageBuffer* o = DMB(b);
+    (void)c;
+    u64 d = o->device;
+    *o = (NvnDeviceMessageBuffer){0};
+    o->device = d;
+}
+void nvn_DeviceMessageBufferSetDevice(CPU* c, u64 b, u64 d) {
+    (void)c;
+    DMB(b)->device = d;
+}
+void nvn_DeviceMessageBufferSetStorage(CPU* c, u64 b, u64 pool, i32 offset, i32 size) {
+    (void)c;
+    DMB(b)->pool = pool;
+    DMB(b)->offset = offset;
+    DMB(b)->size = size;
+}
+void nvn_DeviceMessageBufferEndMessages(CPU* c, u64 b) {
+    (void)c;
+    DMB(b)->begin = 0;
+    DMB(b)->end = 0;
 }
 u64 nvn_MemoryPoolGetBufferAddress(CPU* c, u64 p) {
     (void)c;
@@ -766,7 +873,9 @@ void nvn_TextureBuilderSetPackagedTextureLayout(CPU* c, u64 b, u64 layout) {
     memset(o->layout, 0, sizeof o->layout); /* guest memory: every byte the game sees */
     if (!layout) return;
     memcpy(o->layout, GP(layout), sizeof o->layout);
-    o->d.bits |= (u8)(NVN_TEX_HAS_LAYOUT | ((o->layout[0] + 1u) & NVN_TEX_BLOCK_H));
+    /* the block height's log2 is bits 0-3 of the first halfword, as the game's driver reads it (bits 4-7 and 8-11
+       are fields of their own, nonzero for some of an Ounce game's textures) */
+    o->d.bits |= (u8)(NVN_TEX_HAS_LAYOUT | (((o->layout[0] & 0xfu) + 1u) & NVN_TEX_BLOCK_H));
 }
 /* the storage class: 0x100 with the GMMU page kind, as the game's driver answers (gpu/nvn/nvn_tex.c nvn_tex_storage) */
 i32 nvn_TextureBuilderGetStorageClass(CPU* c, u64 b) {
@@ -895,10 +1004,16 @@ int nvn_TextureInitialize(CPU* c, u64 t, u64 b) {
     NvnTexLayout l;
     u64 memory = nvn_pool_memory(s->pool), gpu = nvn_pool_gpu(s->pool);
     (void)c;
-    nvn_tex_layout(&s->d, &l);
+    o.d = s->d;
+    /* The SDK's nvnTextureInitializeFromNativeImage builds a block linear texture over a video image. Its layout is
+       between the runtime's decoder and this texture, as the game never reads the bytes: the decoder writes rows */
+    if (s->pool && NVN_OBJ(NvnPool, s->pool)->linear_pitch) {
+        o.d.flags |= NVN_TEXTURE_FLAGS_LINEAR;
+        o.d.stride = NVN_OBJ(NvnPool, s->pool)->linear_pitch;
+    }
+    nvn_tex_layout(&o.d, &l);
     o.magic = NVN_MAGIC('T', 'E', 'X', 0);
     o.gpu = gpu ? gpu + (u64)s->offset : 0;
-    o.d = s->d;
     o.pool = s->pool;
     o.offset = s->offset;
     o.memory = memory ? memory + (u64)s->offset : 0;
@@ -1502,6 +1617,137 @@ void nvn_ProgramFinalize(CPU* c, u64 p) {
     NVN_OBJ(NvnProgram, p)->magic = 0;
     LOGV("nvn: program %llx finalized (called from %llx)\n", (unsigned long long)p, (unsigned long long)c->x[30]);
 }
+/* ---- the Ounce's program builder (API 231+) ---- */
+#define PB(b) NVN_OBJ(NvnProgramBuilder, b)
+void nvn_ProgramBuilderSetDefaults(CPU* c, u64 b) {
+    (void)c;
+    memset(PB(b), 0, sizeof(NvnProgramBuilder));
+    PB(b)->max_callable = 2; /* the driver's defaults ({2,2} at 0x58) */
+    PB(b)->max_trace = 2;
+}
+void nvn_ProgramBuilderSetDevice(CPU* c, u64 b, u64 d) {
+    (void)c;
+    PB(b)->device = d;
+}
+u64 nvn_ProgramBuilderGetDevice(CPU* c, u64 b) {
+    (void)c;
+    return PB(b)->device;
+}
+void nvn_ProgramBuilderSetSampleShading(CPU* c, u64 b, i32 mode) {
+    (void)c;
+    PB(b)->sample_shading = (u32)mode;
+}
+i32 nvn_ProgramBuilderGetSampleShading(CPU* c, u64 b) {
+    (void)c;
+    return (i32)PB(b)->sample_shading;
+}
+void nvn_ProgramBuilderSetShaders(CPU* c, u64 b, i32 n, u64 sd) {
+    (void)c;
+    PB(b)->shader_count = (u32)n;
+    PB(b)->shaders = sd;
+}
+u64 nvn_ProgramBuilderGetShaders(CPU* c, u64 b) {
+    (void)c;
+    return PB(b)->shaders;
+}
+i32 nvn_ProgramBuilderGetShaderCount(CPU* c, u64 b) {
+    (void)c;
+    return (i32)PB(b)->shader_count;
+}
+void nvn_ProgramBuilderSetDebugDataHashes(CPU* c, u64 b, i32 n, u64 hashes) {
+    (void)c, (void)b, (void)n, (void)hashes;
+}
+u64 nvn_ProgramBuilderGetDebugDataHashes(CPU* c, u64 b) {
+    (void)c, (void)b;
+    return 0;
+}
+void nvn_ProgramBuilderSetRayTracingModules(CPU* c, u64 b, i32 n, u64 modules) {
+    (void)c;
+    PB(b)->rt_modules = (u32)n;
+    PB(b)->rt_module_ptr = modules;
+}
+void nvn_ProgramBuilderSetSubroutineLinkage(CPU* c, u64 b, i32 n, u64 maps) {
+    (void)c, (void)b, (void)n, (void)maps;
+}
+u64 nvn_ProgramBuilderGetSubroutineLinkage(CPU* c, u64 b) {
+    (void)c, (void)b;
+    return 0;
+}
+i32 nvn_ProgramBuilderGetSubroutineLinkageCount(CPU* c, u64 b) {
+    (void)c, (void)b;
+    return 0;
+}
+void nvn_ProgramBuilderSetMaxCallableRecursionDepth(CPU* c, u64 b, i32 depth) {
+    (void)c;
+    PB(b)->max_callable = (u32)depth;
+}
+i32 nvn_ProgramBuilderGetMaxCallableRecursionDepth(CPU* c, u64 b) {
+    (void)c;
+    return (i32)PB(b)->max_callable;
+}
+void nvn_ProgramBuilderSetMaxTraceRecursionDepth(CPU* c, u64 b, i32 depth) {
+    (void)c;
+    PB(b)->max_trace = (u32)depth;
+}
+i32 nvn_ProgramBuilderGetMaxTraceRecursionDepth(CPU* c, u64 b) {
+    (void)c;
+    return (i32)PB(b)->max_trace;
+}
+void nvn_ProgramBuilderSetProgramRayTracingFlags(CPU* c, u64 b, i32 flags) {
+    (void)c;
+    PB(b)->rt_flags = (u32)flags;
+}
+i32 nvn_ProgramBuilderGetProgramRayTracingFlags(CPU* c, u64 b) {
+    (void)c;
+    return (i32)PB(b)->rt_flags;
+}
+/* An Ounce control section: version 0xc9 at 0x04 (where the older ones have 1), in formats 7 and 11 so far, which
+   share their layout */
+static int ounce_section(u64 control) {
+    u32 format = gr32(control + 8);
+    if (gr32(control + 4) != 0xc9) return 0;
+    if (format != 7 && format != 11) LOG_LIMIT(1, "nvn: an Ounce control section of format %u\n", format);
+    return 1;
+}
+/* an Ounce program's NVN stage: its control section's (nvn_section.h). The header that starts a graphics program
+   at its GPU address data cannot tell a task or mesh program from a vertex or tessellation evaluation one, so it only
+   checks the section's stage of the other programs */
+static u32 stage11(u64 data, u64 control) {
+    static const u8 nvn_of[] = {NVN_SHADER_STAGE_VERTEX, NVN_SHADER_STAGE_TESS_CONTROL, NVN_SHADER_STAGE_TESS_EVALUATION,
+                                NVN_SHADER_STAGE_GEOMETRY, NVN_SHADER_STAGE_FRAGMENT}; /* by ST_VS to ST_FS */
+    u32 stage = nvn_section_stage(GP(control));
+    if (stage == NVN_SHADER_STAGE_TASK || stage == NVN_SHADER_STAGE_MESH) return stage;
+    u8 w[4];
+    gmem_read_code(data, w, sizeof w);
+    int s = sm86_sph_stage(snx_ld_le32(w));
+    u32 sph = s < 0 ? NVN_SHADER_STAGE_COMPUTE : nvn_of[s];
+    if (stage != sph)
+        LOG_LIMIT(4, "nvn: an Ounce control section of stage %u for a program whose header says stage %u\n", stage, sph);
+    return sph;
+}
+/* An Ounce mesh or task program, logged with its section's fields, and its bytes kept with the sm86_dump setting */
+static void log_mesh(u64 data, u64 control, u32 stage) {
+    NvnSectionMesh m = nvn_section_mesh(GP(control));
+    u32 bytes = gr32(control + 0x44), sph[32];
+    u8 head[SM86_SPH_BYTES];
+    gmem_read_code(data, head, sizeof head);
+    for (u32 i = 0; i < 32; i++) sph[i] = snx_ld_le32(head + 4 * i);
+    LOG_LIMIT(64,
+              "nvn: %s program at %llx: %#x bytes, SPH %08x, %u invocations, payload %#x, %s, %u vertices, %u "
+              "primitives of %u vertices, per-primitive header at %#x\n",
+              stage == NVN_SHADER_STAGE_TASK ? "task" : "mesh", (unsigned long long)data, bytes, sph[0],
+              m.threads, m.payload, m.has_task ? "after a task program" : "alone", m.max_vertices, m.max_primitives,
+              m.primitive_vertices, m.gs_header);
+    if (g_shader_sm86_dump && g_shader_sm86_dump[0] && bytes > SM86_SPH_BYTES && bytes <= 0x100000) {
+        u8* code = malloc(bytes);
+        if (code) {
+            gmem_read_code(data, code, bytes);
+            sm86_debug_dump(stage == NVN_SHADER_STAGE_TASK ? "task" : "mesh", code + SM86_SPH_BYTES,
+                            bytes - SM86_SPH_BYTES, sph, "a mesh-pipeline program");
+            free(code);
+        }
+    }
+}
 /* A stage's control section, as the game's driver reads it (its accessor for the newest format, which one game's
    format 8 sections share): 0x00 the magic, 0x04 1, 0x08 the format, 0x700 the constants' offset in the code area,
    0x704 the code area's bytes, 0x708 the program's offset (past the driver's 0x30-byte wrapper in a graphics stage),
@@ -1512,6 +1758,34 @@ static int stage_of(NvnProgram* o, u64 data, u64 control) {
     u32 magic = gr32(control), one = gr32(control + 4), format = gr32(control + 8), cb = gr32(control + 0x700),
         size = gr32(control + 0x704), off = gr32(control + 0x708), stage = gr32(control + 0x714);
     NvnStage* st;
+    /* An Ounce control section (version 0xc9, formats 7 and 11): its program is SM86 code at data, with no wrapper. A graphics program
+       starts with its 128-byte header, whose word 0 gives the stage, and a compute program with its first
+       instruction. 0x38 is the code's bytes and 0x3c the constants' (bank 1), which start at 0x40, the code's bytes
+       rounded up to 256 (a jump table at c[1][0] shows it) */
+    if (magic == 0x98761234u && ounce_section(control)) {
+        if (!data) return 0;
+        u32 stage11_of = stage11(data, control);
+        if (stage11_of >= NVN_STAGES) {
+            LOG_LIMIT(4, "nvn: an Ounce control section of stage %u\n", stage11_of);
+            return 0;
+        }
+        if (stage11_of >= NVN_SHADER_STAGE_TASK) log_mesh(data, control, stage11_of);
+        st = &o->st[stage11_of];
+        st->data = data;
+        st->off = 0;
+        st->cb = (u16)(gr32(control + 0x40) >> 8);
+        st->cb_size = (u16)((gr32(control + 0x3c) + 0xff) >> 8);
+        /* a compute program's workgroup size, at 0x58-0x60 of its section (0 in the graphics ones), and its shared
+           memory bytes at 0x64: 0 in most of one game's programs, 0x800 to 0xc000 in the others. Without it the
+           translator gave each 16 KiB, and those of 48 KiB reached past their shared array */
+        if (st == &o->st[NVN_SHADER_STAGE_COMPUTE]) {
+            o->block[0] = (u16)gr32(control + 0x58);
+            o->block[1] = (u16)gr32(control + 0x5c);
+            o->block[2] = (u16)gr32(control + 0x60);
+            o->off_a = gr32(control + 0x64);
+        }
+        return 1;
+    }
     /* a graphics stage's program follows the driver's 0x30-byte wrapper; an older SDK's compute program (format 14)
        starts its code area at 0, with no wrapper (its first words are a scheduling word, 0x001fc000e22007f0): its
        SetShaders failing, one game's effects system went on to read the program's interface table, which the
@@ -1546,7 +1820,7 @@ static int stage_of(NvnProgram* o, u64 data, u64 control) {
     }
     return 1;
 }
-/* Under xfb_lock, find a serial or its insertion point. Both metadata entry types start with their serial.
+/* Under xfb_lock, find a serial or its insertion point. Each metadata entry type starts with its serial.
    Shader creation can finish out of serial order. Callers receive copies, so the arrays can grow or move. */
 static u32 program_metadata_index(const void* entries, u32 count, size_t stride, u64 serial) {
     u32 lo = 0, hi = count;
@@ -1560,6 +1834,27 @@ static u32 program_metadata_index(const void* entries, u32 count, size_t stride,
             hi = mid;
     }
     return lo;
+}
+/* Under xfb_lock, entry (stride bytes, starting with its serial) into the sorted array *entries of *count, which
+   grows by doubling from 32: what names the entries in the fatal message when memory runs out */
+static void program_metadata_insert(void** entries, u32* count, u32* capacity, size_t stride, const void* entry,
+                                    const char* what) {
+    if (*count == *capacity) {
+        u32 grown_to = *capacity ? *capacity * 2 : 32;
+        if (grown_to < *capacity || (size_t)grown_to > SIZE_MAX / stride)
+            fatal("nvn: program %s exceed the address space", what);
+        void* grown = realloc(*entries, (size_t)grown_to * stride);
+        if (!grown) fatal("nvn: no memory for %u program %s", grown_to, what);
+        *entries = grown;
+        *capacity = grown_to;
+    }
+    u64 serial;
+    memcpy(&serial, entry, sizeof serial);
+    u32 at = program_metadata_index(*entries, *count, stride, serial);
+    u8* base = *entries;
+    memmove(base + (size_t)(at + 1) * stride, base + (size_t)at * stride, (size_t)(*count - at) * stride);
+    memcpy(base + (size_t)at * stride, entry, stride);
+    (*count)++;
 }
 /* Layouts stay immutable after SetShaders because recorded commands can retain any earlier program serial. */
 int nvn_program_xfb(u64 serial, ShXfb* x) {
@@ -1580,6 +1875,32 @@ int nvn_program_tess(u64 serial, NvnTessStage stages[2]) {
     }
     pm_unlock(&g_nvn.object.xfb_lock);
     return found;
+}
+/* the Ounce records of the program SetShaders gave serial, all 0 for none */
+static NvnOunceEntry ounce_find(u64 serial) {
+    NvnOunceEntry e = {0};
+    pm_lock(&g_nvn.object.xfb_lock);
+    u32 i = program_metadata_index(g_nvn.object.ounce, g_nvn.object.nounce, sizeof *g_nvn.object.ounce, serial);
+    if (i < g_nvn.object.nounce && g_nvn.object.ounce[i].serial == serial) e = g_nvn.object.ounce[i];
+    pm_unlock(&g_nvn.object.xfb_lock);
+    return e;
+}
+void nvn_program_c0(u64 serial, u8 c0[NVN_C0_RECORD]) {
+    NvnOunceEntry e = ounce_find(serial);
+    memcpy(c0, e.c0, NVN_C0_RECORD);
+}
+DsMeshKey nvn_program_mesh(u64 serial) { return ounce_find(serial).mesh; }
+/* an Ounce program's records, kept for its serial when it has any */
+static void ounce_of(NvnOunceEntry* e, u64 serial) {
+    static const NvnOunceEntry none = {0};
+    if (!memcmp(e->c0, none.c0, sizeof e->c0) && !memcmp(&e->mesh, &none.mesh, sizeof e->mesh)) return;
+    e->serial = serial;
+    pm_lock(&g_nvn.object.xfb_lock);
+    void* entries = g_nvn.object.ounce;
+    program_metadata_insert(&entries, &g_nvn.object.nounce, &g_nvn.object.ounce_capacity, sizeof *e, e,
+                            "c[0] records and mesh fields");
+    g_nvn.object.ounce = entries;
+    pm_unlock(&g_nvn.object.xfb_lock);
 }
 /* The control-section ABI has fixed evaluation values at0x738..744. Format16 adds control values at0x848 and
    independent declaration flags at0x858/868. Earlier evaluation binaries declare all four fields implicitly. */
@@ -1606,20 +1927,10 @@ static void tess_of(const u64 controls[2], u64 serial) {
         entry.stage[stage] = (NvnTessStage){domain | spacing << 4 | (u32)(raw[2] != 0) << 8 | winding << 12, declared};
     }
     pm_lock(&g_nvn.object.xfb_lock);
-    if (g_nvn.object.ntess == g_nvn.object.tess_capacity) {
-        u32 capacity = g_nvn.object.tess_capacity ? g_nvn.object.tess_capacity * 2 : 32;
-        if (capacity < g_nvn.object.tess_capacity || (size_t)capacity > SIZE_MAX / sizeof *g_nvn.object.tess)
-            fatal("nvn: tessellation program declarations exceed the address space");
-        NvnTessEntry* grown = realloc(g_nvn.object.tess, (size_t)capacity * sizeof *grown);
-        if (!grown) fatal("nvn: no memory for %u tessellation program declarations", capacity);
-        g_nvn.object.tess = grown;
-        g_nvn.object.tess_capacity = capacity;
-    }
-    u32 at = program_metadata_index(g_nvn.object.tess, g_nvn.object.ntess, sizeof *g_nvn.object.tess, serial);
-    memmove(g_nvn.object.tess + at + 1, g_nvn.object.tess + at,
-            (size_t)(g_nvn.object.ntess - at) * sizeof *g_nvn.object.tess);
-    g_nvn.object.tess[at] = entry;
-    g_nvn.object.ntess++;
+    void* entries = g_nvn.object.tess;
+    program_metadata_insert(&entries, &g_nvn.object.ntess, &g_nvn.object.tess_capacity, sizeof entry, &entry,
+                            "tessellation declarations");
+    g_nvn.object.tess = entries;
     pm_unlock(&g_nvn.object.xfb_lock);
 }
 /* The capture layout a stage's control section gives, as the game's driver reads it into the 3D engine's
@@ -1633,6 +1944,9 @@ static void xfb_of(u64 control, u64 serial) {
                                    0xd0, 0xd4, 0xd8, 0xdc, 0xe0, 0xe4, 0xb0, 0xb1, 0xb2, 0xb3, 0xb4,
                                    0xb5, 0xb6, 0xb7, 0xbf, 0x1a, 0x19, 0xe8, 0xff, 0x18, 0xff};
     const u8* c = GP(control);
+    /* an Ounce control section (version 0xc9) stores transform feedback differently: its 0x6ec byte is not the
+       capture flag, so treat it as not capturing (the old layout's reads would misread garbage) */
+    if (ounce_section(control)) return;
     if (!c[0x6ec]) return;
     NvnXfbEntry e = {0};
     e.serial = serial;
@@ -1650,20 +1964,10 @@ static void xfb_of(u64 control, u64 serial) {
         }
     }
     pm_lock(&g_nvn.object.xfb_lock);
-    if (g_nvn.object.nxfb == g_nvn.object.xfb_capacity) {
-        u32 capacity = g_nvn.object.xfb_capacity ? g_nvn.object.xfb_capacity * 2 : 32;
-        if (capacity < g_nvn.object.xfb_capacity || (size_t)capacity > SIZE_MAX / sizeof *g_nvn.object.xfb)
-            fatal("nvn: transform feedback program layouts exceed the address space");
-        NvnXfbEntry* grown = realloc(g_nvn.object.xfb, (size_t)capacity * sizeof *grown);
-        if (!grown) fatal("nvn: no memory for %u transform feedback program layouts", capacity);
-        g_nvn.object.xfb = grown;
-        g_nvn.object.xfb_capacity = capacity;
-    }
-    u32 at = program_metadata_index(g_nvn.object.xfb, g_nvn.object.nxfb, sizeof *g_nvn.object.xfb, serial);
-    memmove(g_nvn.object.xfb + at + 1, g_nvn.object.xfb + at,
-            (size_t)(g_nvn.object.nxfb - at) * sizeof *g_nvn.object.xfb);
-    g_nvn.object.xfb[at] = e;
-    g_nvn.object.nxfb++;
+    void* entries = g_nvn.object.xfb;
+    program_metadata_insert(&entries, &g_nvn.object.nxfb, &g_nvn.object.xfb_capacity, sizeof e, &e,
+                            "transform feedback layouts");
+    g_nvn.object.xfb = entries;
     pm_unlock(&g_nvn.object.xfb_lock);
 }
 
@@ -1695,6 +1999,7 @@ static int set_shaders(u64 p, i32 n, u64 sd, u64 stride) {
     u64 last = 0; /* the control section of the last stage before rasterization */
     u64 tess_controls[2] = {0};
     u32 subroutine_mask = 0;
+    NvnOunceEntry ounce = {0};
     i32 i, last_rank = -1;
     if (n < 0 || n > 6) {
         LOG_LIMIT(8, "nvn: nvnProgramSetShaders with %d stages\n", n);
@@ -1705,12 +2010,21 @@ static int set_shaders(u64 p, i32 n, u64 sd, u64 stride) {
     memset(o->block, 0, sizeof o->block);
     o->off_a = 0;
     for (i = 0; i < n; i++) {
+        u64 data = gr64(sd + stride * (u64)i);                         /* a GPU address, 64 bits in every game */
         u64 control = nvn_gptr(sd + stride * (u64)i + 8); /* a pointer: its word in a 32-bit game */
         u32 stage;
         i32 rank;
-        if (!stage_of(o, gr64(sd + stride * (u64)i), control)) return 0;
+        if (!stage_of(o, data, control)) return 0;
+        /* an Ounce compute program's c[0] record (nvn_program_c0), or its task and mesh programs' fields
+           (nvn_program_mesh) */
+        if (g_nvn.loader.api >= 231u << 16 && ounce_section(control)) {
+            u32 s11 = stage11(data, control);
+            if (s11 == NVN_SHADER_STAGE_COMPUTE) memcpy(ounce.c0, GP(control + 0xa8), NVN_C0_RECORD);
+            if (s11 == NVN_SHADER_STAGE_TASK || s11 == NVN_SHADER_STAGE_MESH)
+                nvn_section_mesh_key(GP(control), s11, &ounce.mesh);
+        }
         /* geometry, else tessellation evaluation, else control, else vertex: the driver's order */
-        stage = gr32(control + 0x714);
+        stage = ounce_section(control) ? stage11(data, control) : gr32(control + 0x714);
         if (gr32(control + 8) >= 7 && GP(control)[0x7c0]) subroutine_mask |= 1u << stage;
         if (stage == NVN_SHADER_STAGE_TESS_CONTROL) tess_controls[0] = control;
         if (stage == NVN_SHADER_STAGE_TESS_EVALUATION) tess_controls[1] = control;
@@ -1730,6 +2044,7 @@ static int set_shaders(u64 p, i32 n, u64 sd, u64 stride) {
     if (last) xfb_of(last, o->serial);
     tess_of(tess_controls, o->serial);
     sub_program(o->serial, subroutine_mask);
+    ounce_of(&ounce, o->serial);
     return 1;
 }
 int nvn_ProgramSetShaders(CPU* c, u64 p, i32 n, u64 sd) {
@@ -1746,6 +2061,16 @@ int nvn_ProgramSetShadersExt(CPU* c, u64 p, i32 n, u64 sd) {
          (unsigned long long)c->x[30]);
     return ok;
 }
+/* The Ounce's program from a builder: its stages from the builder's shader data (NVNshaderData entries, which the
+   builder points to), with the builder's sample shading, as SetShaders takes them */
+int nvn_ProgramInitializeFromBuilder(CPU* c, u64 p, u64 b) {
+    NvnProgram* o = NVN_OBJ(NvnProgram, p);
+    (void)c;
+    memset(o, 0, sizeof *o); /* guest memory: every byte the game sees */
+    o->magic = NVN_MAGIC('P', 'R', 'O', 'G');
+    o->sample_shading = (u16)PB(b)->sample_shading;
+    return set_shaders(p, (i32)PB(b)->shader_count, PB(b)->shaders, sizeof(NVNshaderData));
+}
 
 /* the sample shading of the program's next SetShaders: NVN_SAMPLE_SHADING_* (0 as the program says, 1 every sample, 2
    not every sample), kept in the low byte until SetShaders applies it (the high byte, which the draws read) */
@@ -1753,6 +2078,19 @@ void nvn_ProgramSetSampleShading(CPU* c, u64 p, i32 mode) {
     NvnProgram* o = NVN_OBJ(NvnProgram, p);
     (void)c;
     o->sample_shading = (u16)((o->sample_shading & 0xff00) | ((u32)mode & 0x3f));
+}
+/* No ray tracing yet. A game takes the largest of these to size memory, and a size of 0 stops it there: this one is
+   made up. The group handles stay what the caller's memory holds, as nothing dispatches rays */
+u64 nvn_ProgramGetScratchBytesPerWarp(CPU* c, u64 p) {
+    (void)c;
+    (void)p;
+    LOG_LIMIT(1, "nvn: a program's scratch bytes asked for, and made up: no ray tracing yet\n");
+    return 0x1000;
+}
+void nvn_ProgramGetShaderGroupHandle(CPU* c, u64 p) {
+    (void)c;
+    (void)p;
+    LOG_LIMIT(1, "nvn: a program's shader group handles asked for: no ray tracing yet\n");
 }
 /* the tiled cache's subtile size a program asks for: the game's driver's SetShaders sets it to 0 and nothing in the
    API sets it otherwise (NVN 55.15). The renderer has no tiled cache */
@@ -2538,6 +2876,17 @@ int nvn_MultisampleStateGetSampleLocationsGridEnable(CPU* c, u64 s) {
     (void)c;
     return (MS(s)->flags & NVN_MS_GRID) != 0;
 }
+/* the Ounce's coverage truncation (API 231), bit 5 of the driver's first word: kept for the getter. The renderer
+   rasterizes without it */
+void nvn_MultisampleStateSetCoverageTruncationEnable(CPU* c, u64 s, int on) {
+    (void)c;
+    if (on) LOG_LIMIT(1, "nvn: coverage truncation is not drawn\n");
+    ms_flag(s, NVN_MS_COV_TRUNC, on);
+}
+int nvn_MultisampleStateGetCoverageTruncationEnable(CPU* c, u64 s) {
+    (void)c;
+    return (MS(s)->flags & NVN_MS_COV_TRUNC) != 0;
+}
 /* the pixels the sample locations cover, as the game's driver answers: 16 locations in all, so a 4x4 grid of pixels
    for one sample, 2x4 for two, 2x2 for four, 1x2 for eight and 1x1 for sixteen, by the larger of the samples and the
    raster samples. Other counts write nothing */
@@ -2627,7 +2976,7 @@ i32 nvn_DeviceGetDepthMode(CPU* c, u64 d) {
 u64 nvn_DeviceGetCurrentTimestampInNanoseconds(CPU* c, u64 d) {
     (void)c;
     (void)d;
-    return guest_ticks() * 625 / 12;
+    return guest_gpu_ticks() * 625 / 12;
 }
 
 /* ============================================================ builder getters: what was set */

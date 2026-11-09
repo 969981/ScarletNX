@@ -48,7 +48,7 @@ snx_component(kernel hle/hle.c hle/kernel/kernel.c hle/kernel/thread.c hle/kerne
 # the SVC dispatch, generated from hle/svc/hos.svc
 include("${PROJECT_SOURCE_DIR}/cmake/svcgen.cmake")
 snx_svcgen(snx_kernel)
-snx_component(hle hle/services/services.c hle/services/audren.c hle/services/audren_dsp.c hle/services/pl.c hle/services/pl_font.c hle/services/sm.c hle/services/am.c hle/services/set.c hle/services/time.c hle/services/acc.c hle/services/users.c hle/services/audio.c
+snx_component(hle hle/services/services.c hle/services/audren.c hle/services/audren_dsp.c hle/services/pl.c hle/services/pl_font.c hle/services/sm.c hle/services/am.c hle/services/gsv.c hle/services/native_video.c hle/services/native_video_core.c hle/services/set.c hle/services/time.c hle/services/acc.c hle/services/users.c hle/services/audio.c
               hle/services/misc.c hle/services/ldr.c hle/services/network/bsd.c hle/services/network/dns.c
               hle/services/network/nifm.c hle/services/network/ssl.c hle/services/network/ldn.c hle/services/network/room.c hle/filesystem/fs.c hle/services/hid.c hle/services/hid_motion.c hle/services/hid_touch.c hle/services/vi.c hle/services/nvdrv.c
               hle/hook/hook.c hle/hook/libc.c hle/hook/diag.c hle/hook/codec.c hle/hook/audio_stream.c hle/hook/verify.c hle/hook/version.c)
@@ -66,7 +66,7 @@ include("${PROJECT_SOURCE_DIR}/cmake/swipc.cmake")
 snx_swipc(snx_hle FNS ROOT "${CMAKE_CURRENT_SOURCE_DIR}" FILES
           hle/services/types.swipc hle/services/sm.swipc hle/services/set.swipc hle/services/acc.swipc
           hle/services/audio.swipc hle/services/ldr.swipc hle/services/pl.swipc hle/services/time.swipc
-          hle/services/misc.swipc hle/services/am.swipc hle/services/hid.swipc
+          hle/services/misc.swipc hle/services/am.swipc hle/services/native_video.swipc hle/services/gsv.swipc hle/services/hid.swipc
           hle/services/vi.swipc hle/services/nvdrv.swipc hle/services/network/bsd.swipc
           hle/services/network/dns.swipc hle/services/network/nifm.swipc hle/services/network/ssl.swipc
           hle/services/network/ldn.swipc
@@ -77,11 +77,12 @@ target_link_libraries(snx_video PRIVATE FFmpeg::avcodec)
 include("${PROJECT_SOURCE_DIR}/cmake/splash.cmake")
 target_link_libraries(snx_hle PRIVATE FFmpeg::avcodec OpenSSL::SSL snx_splash)
 snx_component(gpu gpu/gpu.c gpu/maxwell/engines.c gpu/maxwell/mme.c gpu/maxwell/compute.c gpu/maxwell/fermi2d.c gpu/maxwell/dma.c gpu/maxwell/write_pages.c gpu/draw_state.c gpu/maxwell/draw_state.c gpu/maxwell/maxwell3d.c gpu/renderer.c
-              gpu/nvn/nvn_loader.c gpu/nvn/nvn_object.c gpu/nvn/nvn_cmd.c gpu/nvn/nvn_queue.c
+              gpu/nvn/nvn_loader.c gpu/nvn/nvn_object.c gpu/nvn/nvn_cmd.c gpu/nvn/nvn_queue.c gpu/nvn/nvn_dlss.c
               gpu/nvn/nvn_tex.c gpu/nvn/nvn_driver.c gpu/nvn/nvn_tic.c gpu/nvn/nvn_replay.c gpu/nvn/nvn_draw.c gpu/nvn/nvn_copy.c gpu/nvn/nvn_state.c
               gpu/nvn/nvn_save.c
               gpu/shipped_pass.c)
 # the NVN functions nvn implements: their adapters and table, generated from gpu/nvn/nvn.hook
+target_link_libraries(snx_gpu PRIVATE snx_zstd) # an Ounce game's .zs shader files (gpu/shipped_pass.c)
 snx_hookgen(snx_gpu SPEC "${CMAKE_CURRENT_SOURCE_DIR}/gpu/nvn/nvn.hook" PREFIX nvn NAME gpu/nvn/nvn.hook A32)
 include("${PROJECT_SOURCE_DIR}/cmake/ship_walk.cmake")
 snx_ship_walk(gpu/shipped_pass.c)
@@ -114,14 +115,15 @@ snx_component(shader gpu/shader/shader.c gpu/shader/decode.c gpu/shader/corpus.c
                      gpu/shader/spirv_translate.c gpu/shader/spirv_compute.c gpu/shader/structure.c
                      gpu/shader/shared_reach.c gpu/shader/registers.c gpu/shader/forms.c gpu/shader/dataflow.c
                      gpu/shader/emit_int.c gpu/shader/emit_float.c gpu/shader/emit_memory.c gpu/shader/emit_texture.c
-                     gpu/shader/emit_io.c gpu/shader/emit_flow.c gpu/shader/emit_thread.c gpu/shader/advanced_blend_spirv.c gpu/shader/coverage_spirv.c gpu/shader/capture_tiles_spirv.c gpu/shader/depth_stencil_spirv.c)
+                     gpu/shader/emit_io.c gpu/shader/emit_flow.c gpu/shader/emit_thread.c gpu/shader/advanced_blend_spirv.c gpu/shader/coverage_spirv.c gpu/shader/capture_tiles_spirv.c gpu/shader/depth_stencil_spirv.c
+                     gpu/shader/sm86_decode.c gpu/shader/sm86_translate.c)
 # the opcode enum and decoder, generated from gpu/shader/maxwell_opcodes.def
 include("${PROJECT_SOURCE_DIR}/cmake/shaderdec.cmake")
 snx_shaderdec(snx_shader)
 # the drivers known to break an extension or feature, compiled in from gpu/vk/extension_bans.txt
 include("${PROJECT_SOURCE_DIR}/cmake/vk_extension_bans.cmake")
 snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/descriptors.c gpu/vk/descriptor_heaps.c gpu/vk/descriptor_objects.c gpu/vk/cmd.c gpu/vk/record.c gpu/vk/format.c gpu/vk/surface.c gpu/vk/texture.c
-                 gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/xfb.c gpu/vk/display.c gpu/vk/compute.c
+                 gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/writelog.c gpu/vk/mirror.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/xfb.c gpu/vk/display.c gpu/vk/compute.c
                  gpu/vk/pending_pages.c gpu/vk/checkpoints.c gpu/vk/image_out.c gpu/vk/depth_pack.c gpu/vk/memory.c gpu/vk/resource_stats.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/bc7_cache.c gpu/vk/blocklinear.c gpu/vk/texconv.c gpu/vk/owned.c gpu/vk/nvdec.c gpu/vk/dma.c gpu/vk/blit.c gpu/vk/msaa.c gpu/vk/ui.c gpu/texture/blocklinear.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/vma.cpp gpu/vk/gpuprof.c gpu/vk/uma.c
                  gpu/vk/ftz_probe.c gpu/vk/vertex_input.c gpu/vk/extension_bans.c gpu/vk/pipeline_library.c
                  "${PROJECT_BINARY_DIR}/generated/vk_extension_bans_text.c"
@@ -153,6 +155,9 @@ snx_glsl_spirv(snx_vk SOURCE gpu/vk/query_predicate.comp NAME query_predicate_sp
 snx_glsl_spirv(snx_vk SOURCE gpu/vk/query_count.comp NAME query_count_spv HEADER nx/gpu/vk/query_count_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/vk/xfb_indirect.comp NAME xfb_indirect_spv HEADER nx/gpu/vk/xfb_indirect_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/vk/depth_pack.comp NAME depth_pack_spv HEADER nx/gpu/vk/depth_pack_spv.h)
+snx_glsl_spirv(snx_vk SOURCE gpu/vk/mirror_harvest.comp NAME mirror_harvest_spv HEADER nx/gpu/vk/mirror_harvest_spv.h)
+snx_glsl_spirv(snx_vk SOURCE gpu/vk/mirror_fold.comp NAME mirror_fold_spv HEADER nx/gpu/vk/mirror_fold_spv.h)
+snx_glsl_spirv(snx_vk SOURCE gpu/vk/wlog_merge.comp NAME wlog_merge_spv HEADER nx/gpu/vk/wlog_merge_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/vk/query_compare.comp NAME query_compare_spv
                HEADER nx/gpu/vk/query_compare_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/vk/ftz_probe.comp NAME ftz_probe_spv HEADER nx/gpu/vk/ftz_probe_spv.h)
@@ -343,13 +348,27 @@ endif()
 
 # Opt-in because normal unit-test runs need neither an ICD nor a GPU. All rendering uses the real runtime.
 if(BUILD_TESTING AND SNX_TEST_VULKAN)
+    # the SM86 translator on the device against the CPU reference (tests/support/sm86_ref.c), whose rounding modes
+    # come from fesetround: -frounding-math keeps the compiler from folding them away
+    add_executable(snx-test-shader-sm86-gpu "${PROJECT_SOURCE_DIR}/tests/shader_sm86_gpu.c"
+        "${PROJECT_SOURCE_DIR}/tests/support/sm86_ref.c" "${volk_SOURCE_DIR}/volk.c")
+    target_include_directories(snx-test-shader-sm86-gpu PRIVATE "${PROJECT_SOURCE_DIR}/tests")
+    target_link_libraries(snx-test-shader-sm86-gpu PRIVATE snx_nx_flags snx_shader ${CMAKE_DL_LIBS})
+    set_source_files_properties("${PROJECT_SOURCE_DIR}/tests/support/sm86_ref.c" PROPERTIES COMPILE_OPTIONS
+                                "-frounding-math")
+    if(NOT WIN32)
+        target_link_libraries(snx-test-shader-sm86-gpu PRIVATE m)
+    endif()
+    add_test(NAME shader_sm86_gpu COMMAND snx-test-shader-sm86-gpu)
+    set_tests_properties(shader_sm86_gpu PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     # the BC7 encoder run on the CPU (tests/glsl/bc7_cpu.cpp): what the encoder's blocks between frames are held to
     # (tests/vulkan_astc_later.inc)
     add_executable(snx-test-vulkan "${PROJECT_SOURCE_DIR}/tests/vulkan_headless.c"
         "${PROJECT_SOURCE_DIR}/tests/spirv_emitter_fixture.c" "${PROJECT_SOURCE_DIR}/tests/support/nvdec_ref.c"
         "${PROJECT_SOURCE_DIR}/tests/support/vic_ref.c" "${PROJECT_SOURCE_DIR}/tests/support/dma_ref.c"
         "${PROJECT_SOURCE_DIR}/tests/support/fermi2d_ref.c" "${PROJECT_SOURCE_DIR}/tests/support/half.c"
-        "${PROJECT_SOURCE_DIR}/tests/glsl/bc7_cpu.cpp")
+        "${PROJECT_SOURCE_DIR}/tests/glsl/bc7_cpu.cpp" "${PROJECT_SOURCE_DIR}/tests/support/sm86_ref.c")
+    target_include_directories(snx-test-vulkan PRIVATE "${PROJECT_SOURCE_DIR}/tests")
     target_link_libraries(snx-test-vulkan PRIVATE snx_nx_flags ${components} snx_driver FFmpeg::avutil Threads::Threads
                                                   ${CMAKE_DL_LIBS})
     target_include_directories(snx-test-vulkan PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/hookgen/snx_gpu"
@@ -366,6 +385,10 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     # comes back after the load (tests/vulkan_nvn_savestate.inc). Alone, as the load replaces the guest memory
     add_test(NAME vulkan_nvn_savestate COMMAND snx-test-vulkan -H)
     set_tests_properties(vulkan_nvn_savestate PROPERTIES TIMEOUT 60 ENVIRONMENT "SNX_TEST_NVN_CASE=savestate"
+        FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
+    # an Ounce game's mesh draws, which the experimental mesh_draws setting turns on (check_mesh_draws)
+    add_test(NAME vulkan_headless_mesh COMMAND snx-test-vulkan -H --mesh_draws=1)
+    set_tests_properties(vulkan_headless_mesh PROPERTIES TIMEOUT 60
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     add_test(NAME vulkan_storage_lookup COMMAND snx-test-vulkan -H --vk_memory=1 --bench-storage-lookup)
     set_tests_properties(vulkan_storage_lookup PROPERTIES TIMEOUT 60

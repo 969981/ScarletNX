@@ -883,6 +883,87 @@ void nvn_CommandBufferSetControlMemoryCallbackEnabled(CPU* c, u64 cb, int on) {
     (void)c;
     if (t) t->grow = on != 0;
 }
+/* the Ounce's recording mode (graphics/compute/copy/device): the runtime's records carry their own kind, so the
+   mode is not stored (the game's inlined NVN code, which would read it, stays off) */
+void nvn_CommandBufferSetRecordingMode(CPU* c, u64 cb, i32 mode) {
+    (void)c;
+    (void)cb;
+    (void)mode;
+}
+/* the Ounce's compute/copy overlap mode: same as SetRecordingMode, the runtime's records carry their own kind */
+void nvn_CommandBufferSetComputeOverlapMode(CPU* c, u64 cb, i32 mode) {
+    (void)c;
+    (void)cb;
+    (void)mode;
+}
+/* the Ounce's shading rate image, which lowers the fragment rate where it says. The runtime shades each pixel,
+   which gives the image of the full rate. A null texture unbinds it (the game's driver skips its methods) */
+void nvn_CommandBufferBindShadingRateImage(CPU* c, u64 cb, u64 t, u64 v) {
+    (void)c;
+    (void)cb;
+    (void)v;
+    if (t) LOG_LIMIT(1, "nvn: a shading rate image is shaded at the full rate\n");
+}
+/* the shading rates of a viewport's palette, and how the palette is read: the runtime shades at the full rate */
+void nvn_CommandBufferShadingRateImagePalette(CPU* c, u64 cb, i32 viewport, i32 n, u64 rates) {
+    (void)c;
+    (void)cb;
+    (void)viewport;
+    (void)n;
+    (void)rates;
+}
+void nvn_CommandBufferSetShadingRatePaletteMode(CPU* c, u64 cb, i32 mode) {
+    (void)c;
+    (void)cb;
+    (void)mode;
+}
+/* the Ounce's geometry processing mode, which the game's driver writes to method 0xe26 of the 3D engine (and 0 to
+   0xe3e). The game sets mode 2 before its mesh draws, which take the mesh pipeline whatever the mode says
+   (DrawMeshTasks*) */
+void nvn_CommandBufferSetGeometryProcessingMode(CPU* c, u64 cb, i32 mode) {
+    (void)c;
+    (void)cb;
+    if (mode) LOG_LIMIT(1, "nvn: geometry processing mode %d\n", mode);
+}
+/* The Ounce's mesh draws (OP_DRAW_MESH). cost: the bytes of the driver's macro call (docs/platforms/nx/ounce.md) */
+static void draw_mesh(CPU* c, u64 cb, i32 first, i32 count, u32 cost) {
+    NvnPDrawMesh d = {0};
+    d.first = first;
+    d.count = count;
+    memcpy(GP(rec(c, cb, OP_DRAW_MESH, offsetof(NvnPDrawMesh, ind), cost)), &d, offsetof(NvnPDrawMesh, ind));
+}
+static void draw_mesh_indirect(CPU* c, u64 cb, u32 form, u64 ind, u64 count, i32 max, i64 stride, u32 cost) {
+    NvnPDrawMesh d = {0};
+    LOG_LIMIT(1, "nvn: the game records indirect mesh draws\n");
+    d.form = form;
+    d.ind = ind;
+    d.mdi_count = count;
+    d.mdi_max = max;
+    d.mdi_stride = stride > 0 && stride <= 0x7fffffff ? (i32)stride : 0;
+    memcpy(GP(rec(c, cb, OP_DRAW_MESH, sizeof d, cost)), &d, sizeof d);
+}
+void nvn_CommandBufferDrawMeshTasks(CPU* c, u64 cb, i32 first, i32 count) { draw_mesh(c, cb, first, count, 12); }
+/* the hardware draws x y z groups in a row, and the program finds its own index in them */
+void nvn_CommandBufferDrawMeshTasks3D(CPU* c, u64 cb, i32 x, i32 y, i32 z) {
+    u64 n = x > 0 && y > 0 && z > 0 ? (u64)x * (u64)y * (u64)z : 0;
+    draw_mesh(c, cb, 0, n > 0x7fffffffu ? 0x7fffffff : (i32)n, 16);
+}
+void nvn_CommandBufferDrawMeshTasksIndirect(CPU* c, u64 cb, u64 ind) { draw_mesh_indirect(c, cb, 0, ind, 0, 1, 8, 12); }
+void nvn_CommandBufferDrawMeshTasks3DIndirect(CPU* c, u64 cb, u64 ind) {
+    draw_mesh_indirect(c, cb, NVN_MESH_3D, ind, 0, 1, 12, 12);
+}
+void nvn_CommandBufferMultiDrawMeshTasksIndirect(CPU* c, u64 cb, u64 ind, i32 n, i64 stride) {
+    draw_mesh_indirect(c, cb, 0, ind, 0, n, stride, COST_RECORD);
+}
+void nvn_CommandBufferMultiDrawMeshTasks3DIndirect(CPU* c, u64 cb, u64 ind, i32 n, i64 stride) {
+    draw_mesh_indirect(c, cb, NVN_MESH_3D, ind, 0, n, stride, COST_RECORD);
+}
+void nvn_CommandBufferMultiDrawMeshTasksIndirectCount(CPU* c, u64 cb, u64 ind, u64 count, i32 max, i64 stride) {
+    draw_mesh_indirect(c, cb, 0, ind, count, max, stride, COST_RECORD);
+}
+void nvn_CommandBufferMultiDrawMeshTasks3DIndirectCount(CPU* c, u64 cb, u64 ind, u64 count, i32 max, i64 stride) {
+    draw_mesh_indirect(c, cb, NVN_MESH_3D, ind, count, max, stride, COST_RECORD);
+}
 /* a recording starts with its first command, as in NVN */
 void nvn_CommandBufferBeginRecording(CPU* c, u64 cb) {
     NvnCmdBuf* o = CB(cb);
@@ -1045,6 +1126,23 @@ void nvn_CommandBufferUpdateUniformBuffer(CPU* c, u64 cb, u64 buffer, u64 buffer
     r->size = size;
     memcpy(GP(payload + sizeof *r), GP(data), (size_t)size);
 }
+/* An Ounce game's push constants: bytes (at most 256, in words) of a root table from byte offset on, copied into the
+   record. The game's driver writes table | offset << 8 to method 0x141 of the 3D or compute engine
+   (SET_ROOT_TABLE_SELECTOR), then the words to 0x142 (LOAD_ROOT_TABLE), and nothing for fewer than 4 bytes. It passes
+   the API's offset, in bytes as NVN's offsets are, and it cuts a push at 256 bytes, a table's size */
+static void push_constants(CPU* c, u64 cb, int compute, i32 table, i32 offset, i32 bytes, u64 data) {
+    u32 words = (u32)(bytes < 0 ? 0 : bytes > 0x100 ? 0x100 : bytes) / 4;
+    if (!words) return;
+    u64 payload = rec(c, cb, OP_PUSH_CONSTANTS, sizeof(NvnPPush) + 4 * (size_t)words, 4 * (words + 2));
+    *NVN_OBJ(NvnPPush, payload) = (NvnPPush){(u8)compute, (u8)(table & 7), (u8)offset, (u8)(words - 1)};
+    memcpy(GP(payload + sizeof(NvnPPush)), GP(data), 4 * (size_t)words);
+}
+void nvn_CommandBufferPushGraphicsConstants(CPU* c, u64 cb, i32 table, i32 offset, i32 bytes, u64 data) {
+    push_constants(c, cb, 0, table, offset, bytes, data);
+}
+void nvn_CommandBufferPushComputeConstants(CPU* c, u64 cb, i32 table, i32 offset, i32 bytes, u64 data) {
+    push_constants(c, cb, 1, table, offset, bytes, data);
+}
 
 /* ============================================================ render targets, clears and fixed state */
 /* A record with textures carries snapshots of their objects after its payload: once recorded, a command no longer
@@ -1119,6 +1217,33 @@ void nvn_CommandBufferCopyTextureToTexture(CPU* c, u64 cb, u64 s, u64 sv, u64 sr
     memcpy(&r->sr, GP(sr), sizeof r->sr);
     memcpy(&r->dr, GP(dr), sizeof r->dr);
     r->flags = flags;
+}
+/* nvnCommandBufferEvaluateDlss with no upscaler (nvn_dlss.c): the input color's subrectangle copied onto the output's
+   with a linear filter, as CopyTextureToTexture scales. The input's size is the parameters' subrectangle size, else
+   the network's render size; the output's is the network's output size, else the output texture's. Depth, motion
+   vectors, jitter and exposure go unused */
+void nvn_CommandBufferEvaluateDlss(CPU* c, u64 cb, u64 n, u64 p) {
+    const NvnDlssParameters q = *NVN_OBJ(const NvnDlssParameters, p);
+    const NvnDlssNetwork* o = NVN_OBJ(const NvnDlssNetwork, n);
+    i32 in_w = q.input_size[0] > 0 ? q.input_size[0] : o->render[0];
+    i32 in_h = q.input_size[1] > 0 ? q.input_size[1] : o->render[1];
+    i32 out_w = o->output[0], out_h = o->output[1];
+    NvnPCopyT2T* r;
+    if (!q.input.texture || !q.output.texture) {
+        LOG_LIMIT(4, "nvn: DLSS evaluation without an input or output texture: nothing copied\n");
+        return;
+    }
+    if (out_w <= 0 || out_h <= 0) {
+        const NvnTexture* t = NVN_OBJ(const NvnTexture, q.output.texture);
+        out_w = (i32)t->d.width;
+        out_h = (i32)t->d.height;
+    }
+    r = copy_t2t(c, cb, q.input.texture, q.input.view, q.output.texture, q.output.view);
+    r->sr = (NVNcopyRegion){q.base[0][0], q.base[0][1], 0, in_w, in_h, 1};
+    r->dr = (NVNcopyRegion){q.base[4][0], q.base[4][1], 0, out_w, out_h, 1};
+    r->flags = NVN_COPY_FLAGS_LINEAR_FILTER_BIT;
+    LOG_LIMIT(4, "nvn: DLSS evaluation copied %dx%d at (%d, %d) to %dx%d at (%d, %d)\n", in_w, in_h, q.base[0][0],
+              q.base[0][1], out_w, out_h, q.base[4][0], q.base[4][1]);
 }
 /* a multisample resolve of the whole texture, recorded as a copy (nxnative's) */
 static void downsample(CPU* c, u64 cb, u64 s, u64 sv, u64 d, u64 dv) {
@@ -1366,6 +1491,11 @@ void nvn_CommandBufferSetShaderScratchMemory(CPU* c, u64 cb, u64 pool, i64 offse
     (void)offset;
     (void)size;
 }
+void nvn_CommandBufferSetComputeWorkloadPriority(CPU* c, u64 cb, i32 priority) {
+    (void)c;
+    (void)cb;
+    (void)priority;
+}
 void nvn_CommandBufferSetTiledCacheAction(CPU* c, u64 cb, i32 action) {
     (void)c;
     (void)cb;
@@ -1577,12 +1707,16 @@ void nvn_CommandBufferWaitSync(CPU* c, u64 cb, u64 sync) {
 /* ============================================================ binds */
 /* the program's stages as they are now: the game may set new shaders in it before it submits */
 void nvn_CommandBufferBindProgram(CPU* c, u64 cb, u64 program, i32 stages) {
-    NvnPBindProgram* r = REC(c, cb, OP_BIND_PROGRAM, NvnPBindProgram, 128);
+    /* an Ounce game's record ends with its task and mesh stages. Another's stops before them, in the 128 bytes the
+       driver writes, so that its records stay in the game's command memory */
+    const int ounce = g_nvn.loader.api >= 231u << 16;
+    NvnPBindProgram* r = (NvnPBindProgram*)(void*)GP(
+        rec(c, cb, OP_BIND_PROGRAM, ounce ? sizeof(NvnPBindProgram) : NVN_PBIND_SWITCH_BYTES, 128));
     const NvnProgram* p = program ? NVN_OBJ(const NvnProgram, program) : NULL;
     r->stages = stages;
     if (p && p->magic == NVN_MAGIC('P', 'R', 'O', 'G')) {
         r->off_a = p->off_a;
-        memcpy(r->st, p->st, sizeof r->st);
+        memcpy(r->st, p->st, (ounce ? NVN_STAGES : NVN_SHADER_STAGE_TASK) * sizeof r->st[0]);
         r->serial = p->serial;
         memcpy(r->block, p->block, sizeof r->block);
         r->sample_shading = p->sample_shading;
@@ -1899,6 +2033,22 @@ void nvn_CommandBufferDrawElementsInstanced(CPU* c, u64 cb, i32 prim, i32 type, 
 }
 void nvn_CommandBufferDrawElementsBaseVertex(CPU* c, u64 cb, i32 prim, i32 type, i32 count, u64 ib, i32 base_vertex) {
     draw_idx(c, cb, prim, type, count, ib, base_vertex, 0, 1, 48);
+}
+/* No ray tracing yet: what a game records of its acceleration structures does nothing */
+void nvn_CommandBufferBindAccelerationStructure(CPU* c, u64 cb) {
+    (void)c;
+    (void)cb;
+    LOG_LIMIT(1, "nvn: an acceleration structure bound: no ray tracing yet\n");
+}
+void nvn_CommandBufferBuildAccelerationStructures(CPU* c, u64 cb) {
+    (void)c;
+    (void)cb;
+    LOG_LIMIT(1, "nvn: acceleration structures built: no ray tracing yet\n");
+}
+void nvn_CommandBufferCompactAccelerationStructure(CPU* c, u64 cb) {
+    (void)c;
+    (void)cb;
+    LOG_LIMIT(1, "nvn: an acceleration structure compacted: no ray tracing yet\n");
 }
 /* caller: the game's call site, which names the dispatcher */
 void nvn_CommandBufferDispatchCompute(CPU* c, u64 cb, i32 x, i32 y, i32 z) {

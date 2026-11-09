@@ -18,6 +18,7 @@ void vk_unlock(void);
 void vk_release_events(void);
 void vk_compute_land_through(u64);
 void vk_land_through(u64);
+void vk_mirror_publish(void);
 void vk_wait_submit(u64);
 void vk_compute_wait(u64);
 void vk_gfx_image_land(void);
@@ -56,7 +57,15 @@ typedef struct {
 } SamplesCount; /* vk.h's */
 #include "nx/gpu/vk/release.c"
 typedef void (*VkChangedRun)(void* user, u32 from, u32 to); /* vk.h's, for writeback.c */
+typedef struct {
+    u32 from, to;
+} VkRun;
+int vk_written_since(const u8* host, u64 len, u32 since);
 #include "nx/gpu/vk/writeback.c"
+int vk_written_since(const u8* host, u64 len, u32 since) { /* no write tracking here */
+    (void)host, (void)len, (void)since;
+    return -1;
+}
 
 int g_gpu_releases;
 static unsigned lock_depth, landing_calls, payload_writes, submits, query_reads, events_signaled;
@@ -131,8 +140,11 @@ void gmmu_pieces(u64 gva, u64 size, void (*fn)(void* ctx, u64 gva, u64 cpu, u64 
 }
 u32 syncpt_read(u32 id) { return id < 128 ? completed[id] : 0; }
 /* under vk_lock, so the events it reaches wait for vk_unlock (memory/own.c's traps are answered under vk_lock) */
+/* the GPU mirror's pages landed submits wrote, not yet GPU-owned: no release may let the game read them */
+static int mirror_unpublished;
 void syncpt_add_quiet(u32 id, u32 n) {
     assert(lock_depth && vk_result_landing());
+    assert(!mirror_unpublished);
     completed[id] += n;
     events_due = 1;
 }
@@ -145,6 +157,7 @@ void syncpt_events(void) {
 }
 int gmem_write(u64 address, const void* data, u64 size) {
     assert(lock_depth && vk_result_landing());
+    assert(!mirror_unpublished);
     vk_release_need(address, size); /* the real memory layer reenters here */
     u64 physical = gmmu_translate(address);
     assert(physical && physical + size <= sizeof memory);
@@ -155,6 +168,10 @@ int gmem_write(u64 address, const void* data, u64 size) {
 u8* gmem_ptr(u64 address, u64 size) {
     (void)size;
     return writeback_direct ? memory + gmmu_translate(address) : NULL;
+}
+u8* gmem_host(u64 address, u64 size) {
+    (void)size;
+    return memory + gmmu_translate(address);
 }
 int gmem_read(u64 address, void* data, u64 size) {
     vk_release_need(address, size);
@@ -180,7 +197,14 @@ void vk_compute_land_through(u64 gate) {
         assert(completed[3] == 0); /* release follows all output reconciliation */
     }
 }
-void vk_land_through(u64 gate) { assert(waited_graphics >= gate); }
+void vk_land_through(u64 gate) {
+    assert(waited_graphics >= gate);
+    mirror_unpublished = 1;
+}
+void vk_mirror_publish(void) {
+    assert(lock_depth);
+    mirror_unpublished = 0;
+}
 void vk_wait_submit(u64 gate) {
     if (gate > waited_graphics) waited_graphics = gate;
 }
