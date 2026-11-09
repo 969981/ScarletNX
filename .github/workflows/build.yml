@@ -243,7 +243,9 @@ jobs:
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
       # a block only a stale stack slot or register still points at is a leak, on every machine alike: with them
       # read, what a leak check finds depends on what the stack happened to hold at exit
-      LSAN_OPTIONS: use_stacks=0:use_registers=0
+      # Suppress only the external Vulkan loader's confirmed 128-byte cache leak.
+      # All ScarletNX allocations remain under LeakSanitizer.
+      LSAN_OPTIONS: use_stacks=0:use_registers=0:suppressions=${{ github.workspace }}/tests/lsan-vulkan-loader.supp
     steps:
       - name: Name the week
         id: week
