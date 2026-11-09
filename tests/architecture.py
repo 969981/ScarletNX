@@ -369,6 +369,11 @@ def check_include_shadows(repo, build):
         for entry in configuration['targets']:
             target = json.loads((reply / entry['jsonFile']).read_text(encoding='utf-8'))
             for group in target.get('compileGroups', ()):
+                # RC resource-file includes do not participate in the C/C++
+                # header search path. On Windows they legitimately point at
+                # src/common/platform for runtime.rc and its assets.
+                if group.get('language') not in ('C', 'CXX'):
+                    continue
                 for include in group.get('includes', ()):
                     directory = Path(include['path'])
                     if not directory.is_absolute():
