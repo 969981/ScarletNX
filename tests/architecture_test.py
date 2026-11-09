@@ -169,9 +169,14 @@ class ArchitectureTests(unittest.TestCase):
                         }
                     ]
                 },
-                'gui.json': {'compileGroups': [{'includes': [{'path': str(repo / 'src/gui')}]}]},
+                # C/C++ headers can shadow standard headers, but RC's include
+                # search path does not participate in C/C++ compilation.
+                'gui.json': {'compileGroups': [
+                    {'language': 'RC', 'includes': [{'path': str(repo / 'src/gui')}]},
+                    {'language': 'C', 'includes': [{'path': str(repo / 'src/gui')}]},
+                ]},
                 # only src/runner is on the path, so src/runner/process/process.h hides nothing
-                'runner.json': {'compileGroups': [{'includes': [{'path': 'src/runner'}]}]},
+                'runner.json': {'compileGroups': [{'language': 'C', 'includes': [{'path': 'src/runner'}]}]},
             }
             for name, content in documents.items():
                 (reply / name).write_text(json.dumps(content), encoding='utf-8')
