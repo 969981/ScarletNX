@@ -96,6 +96,16 @@ static u32 g_phead, g_ptail; /* batches put aside, landed */
 static VkWriteLog** g_logs;
 static u32 g_nlogs, g_caplogs;
 static VkWriteLog* g_cs_spare; /* a log taken for a dispatch whose setup was abandoned: the next dispatch reuses it */
+/* the spare made a log of parts parts, in the GPU's memory (gpu) or in host memory: NULL when none can be made */
+static VkWriteLog* cs_log(u32 parts, int gpu) {
+    if (g_cs_spare &&
+        (vk_wlog_size(g_cs_spare) != (u64)parts * SH_WLOG_PART * 4 || vk_wlog_on_gpu(g_cs_spare) != !!gpu)) {
+        vk_wlog_put(g_cs_spare);
+        g_cs_spare = NULL;
+    }
+    if (!g_cs_spare) g_cs_spare = gpu ? vk_wlog_get_gpu(parts) : vk_wlog_get(parts);
+    return g_cs_spare;
+}
 static void logs_unref(VkWriteLog** logs, u32* n) {
     for (u32 i = 0; i < *n; i++) vk_wlog_unref(logs[i]);
     *n = 0;
@@ -280,10 +290,8 @@ static u64 arena_alloc(u64 size) {
    own two-query pool, so a landed batch's results survive the batches recorded after it */
 static VkQueryPool g_cqpool;
 static u16 g_cq0, g_cq1;
-static u64 g_cq_ep;       /* the connection the batch's begin went out on */
-static i64 g_cs_cal_prev; /* the client's clock at the track's last calibration pair */
-static u64 g_cs_cal_conn; /* the connection that baseline was taken on */
-static int g_cs_cal_ok;   /* the context was announced calibrated, so calibration events are for it */
+static u64 g_cq_ep;             /* the connection the batch's begin went out on */
+static SnxTracyGpuCal g_cs_cal; /* the announcement's anchor, and the connection it belongs to */
 /* the landed batch's timestamps onto the track: the context announced at its first read-back (with the calibration
    clock's pair for its anchor when it has one), then calibrated or anchored, then the pair of timestamps its zone
    went out with */
@@ -295,27 +303,18 @@ static void cs_times(VkQueryPool pool, u16 q0, u16 q1, u64 ep) {
     int cal = vk_gpuprof_calibrated();
     i64 cpu = 0, gpu = 0;
     int have = cal && vk_gpuprof_clock(&cpu, &gpu);
-    u64 conn = snx_tracy_connection_id();
-    if (conn != g_cs_cal_conn) { /* a new connection's server re-anchored at the replayed context */
-        g_cs_cal_conn = conn;
-        g_cs_cal_prev = 0;
-        g_cs_cal_ok = 0; /* its announcement sets this again, as the client replays the context */
-    }
+    snx_tracy_gpu_cal_reconnect(&g_cs_cal);
     /* A context is announced calibrated only with a pair in hand: without one the server has no anchor and
        applies no calibration to the times sent after it, which shows as times far from the CPU's. The flag
        latches at the announcement, so a context announced without one is never sent calibration events: the
        server would assert on a context it was told is uncalibrated. */
     if (snx_tracy_gpu_context(VK_GPU_CTX_COMPUTE, have ? gpu : ts2[1], g_vk.props.limits.timestampPeriod, have,
                               "compute")) {
-        g_cs_cal_prev = have ? cpu : 0; /* the anchor is the announcement's own pair */
-        g_cs_cal_ok = have;
+        snx_tracy_gpu_cal_announce(&g_cs_cal, have, have ? cpu : 0); /* the anchor is the announcement's pair */
     }
     if (have) {
-        if (g_cs_cal_ok && g_cs_cal_prev) {
-            i64 delta = cpu - g_cs_cal_prev;
-            if (delta > 0) snx_tracy_gpu_calibrate(gpu, delta, VK_GPU_CTX_COMPUTE);
-        }
-        g_cs_cal_prev = cpu;
+        i64 delta = snx_tracy_gpu_cal_delta(&g_cs_cal, cpu);
+        if (delta > 0) snx_tracy_gpu_calibrate(gpu, delta, VK_GPU_CTX_COMPUTE);
     } else
         snx_tracy_gpu_sync(ts2[1], VK_GPU_CTX_COMPUTE);
     if (q0 && q1) {
@@ -364,15 +363,11 @@ static void cs_submit(void) {
     }
 }
 static void cs_wait(u64 value) {
-    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
-                              .semaphoreCount = 1,
-                              .pSemaphores = &g_vk_csem,
-                              .pValues = &value};
     u64 t0 = plat_ns();
     SNX_ZONE_C(z, "vk compute wait", 0xb05252);
     SNX_ZONE_VALUE(z, value);
     gpu_wait_note("a compute batch", value);
-    VK_OK(vkWaitSemaphores(g_vk.dev, &wi, UINT64_MAX));
+    vk_wait_semaphore(g_vk_csem, value);
     gpu_wait_note(NULL, 0);
     __atomic_add_fetch(&g_vk_cs_wait_ns, plat_ns() - t0, __ATOMIC_RELAXED);
 }
@@ -1087,11 +1082,16 @@ static void res_unref_all(VkOwnRes** made, int n) {
    run of guest memory, at an offset the device binds a storage buffer at. cpu[i]: each buffer's guest address. An
    Ounce program's buffer is all of the memory mapped from its address, up to 16 MiB (vk_gbuf_desc): made anew for each
    dispatch, with its input copied in on the CPU and composed over the results before it, the copies took most of one
-   game's GPU thread (hundreds of 16 MiB bindings a frame, at addresses a few KiB apart) */
+   game's GPU thread (hundreds of 16 MiB bindings a frame, at addresses a few KiB apart).
+   A Switch program logs its writes too (shader/write_log.c), but its buffers have the size the game binds, and it
+   doesn't take the mirror: with it, one Switch game's props (a table's umbrella, plants, a wall's glow) vanished for
+   one frame in 3 to 9 of 250 shots in each of three runs, and in none of 250 without it (two runs) or with it where the
+   host doesn't trap guest memory (memory_traps=2). What of the mirror's GPU-owned pages (vk_mirror_publish) loses
+   them is not found yet */
 static int mirror_plan(const CsPipe* p, int ng, const u64* sa, const u32* ss, u64* cpu) {
     u64 align = g_vk.props.limits.minStorageBufferOffsetAlignment;
     int marked = 0;
-    if (!p->si.nmarks || !vk_mirror_on()) return 0;
+    if (!p->si.nmarks || !g_shader_sm86 || !vk_mirror_on()) return 0;
     for (int i = 0; i < ng; i++) {
         cpu[i] = 0;
         if (!sa[i]) continue;
@@ -1168,7 +1168,10 @@ void vk_dispatch(const DispatchState* d) {
         u32 wseen, code_len; /* vk_ww_now() then, and the bytes of the window */
         CsPipe* p;
     };
-    static struct cs_fast fc[VK_CSF_SETS * VK_CSF_WAYS]; /* lookup_ways.h */
+    /* by the program's address (lookup_ways.h). An Ounce game dispatches a few hundred programs a frame: in 64 entries
+       they put each other out, and almost every dispatch read, hashed and walked its program again (up to 512 KiB,
+       CS_WINDOW) */
+    static struct cs_fast fc[VK_CSF_SETS * VK_CSF_WAYS];
     u64 pa = d->code;
     u32 epoch = vk_ww_epoch(); /* before the code is checked or read */
     struct cs_fast *ways = &fc[vk_csf_set(pa) * VK_CSF_WAYS], *fe = NULL;
@@ -1505,19 +1508,12 @@ rebind:
     }
     /* the program's write log (ShaderInfo.gbuf_mark): a deferred dispatch's written buffers land only the bytes the
        log gives, and every dispatch that marks must bind it, or the stores' atomic OR reads an unwritten descriptor
-       (Xid 13). Part p is SH_WLOG_PART words, its flags first, at the program's own place in the log */
+       (Xid 13). Part p is SH_WLOG_PART words, its flags first, at the program's own place in the log. In the mirror
+       only the GPU reads it (vk_mirror_fold): in the GPU's memory (writelog.c) */
     VkWriteLog* log = NULL;
-    if (p->si.nmarks) {
-        if (g_cs_spare && vk_wlog_size(g_cs_spare) != (u64)p->si.nmarks * SH_WLOG_PART * 4) {
-            vk_wlog_put(g_cs_spare);
-            g_cs_spare = NULL;
-        }
-        if (!g_cs_spare) g_cs_spare = vk_wlog_get(p->si.nmarks);
-        if (!g_cs_spare) {
-            g_cs_skips[CS_SKIP_RESOURCES]++;
-            return;
-        }
-        log = g_cs_spare;
+    if (p->si.nmarks && !(log = cs_log(p->si.nmarks, mir))) {
+        g_cs_skips[CS_SKIP_RESOURCES]++;
+        return;
     }
     u32 wseen = vk_ww_now(); /* before the inputs are read */
     /* in the mirror, brought up to date: what other work has pending there lands first. Where it can't be (no memory
@@ -1529,6 +1525,11 @@ rebind:
             if (sa[i]) mirror_need_others(sa[i], ss[i]);
         for (int i = 0; i < ng && mir; i++)
             if (sa[i]) mir = vk_mirror_slice(sa[i], ss[i], &mbuf[i], &moff[i]);
+        /* the copies' path reads the log on the CPU (land_logged): one in host memory */
+        if (!mir && log && !(log = cs_log(p->si.nmarks, 0))) {
+            g_cs_skips[CS_SKIP_RESOURCES]++;
+            return;
+        }
     }
     u64 so[16];
     VkBuffer bi_buf[16];
@@ -1581,8 +1582,10 @@ rebind:
             o = so[i] = chain[i] >= 0 ? (u64)chain[i] : arena_alloc(ss[i]);
             if (chain[i] >= 0)
                 ; /* written by an earlier dispatch of the batch, read in place */
-            else if (sa[i] && (!p->si.gbuf_mark[i] || ((p->si.gbuf_rmask >> i) & 1)))
-                gmem_read(sa[i], g_ar_ptr + o, ss[i]); /* read, or not logged (gbuf_rmask is the SM86 translator's) */
+            /* read: its bytes copied in. So are those of one written and not logged: its result is what differs from
+               them after the dispatch, and a store of the bytes zeroed in their place would differ from nothing */
+            else if (sa[i] && (((p->si.gbuf_rmask >> i) & 1) || !(log && p->si.gbuf_mark[i])))
+                gmem_read(sa[i], g_ar_ptr + o, ss[i]);
             else {
                 if (sa[i]) gmem_need(sa[i], ss[i]); /* write-only: results pending there land, but nothing is read */
                 memset(g_ar_ptr + o, 0, ss[i]);
@@ -1933,12 +1936,11 @@ rebind:
     }
     rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p->p);
     rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk.cs_playout, 0, 1, &set, 0, NULL);
-    vk_gpuprof_tag(p->key); /* vk_gpu_profile sums the dispatches' time by program */
     if (d->indirect) {
-        rec_CmdDispatchIndirect(cb, grid_buf, grid_off);
+        rec_CmdDispatchIndirectKey(cb, grid_buf, grid_off, p->key, pa);
     } else {
         vk_ck(cb, VK_CK_DISPATCH, gx, gy, gz, 0);
-        rec_CmdDispatch(cb, gx, gy, gz);
+        rec_CmdDispatchKey(cb, gx, gy, gz, p->key, pa);
     }
     if (mir) { /* the bytes its log gives into the mirror's mask, for the submit's harvest to land */
         VkMirFold f[16];
@@ -1946,6 +1948,7 @@ rebind:
         for (int i = 0; i < ng; i++)
             if (p->si.gbuf_mark[i] && sa[i]) f[nf++] = (VkMirFold){mcpu[i], ss[i], p->si.gbuf_mark[i] - 1u};
         vk_mirror_fold(cb, vk_wlog_buffer(log), vk_wlog_size(log), f, nf);
+        vk_wlog_clear(cb, log); /* in the GPU's memory (cs_log): the folds were its only readers */
     }
     if (log) { /* recorded: the dispatch's reference goes with the work that writes the log */
         g_cs_spare = NULL;

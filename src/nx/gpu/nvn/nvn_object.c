@@ -409,7 +409,8 @@ int nvn_MemoryPoolInitialize(CPU* c, u64 p, u64 b) {
     va = gmmu_space_alloc(lead + o.size, NVN_POOL_ALIGN);
     if (va && o.memory) gmmu_space_map(va, o.memory - lead, lead + o.size);
     nvn_wait_end();
-    if (!va) fatal("nvn: no GPU address space left for a memory pool of %llx bytes", (unsigned long long)o.size);
+    if (!va)
+        fatal("nvn: no GPU address space left for a memory pool of %llx bytes", (unsigned long long)o.size);
     o.gpu = va + lead;
     memcpy(GP(p), &o, sizeof o);
     LOGV("nvn: memory pool %llx: %llx, %llx bytes at GPU %llx, flags %#x\n", (unsigned long long)p,
@@ -1605,10 +1606,14 @@ void nvn_SamplerFinalize(CPU* c, u64 s) {
 }
 
 /* ============================================================ programs */
+/* the bytes of the game's program object that NvnProgram takes: the task and mesh stages only in an Ounce game's */
+static size_t program_bytes(void) {
+    return g_nvn.loader.api >= 231u << 16 ? sizeof(NvnProgram) : NVN_PROGRAM_SWITCH_BYTES;
+}
 /* a program's life at log level 2, with the game's call: which thread made or ended a program before another bound it */
 int nvn_ProgramInitialize(CPU* c, u64 p, u64 d) {
     (void)d;
-    memset(GP(p), 0, sizeof(NvnProgram)); /* guest memory: every byte the game sees */
+    memset(GP(p), 0, program_bytes()); /* guest memory: every byte the game sees */
     NVN_OBJ(NvnProgram, p)->magic = NVN_MAGIC('P', 'R', 'O', 'G');
     LOGV("nvn: program %llx initialized (called from %llx)\n", (unsigned long long)p, (unsigned long long)c->x[30]);
     return 1;
@@ -1998,15 +2003,15 @@ static int set_shaders(u64 p, i32 n, u64 sd, u64 stride) {
     NvnProgram* o = NVN_OBJ(NvnProgram, p);
     u64 last = 0; /* the control section of the last stage before rasterization */
     u64 tess_controls[2] = {0};
-    u32 subroutine_mask = 0;
     NvnOunceEntry ounce = {0};
+    u32 subroutine_mask = 0;
     i32 i, last_rank = -1;
     if (n < 0 || n > 6) {
         LOG_LIMIT(8, "nvn: nvnProgramSetShaders with %d stages\n", n);
         return 0;
     }
     /* guest memory: every byte the game sees */
-    memset(o->st, 0, sizeof o->st);
+    memset(o->st, 0, program_bytes() - offsetof(NvnProgram, st));
     memset(o->block, 0, sizeof o->block);
     o->off_a = 0;
     for (i = 0; i < n; i++) {
@@ -2043,8 +2048,8 @@ static int set_shaders(u64 p, i32 n, u64 sd, u64 stride) {
     o->sample_shading = (u16)((o->sample_shading & 0xff) | (o->sample_shading & 0xff) << 8);
     if (last) xfb_of(last, o->serial);
     tess_of(tess_controls, o->serial);
-    sub_program(o->serial, subroutine_mask);
     ounce_of(&ounce, o->serial);
+    sub_program(o->serial, subroutine_mask);
     return 1;
 }
 int nvn_ProgramSetShaders(CPU* c, u64 p, i32 n, u64 sd) {
@@ -2189,7 +2194,8 @@ int nvn_sub_linkage_valid(const NvnSubLinkage* l) {
 int nvn_ProgramSetSubroutineLinkage(CPU* c, u64 p, i32 n, u64 maps) {
     (void)c;
     if (!p || !maps || n <= 0 || n > 6) return 0;
-    NvnProgram program = *NVN_OBJ(const NvnProgram, p);
+    NvnProgram program = {0};
+    memcpy(&program, GP(p), program_bytes());
     if (program.magic != NVN_MAGIC('P', 'R', 'O', 'G')) return 0;
     NvnSubLinkage* made[6] = {0};
     u32 mask = 0;

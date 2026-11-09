@@ -838,8 +838,9 @@ static void test_compute_forms(const char* dir) {
 }
 
 /* SUST.P to a 2D image with its handle in c[0][0x30], and SULD.P from it, by the kind of the renderer's key: the
-   bindless rule of spirv_translate.c gives 2 (unsigned) without bit 8 of rt_int_mask, 0 (float) with it, and 3
-   (signed) with bit 8 of rt_sint_mask. ShaderInfo.img[].type is the dimension code, 3 for 2D */
+   bindless rule of spirv_translate.c gives 2 (unsigned) without bit 0 of img_int_mask, 0 (float) with it, and 3
+   (signed) with bit 0 of img_sint_mask, the masks compute.c and pipeline.c key a program by. rt_int_mask's bit 8,
+   where the key was before, changes nothing. ShaderInfo.img[].type is the dimension code, 3 for 2D */
 static void test_image_kinds(const char* dir) {
     u8 code[16 * 4] = {0};
     Word x = fix(0xb9b); /* SUST.P.2D.RGBA [R0], R4, c[0][0x30] */
@@ -864,14 +865,38 @@ static void test_image_kinds(const char* dir) {
     for (u32 k = 0; k < 3; k++) {
         ShaderInfo si = {0};
         si.cs_local[0] = si.cs_local[1] = si.cs_local[2] = 1;
-        if (k == 1) si.rt_sint_mask = 1u << 8;
-        if (k == 2) si.rt_int_mask = 1u << 8;
+        si.rt_int_mask = si.rt_sint_mask = 1u << 8;
+        if (k == 1) si.img_sint_mask = 1;
+        if (k == 2) si.img_int_mask = 1;
         size_t count = 0;
         u32* spv = sm86_to_spirv(code, 4 * 16, ST_CS, NULL, &si, &count);
         CHECK(spv != NULL);
         if (!spv) fprintf(stderr, "image kind: %s\n", si.first_unsupported);
         CHECK(si.nimg == 1 && si.img[0].kind == kinds[k] && si.img[0].type == 3 && si.img[0].cbuf_off == 0x30 / 4);
         if (spv) CHECK(keep_module(dir, names[k], spv, count));
+        free(spv);
+    }
+}
+
+/* A fragment program's KILL says so in has_discard, which the renderer reads before it tests depth ahead of the
+   program; one without a KILL leaves it 0 */
+static void test_kill_discard(void) {
+    for (u32 k = 0; k < 2; k++) {
+        u8 code[16 * 4] = {0};
+        u32 n = 0, fsph[32] = {0};
+        Word x = fix(0x95b); /* KILL */
+        set(&x, 87, 3, 7);
+        if (k) put(code, n++, x);
+        put(code, n++, exit_insn());
+        put(code, n, bra(n, n, 7, 0));
+        n++;
+        fsph[0] = sph0(2, 5);
+        fsph[18] = 0xf;
+        ShaderInfo si = {0};
+        size_t count = 0;
+        u32* spv = sm86_to_spirv(code, n * 16, ST_FS, fsph, &si, &count);
+        CHECK(spv != NULL && si.has_discard == (int)k);
+        if (!spv || si.has_discard != (int)k) fprintf(stderr, "kill discard %u: has_discard %d\n", k, si.has_discard);
         free(spv);
     }
 }
@@ -1888,6 +1913,64 @@ static void test_fragment_depth(const char* dir) {
     (void)dir;
 }
 
+/* ISETP.GE.U32.AND Pd, PT, RZ, imm, PT: Pd true for imm 0, false for 1 */
+static Word setp_const(u32 pd, u32 imm) {
+    Word x = alu(0x00c, 4, 255, 255);
+    set(&x, 32, 32, imm);
+    set(&x, 76, 3, 6);
+    set(&x, 81, 3, pd);
+    set(&x, 84, 3, 7);
+    set(&x, 87, 3, 7);
+    return x;
+}
+/* A BRA's or an EXIT's predicate operand (bits 87-89, 90 negates it) holds with the guard: the instruction takes effect
+   only where both do. One game's interface programs end @P0 EXIT P1, P0 their KILL's switch and P1 its test, before
+   the MOVs to the colour's registers: with the operand left out every lane with P0 exited with R0-R3 unwritten, and
+   the title screen drew nothing. Colour 0 is R0-R3, 0.25 before the instruction and 0.75 after it when it falls
+   through. Cases: the guard (P0, true), the operand (P1, 7 for none), its negation, P1's value, and whether it's a BRA
+   over the MOVs instead of an EXIT */
+static void test_flow_operand(const char* dir) {
+    static const struct {
+        u32 guard, operand, negate, p1, bra, exits;
+    } cases[] = {
+        {0, 1, 0, 0, 0, 0}, /* @P0 EXIT P1, P1 false: no exit */
+        {0, 1, 0, 1, 0, 1}, /* @P0 EXIT P1, P1 true */
+        {0, 1, 1, 0, 0, 1}, /* @P0 EXIT !P1, P1 false */
+        {7, 1, 0, 0, 0, 0}, /* EXIT P1, P1 false: the block goes on */
+        {7, 1, 0, 1, 0, 1}, /* EXIT P1, P1 true */
+        {0, 7, 0, 0, 0, 1}, /* @P0 EXIT */
+        {0, 1, 0, 0, 1, 0}, /* @P0 BRA P1, P1 false: not taken */
+        {0, 1, 0, 1, 1, 1}, /* @P0 BRA P1, P1 true */
+        {7, 1, 1, 1, 1, 0}, /* BRA !P1, P1 true: not taken */
+    };
+    for (u32 i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        u8 code[16 * 16] = {0};
+        u32 n = 0;
+        for (u32 r = 0; r < 4; r++) put(code, n++, mov_imm(r, f2u(0.25f)));
+        put(code, n++, setp_const(0, 0));
+        put(code, n++, setp_const(1, cases[i].p1 ? 0 : 1));
+        Word x = cases[i].bra ? bra(n, n + 5, cases[i].guard, 0) : exit_insn();
+        set(&x, 12, 3, cases[i].guard);
+        set(&x, 87, 3, cases[i].operand);
+        set(&x, 90, 1, cases[i].negate);
+        put(code, n++, x);
+        for (u32 r = 0; r < 4; r++) put(code, n++, mov_imm(r, f2u(0.75f)));
+        put(code, n++, exit_insn());
+        put(code, n, bra(n, n, 7, 0));
+        n++;
+        u32 fsph[32] = {0};
+        fsph[0] = sph0(2, 5);
+        fsph[18] = 0xf;
+        SpvEvalEnv env = {0};
+        int ran = run_stage(ST_FS, code, n, fsph, &env);
+        u32 want = f2u(cases[i].exits ? 0.25f : 0.75f);
+        CHECK(ran && env.out[0][0] == want && env.out[0][3] == want);
+        if (!ran || env.out[0][0] != want)
+            fprintf(stderr, "flow operand, case %u: colour %08x, %08x expected\n", i, env.out[0][0], want);
+    }
+    (void)dir;
+}
+
 /* LDG.E (no uniform) of type 4 (32 bits) or 5 (64 bits) into dst from [addr + imm], and STG.E of data */
 static Word ldg_nou(u32 dst, u32 addr, u32 imm, u32 type) {
     Word x = fix(0x381);
@@ -1946,9 +2029,9 @@ static void test_global_pointer(const char* dir) {
     env.ubo_words[SNX_VKB_CB] = 1024;
     env.ubo[SNX_VKB_SSBO] = buffer;
     env.ubo_words[SNX_VKB_SSBO] = 64;
-    /* no atlas of pages: each buffer's first page entry ~0, so its words stay where it is bound (gbuf_word_index) */
+    /* a draw's page table of its buffers (SNX_VKB_SMAP): each one bound whole, with no atlas */
     static u32 smap[48];
-    memset(smap, 0xff, 16 * sizeof *smap);
+    for (u32 k = 0; k < 16; k++) smap[k] = ~0u;
     env.ubo[SNX_VKB_SMAP] = smap;
     env.ubo_words[SNX_VKB_SMAP] = 48;
     int ran = run_stage(ST_VS, code, 15, vsph, &env);
@@ -2610,6 +2693,7 @@ int main(int argc, char** argv) {
     test_alu_group(dir);
     test_compute_forms(dir);
     test_image_kinds(dir);
+    test_kill_discard();
     test_root_tables(dir);
     test_texel_offsets(dir);
     test_global_flow(dir);
@@ -2629,6 +2713,7 @@ int main(int argc, char** argv) {
     test_tex_f16(dir);
     test_output_defaults(dir);
     test_fragment_depth(dir);
+    test_flow_operand(dir);
     test_global_pointer(dir);
     test_mesh(dir);
     test_task(dir);

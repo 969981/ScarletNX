@@ -283,15 +283,27 @@ setting Vulkan ban ignore
 setting ASTC mode
     label ASTC textures
     key astc_mode
-    int 0 2
+    int 0 3
     default 0
     startup
-    words Auto|Exact|BC7
-    help How a GPU that samples BCn but not ASTC (most desktop ones) holds ASTC textures. Auto = Exact where the GPU's
-    help memory budget is 8 GB or more as the game starts, else BC7. Exact = decoded to RGBA8, exactly as the game's
+    words Auto|Exact|BC7|BC7 at load
+    help How a GPU that samples BCn but not ASTC (most desktop ones) holds ASTC textures. Auto = BC7 at load for an Ounce
+    help game, as feat/ounce holds them; for any other, Exact where the GPU's memory budget is 8 GB or more as the game
+    help starts, else BC7. Exact = decoded to RGBA8, exactly as the game's
     help blocks decode, in four times the memory. BC7 = shown at once decoded to RGBA8, then encoded again as BC7 between
     help frames, a few at a time, into a quarter of RGBA8's memory, close to what the blocks decode to but not always the
-    help same. Where the GPU samples ASTC it does nothing. It takes the place of astc_bc, whose 1 is Auto
+    help same. A later run loads them from the BC7 cache. BC7 at load = encoded as BC7 as each texture loads, with no
+    help RGBA8 image before it, as feat/ounce does (temporary, to compare). Where the GPU samples ASTC it does
+    help nothing. It takes the place of astc_bc, whose 1 is Auto
+setting BC7 queue
+    key bc7_queue
+    int 0 16384
+    default 0
+    startup
+    words Auto|#
+    help The thousands of blocks the BC7 encoder may have queued on the GPU before an upload waits for it to do them.
+    help 0 = by the GPU's own memory: 256 for every 2 GB of it, from 256 to 4096, and 256 on a GPU that shares the
+    help computer's memory (a GT 1030, 2 GB, lost the device with more queued). 1 to 16384 = that many thousand
 
 table g_performance_ini
 setting FPS limit
@@ -371,6 +383,15 @@ setting Async pipelines
     words Off|On
     help 1 = what a new shader draws is skipped while its pipeline is made, instead of the game waiting for it: no
     help pause where a new shader first appears, and the things it draws show up a few frames late
+setting Pipeline libraries
+    key pipeline_libraries
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help 1 = where the GPU has graphics pipeline libraries, a new pipeline links parts of its shaders that compile
+    help once, and an optimized one is made in the background: a new state of a known shader no longer stalls the
+    help game for a compile. 0 = each pipeline compiles its shaders whole
 setting Prepare shaders
     key prepare_shaders
     int 0 2
@@ -863,6 +884,25 @@ setting Vulkan validation layer
     help 1 = the Vulkan validation layer (VK_LAYER_KHRONOS_validation, the Vulkan SDK's) checks every Vulkan call and
     help logs what it finds. It slows the game down a lot, and a missing layer is only a warning. 2 = also GPU-assisted
     help validation, which finds out-of-bounds and unwritten descriptor accesses in shaders, and is slower again
+setting Vulkan pipeline cache
+    key vk_pipeline_cache
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help 1 = the GPU driver's compiled pipelines are kept between runs (shader_cache/vk_pipelines.bin). 0 = they are
+    help neither read nor written: every pipeline is compiled again, as in a first run, to measure that
+setting GPU mirror past limit
+    key vk_mirror_past_limit
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help 1 = the GPU mirror of guest memory, where an Ounce game's programs read and write their storage, is made even
+    help where it is bigger than the device's maxBufferSize, as feat/ounce makes it: RADV (4 GiB) makes and runs it,
+    help though the validation layer calls it invalid. 0 = only where it fits; elsewhere the storage results land
+    help through the CPU, several times slower in one game. With vk_validation on it is made only where it fits,
+    help as the layer would report it. Temporary, to compare
 setting Vulkan API
     label Vulkan version
     key vk_api
@@ -1019,10 +1059,10 @@ setting Memory traps
     startup
     words Auto|Protection|Off
     help How the runtime traps guest memory the GPU owns until the CPU touches it (docs/layers/gpu/ownership.md). 0 =
-    help userfaultfd's minor faults where Linux has them, else page protection; none yet on Windows, macOS and
-    help FreeBSD. 1 = page protection and the fault handler, as Android and Linux before 5.13 trap (Linux and Android
-    help only: elsewhere it says so at start). 2 = none: a GPU result lands in guest memory at its fence, to measure
-    help and test that path
+    help userfaultfd's minor faults where Linux has them, else page protection, which Windows uses with an exception
+    help handler; none yet on macOS and FreeBSD. 1 = page protection and the fault handler, as Android, Linux before
+    help 5.13 and Windows trap (Linux, Android and Windows only: elsewhere it says so at start). 2 = none: a GPU result
+    help lands in guest memory at its fence, to measure and test that path
 setting Host page size
     key host_page
     int 0 1048576

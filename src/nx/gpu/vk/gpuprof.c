@@ -81,6 +81,9 @@ static u64 g_draws_at_begin;
 /* the gaps between passes by what was recorded in them: dispatches, else copies, else barriers, else nothing (the
    GPU waiting for the next submission or a semaphore) */
 static const char* const g_gap_name[4] = {"with dispatches", "with copies", "with barriers only", "with nothing"};
+/* the same gaps and idle sums as plots, for a --tracy run whose vk_gpu_profile leaves the log lines out */
+static const char* const g_gap_plot[4] = {"gpu gap: dispatches", "gpu gap: copies", "gpu gap: barriers",
+                                          "gpu gap: nothing"};
 static u64 g_gap_ns[4], g_gaps[4];
 static u64 g_x_at_end, g_b_at_end, g_d_at_end, g_k_at_end[3], g_bytes_at_end;
 /* the copy gaps by their mix: buffer copies only, with buffer-image copies, with image copies or blits */
@@ -100,6 +103,8 @@ enum { IDLE_WAITED, IDLE_FRAME, IDLE_RECORDING, IDLE_QUEUED, IDLE_N };
 static const char* const g_idle_name[IDLE_N] = {
     "the CPU waited for the submission that ended (a round trip)", "the CPU between frames (after a present)",
     "the CPU still recording the next one", "submitted, not started (semaphores, the recording thread)"};
+static const char* const g_idle_plot[IDLE_N] = {"gpu idle: waited", "gpu idle: frame", "gpu idle: recording",
+                                                "gpu idle: queued"};
 static u64 g_idle_ns[IDLE_N], g_idles[IDLE_N], g_busy_ns, g_subs, g_sub_why[VK_SUB_N];
 static u64 g_round_ns[VK_WAIT_N]; /* IDLE_WAITED by the kind of the CPU's wait */
 /* The busy time by what the submissions held: rendering passes, else dispatches, else copies, else nothing. Most of
@@ -131,11 +136,9 @@ static struct {
 #if defined(SNX_TRACY)
 /* Tracy's GPU track: the passes as zones on the GPU's clock, their timestamps read back with the frame's results,
    the emissions themselves in the platform layer (tracy.c). A profiling run asks for them: the setting, or the
-   client being up. The calibration baseline is reset at a new connection, whose server re-anchored at the replayed
-   context's original pair. */
-static i64 g_cal_cpu_prev; /* the client's clock at the track's last calibration pair */
-static u64 g_cal_conn;     /* the connection that baseline was taken on */
-static int g_cal_ok;       /* the context was announced calibrated, so calibration events are for it */
+   client being up. A new connection's server re-anchors at the replayed context's original pair, so the caller's
+   CPU delta is measured from that pair again (SnxTracyGpuCal). */
+static SnxTracyGpuCal g_cal; /* the announcement's anchor, and the connection it belongs to */
 #endif
 
 int vk_gpuprof_calibrated(void) {
@@ -441,30 +444,21 @@ void vk_gpuprof_frame_done(u32 slot) {
        that very pair; else the GPU clock is anchored at this moment: the last timestamp was written before
        timeline_wait returned, so this is its CPU time. */
     if (snx_tracy_attached()) {
-        u64 conn = snx_tracy_connection_id();
         int cal = vk_gpuprof_calibrated();
         i64 cpu = 0, gpu = 0;
         int have = cal && vk_gpuprof_clock(&cpu, &gpu);
-        if (conn != g_cal_conn) { /* a new connection's server re-anchored at the replayed context */
-            g_cal_conn = conn;
-            g_cal_cpu_prev = 0;
-            g_cal_ok = 0; /* its announcement sets this again, as the client replays the context */
-        }
+        snx_tracy_gpu_cal_reconnect(&g_cal);
         /* A context is announced calibrated only with a pair in hand: without one the server has no anchor and
            applies no calibration to the times sent after it, which shows as times far from the CPU's. The flag
            latches at the announcement, so a context announced without one is never sent calibration events:
            the server would assert on a context it was told is uncalibrated. */
         if (snx_tracy_gpu_context(VK_GPU_CTX_GRAPHICS, have ? gpu : (i64)ts[g->used - 1],
                                   g_vk.props.limits.timestampPeriod, have, "graphics")) {
-            g_cal_cpu_prev = have ? cpu : 0; /* the anchor is the announcement's own pair */
-            g_cal_ok = have;
+            snx_tracy_gpu_cal_announce(&g_cal, have, have ? cpu : 0); /* the anchor is the announcement's pair */
         }
         if (have) {
-            if (g_cal_ok && g_cal_cpu_prev) {
-                i64 delta = cpu - g_cal_cpu_prev;
-                if (delta > 0) snx_tracy_gpu_calibrate(gpu, delta, VK_GPU_CTX_GRAPHICS);
-            }
-            g_cal_cpu_prev = cpu;
+            i64 delta = snx_tracy_gpu_cal_delta(&g_cal, cpu);
+            if (delta > 0) snx_tracy_gpu_calibrate(gpu, delta, VK_GPU_CTX_GRAPHICS);
         } else
             snx_tracy_gpu_sync((i64)ts[g->used - 1], VK_GPU_CTX_GRAPHICS);
         for (u32 i = 0; i < g->npass; i++) {
@@ -598,9 +592,34 @@ static int key_cmp(const void* a, const void* b) {
     u64 x = ((const GpKey*)a)->ns, y = ((const GpKey*)b)->ns;
     return x < y ? 1 : x > y ? -1 : 0;
 }
+/* the window's gaps and idle time as plots: the log's sums, so a --tracy run whose setting is off still shows where
+   the GPU's time went. The gaps are per frame, the idle time per present, and the busy share of the window's wall */
+static void gp_plots(void) {
+    u64 now = plat_ns(), presents = (u32)(g_vk_present - g_present0), wall = now - g_t0;
+    double f = g_frames ? (double)g_frames : 1.0;
+    for (int c = 0; c < 4; c++) SNX_PLOT(g_gap_plot[c], (double)g_gap_ns[c] / 1e6 / f);
+    for (int c = 0; c < IDLE_N; c++)
+        SNX_PLOT(g_idle_plot[c], presents ? (double)g_idle_ns[c] / 1e6 / (double)presents : 0.0);
+    if (g_t0 && wall) SNX_PLOT("gpu busy", 100.0 * (double)g_busy_ns / (double)wall);
+    SNX_PLOT("gpu submissions/frame", (double)g_subs / f);
+}
 /* the targets that took the most GPU time, then a fresh sum */
 static void gp_report(void) {
-    if (g_on <= 0 || !g_frames) return;
+    if (!g_frames) return;
+    gp_plots();
+    if (g_on <= 0) {
+        /* the setting is off and the client asked for the sums: the plots have them, and the next window starts */
+        memset(g_mix_ns, 0, sizeof g_mix_ns);
+        memset(g_mixes, 0, sizeof g_mixes);
+        memset(g_mix_bytes, 0, sizeof g_mix_bytes);
+        memset(g_mix_n, 0, sizeof g_mix_n);
+        memset(g_gap_ns, 0, sizeof g_gap_ns);
+        memset(g_gaps, 0, sizeof g_gaps);
+        memset(g_key, 0, sizeof g_key);
+        g_pass_ns = g_span_ns = g_frames = g_lost = 0;
+        gp_idle_report();
+        return;
+    }
     static GpKey sorted[GP_KEYS];
     memcpy(sorted, g_key, sizeof sorted);
     qsort(sorted, GP_KEYS, sizeof *sorted, key_cmp);
@@ -629,9 +648,23 @@ static void gp_report(void) {
             (unsigned long long)sorted[i].draws, (unsigned long long)sorted[i].gva, sorted[i].w, sorted[i].h,
             sorted[i].fmt);
     memset(g_key, 0, sizeof g_key);
-    /* the dispatches by tag: compute programs by key (vulkan: compute KEY ready), the ASTC decode and BC7 encode, and
-       the renderer's own (0) */
+    /* the dispatches by tag: compute programs by key (vulkan: compute KEY ready), and the renderer's own pipelines by
+       their VK_PROF_* */
     if (g_disps) {
+        static const char* const own[VK_PROF_N] = {[VK_PROF_NONE] = "untagged",
+                                                   [VK_PROF_ASTC] = "the ASTC decode",
+                                                   [VK_PROF_BC7] = "the BC7 encode",
+                                                   [VK_PROF_MIRROR_FOLD] = "the GPU mirror's fold",
+                                                   [VK_PROF_MIRROR_HARVEST] = "the GPU mirror's harvest",
+                                                   [VK_PROF_WLOG_MERGE] = "the write log's merge",
+                                                   [VK_PROF_BL_MOVE] = "a block linear move",
+                                                   [VK_PROF_DEPTH_PACK] = "the depth pack",
+                                                   [VK_PROF_TEXCONV] = "a texture conversion",
+                                                   [VK_PROF_VIC] = "a VIC composition",
+                                                   [VK_PROF_XFB_INDIRECT] = "transform feedback's draw arguments",
+                                                   [VK_PROF_QUERY_PREDICATE] = "the queries' predicates",
+                                                   [VK_PROF_QUERY_COMPARE] = "a query compare",
+                                                   [VK_PROF_QUERY_COUNT] = "the queries' counts"};
         static GpDKey ds[GP_DKEYS];
         memcpy(ds, g_dkey, sizeof ds);
         qsort(ds, GP_DKEYS, sizeof *ds, dkey_cmp);
@@ -640,16 +673,13 @@ static void gp_report(void) {
         LOG("vulkan: GPU   dispatches and copies: %.2f ms a frame, %llu of them timed\n",
             (double)g_disp_ns / 1e6 / (double)g_frames, (unsigned long long)g_disps);
         for (int i = 0; i < 16 && ds[i].n; i++) {
-            char what[64];
+            char what[96];
             if (ds[i].kind != VK_OP_DISPATCH) /* a copy: by where it was recorded, from vk_gpuprof_base */
                 snprintf(what, sizeof what, "recorded at base%+lld", (long long)ds[i].key);
+            else if (ds[i].key < VK_PROF_N)
+                snprintf(what, sizeof what, "the renderer's own, %s", own[ds[i].key]);
             else
-                snprintf(what, sizeof what, "%s %016llx",
-                         ds[i].key == VK_PROF_ASTC  ? "the ASTC decode"
-                         : ds[i].key == VK_PROF_BC7 ? "the BC7 encode"
-                         : ds[i].key                ? "compute"
-                                                    : "the renderer's own",
-                         (unsigned long long)ds[i].key);
+                snprintf(what, sizeof what, "compute %016llx", (unsigned long long)ds[i].key);
             LOG("vulkan: GPU     %.2f ms a frame (%.3f ms each, %.1f MB a frame): %llu %s, %s\n",
                 (double)ds[i].ns / 1e6 / (double)g_frames, (double)ds[i].ns / 1e6 / (double)ds[i].n,
                 (double)ds[i].bytes / 1048576.0 / (double)g_frames, (unsigned long long)ds[i].n, kinds[ds[i].kind],

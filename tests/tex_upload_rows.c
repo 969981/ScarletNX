@@ -596,7 +596,7 @@ int vk_cache_image_create(const VkImageCreateInfo* ii, VkImage* img, VmaAllocati
    pages bound as vk_image_resident is asked, each 64 KiB, those it gives memory marked 2 as memory.c marks them */
 static struct {
     VkResidentShape shape;
-    u8 bound[64];
+    u8 bound[128];
     u32 pages;
 } g_res;
 int vk_resident_shape(const VkImageCreateInfo* ii, VkResidentShape* s) {
@@ -620,6 +620,27 @@ int vk_image_resident(VkImage img, u8* want, u32 n, u64* bytes) {
         g_res.bound[i] = want[i] != 0;
         *bytes += g_res.bound[i] ? 0x10000 : 0;
     }
+    return 1;
+}
+/* sparse residency: none here either */
+int vk_image_create_sparse(const VkImageCreateInfo* ii, VkImage* img) {
+    (void)ii, (void)img;
+    return 0;
+}
+const VkSparseShape* vk_image_sparse_shape(VkImage img) {
+    (void)img;
+    return NULL;
+}
+int vk_image_sparse_bind(VkImage img, const u8* bits, u64* bytes) {
+    (void)img, (void)bits, (void)bytes;
+    return -1;
+}
+u64 vk_image_sparse_need(VkImage img, const u8* bits) {
+    (void)img, (void)bits;
+    return 0;
+}
+int vk_image_sparse_bound(VkImage img, u32 layer, u32 level, u32 y0, u32 y1, u32 z0, u32 z1, int all) {
+    (void)img, (void)layer, (void)level, (void)y0, (void)y1, (void)z0, (void)z1, (void)all;
     return 1;
 }
 void vk_surf_bytes(Surf* s, u64 bytes) { s->bytes = bytes; }
@@ -1204,9 +1225,10 @@ static void check_astc_call(const Surf* t, u32 c, u32 x, u32 y, u32 w, u32 h, u3
    and the tail mapped: its whole upload decodes (and encodes) each bound tile's blocks into its 256x256 texels, and
    the tail's levels, and copies none of their bytes into the image as they are. Then 16 bytes of tile (1, 0) written:
    the run of blocks they lie in decoded again, and nothing for 16 of a hole; a tile of level 0 mapped: bound, and
-   decoded whole. An ASTC 8x8 one, the device's blocks 4 GOBs high in its layout where its blocks are 8, a 6x6 one,
-   whose blocks aren't whole in 256 texels, and one the device makes no sparse image of are made whole, the log line
-   saying the format and why */
+   decoded whole. An ASTC 8x8 one, the device's blocks 4 GOBs high in its layout where its blocks are 8, binds them in
+   stacks of two (resident_stacks): 85 bricks of 16 KiB, and its first tile mapped, 64 KiB, binds the 2x2 device
+   blocks it covers, 0, 1, 8 and 9. A 6x6 one, whose blocks aren't whole in 256 texels, and one the device makes no
+   sparse image of are made whole, the log line saying the format and why */
 static void check_resident_astc(void) {
     Surf t = tex(1024, 1024, 1, 11, 16, 3, 0, 1);
     VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -1251,7 +1273,7 @@ static void check_resident_astc(void) {
     check_astc_call(&t, 0, 512, 0, 256, 256, 0);
     g_map.count = 0;
     astc_append = 0;
-    /* made whole, saying why */
+    /* bound in stacks; made whole, saying why */
     Surf e = tex(2048, 2048, 1, 12, 16, 3, 0, 1), s = tex(1536, 1536, 1, 11, 16, 3, 0, 1), n = t;
     e.f = s.f = t.f;
     e.f.bw = e.f.bh = 8;
@@ -1261,12 +1283,14 @@ static void check_resident_astc(void) {
     s.layer_size = s.size = bl_layer_size(1536, 1536, 1, &s.f, 3, 0, 4, 11);
     g_res.shape = (VkResidentShape){{256, 256, 1}, 4, 1};
     g_log[0] = 0;
-    CHECK(!resident_image(&e, &ii) && !e.bricks);
-    CHECK(
-        strstr(g_log, "2048x2048x1 texture of 12 levels in ASTC 8x8 as BC7 with holes in its mapping is made whole") &&
-        strstr(g_log,
-               "blocks of 256x256x1 texels, 8 GOBs across and 4 high in its layout, its mip tail from level 4") &&
-        strstr(g_log, "level 0 has blocks 8 GOBs high and 1 deep"));
+    CHECK(resident_image(&e, &ii) && e.bricks == 85 && e.tail_first == 4 && e.brick_bytes == 0x4000 && !g_log[0]);
+    u8 want[86] = {0};
+    g_map.count = 1;
+    g_map.gva[0] = GVA, g_map.n[0] = 0x10000; /* tile (0, 0) of level 0: its units 0 and 1, 32 KiB each */
+    CHECK(resident_bind_mapped(&e, want) && g_res.pages == 86);
+    for (u32 i = 0; i < 86; i++) CHECK(g_res.bound[i] == (i == 0 || i == 1 || i == 8 || i == 9));
+    for (u32 i = 0; i < 86; i++) CHECK(!want[i] == (i > 3)); /* the two units' four shares, in the guest's order */
+    g_map.count = 0;
     g_log[0] = 0;
     CHECK(!resident_image(&s, &ii) && !s.bricks);
     CHECK(strstr(g_log, "in ASTC 6x6 as BC7 with holes") && strstr(g_log, "256x256x1 texels, not whole 6x6 blocks,"));
@@ -1494,7 +1518,11 @@ int main(void) {
         stage_used = nregs = 0, astc_used = 0;
         CHECK(tex_upload(&b) && g_astc_key.keyed && memcmp(first, g_astc_key.content, sizeof first));
         guest[3 * b.layer_size + 77] ^= 0x10;
-        g_nown = 1, g_astc_key.owner_over = 1;
+        /* owners elsewhere, none over the level's bytes: the same key */
+        g_nown = 1;
+        stage_used = nregs = 0, astc_used = 0;
+        CHECK(tex_upload(&b) && g_astc_key.keyed && !memcmp(first, g_astc_key.content, sizeof first));
+        g_astc_key.owner_over = 1;
         stage_used = nregs = 0, astc_used = 0;
         CHECK(tex_upload(&b) && !g_astc_key.keyed);
         g_nown = 0, g_astc_key.owner_over = 0;

@@ -13,6 +13,7 @@
 #include <stddef.h>
 #include "nx/gpu/shader/sm86.h"
 #include "nx/gpu/shader/translator.h"
+#include "nx/gpu/shader/write_log.h"
 #include "common/utilities/spirv_emit.h"
 #include <stdarg.h>
 
@@ -210,6 +211,14 @@ static u32 saturate(Ctx* c, u32 v, int on) {
     u32 positive = spv_emit_fcompare(&c->e, c->t_bool, 4, v, cf(c, 0.0f)); /* NAK's FloatCmpOp: 4 >, 6 >= */
     u32 low = spv_emit_glsl_binary(&c->e, c->t_f32, c->glsl, SPV_GLSL_F_MIN, v, cf(c, 1.0f));
     return spv_emit_select(&c->e, c->t_f32, positive, low, cf(c, 0.0f));
+}
+/* where an instruction runs: its guard, and a BRA's or an EXIT's predicate operand (sm86_has_cond) as well. One game's
+   interface programs exit the lanes their KILL took with @P0 EXIT P1: with P1 left out, every lane of a draw with P0
+   set exited before the MOVs to its outputs, and the whole title screen drew transparent black */
+static u32 guard(Ctx* c, const Sm86Insn* in) {
+    u32 v = prd(c, in->pred, in->pred_not, 0), p = sm86_field(in, 87, 3), negate = sm86_field(in, 90, 1);
+    if (!sm86_has_cond(in) || (p == SM86_PT && !negate)) return v;
+    return op2(c, SPV_OP_LOGICAL_AND, c->t_bool, v, prd(c, p, negate, 0));
 }
 static u32 combine(Ctx* c, u32 set_op, u32 x, u32 acc) {
     switch (set_op) {
@@ -646,45 +655,21 @@ static void mark_read(Ctx* c, u32 key) {
         }
 }
 /* A compute program's store of bytes bytes (1, 2, 4, 8 or 16) at byte offset into global buffer key records them in
-   the write log (ShaderInfo.gbuf_mark, SH_WLOG_*): a plain store of 1 into its window's flag, as every store of a
-   window writes the same, and an atomic OR of its bytes' bits into that window's mask, which other invocations OR
-   into too. The offset is taken as aligned to the size, as the GPU requires of every global access, so its bits are
-   in one mask word. A store past the windows sets the last window's flag and no bit. The renderer lands the bytes
-   logged and no others: an Ounce program's buffer is all of the memory mapped from its address, up to 16 MiB, and
-   finding what changed by comparing its bytes with a copy taken before the dispatch was most of one game's CPU time */
+   the write log (ShaderInfo.gbuf_mark, write_log.c's shader_wlog_store). The renderer lands the bytes logged and no
+   others: an Ounce program's buffer is all of the memory mapped from its address, up to 16 MiB, and finding what
+   changed by comparing its bytes with a copy taken before the dispatch was most of one game's CPU time */
 static void mark_written(Ctx* c, u32 key, u32 offset, u32 bytes) {
     int slot = -1;
     if (c->stage != ST_CS) return;
     for (int i = 0; i < c->si->ngbuf; i++)
         if (c->si->gbuf_cbuf_off[i] == key) slot = i;
     if (slot < 0) return;
-    if (!c->si->gbuf_mark[slot]) c->si->gbuf_mark[slot] = ++c->si->nmarks;
-    u32 part = (u32)(c->si->gbuf_mark[slot] - 1) * SH_WLOG_PART;
+    u32 part = shader_wlog_part(c->si, slot);
     if (!c->wpages) {
-        u32 array = spv_emit_type_runtime_array(&c->e, c->t_u32, 4);
-        u32 structure = spv_emit_type_struct_one(&c->e, array);
-        c->wpages = spv_emit_storage_buffer(&c->e, structure, (u32)shader_vk_set(c->stage), SNX_VKB_WPAGES);
+        c->wpages = shader_wlog_buffer(&c->e, c->t_u32, (u32)shader_vk_set(c->stage));
         add_interface(c, c->wpages);
     }
-    u32 ptr_type = spv_emit_type_storage_pointer(&c->e, c->t_u32);
-    u32 at = spv_emit_bitwise_and_u32(&c->e, c->t_u32, offset, cu(c, ~(bytes - 1)));
-    u32 window = spv_emit_shift_right_u32(&c->e, c->t_u32, at, cu(c, 12)), last = cu(c, SH_WPAGE_SLOT - 1);
-    u32 past = spv_emit_u_less(&c->e, c->t_bool, last, window);
-    window = spv_emit_select(&c->e, c->t_u32, past, last, window);
-    u32 flag = spv_emit_iadd_u32(&c->e, c->t_u32, window, cu(c, part));
-    spv_emit_store(&c->e, spv_emit_storage_access_u32(&c->e, ptr_type, c->wpages, c->zero, flag), cu(c, 1));
-    u32 word = spv_emit_iadd_u32(
-        &c->e, c->t_u32,
-        spv_emit_iadd_u32(&c->e, c->t_u32, spv_emit_imul_u32(&c->e, c->t_u32, window, cu(c, SH_WLOG_MASK)),
-                          spv_emit_shift_right_u32(
-                              &c->e, c->t_u32, spv_emit_bitwise_and_u32(&c->e, c->t_u32, at, cu(c, 4095)), cu(c, 5))),
-        cu(c, part + SH_WPAGE_SLOT));
-    u32 bits = spv_emit_shift_left_u32(&c->e, c->t_u32, cu(c, (u32)((1ull << bytes) - 1)),
-                                       spv_emit_bitwise_and_u32(&c->e, c->t_u32, at, cu(c, 31)));
-    bits = spv_emit_select(&c->e, c->t_u32, past, cu(c, 0), bits);
-    spv_emit_atomic_u32(&c->e, c->t_u32, SPV_OP_ATOMIC_OR,
-                        spv_emit_storage_access_u32(&c->e, ptr_type, c->wpages, c->zero, word), bits);
-    c->si->gbuf_marks |= 1u << slot;
+    shader_wlog_store(&c->e, c->t_u32, c->t_bool, c->wpages, part, offset, bytes);
 }
 /* LDG and STG, as spirv_translate.c's global memory: the buffer is the one whose 64-bit address the constant buffer
    word that track_globals found holds (ShaderInfo.gbuf_cbuf_off), and the byte offset into it is the address less
@@ -765,8 +750,10 @@ static void global_dynamic(Ctx* c, const Sm86Insn* in, int uniform_form, int loa
         u32 offset = lo32(c, relative);
         if (load)
             mem_load(c, buffer, offset, type, in->dst, 0);
-        else
+        else {
+            mark_written(c, keys[k], offset, type < 2 ? 1 : type < 4 ? 2 : type == 4 ? 4 : type == 5 ? 8 : 16);
             mem_store(c, buffer, offset, type, sm86_field(in, 32, 8));
+        }
         spv_emit_branch(&c->e, merges[k]);
         spv_emit_label(&c->e, other);
     }
@@ -1206,10 +1193,10 @@ static void isbe(Ctx* c, const Sm86Insn* in) {
 
 /* ---- textures and surfaces ---- */
 
-/* whether the instruction at k goes on to k + 1: not after a BRA, BRX or EXIT that always leaves, nor a RET */
+/* whether the instruction at k goes on to k + 1: not after a BRA, BRX or EXIT that always leaves (its operand too,
+   sm86_always), nor a RET */
 static int falls_through(const Sm86Insn* in) {
-    int always = in->pred == SM86_PT && !in->pred_not;
-    return !((in->op == SM86_BRA || is_brx(in->op) || in->op == SM86_EXIT) && always) && in->op != SM86_RET;
+    return !((in->op == SM86_BRA || is_brx(in->op) || in->op == SM86_EXIT) && sm86_always(in)) && in->op != SM86_RET;
 }
 static u32 brx_targets(Ctx* c, u32 i, u32* targets, u32 max);
 /* the instructions that jump to each one, build_structure's edges: a BRA's target, a BRX's cases. Returns 0 when it
@@ -1219,7 +1206,7 @@ static int flow_sources(Ctx* c) {
     u32 n = c->n, total = 0, t[64];
     for (u32 i = 0; i < n; i++) {
         const Sm86Insn* in = &c->in[i];
-        if (in->pred == SM86_PT && in->pred_not) continue;
+        if (sm86_never(in)) continue;
         if (in->op == SM86_BRA) total++;
         else if (is_brx(in->op))
             total += brx_targets(c, i, t, 64);
@@ -1235,7 +1222,7 @@ static int flow_sources(Ctx* c) {
     for (int pass = 0; pass < 2; pass++)
         for (u32 i = 0; i < n; i++) {
             const Sm86Insn* in = &c->in[i];
-            if (in->pred == SM86_PT && in->pred_not) continue;
+            if (sm86_never(in)) continue;
             u32 count = 0;
             if (in->op == SM86_BRA) t[count++] = sm86_branch_target(in, i);
             else if (is_brx(in->op))
@@ -1897,10 +1884,10 @@ static void surface(Ctx* c, const Sm86Insn* in) {
         }
         slot = si->nimg++;
         /* the kind, as spirv_translate.c's rule for a bindless image: an R32ui image for an atomic (1); else the
-           renderer's key, bit 8 + slot of rt_int_mask for a format of the other class, gives a float image (0) or
-           an unsigned one (2), and of rt_sint_mask a signed one (3) */
-        u32 kind = atomic ? 1 : si->rt_int_mask & (1u << (8 + slot)) ? 0 : 2;
-        if (!atomic && (si->rt_sint_mask & (1u << (8 + slot)))) kind = 3;
+           renderer's key, bit slot of img_int_mask for a format of the other class, gives a float image (0) or an
+           unsigned one (2), and of img_sint_mask a signed one (3) */
+        u32 kind = atomic ? 1 : si->img_int_mask & (1u << slot) ? 0 : 2;
+        if (!atomic && (si->img_sint_mask & (1u << slot))) kind = 3;
         si->img[slot].cbuf_off = off;
         si->img[slot].type = (u8)type;
         si->img[slot].bindless = 1;
@@ -2494,6 +2481,9 @@ static u32 mesh_entry(Ctx* c, u32 body) {
     spv_emit_control_barrier(e, c->t_u32);
     if (c->stage == ST_TS) {
         u32 count = spv_emit_load(e, c->t_u32, isbe_ptr(c, payload_var(c), SPV_STORAGE_TASK_PAYLOAD, cu(c, 1)));
+        /* within the device's limit: a count past it is undefined behavior, which can hang the GPU */
+        if (g_shader_mesh_tasks_max)
+            count = spv_emit_glsl_binary(e, c->t_u32, c->glsl, SPV_GLSL_U_MIN, count, cu(c, g_shader_mesh_tasks_max));
         SPV_VOID(e, 5294 /* OpEmitMeshTasksEXT */, count, cu(c, 1), cu(c, 1), payload_var(c));
         spv_emit_function_end(e);
         return fn;
@@ -3698,6 +3688,7 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
         case SM86_LDSM: ldsm(c, in); return;
         case SM86_MOVM: movm(c, in); return;
         case SM86_KILL:
+            c->si->has_discard = 1; /* the renderer tests depth before the program only for one that keeps its pixels */
             spv_emit_capability(&c->e, SPV_CAPABILITY_DEMOTE_TO_HELPER_INVOCATION);
             spv_emit_demote(&c->e);
             return;
@@ -4063,7 +4054,7 @@ static ShStructure* build_structure(Ctx* c) {
     leader[0] = 1;
     for (u32 i = 0; i < n && !c->failed; i++) {
         const Sm86Insn* in = &c->in[i];
-        int never = in->pred == SM86_PT && in->pred_not;
+        int never = sm86_never(in);
         if (in->op == SM86_BRA && !never) {
             u32 t = sm86_branch_target(in, i);
             if (t >= n) {
@@ -4083,7 +4074,7 @@ static ShStructure* build_structure(Ctx* c) {
             for (u32 k = 0; k < count; k++) leader[cases[ncases + k]] = 1;
             ncases += count;
             leader[i + 1] = 1;
-        } else if ((in->op == SM86_EXIT && in->pred == SM86_PT && !in->pred_not) || in->op == SM86_RET)
+        } else if ((in->op == SM86_EXIT && sm86_always(in)) || in->op == SM86_RET)
             leader[i + 1] = 1;
     }
     u32 nb = 0;
@@ -4104,7 +4095,7 @@ static ShStructure* build_structure(Ctx* c) {
         for (u32 b = 0; b < nb; b++) {
             u32 end = b + 1 < nb ? start[b + 1] : n, last = end - 1;
             const Sm86Insn* in = &c->in[last];
-            int always = in->pred == SM86_PT && !in->pred_not, never = in->pred == SM86_PT && in->pred_not;
+            int always = sm86_always(in), never = sm86_never(in);
             sw_first[b] = nsw;
             if (in->op == SM86_BRA && !never) {
                 succ[2 * b] = block_of[sm86_branch_target(in, last)];
@@ -4145,7 +4136,9 @@ static ShStructure* build_structure(Ctx* c) {
 static Sm86Insn make_bra(const Sm86Insn* in, u32 ip, u32 target) {
     u64 field = (((u64)target - (u64)ip - 1) * 4) & ((1ull << 48) - 1);
     u64 lo = 0x947u | (u64)in->pred << 12 | (u64)in->pred_not << 15 | field << 34;
-    u64 hi = field >> 30 | 7ull << 23 | 7ull << 46 | 7ull << 49; /* condition PT, no barriers */
+    /* a BRA keeps its predicate operand (sm86_has_cond), a CALL's or a RET's is PT; no barriers */
+    u64 cond = in->op == SM86_BRA ? sm86_field(in, 87, 4) : 7;
+    u64 hi = field >> 30 | cond << 23 | 7ull << 46 | 7ull << 49;
     Sm86Insn out;
     sm86_decode(lo, hi, &out);
     return out;
@@ -4163,8 +4156,8 @@ static Sm86Insn* inline_calls(Ctx* c, Sm86Insn* insn, u32* count) {
     for (u32 i = 0, copies = 0; i < n; i++) {
         if (out[i].op != SM86_CALL) continue;
         u32 entry = sm86_branch_target(&out[i], i), end = entry;
-        while (end < n && !(out[end].op == SM86_BRA && out[end].pred == SM86_PT && !out[end].pred_not &&
-                            sm86_branch_target(&out[end], end) == end))
+        while (end < n &&
+               !(out[end].op == SM86_BRA && sm86_always(&out[end]) && sm86_branch_target(&out[end], end) == end))
             end++;
         if (entry >= *count || end >= *count || ++copies > 64) {
             fail(c, "CALL to 0x%x that the inlining can't take", entry * 16);
@@ -4546,7 +4539,7 @@ u32* sm86_to_spirv_ftz(const u8* code, u32 bytes, int stage, const u32* sph, Sha
             }
             for (u32 i = se.body_start; i < se.body_end && !c->failed; i++) {
                 const Sm86Insn* in = &insn[i];
-                int always = in->pred == SM86_PT && !in->pred_not, never = in->pred == SM86_PT && in->pred_not;
+                int always = sm86_always(in), never = sm86_never(in);
                 if (never) continue;
                 if (is_brx(in->op)) { /* the block's end: SHS_SWITCH takes the target's instruction */
                     u32 index = in->op == SM86_BRXU ? urd(c, sm86_field(in, 24, 6)) : rd(c, sm86_field(in, 24, 8));
@@ -4555,7 +4548,7 @@ u32* sm86_to_spirv_ftz(const u8* code, u32 bytes, int stage, const u32* sph, Sha
                     continue;
                 }
                 if (in->op == SM86_BRA) { /* the block's end: SHS_IF takes its condition */
-                    c->branch_cond = always ? 0 : prd(c, in->pred, in->pred_not, 0);
+                    c->branch_cond = always ? 0 : guard(c, in);
                     continue;
                 }
                 if (in->op == SM86_EXIT && always) {
@@ -4566,7 +4559,7 @@ u32* sm86_to_spirv_ftz(const u8* code, u32 bytes, int stage, const u32* sph, Sha
                 }
                 u32 merge = 0;
                 if (!always) {
-                    u32 cond = prd(c, in->pred, in->pred_not, 0), then = spv_emit_id(e);
+                    u32 cond = guard(c, in), then = spv_emit_id(e);
                     merge = spv_emit_id(e);
                     spv_emit_selection_merge(e, merge);
                     spv_emit_branch_conditional(e, cond, then, merge);

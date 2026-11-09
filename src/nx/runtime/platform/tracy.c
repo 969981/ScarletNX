@@ -409,14 +409,26 @@ void snx_tracy_thread_name(const char* name) {
     snx_tracy_leave();
 }
 
-/* The plots' formats: the byte counts as sizes, the idle mark as steps. */
+/* The plots' formats: the byte counts as sizes, the shares as percent, the idle mark as steps. */
 static void tracy_plots_send(void) {
     static const struct {
         const char* name;
         int type, step, fill;
     } cfg[] = {
-        {"gpu memory", 1, 0, 1},   {"gpu memory budget", 1, 0, 1}, {"texture uploads", 0, 0, 1},
-        {"guest memory", 1, 0, 1}, {"compute cpu reads", 0, 0, 1}, {"gpu idle", 0, 1, 0},
+        {"gpu memory", 1, 0, 1},       {"gpu memory budget", 1, 0, 1},  {"texture uploads", 0, 0, 1},
+        {"guest memory", 1, 0, 1},     {"compute cpu reads", 0, 0, 1},  {"gpu thread idle", 0, 1, 0},
+        {"frame ms", 0, 0, 1},         {"draws", 0, 0, 1},              {"dispatches", 0, 0, 1},
+        {"shaders", 0, 0, 1},          {"host heap", 1, 0, 1},          {"host rss", 1, 0, 1},
+        {"host free", 1, 0, 1},        {"guest cpu", 2, 0, 1},          {"process cpu", 2, 0, 1},
+        {"guest threads", 0, 0, 1},    {"svc/s", 0, 0, 1},              {"svc miss/s", 0, 0, 1},
+        {"nce outcalls/s", 0, 0, 1},   {"nce hooks/s", 0, 0, 1},        {"nce kicks/s", 0, 0, 1},
+        {"guest top thread ms", 0, 0, 1}, {"gpu gap: dispatches", 0, 0, 1}, {"gpu gap: copies", 0, 0, 1},
+        {"gpu gap: barriers", 0, 0, 1}, {"gpu gap: nothing", 0, 0, 1},  {"gpu idle: waited", 0, 0, 1},
+        {"gpu idle: frame", 0, 0, 1},  {"gpu idle: recording", 0, 0, 1}, {"gpu idle: queued", 0, 0, 1},
+        {"gpu busy", 2, 0, 1},         {"gpu submissions/frame", 0, 0, 1},
+        {"submits pending", 0, 0, 1},    {"compute pending", 0, 0, 1},    {"pipelines", 0, 0, 1},
+        {"pipeline make ms", 0, 0, 1},   {"pipeline wait ms", 0, 0, 1},   {"pipeline cache hits", 0, 0, 1},
+        {"io read MB/s", 0, 0, 1},       {"io write MB/s", 0, 0, 1},
     };
     if (!snx_tracy_enter()) return;
     if (TracyCIsConnected)
@@ -535,6 +547,39 @@ void snx_tracy_gpu_calibrate(int64_t gpu_time, int64_t cpu_delta, int ctx) {
         ___tracy_emit_gpu_calibration_serial(c);
     }
     snx_tracy_leave();
+}
+
+/* The caller's anchor: the context announcement's own pair, which a new connection replays. The server
+   measures its GPU delta from that pair and takes the CPU delta from the events the caller sends, so both
+   sides must count from the same point after a reconnect. */
+void snx_tracy_gpu_cal_announce(SnxTracyGpuCal* c, int calibrated, int64_t cpu) {
+    c->calibrated = calibrated;
+    c->cpu_anchor = calibrated ? cpu : 0;
+    c->cpu_prev = c->cpu_anchor;
+}
+
+/* A new connection's server re-anchored at the replayed context's original pair, so the CPU delta is measured
+   from the announcement again. The caller asks at each read-back: the compare is the anchor's, and no caller
+   keeps a connection of its own for it. */
+void snx_tracy_gpu_cal_reconnect(SnxTracyGpuCal* c) {
+    uint64_t conn = snx_tracy_connection_id();
+    if (conn == c->conn) return;
+    c->conn = conn;
+    c->cpu_prev = c->cpu_anchor;
+}
+
+int64_t snx_tracy_gpu_cal_delta(SnxTracyGpuCal* c, int64_t cpu) {
+    int64_t d;
+    if (!c->calibrated) return 0;
+    if (!c->cpu_prev) { /* no anchor was taken: the next pair starts one */
+        c->cpu_prev = cpu;
+        return 0;
+    }
+    d = cpu - c->cpu_prev;
+    /* a clock that does not advance sends none, and keeps the anchor the server still has */
+    if (d <= 0) return 0;
+    c->cpu_prev = cpu;
+    return d;
 }
 
 /* The named locks' events: each PMutex that pm_lock_announce named reports its waits, takes and releases here, and
