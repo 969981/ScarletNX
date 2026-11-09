@@ -245,7 +245,7 @@ jobs:
       # read, what a leak check finds depends on what the stack happened to hold at exit
       # Suppress only the external Vulkan loader's confirmed 128-byte cache leak.
       # All ScarletNX allocations remain under LeakSanitizer.
-      LSAN_OPTIONS: use_stacks=0:use_registers=0:suppressions=${{ github.workspace }}/tests/lsan-vulkan-loader.supp
+      LSAN_OPTIONS: use_stacks=0:use_registers=0
     steps:
       - name: Name the week
         id: week
@@ -301,6 +301,10 @@ jobs:
             echo "CCACHE_NOHASHDIR=true"
             echo "SNX_DEPS_CACHE=$ws/.cache/deps"
             echo "SNX_CCACHE_START=$(date +%s)"
+            # github.workspace resolves to a host path in container jobs.
+            # Use GITHUB_WORKSPACE inside the running container instead.
+            test -r "$ws/tests/lsan-vulkan-loader.supp"
+            echo "LSAN_OPTIONS=use_stacks=0:use_registers=0:suppressions=$ws/tests/lsan-vulkan-loader.supp"
           } >> "$GITHUB_ENV"
       - name: Build with the sanitizers
         run: |
