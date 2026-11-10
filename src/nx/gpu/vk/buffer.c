@@ -131,6 +131,7 @@ static void vb_free(u32 idx) {
     g_vbfree = idx;
     g_vblive--;
 }
+#define PATCH_RUNS0 256 /* the runs a patch holds before it needs memory of its own (patch_note) */
 static struct {
     u32 head, tail;
     u32 n;
@@ -154,6 +155,12 @@ static struct {
     struct {
         u64 copied, read_back, merged, kept;
     } wstat, wstat_seen;
+    /* the runs of the patch being made (patch_note): in r0, or in more (cap of them) once they didn't fit */
+    struct {
+        VkBufferCopy r0[PATCH_RUNS0];
+        VkBufferCopy* more;
+        u32 cap;
+    } patch;
 } g_buffer;
 /* why keep_new turned a writable binding away (temporary diagnosis of the writeback cost) */
 enum { KF_NONE, KF_TRAPS_OFF, KF_UMA, KF_EMPTY, KF_UNALIGNED, KF_NOT_CONTIG, KF_CPU_READ, KF_N };
@@ -899,8 +906,8 @@ void vk_buf_frame_done(u64 frame) {
     vk_uma_frame_done(frame);
 }
 /* At the frame's submit: its storage results are copied into host-cached memory (vk_stage_back), where landing them
-   compares bytes quickly. A result whose copy can't be allocated is read where the shader wrote it, as a logged one
-   is. A kept one stays in its owner */
+   compares bytes quickly, or takes a logged one's runs. A result whose copy can't be allocated is read where the
+   shader wrote it. A kept one stays in its owner */
 void vk_buf_host_barrier(VkCommandBuffer cb, u64 frame) {
     vk_uma_host_barrier(cb, frame);
     vk_mirror_harvest(cb, frame); /* the pages the submit's programs wrote in the GPU mirror */
@@ -923,9 +930,10 @@ void vk_buf_host_barrier(VkCommandBuffer cb, u64 frame) {
     VkBuffer src = VK_NULL_HANDLE, dst = VK_NULL_HANDLE;
     for (GfxOut* o = first; o; o = o->next) {
         if (o->frame != frame || o->keep) continue;
-        /* a logged result is read where its shader wrote it: only the bytes its writers logged, a few windows of a
-           binding of up to 16 MiB, which copying whole crossed PCIe for every dispatch */
-        if (!o->org) continue;
+        /* a logged one too, whole: where its shader wrote it, the output ring, can be device memory behind the BAR,
+           and the CPU's reads of its logged runs there were 19% of a Switch game's GPU thread in its street (728
+           results a frame of 3.8 KB on average, all logged since the Maxwell programs log their stores). An Ounce
+           program's 16 MiB bindings, which made this one take its runs in place, are in the GPU mirror */
         VkBuffer back;
         u64 at;
         VmaAllocation mem;
@@ -2974,53 +2982,69 @@ static void drop_own(u32 i) {
    (vk_buf_get_window) made it hash and copy all of it, again at each submit until it held still for two checks. In
    one game's underground, where terrain streams in as the player moves, that was most of each hitch */
 #define PATCH_MIN (256u << 10)
-#define PATCH_RUNS 64
+/* The runs are copied as they are, however many: past 64 of them, they were joined into one copy from the first to the
+   end of the last, and a Switch game's city street, whose CPU writes pages all over a 64 MiB window of indices, copied
+   about 50 MB a frame that way, a quarter of its GPU thread. One patch is made at a time (vk_lock), in g_buffer.patch */
 typedef struct {
     const u8* src;
-    VkBufferCopy r[PATCH_RUNS];
     u32 n;
-    u64 bytes;
+    int whole; /* no room for the runs: from the first to the end of the last, in one copy (the first run's) */
 } Patch;
+static VkBufferCopy* patch_runs(void) { return g_buffer.patch.more ? g_buffer.patch.more : g_buffer.patch.r0; }
 static void patch_note(void* user, u64 at, u64 n) {
     Patch* p = user;
-    if (p->n < PATCH_RUNS) p->r[p->n] = (VkBufferCopy){0, at, n};
-    p->n++;
-    p->bytes += n;
+    VkBufferCopy* r = patch_runs();
+    if (p->whole) {
+        r[0].size = at + n - r[0].dstOffset;
+        return;
+    }
+    if (p->n && r[p->n - 1].dstOffset + r[p->n - 1].size == at) { /* touching the last: one */
+        r[p->n - 1].size += n;
+        return;
+    }
+    u32 cap = g_buffer.patch.more ? g_buffer.patch.cap : PATCH_RUNS0;
+    if (p->n == cap) {
+        VkBufferCopy* more = cap * 2 <= cap ? NULL : realloc(g_buffer.patch.more, (size_t)cap * 2 * sizeof *more);
+        if (!more) { /* the runs so far and this one in one copy */
+            p->whole = 1;
+            r[0].size = at + n - r[0].dstOffset;
+            p->n = 1;
+            return;
+        }
+        if (!g_buffer.patch.more) memcpy(more, g_buffer.patch.r0, sizeof g_buffer.patch.r0);
+        g_buffer.patch.more = r = more;
+        g_buffer.patch.cap = cap * 2;
+    }
+    r[p->n++] = (VkBufferCopy){0, at, n};
 }
 static int patch_apply(const Vb* e, Patch* pt);
 static int patch_own(u32 i, const u8* host, u32 since) {
     Vb* e = &g_vb[i];
     Patch pt = {.src = host};
     vk_written_runs(host, e->len, since, patch_note, &pt);
-    if (pt.n > PATCH_RUNS) { /* scattered: from the first written byte to the end of the last run, in one copy */
-        u64 o = (u64)(host - g_mem), a = pt.r[0].dstOffset, b = e->len;
-        for (u64 pg = (o + e->len - 1) >> 12; pg > o >> 12 && !page_written(pg, since); pg--) b = (pg << 12) - o;
-        pt.r[0] = (VkBufferCopy){0, a, b - a};
-        pt.n = 1;
-        pt.bytes = b - a;
-    }
     return patch_apply(e, &pt);
 }
 /* pt's runs of the entry's bytes (pt->src) copied over its own buffer: staged, then copied on the GPU */
-static int patch_apply(const Vb* e, Patch* pt0) {
-    Patch pt = *pt0;
+static int patch_apply(const Vb* e, Patch* pt) {
+    VkBufferCopy* r = patch_runs();
     VkBuffer sb;
-    u64 so, at = 0;
+    u64 so, at = 0, bytes = 0;
     u8* p;
-    if (!pt.n) return 1;
-    if (!(p = vk_stage_upload(pt.bytes, vk_stage_align(), &sb, &so))) return 0;
-    for (u32 k = 0; k < pt.n; k++) {
-        memcpy(p + at, pt.src + pt.r[k].dstOffset, pt.r[k].size);
-        pt.r[k].srcOffset = so + at;
-        at += pt.r[k].size;
+    if (!pt->n) return 1;
+    for (u32 k = 0; k < pt->n; k++) bytes += r[k].size; /* a whole one's span is more than its runs */
+    if (!(p = vk_stage_upload(bytes, vk_stage_align(), &sb, &so))) return 0;
+    for (u32 k = 0; k < pt->n; k++) {
+        memcpy(p + at, pt->src + r[k].dstOffset, r[k].size);
+        r[k].srcOffset = so + at;
+        at += r[k].size;
     }
-    if (copy_stats_on()) g_copy_owned += pt.bytes;
+    if (copy_stats_on()) g_copy_owned += bytes;
     vk_render_end(); /* copies happen outside rendering passes */
     /* the draws recorded and submitted before read the old bytes, and an earlier patch wrote them: both are done
        before the copy writes */
     copy_barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
                  VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    rec_CmdCopyBuffer(vk_cmd(), sb, e->buf, pt.n, pt.r);
+    rec_CmdCopyBuffer(vk_cmd(), sb, e->buf, pt->n, r);
     copy_barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_MEMORY_READ_BIT);
     return 1;
@@ -3047,11 +3071,6 @@ static int patch_dirty(u32 i, u64 gva, const u8* host, u64 gw, u32 ws) {
             patch_note(&pt, a, b - a);
         }
         in = d;
-    }
-    if (pt.n > PATCH_RUNS) { /* scattered: from the first dirty byte to the end of the range, in one copy */
-        pt.r[0] = (VkBufferCopy){0, pt.r[0].dstOffset, e->len - pt.r[0].dstOffset};
-        pt.n = 1;
-        pt.bytes = pt.r[0].size;
     }
     return patch_apply(e, &pt);
 }

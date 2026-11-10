@@ -32,6 +32,7 @@
 #include "nx/gpu/texture/texconv_modes.glsl"
 #include "nx/gpu/vk/draw_texture.h"
 #include "nx/gpu/vk/draw_texture_shader.h"
+#include "nx/gpu/vk/lookup_ways.h"
 #include "nx/gpu/vk/pending_pages.h"
 #include "nx/gpu/vk/tess_passthrough.h"
 #include "nx/gpu/vk/quad_indices.h"
@@ -1120,8 +1121,8 @@ static Surf* capture_sample(Surf* texture) {
 
 /* What a texture handle resolved to, kept while nothing it came from can have changed: the pools' addresses, the
    surface table at the texture's address (vk_surf_epoch_at: tex_from_tic looks nowhere else, and a texture's drawn
-   targets are taken in by vk_tex_recheck at every hit), the CPU's writes the stream can see (vk_ww_epoch), the
-   results pending over guest memory (none was added: g_pend_any.adds) and the GPU's writes to the two headers. With
+   targets are taken in by vk_tex_recheck at every hit), the CPU's writes to the two headers (tex_memo_unwritten), the
+   results pending over what it read (tex_memo_unpended) and the GPU's writes to the two headers. With
    the whole table's epoch, a texture made anywhere dropped them all: 8% of one game's lookups. A draw resolved each
    of its textures again, reading both headers and finding the texture by them: a tenth of the GPU thread in one
    game, for the same few hundred handles every draw. A kept texture is still checked against its memory
@@ -1135,12 +1136,47 @@ typedef struct {
     u64 tic_base, tsc_base, gw, adds;
     u64 t_gva; /* t's address when kept: its bucket of the surface table tells whether t is still there */
     u32 handle, surf_epoch, ww_epoch;
+    u32 wseen; /* vk_ww_now() before the headers were read */
     u32 tic[8], tsc[8];
     Surf* t;
-    int rt; /* t is the render target itself, read whole */
+    int rt;   /* t is the render target itself, read whole */
+    u32 used; /* g_tex_memo.use when last found or kept: the way used longest ago makes room */
 } TexMemo;
-#define TEX_MEMO 4096
-static TexMemo g_tex_memo[TEX_MEMO];
+/* by the handle, in sets of TEX_MEMO_WAYS ways. With one way in 4096 slots, a handle that shared its slot with another
+   one the draws used too put it out each time: 9% of an Ounce game's lookups in a race and 22% of a Switch game's in
+   its street resolved a handle again that way. A miss doesn't take a way unless what it found is kept */
+#define TEX_MEMO_SET_BITS 11
+#define TEX_MEMO_WAYS     4
+static struct {
+    TexMemo set[1u << TEX_MEMO_SET_BITS][TEX_MEMO_WAYS];
+    u32 use; /* counts the lookups that found or kept a way */
+} g_tex_memo;
+/* The CPU's writes since m was kept, when the stream's epoch moved: an epoch moves at each submission and each wait
+   that ends, and the CPU writes somewhere in nearly every one. What a handle resolves to comes from its two headers
+   alone, with the rest checked at each hit as tex_from_tic checks it (vk_tex_recheck for a texture's texels, the read
+   check and the defined contents for a render target), so a memo whose headers weren't written stays (1), with the
+   epoch and the baseline brought up to now. In one game's street the epoch dropped 39% of the lookups */
+static int tex_memo_unwritten(TexMemo* m, u64 tic_at, u64 tsc_at, u32 epoch, u32 now) {
+    if (m->ww_epoch == epoch) return 1;
+    if (vk_written_since(gmem_host(tic_at, 32), 32, m->wseen) != 0 ||
+        vk_written_since(gmem_host(tsc_at, 32), 32, m->wseen) != 0)
+        return 0;
+    m->ww_epoch = epoch;
+    m->wseen = now;
+    return 1;
+}
+/* The results added since m was kept, when any was added anywhere: what m read is its two headers and its texture's
+   memory, and while no pending result covers those, it reads them the same (1), with the count brought up to now. The
+   pages pending results cover are counted by GPU page (pend_hit), so this is a few lookups. Dispatches add results all
+   through a frame, and the count dropped 37% of one game's lookups once the epoch no longer did */
+static int tex_memo_unpended(TexMemo* m, u64 tic_at, u64 tsc_at, u64 adds) {
+    if (m->adds == adds) return 1;
+    if (pend_hit(&g_pend_any, tic_at, 32) || pend_hit(&g_pend_any, tsc_at, 32) ||
+        pend_hit(&g_pend_any, m->t->gva, vk_surf_guest_size(m->t)))
+        return 0;
+    m->adds = adds;
+    return 1;
+}
 static void tex_resolve(const DsState* ds, u32 handle, TexRes* x) {
     const DsBindings* b = &ds->bind;
     if (b->smp_mode) {
@@ -1150,9 +1186,15 @@ static void tex_resolve(const DsState* ds, u32 handle, TexRes* x) {
     }
     u64 tic_base = b->tex_pool, tsc_base = b->smp_pool;
     u64 tic_at = tic_base + (handle & 0xFFFFF) * 32ull, tsc_at = tsc_base + ((handle >> 20) & 0xFFF) * 32ull;
-    TexMemo* m = &g_tex_memo[(handle * 0x9E3779B1u) >> 20];
+    TexMemo* set = g_tex_memo.set[((u64)handle * VK_FIB_MULT) >> (64 - TEX_MEMO_SET_BITS)];
+    TexMemo* m = NULL;
+    for (u32 w = 0; w < TEX_MEMO_WAYS && !m; w++)
+        if (set[w].t && set[w].handle == handle && set[w].ds == ds && set[w].tic_base == tic_base &&
+            set[w].tsc_base == tsc_base)
+            m = &set[w];
     u64 gw = gpu_mem_generation();
-    u32 epoch = vk_ww_epoch(); /* before the headers are read */
+    u32 epoch = vk_ww_epoch(), now = vk_ww_now(); /* before the headers are read */
+    u64 adds = __atomic_load_n(&g_pend_any.adds, __ATOMIC_RELAXED);
     x->handle = handle;
     x->have = 1;
     /* an index past its pool's limit names no header: no texture, or the
@@ -1174,11 +1216,11 @@ static void tex_resolve(const DsState* ds, u32 handle, TexRes* x) {
                   handle, b->tex_max, b->smp_max);
         return;
     }
-    if (m->t && m->ds == ds && m->handle == handle && m->tic_base == tic_base && m->tsc_base == tsc_base &&
-        m->surf_epoch == vk_surf_epoch_at(m->t_gva) && m->ww_epoch == epoch && !g_gfx_img_any &&
-        m->adds == __atomic_load_n(&g_pend_any.adds, __ATOMIC_RELAXED) &&
+    if (m && m->surf_epoch == vk_surf_epoch_at(m->t_gva) && tex_memo_unwritten(m, tic_at, tsc_at, epoch, now) &&
+        !g_gfx_img_any && tex_memo_unpended(m, tic_at, tsc_at, adds) &&
         (m->gw == gw || (!gpu_mem_dirty_since(m->gw, tic_at, 32) && !gpu_mem_dirty_since(m->gw, tsc_at, 32)))) {
         m->gw = gw;
+        m->used = ++g_tex_memo.use;
         memcpy(x->tic, m->tic, sizeof x->tic);
         memcpy(x->tsc, m->tsc, sizeof x->tsc);
         if (m->rt) {
@@ -1197,19 +1239,26 @@ static void tex_resolve(const DsState* ds, u32 handle, TexRes* x) {
     vk_gmem_words(tic_at, x->tic, 8);
     vk_gmem_words(tsc_at, x->tsc, 8);
     x->t = vk_tex_from_tic(x->tic);
-    m->t = NULL;
+    if (m) m->t = NULL; /* what it held is gone: kept again below if it can be */
     Surf* at = x->t ? vk_rt_find(x->t->gva) : NULL;
     if (x->t && (x->t->is_rt ? x->t == at : !at)) {
+        if (!m) { /* an empty way, else the one used longest ago */
+            m = &set[0];
+            for (u32 w = 1; w < TEX_MEMO_WAYS && m->t; w++)
+                if (!set[w].t || (i32)(set[w].used - m->used) < 0) m = &set[w];
+        }
+        m->used = ++g_tex_memo.use;
         m->rt = x->t->is_rt;
         m->ds = ds;
         m->handle = handle;
         m->tic_base = tic_base;
         m->tsc_base = tsc_base;
         m->gw = gpu_mem_generation();
-        m->adds = __atomic_load_n(&g_pend_any.adds, __ATOMIC_RELAXED);
+        m->adds = adds;
         m->t_gva = x->t->gva;
         m->surf_epoch = vk_surf_epoch_at(x->t->gva);
         m->ww_epoch = epoch;
+        m->wseen = now;
         memcpy(m->tic, x->tic, sizeof m->tic);
         memcpy(m->tsc, x->tsc, sizeof m->tsc);
         m->t = x->t;
@@ -1264,13 +1313,20 @@ VkImageViewType vk_storage_image_type(const ShaderInfo* si, int i) {
 
 u32 vk_gbuf_desc(int stage, u32 off, const u32* v, u64* addr) {
     u32 size = stage == ST_VS && off == 0xb0 ? 16 : v[2];
+    u64 cpu = 0;
     *addr = ((u64)v[1] << 32) | v[0];
+    /* An address with nothing mapped there is no buffer, as address 0 is: it reads zeros and its writes land nowhere,
+       as the copies of guest memory gave it before. The program cannot access it, or it would fault on the console.
+       An Ounce game's dispatches leave such an address in a slot, and the GPU mirror took no dispatch with one: each
+       copied its written buffers on the CPU instead, about 230 MB a second of one race */
     if (!shader_gbuf_sized(stage, off) && off != 0xb0) {
         /* a bare address in the program's own constant buffer has no size beside it: the memory mapped from it on,
            whole words, to the cap below (Eden binds such a buffer to the end of its mapping, at most 8 MiB) */
-        u64 cpu = 0;
-        size = *addr ? (u32)gmmu_run(*addr, 16u << 20, &cpu) & ~3u : 0;
-    }
+        u64 run = *addr ? gmmu_run(*addr, 16u << 20, &cpu) : 0;
+        if (!run) *addr = 0;
+        size = (u32)run & ~3u;
+    } else if (*addr && !gmmu_run(*addr, 1, &cpu))
+        *addr = 0;
     if (!size) size = 16;
     if (size > (16u << 20)) size = 16u << 20;
     return (size + 3) & ~3u;
