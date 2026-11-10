@@ -40,6 +40,8 @@ typedef struct {
     /* resources, made when first used */
     u32 cbuf[18], cbuf_ptr, root;
     u32 gbuf[16], gbuf_ptr, smap;
+    u32 gbuf_f32[16];  /* each global buffer's view as floats, for OpAtomicFAddEXT (atomic_fadd) */
+    u32 cas_var;       /* atomic_fadd's loop's word, made at the start where the device has no float atomics */
     u32 wpages, mbase; /* SNX_VKB_WPAGES and SNX_VKB_MBASE (the GPU mirror's; the write log's bases are in gbuf_mark) */
     u32 gkey;   /* the global buffer the last global_address named */
     u32 shared, shared_ptr, shared_words;
@@ -53,16 +55,33 @@ typedef struct {
     u32 centroid_mask;  /* the inputs decorated Centroid */
     u32 legacy_fs;      /* a fragment program's legacy varying groups (shader_legacy_group), read as generics 17-31 */
     u32 point_coord, front_facing;
+    /* a fragment program at a resolution scale: SNX_VKB_RS's vec4 (scale_component) and the fragment stage's push
+       constants, whose uvec4 marks the textures bound to scaled render targets (scaled_slot) */
+    u32 scale, scale_ptr, scaled_push;
     u32 tex[SH_MAXTEX], tex_sampled[SH_MAXTEX];
     /* an indexed slot's arrays on SNX_VKB_TEXARRAY and SNX_VKB_TEXDEPTH, by kind (its tex[] is the element of the
        instruction being written), and SNX_VKB_TEXMAP and SNX_VKB_TEXFUNCS */
     u32 tex_array[SH_MAXTEX], tex_depth[SH_MAXTEX], tex_depth_type[SH_MAXTEX];
     u32 tex_map, tex_map_ptr, tex_func, tex_func_ptr;
     TexHandle* handle; /* by instruction, what prepare_handles found: NULL for a program without TEX.B */
+    /* texture handles from memory (memory_handles): by instruction, whether it is one of ShaderInfo.memh, and its
+       index there + 1; the values the instructions read, each from its writer (MhDep), for mh_finish */
+    u8* mh_mark;
+    u32* mh_pos;
+    struct MhDep* mh_dep;
+    u32 nmh, nmh_dep, mh_dep_cap;
+    /* a handle's instructions being found (memory_handles): those marked since it began, to unmark when it can't be
+       found, and why it can't (mh_fail) */
+    u32* mh_new;
+    u32 nmh_new;
+    char mh_why[96];
     u32 img[8], img_type[8];
     u32 interfaces[MAX_INTERFACES], ninterfaces;
     /* the uniform register pair a ULDC.64 last loaded from a constant buffer: (bank << 16 | offset) + 1, 0 for none */
-    u32* addr_key;   /* by instruction: the constant buffer word (bank << 16 | offset) + 1 of an LDG's or STG's base */
+    /* by instruction: the global buffer (SH_GBUF_*) + 1 of an LDG's or STG's base, then (n + 1 on) the opcode that
+       wrote its address, then (2 (n + 1) on) whether the address came from memory (track_step) */
+    u32* addr_key;
+    u32 dyn_keys[16], ndyn_keys; /* the keys an address may be one of where they met (track_conflict) */
     u32* jump_first; /* by instruction, the first of the BRAs and BRX that go to it in jump_from (n + 1 words), and */
     u32* jump_from;  /* those instructions: made the first time reg_const_at needs them (flow_sources) */
     u32 cur;         /* the instruction being written */
@@ -71,6 +90,7 @@ typedef struct {
     /* a task or mesh program's ISBE (isbe_var): a mesh program's attribute area and map (Workgroup), a task
        payload (TaskPayloadWorkgroupEXT), their words, and LocalInvocationIndex */
     u32 isbe_attr, isbe_map, payload, isbe_attr_words, isbe_map_words, payload_words, local_index;
+    u32 mesh_first; /* the uniform buffer of an indirect mesh draw's first group (workgroup_index) */
     u32 vertex_words, primitive_words; /* the output words of a vertex and of a primitive (omap_words) */
     u32 prim_attr[32];                 /* a mesh program's per-primitive generic outputs */
     int soft_ftz;                      /* FTZ instructions flush their operands and results here (sm86_to_spirv_ftz) */
@@ -169,6 +189,18 @@ static u32 cbuf_load(Ctx* c, u32 bank, u32 off, u32 index) {
         component = cu(c, (off >> 2) & 3);
     }
     return spv_emit_uniform_component(&c->e, c->cbuf_ptr, var, c->zero, element, component, c->t_u32);
+}
+/* NAK's MemType U8 (0), I8 (1), U16 (2), I16 (3) at byte offset off of a bank, plus index when it isn't 0: a byte or
+   a halfword of the word that holds it, zero or sign extended, as mem_load takes one from memory. LDC's, ULDC's and
+   ULDC.IDX's */
+static u32 cbuf_subword(Ctx* c, u32 bank, u32 off, u32 index, u32 type) {
+    u32 at = index ? spv_emit_iadd_u32(&c->e, c->t_u32, index, cu(c, off)) : cu(c, off);
+    u32 shift = spv_emit_shift_left_u32(
+        &c->e, c->t_u32, spv_emit_bitwise_and_u32(&c->e, c->t_u32, at, cu(c, type < 2 ? 3 : 2)), cu(c, 3));
+    u32 word = cbuf_load(c, bank, off, index), bits = cu(c, type < 2 ? 8 : 16);
+    return type & 1 ? to_u(c, spv_emit_bitfield_sextract(&c->e, c->t_i32, spv_emit_bitcast(&c->e, c->t_i32, word),
+                                                         shift, bits))
+                    : spv_emit_bitfield_uextract(&c->e, c->t_u32, word, shift, bits);
 }
 
 /* ---- ALU sources ---- */
@@ -544,12 +576,89 @@ static u32 builtin_vec3(Ctx* c, u32* var, u32 builtin, u32 k) {
     }
     return spv_emit_vec4_extract(&c->e, c->t_u32, spv_emit_load(&c->e, c->t_v3u, *var), k);
 }
-static u32 frag_coord(Ctx* c, u32 k) {
+/* ---- a fragment program at a resolution scale (resolution= other than 1) ---- */
+
+/* The render targets' images are the resolution scale times the guest's size, and a fragment program counts the
+   guest's pixels and texels, as the Maxwell translator gives them to its programs (spirv_translate.c's needs_scale
+   and shader_scaled_coords): the fragment's x and y are FragCoord's over the scale, a fetch from a texture bound to
+   a scaled target reads texel p in the pixels the image has for it, and a size query of one answers its size over
+   the scale. Other textures (one a compute program stored, one from memory) keep their own texels. Left in the
+   target's pixels, a fetch at the fragment's own coordinates read a texture of the guest's size over the target's
+   top-left corner alone, and past the texture's edge everywhere else */
+/* component k of SNX_VKB_RS's vec4, which the renderer gives the fragment stage (vk/render.c's frame_consts): 0 and
+   1 are 1 / the resolution scale, 2 the scale */
+static u32 scale_component(Ctx* c, u32 k) {
+    if (!c->scale) {
+        c->scale = spv_emit_uniform_vec4_array(&c->e, c->t_v4f, c->t_f32, c->t_u32, (u32)shader_vk_set(ST_FS),
+                                               SNX_VKB_RS, 1, &c->scale_ptr);
+        add_interface(c, c->scale);
+    }
+    return spv_emit_uniform_component(&c->e, c->scale_ptr, c->scale, c->zero, c->zero, cu(c, k), c->t_f32);
+}
+/* whether texture slot is bound to a scaled render target: its bit in the uvec4 after the fragment stage's vec4 at
+   push constant offset 16 (vk/render.c: x the slots 0 to 31, y 32 to 63), as a bool */
+static u32 scaled_slot(Ctx* c, int slot) {
+    if (!c->scaled_push) {
+        u32 pointer;
+        c->scaled_push = spv_emit_push_vec4(&c->e, c->t_v4f, c->t_f32, 16, c->t_v4u, &pointer);
+        add_interface(c, c->scaled_push);
+    }
+    u32 bits = spv_emit_push_component_f32(&c->e, spv_emit_type_pointer(&c->e, 9, c->t_u32), c->scaled_push, cu(c, 1),
+                                           cu(c, slot >= 32), c->t_u32); /* 9: PushConstant */
+    u32 bit = spv_emit_bitwise_and_u32(
+        &c->e, c->t_u32, spv_emit_shift_right_u32(&c->e, c->t_u32, bits, cu(c, (u32)slot & 31)), cu(c, 1));
+    return spv_emit_i_not_equal(&c->e, c->t_bool, bit, c->zero);
+}
+static u32 fl(Ctx* c, u32 v) { return spv_emit_glsl_unary(&c->e, c->t_f32, c->glsl, SPV_GLSL_FLOOR, v); }
+/* FragCoord's component k, in the pixels of the target's image */
+static u32 frag_pixel(Ctx* c, u32 k) {
     if (!c->fragcoord) {
         c->fragcoord = spv_emit_fragcoord_input(&c->e, c->t_v4f);
         add_interface(c, c->fragcoord);
     }
     return spv_emit_vec4_extract(&c->e, c->t_f32, spv_emit_load(&c->e, c->t_v4f, c->fragcoord), k);
+}
+/* A fragment program's 2D texel coordinates *x and *y (bits of signed integers) of texture slot, as the image has
+   them. The image of a scaled target has texel p from pixel p times the scale on, and of those the one that lies
+   where the fragment lies in its own guest pixel is fetched, as Eden's rescaling pass places it (SubScale): at a whole
+   scale a pass that fetches its own pixel reads that very pixel, not one for all the fragments of a guest pixel. It
+   stays within the texel's pixels, which at another scale end before a whole one. Another texture keeps p */
+static void scaled_fetch(Ctx* c, int slot, u32* x, u32* y) {
+    u32 scaled = scaled_slot(c, slot), scale = scale_component(c, 2), over = scale_component(c, 0);
+    u32* v[2] = {x, y};
+    for (u32 k = 0; k < 2; k++) {
+        u32 first = nocontract(
+            c,
+            spv_emit_fmul(&c->e, c->t_f32,
+                          spv_emit_convert_s_to_f(&c->e, c->t_f32, spv_emit_bitcast(&c->e, c->t_i32, *v[k])), scale));
+        u32 next = fl(c, nocontract(c, spv_emit_fadd(&c->e, c->t_f32, first, scale)));
+        u32 last = spv_emit_glsl_binary(&c->e, c->t_f32, c->glsl, SPV_GLSL_F_MAX, fl(c, first),
+                                        nocontract(c, op2(c, SPV_OP_F_SUB, c->t_f32, next, cf(c, 1.0f))));
+        /* the fragment's place in its guest pixel, in the image's pixels: 0 up to the scale */
+        u32 pixel = frag_pixel(c, k);
+        u32 corner = nocontract(c, spv_emit_fmul(&c->e, c->t_f32, scale,
+                                                 fl(c, nocontract(c, spv_emit_fmul(&c->e, c->t_f32, pixel, over)))));
+        u32 place = nocontract(c, op2(c, SPV_OP_F_SUB, c->t_f32, pixel, corner));
+        u32 at = spv_emit_glsl_binary(&c->e, c->t_f32, c->glsl, SPV_GLSL_F_MIN,
+                                      fl(c, nocontract(c, spv_emit_fadd(&c->e, c->t_f32, first, place))), last);
+        *v[k] = spv_emit_select(&c->e, c->t_u32, scaled,
+                                spv_emit_bitcast(&c->e, c->t_u32, spv_emit_convert_f_to_s(&c->e, c->t_i32, at)), *v[k]);
+    }
+}
+/* The size *x by *y of texture slot's image as the guest has it: a scaled target's over the scale, rounded as the
+   renderer rounds a scaled size */
+static void scaled_size(Ctx* c, int slot, u32* x, u32* y) {
+    u32 factor = spv_emit_select(&c->e, c->t_f32, scaled_slot(c, slot), scale_component(c, 0), cf(c, 1.0f));
+    u32* v[2] = {x, y};
+    for (u32 k = 0; k < 2; k++) {
+        u32 f = nocontract(c, spv_emit_fmul(&c->e, c->t_f32, spv_emit_convert_u_to_f(&c->e, c->t_f32, *v[k]), factor));
+        *v[k] = spv_emit_convert_f_to_u(&c->e, c->t_u32, nocontract(c, spv_emit_fadd(&c->e, c->t_f32, f, cf(c, 0.5f))));
+    }
+}
+/* FragCoord's component k: x and y in the guest's pixels, z and w as they are */
+static u32 frag_coord(Ctx* c, u32 k) {
+    u32 v = frag_pixel(c, k);
+    return k < 2 ? nocontract(c, spv_emit_fmul(&c->e, c->t_f32, v, scale_component(c, 0))) : v;
 }
 /* ALD's attribute at byte address addr, as bits */
 static u32 attr_load(Ctx* c, u32 addr) {
@@ -671,10 +780,33 @@ static void mark_written(Ctx* c, u32 key, u32 offset, u32 bytes) {
     }
     shader_wlog_store(&c->e, c->t_u32, c->t_bool, c->wpages, part, offset, bytes);
 }
+/* the base address of global buffer key (SH_GBUF_*) as the program finds it when it runs: the constant buffer word,
+   or an indirect buffer's pointer at its cell in its parent buffer, which the program loaded itself (the renderer binds
+   the memory from the pointer it reads there). The low word, or with wide the 64-bit address. 0 when it can't */
+static u32 mem_ptr(Ctx* c, u32 buffer, u32 address, u32 word);
+static u32 mem_word_load(Ctx* c, u32 buffer, u32 ptr);
+static u32 gbuf_base(Ctx* c, u32 key, int wide) {
+    u32 parent = SH_GBUF_PARENT(key);
+    if (SH_GBUF_BANK(parent) >= 18) { /* the renderer reads the base from a bound bank (vk/render.c) */
+        fail(c, "global address whose base is in constant buffer %u", SH_GBUF_BANK(parent));
+        return 0;
+    }
+    if (SH_GBUF_INDIRECT(key)) {
+        u32 buffer = gbuf_slot(c, parent, 0), cell = cu(c, SH_GBUF_CELL(key));
+        if (!buffer) return 0;
+        u32 low = mem_word_load(c, buffer, mem_ptr(c, buffer, cell, 0));
+        return wide ? pair64(c, low, mem_word_load(c, buffer, mem_ptr(c, buffer, cell, 1))) : low;
+    }
+    if (wide)
+        return pair64(c, cbuf_load(c, SH_GBUF_BANK(key), SH_GBUF_OFFSET(key), 0),
+                      cbuf_load(c, SH_GBUF_BANK(key), SH_GBUF_OFFSET(key) + 4, 0));
+    return cbuf_load(c, SH_GBUF_BANK(key), SH_GBUF_OFFSET(key), 0);
+}
 /* LDG and STG, as spirv_translate.c's global memory: the buffer is the one whose 64-bit address the constant buffer
-   word that track_globals found holds (ShaderInfo.gbuf_cbuf_off), and the byte offset into it is the address less
-   that word, read at run time. The address is a register (a pair with bit 90 for the uniform form, bit 72 for the
-   other) and a uniform register pair (bit 72), with a signed 24-bit offset; the low 32 bits of the difference serve */
+   word that track_globals found holds (ShaderInfo.gbuf_cbuf_off), or an indirect buffer's pointer (gbuf_base), and the
+   byte offset into it is the address less that base, read at run time. The address is a register (a pair with bit 90
+   for the uniform form, bit 72 for the other) and a uniform register pair (bit 72), with a signed 24-bit offset; the
+   low 32 bits of the difference serve */
 static u32 global_address(Ctx* c, const Sm86Insn* in, int uniform_form, int write, u32* offset) {
     u32 key = c->addr_key[c->cur];
     if (!key) {
@@ -691,11 +823,8 @@ static u32 global_address(Ctx* c, const Sm86Insn* in, int uniform_form, int writ
         u32 ur = sm86_field(in, in->op == SM86_LDG ? 32 : 64, 6);
         if (ur < SM86_URZ) at = spv_emit_iadd_u32(&c->e, c->t_u32, at, urd(c, ur));
     }
-    if (SH_GBUF_BANK(key) >= 18) { /* the renderer reads the base from a bound bank (vk/render.c) */
-        fail(c, "global address whose base is in constant buffer %u", SH_GBUF_BANK(key));
-        return 0;
-    }
-    u32 base = cbuf_load(c, SH_GBUF_BANK(key), SH_GBUF_OFFSET(key), 0);
+    u32 base = gbuf_base(c, key, 0);
+    if (!base) return 0;
     *offset = spv_emit_isub_u32(&c->e, c->t_u32, at, base);
     c->gkey = key;
     return gbuf_slot(c, key, write);
@@ -707,7 +836,9 @@ static u32 global_address(Ctx* c, const Sm86Insn* in, int uniform_form, int writ
    renderer binds from the address its word holds (vk_gbuf_desc). A load from none of them reads 0 and a store there
    is dropped, where the console's GPU reaches all of its address space. The address: a register, a pair with bit 90
    in the uniform form or bit 72 in the other, plus the uniform register (a pair with bit 72) of the uniform form,
-   plus the signed 24-bit offset */
+   plus the signed 24-bit offset. Its buffers: those of the program's accesses, and the indirect ones an address may be
+   one of (track_conflict): one game's compute programs pick one of two pointers they load with a predicate, then index
+   the table it names */
 static void mem_load(Ctx* c, u32 buffer, u32 address, u32 type, u32 dst, int uniform_dst);
 static void mem_store(Ctx* c, u32 buffer, u32 address, u32 type, u32 data);
 static void global_dynamic(Ctx* c, const Sm86Insn* in, int uniform_form, int load) {
@@ -726,11 +857,12 @@ static void global_dynamic(Ctx* c, const Sm86Insn* in, int uniform_form, int loa
     }
     if (load)
         for (u32 k = 0; k < words && in->dst + k < SM86_RZ; k++) wr(c, in->dst + k, c->zero);
-    /* the program's buffers, each key once, in the order of their first access */
+    /* the program's buffers, each key once, in the order of their first access, then the candidates of addresses
+       that met */
     u32 keys[16], nkeys = 0;
-    for (u32 i = 0; i < c->n; i++) {
-        u32 key = c->addr_key[i], seen = 0;
-        if (!key || SH_GBUF_BANK(key - 1) >= 18) continue;
+    for (u32 i = 0; i < c->n + c->ndyn_keys; i++) {
+        u32 key = i < c->n ? c->addr_key[i] : c->dyn_keys[i - c->n] + 1, seen = 0;
+        if (!key || SH_GBUF_BANK(SH_GBUF_PARENT(key - 1)) >= 18) continue;
         for (u32 k = 0; k < nkeys; k++) seen |= keys[k] == key - 1;
         if (!seen && nkeys < 16) keys[nkeys++] = key - 1;
     }
@@ -738,8 +870,8 @@ static void global_dynamic(Ctx* c, const Sm86Insn* in, int uniform_form, int loa
     for (u32 k = 0; k < nkeys; k++) {
         u32 buffer = gbuf_slot(c, keys[k], !load);
         if (!buffer) return;
-        u32 base = pair64(c, cbuf_load(c, SH_GBUF_BANK(keys[k]), SH_GBUF_OFFSET(keys[k]), 0),
-                          cbuf_load(c, SH_GBUF_BANK(keys[k]), SH_GBUF_OFFSET(keys[k]) + 4, 0));
+        u32 base = gbuf_base(c, keys[k], 1);
+        if (!base) return;
         u32 relative = op2(c, SPV_OP_I_SUB, u64_type(c), address, base);
         u32 inside = spv_emit_u_less(&c->e, c->t_bool, relative, c64(c, 16u << 20));
         u32 then = spv_emit_id(&c->e), other = spv_emit_id(&c->e);
@@ -762,85 +894,171 @@ static void global_dynamic(Ctx* c, const Sm86Insn* in, int uniform_form, int loa
         spv_emit_label(&c->e, merges[k]);
     }
 }
-/* what track_globals follows at an instruction: each register's key, then the opcode that last wrote it (for the
-   message of an address without one). The keys first: the flow settles on them */
+/* what track_globals follows at an instruction: each register's key (a global buffer's SH_GBUF_* + 1, 0 for none),
+   whether it holds that buffer's base itself with nothing added (where the program loads a pointer from, an
+   indirect buffer's cell), and whether its value came from memory (a pointer the program loaded, through moves and
+   arithmetic: global_dynamic's), then the opcode that last wrote it (for the message of an address without a key).
+   The keys and flags first: the flow settles on them */
 typedef struct {
     u32 rkey[256], ukey[64];
+    u8 rexact[256], uexact[64];
+    u8 rdyn[256], udyn[64];
     u16 rsrc[256], usrc[64];
 } TrackState;
 #define TRACK_KEYS offsetof(TrackState, rsrc)
+static int key_indirect(u32 key) { return key && SH_GBUF_INDIRECT(key - 1); }
+/* where two keys meet (a predicated write over the register's key, or two paths): an indirect key against another
+   key takes neither, and the address is then compared with each at run time (global_dynamic), which the two are
+   candidates of. Two constant buffer keys keep track_globals's own rules */
+static void track_conflict(Ctx* c, u32 a, u32 b) {
+    for (u32 k = 0; k < 2; k++) {
+        u32 key = k ? b : a, seen = 0;
+        if (!key) continue;
+        for (u32 j = 0; j < c->ndyn_keys; j++) seen |= c->dyn_keys[j] == key - 1;
+        if (!seen && c->ndyn_keys < 16) c->dyn_keys[c->ndyn_keys++] = key - 1;
+    }
+}
+/* the key of a register source of a global access or an ALU instruction (0 for none) */
+static u32 src_key(const TrackState* s, const Sm86Src* x) {
+    return x->kind == SM86_SRC_REG && x->reg < SM86_RZ     ? s->rkey[x->reg]
+           : x->kind == SM86_SRC_UREG && x->reg < SM86_URZ ? s->ukey[x->reg]
+           : x->kind == SM86_SRC_CBUF && !x->bindless      ? (u32)(x->bank << 16 | x->value) + 1
+                                                           : 0;
+}
+static int src_dyn(const TrackState* s, const Sm86Src* x) {
+    return x->kind == SM86_SRC_REG && x->reg < SM86_RZ     ? s->rdyn[x->reg]
+           : x->kind == SM86_SRC_UREG && x->reg < SM86_URZ ? s->udyn[x->reg]
+                                                           : 0;
+}
+/* a register (uniform when u) takes a key: a guarded write over an indirect key, or of one over another key, leaves it
+   as either, a candidate pair for global_dynamic */
+static void track_write(Ctx* c, TrackState* s, int u, u32 d, u32 key, int exact, int dyn, u16 op, int always) {
+    u32* keys = u ? s->ukey : s->rkey;
+    if (d >= (u ? SM86_URZ : SM86_RZ)) return;
+    if (!always && keys[d] && key && keys[d] != key && (key_indirect(keys[d]) || key_indirect(key))) {
+        track_conflict(c, keys[d], key);
+        key = 0, exact = 0, dyn = 1;
+    }
+    keys[d] = key;
+    (u ? s->uexact : s->rexact)[d] = (u8)exact;
+    (u ? s->udyn : s->rdyn)[d] = (u8)dyn;
+    (u ? s->usrc : s->rsrc)[d] = op;
+}
 /* one instruction of track_globals: an LDG's or STG's key into addr_key, and what its destination gets */
 static void track_step(Ctx* c, u32 i, TrackState* s) {
     const Sm86Insn* in = &c->in[i];
-    int op = in->op, uniform = sm86_ops[op].kind == SM86_K_UALU;
+    int op = in->op, uniform = sm86_ops[op].kind == SM86_K_UALU, always = sm86_always(in);
+    u32 n1 = c->n + 1;
     if (op == SM86_LDG || op == SM86_STG || op == SM86_LDG_NOU || op == SM86_STG_NOU || op == SM86_ATOMG ||
         op == SM86_ATOMG_NOU || op == SM86_RED) {
         int uniform_form = op == SM86_LDG || op == SM86_STG || op == SM86_ATOMG || op == SM86_RED;
         u32 reg = sm86_field(in, 24, 8), ur = uniform_form ? sm86_field(in, op == SM86_LDG ? 32 : 64, 6) : SM86_URZ;
         u32 k = ur < SM86_URZ && s->ukey[ur] ? s->ukey[ur] : reg < SM86_RZ ? s->rkey[reg] : 0;
         c->addr_key[i] = k;
-        c->addr_key[c->n + 1 + i] = ur < SM86_URZ && s->ukey[ur] ? s->usrc[ur] : reg < SM86_RZ ? s->rsrc[reg] : 0;
-        if (!k && ur < SM86_URZ && !s->ukey[ur] && s->usrc[ur]) c->addr_key[c->n + 1 + i] = s->usrc[ur];
+        c->addr_key[n1 + i] = ur < SM86_URZ && s->ukey[ur] ? s->usrc[ur] : reg < SM86_RZ ? s->rsrc[reg] : 0;
+        if (!k && ur < SM86_URZ && !s->ukey[ur] && s->usrc[ur]) c->addr_key[n1 + i] = s->usrc[ur];
+        c->addr_key[2 * n1 + i] = (ur < SM86_URZ && s->udyn[ur]) || (reg < SM86_RZ && s->rdyn[reg]);
         if (op == SM86_LDG || op == SM86_LDG_NOU || op == SM86_ATOMG || op == SM86_ATOMG_NOU) {
-            /* the words loaded are data: one, or two or four for an LDG.64 or .128 */
+            /* the words loaded are data: one, or two or four for an LDG.64 or .128, from memory */
             u32 type = sm86_field(in, 73, 3), words = op == SM86_ATOMG || op == SM86_ATOMG_NOU ? 1
                                                       : type == 5                              ? 2
                                                       : type == 6                              ? 4
                                                                                                : 1;
-            for (u32 w = 0; w < words && in->dst + w < SM86_RZ; w++)
-                s->rkey[in->dst + w] = 0, s->rsrc[in->dst + w] = (u16)op;
+            /* An LDG.64 or .128 of a constant buffer key's base itself plus the offset: each pair it loads is the
+               address of an indirect buffer (SH_GBUF_INDIRECT) whose cell is there. Only the uniform register's or
+               only the register's base, exact, and a cell the key can name */
+            u32 cell = 0, imm = sm86_field(in, 40, 24);
+            int exact =
+                ur < SM86_URZ ? s->ukey[ur] == k && s->uexact[ur] && reg >= SM86_RZ : reg < SM86_RZ && s->rexact[reg];
+            if (words >= 2 && (op == SM86_LDG || op == SM86_LDG_NOU) && k && !key_indirect(k) && exact &&
+                SH_GBUF_PARENT(k - 1) == k - 1 && !(imm & 7) && imm + 8 * (words / 2 - 1) <= SH_GBUF_CELL_MAX)
+                cell = (k - 1) | 1u << 31 | imm / 8 << 21;
+            for (u32 w = 0; w < words && in->dst + w < SM86_RZ; w++) {
+                u32 key = cell && !(w & 1) ? (cell + (w / 2 << 21)) + 1 : 0;
+                track_write(c, s, 0, in->dst + w, key, key != 0, !key, (u16)op, always);
+            }
         }
         return;
     }
+    if (op == SM86_LDS || op == SM86_LDL) { /* data from memory, as a load from global memory's */
+        u32 type = sm86_field(in, 73, 3), words = type == 5 ? 2 : type == 6 ? 4 : 1;
+        for (u32 w = 0; w < words && in->dst + w < SM86_RZ; w++)
+            track_write(c, s, 0, in->dst + w, 0, 0, 1, (u16)op, always);
+        return;
+    }
     u32 key = 0;
-    int found = 0;
+    int found = 0, exact = 0, dyn = 0;
     if (op == SM86_ULDC || (op == SM86_LDC && sm86_field(in, 24, 8) == SM86_RZ))
-        key = (sm86_field(in, 54, 5) << 16 | sm86_field(in, 38, 16)) + 1, found = 1;
+        key = (sm86_field(in, 54, 5) << 16 | sm86_field(in, 38, 16)) + 1, found = 1, exact = 1;
     else if (op == SM86_MOV || op == SM86_UMOV || op == SM86_R2UR) {
         const Sm86Src* b = &in->b;
-        if (op == SM86_R2UR)
-            key = s->rkey[sm86_field(in, 24, 8) & 255];
-        else if (b->kind == SM86_SRC_CBUF && !b->bindless)
-            key = (u32)(b->bank << 16 | b->value) + 1;
+        if (op == SM86_R2UR) {
+            u32 r = sm86_field(in, 24, 8) & 255;
+            key = s->rkey[r], exact = s->rexact[r], dyn = s->rdyn[r];
+        } else if (b->kind == SM86_SRC_CBUF && !b->bindless)
+            key = (u32)(b->bank << 16 | b->value) + 1, exact = 1;
         else if (b->kind == SM86_SRC_REG && b->reg < SM86_RZ)
-            key = s->rkey[b->reg];
+            key = s->rkey[b->reg], exact = s->rexact[b->reg], dyn = s->rdyn[b->reg];
         else if (b->kind == SM86_SRC_UREG && b->reg < SM86_URZ)
-            key = s->ukey[b->reg];
+            key = s->ukey[b->reg], exact = s->uexact[b->reg], dyn = s->udyn[b->reg];
         found = 1;
     } else if ((op == SM86_IADD3 || op == SM86_UIADD3 || op == SM86_IMAD || op == SM86_UIMAD ||
                 op == SM86_IMAD_WIDE || op == SM86_UIMAD_WIDE || op == SM86_LEA || op == SM86_ULEA) &&
                !sm86_field(in, 74, 1) && !((op == SM86_LEA || op == SM86_ULEA) && sm86_field(in, 80, 1))) {
         /* one source with a base: the result is that base at an offset. A constant buffer operand is a base
-           itself, as in ptxas's LEA R0, P0, R2, c[0x0][0x60], 0x2 */
+           itself, as in ptxas's LEA R0, P0, R2, c[0x0][0x60], 0x2. A constant buffer key comes before an indirect
+           one, which a pointer the program loaded has: one of each is the constant buffer's, as before there were
+           indirect keys */
         const Sm86Src* s3[3] = {&in->a, &in->b, &in->c};
-        u32 count = 0, first = 0, last = 3;
+        u32 count = 0, first = 0, last = 3, indirect = 0, nindirect = 0;
         if (op == SM86_IMAD || op == SM86_UIMAD || op == SM86_IMAD_WIDE || op == SM86_UIMAD_WIDE)
             first = 2; /* a product is an offset: only the sum's c can be the base */
         else if (op == SM86_LEA || op == SM86_ULEA)
             first = 1, last = 2; /* the shifted a is an offset: only b */
         for (u32 k = first; k < last; k++) {
-            const Sm86Src* x = s3[k];
-            u32 v = x->kind == SM86_SRC_REG && x->reg < SM86_RZ     ? s->rkey[x->reg]
-                    : x->kind == SM86_SRC_UREG && x->reg < SM86_URZ ? s->ukey[x->reg]
-                    : x->kind == SM86_SRC_CBUF && !x->bindless      ? (u32)(x->bank << 16 | x->value) + 1
-                                                                    : 0;
-            if (v) key = v, count++;
+            u32 v = src_key(s, s3[k]);
+            if (key_indirect(v))
+                indirect = v, nindirect++;
+            else if (v)
+                key = v, count++;
         }
-        if (count != 1) key = 0;
+        if (count != 1) key = !count && nindirect == 1 ? indirect : 0;
         found = 1;
+    }
+    /* a value from memory stays one through the arithmetic that moves an address: each source the instruction reads */
+    switch (op) {
+        case SM86_IADD3:
+        case SM86_UIADD3:
+        case SM86_IMAD:
+        case SM86_UIMAD:
+        case SM86_IMAD_WIDE:
+        case SM86_UIMAD_WIDE:
+        case SM86_LOP3:
+        case SM86_ULOP3: dyn |= src_dyn(s, &in->c); /* fall through */
+        case SM86_LEA:
+        case SM86_ULEA:
+        case SM86_SEL:
+        case SM86_USEL: dyn |= src_dyn(s, &in->a) || src_dyn(s, &in->b); break;
+        case SM86_SHF:
+        case SM86_USHF: dyn |= src_dyn(s, &in->a) || src_dyn(s, &in->c); break;
+        default: break;
     }
     /* the destination: the key, or none for any other write (the high word of a pair takes none either) */
     u32 d = uniform || op == SM86_ULDC || op == SM86_UMOV || op == SM86_R2UR ? sm86_field(in, 16, 6) : in->dst;
     int to_uniform = uniform || op == SM86_ULDC || op == SM86_R2UR || op == SM86_S2UR || op == SM86_ULDC_IDX;
-    int wide = op == SM86_ULDC || op == SM86_LDC || op == SM86_IMAD_WIDE || op == SM86_UIMAD_WIDE;
-    if (!found) key = 0;
+    /* a 64-bit result's high word takes no key: ULDC's and LDC's of type 5 alone. A ULDC of one word took the key of
+       the register after its own, and one game's material program lost UR7, c[0][0x530] + 0x30, to a ULDC UR6 of a
+       word a thousand instructions before its LDG */
+    int wide = ((op == SM86_ULDC || op == SM86_LDC) && sm86_field(in, 73, 3) == 5) || op == SM86_IMAD_WIDE ||
+               op == SM86_UIMAD_WIDE;
+    if (!found) key = 0, exact = 0;
     if (to_uniform) {
-        if (d < SM86_URZ) s->ukey[d] = key, s->usrc[d] = (u16)op;
-        if (wide && d + 1 < SM86_URZ) s->ukey[d + 1] = 0;
+        track_write(c, s, 1, d, key, exact, dyn, (u16)op, always);
+        if (wide && d + 1 < SM86_URZ) s->ukey[d + 1] = 0, s->uexact[d + 1] = 0, s->udyn[d + 1] = (u8)dyn;
     } else if ((sm86_ops[op].kind == SM86_K_ALU || op == SM86_LDC || op == SM86_S2R || op == SM86_CS2R) &&
                op != SM86_FSETP && op != SM86_ISETP && op != SM86_DSETP && op != SM86_HSETP2 && op != SM86_R2P) {
-        if (d < SM86_RZ) s->rkey[d] = key, s->rsrc[d] = (u16)op;
-        if (wide && d + 1 < SM86_RZ) s->rkey[d + 1] = 0;
+        track_write(c, s, 0, d, key, exact, dyn, (u16)op, always);
+        if (wide && d + 1 < SM86_RZ) s->rkey[d + 1] = 0, s->rexact[d + 1] = 0, s->rdyn[d + 1] = (u8)dyn;
     }
 }
 /* BRX, and BRXU, which takes its index from a uniform register */
@@ -852,9 +1070,24 @@ static int flow_sources(Ctx* c);
    one source that has it, as Eden's Track follows Maxwell's. Along the flow: a block starts with the keys its
    reached predecessors end with where they agree, until no block's end changes. In program order, a jump table's
    cases wrote over a register that the code after them had from before them, on every path */
+/* where two paths meet: the keys they agree on, exact where both are; dyn where either is, or where an indirect key
+   meets another (track_conflict) */
+static void track_meet(Ctx* c, u32* key, u8* exact, u8* dyn, const u32* key2, const u8* exact2, const u8* dyn2, u32 n) {
+    for (u32 r = 0; r < n; r++) {
+        if (key[r] != key2[r]) {
+            if (key_indirect(key[r]) || key_indirect(key2[r])) {
+                track_conflict(c, key[r], key2[r]);
+                dyn[r] = 1;
+            }
+            key[r] = 0, exact[r] = 0;
+        } else
+            exact[r] &= exact2[r];
+        dyn[r] |= dyn2[r];
+    }
+}
 static int track_globals(Ctx* c) {
     u32 n = c->n, nb = 0;
-    c->addr_key = calloc(2 * ((size_t)n + 1), sizeof *c->addr_key);
+    c->addr_key = calloc(3 * ((size_t)n + 1), sizeof *c->addr_key);
     if (!c->addr_key || !flow_sources(c)) return 0;
     if (c->failed) return 1;
     u32* start = malloc(((size_t)n + 1) * sizeof *start);
@@ -899,10 +1132,8 @@ static int track_globals(Ctx* c) {
                     *s = out[p];
                     continue;
                 }
-                for (u32 r = 0; r < 256; r++)
-                    if (s->rkey[r] != out[p].rkey[r]) s->rkey[r] = 0;
-                for (u32 r = 0; r < 64; r++)
-                    if (s->ukey[r] != out[p].ukey[r]) s->ukey[r] = 0;
+                track_meet(c, s->rkey, s->rexact, s->rdyn, out[p].rkey, out[p].rexact, out[p].rdyn, 256);
+                track_meet(c, s->ukey, s->uexact, s->udyn, out[p].ukey, out[p].uexact, out[p].udyn, 64);
             }
             if (!preds) continue; /* nothing reaches it yet */
             for (u32 i = first; i < start[b + 1]; i++) track_step(c, i, s);
@@ -1065,6 +1296,52 @@ static void mem_store(Ctx* c, u32 buffer, u32 address, u32 type, u32 data) {
         mem_word_store(c, buffer, mem_ptr(c, buffer, address, k), rd(c, data >= SM86_RZ ? data : data + k));
 }
 
+/* RED.ADD.F32 and ATOMG.ADD.F32 (NAK's AtomType F32, .FTZ.RN): a float atomic add to the word of a global buffer at
+   the byte address, the word before it returned. With the device's shaderBufferFloat32AtomicAdd one OpAtomicFAddEXT
+   through the buffer's view as floats (the same binding, Aliased as the words'). Else a loop of compare and exchange
+   on the word's bits, which ends once no other invocation stored to the word between its load and its exchange: one
+   of the lanes that race on a word succeeds each time round. Its sum flushes subnormals as the instruction does
+   (ftz) */
+static u32 atomic_fadd(Ctx* c, u32 buffer, u32 address, u32 data) {
+    if (g_shader_float_atomic_add) {
+        u32 slot = 0;
+        while (slot < 15 && c->gbuf[slot] != buffer) slot++;
+        if (!c->gbuf_f32[slot]) {
+            u32 structure = spv_emit_type_struct_one(&c->e, spv_emit_type_runtime_array(&c->e, c->t_f32, 4));
+            c->gbuf_f32[slot] =
+                spv_emit_storage_buffer(&c->e, structure, (u32)shader_vk_set(c->stage), SNX_VKB_SSBO + slot);
+            spv_emit_decorate(&c->e, c->gbuf_f32[slot], 20 /* Aliased */, NULL, 0);
+            if (!c->coop) spv_emit_decorate(&c->e, c->gbuf_f32[slot], 23 /* Coherent */, NULL, 0);
+            add_interface(c, c->gbuf_f32[slot]);
+        }
+        spv_emit_extension(&c->e, "SPV_EXT_shader_atomic_float_add");
+        spv_emit_capability(&c->e, 6033 /* AtomicFloat32AddEXT */);
+        u32 index = gbuf_word_index(c, buffer, spv_emit_shift_right_u32(&c->e, c->t_u32, address, cu(c, 2)));
+        u32 ptr = spv_emit_storage_access_u32(&c->e, spv_emit_type_storage_pointer(&c->e, c->t_f32), c->gbuf_f32[slot],
+                                              c->zero, index);
+        return to_u(c, SPV(&c->e, 6035 /* OpAtomicFAddEXT */, c->t_f32, ptr, cu(c, 1) /* Device */,
+                           cu(c, 0) /* Relaxed */, to_f(c, data)));
+    }
+    SpvEmitter* e = &c->e;
+    u32 ptr = mem_ptr(c, buffer, address, 0), header = spv_emit_id(e), body = spv_emit_id(e), cont = spv_emit_id(e),
+        merge = spv_emit_id(e);
+    spv_emit_store(e, c->cas_var, mem_word_load(c, buffer, ptr));
+    spv_emit_branch(e, header);
+    spv_emit_label(e, header);
+    spv_emit_loop_merge(e, merge, cont);
+    spv_emit_branch(e, body);
+    spv_emit_label(e, body);
+    u32 old = spv_emit_load(e, c->t_u32, c->cas_var);
+    u32 sum = nocontract(c, spv_emit_fadd(e, c->t_f32, ftz(c, to_f(c, old), 1), ftz(c, to_f(c, data), 1)));
+    u32 seen = spv_emit_atomic_compare_exchange_u32(e, c->t_u32, ptr, to_u(c, ftz(c, sum, 1)), old);
+    spv_emit_store(e, c->cas_var, seen);
+    spv_emit_branch_conditional(e, spv_emit_i_equal(e, c->t_bool, seen, old), merge, cont);
+    spv_emit_label(e, cont);
+    spv_emit_branch(e, header);
+    spv_emit_label(e, merge);
+    return old;
+}
+
 /* ---- task and mesh programs ---- */
 
 /* A task or mesh program reads and writes its stage's memory, the ISBE ("internal stage buffer entry"), with ISBERD
@@ -1135,7 +1412,21 @@ static u32 map_var(Ctx* c) { return isbe_var(c, &c->isbe_map, SPV_STORAGE_WORKGR
 static u32 workgroup_index(Ctx* c) {
     u32 id = builtin_vec3(c, &c->group_id, 26, 0);
     if (c->stage == ST_MS && c->si->mesh.has_task) return id;
-    return spv_emit_iadd_u32(&c->e, c->t_u32, id, to_u(c, push_component(c, 0)));
+    /* an indirect draw's first group: the record's, in the uniform buffer at SNX_VKB_RS (SH_PUSH_GPU_MESH_FIRST) */
+    if (!c->mesh_first) {
+        c->mesh_first = spv_emit_uniform_vec4_array(&c->e, c->t_v4u, c->t_u32, c->t_u32, (u32)shader_vk_set(c->stage),
+                                                    SNX_VKB_RS, 1, &c->cbuf_ptr);
+        add_interface(c, c->mesh_first);
+    }
+    u32 flags = to_u(c, push_component(c, 2));
+    u32 gpu = spv_emit_i_not_equal(&c->e, c->t_bool,
+                                   spv_emit_bitwise_and_u32(&c->e, c->t_u32, flags, cu(c, SH_PUSH_GPU_MESH_FIRST)),
+                                   c->zero);
+    u32 first = spv_emit_select(
+        &c->e, c->t_u32, gpu,
+        spv_emit_uniform_component(&c->e, c->cbuf_ptr, c->mesh_first, c->zero, c->zero, c->zero, c->t_u32),
+        to_u(c, push_component(c, 0)));
+    return spv_emit_iadd_u32(&c->e, c->t_u32, id, first);
 }
 /* ISBERD and ISBEWR (NAK's sm70_encode.rs): the offset register at 24-31, the data register at 32-39 (ISBEWR), the
    immediate offset at 40-55, the size at 74-75 (U8 0, U16 1, B32 2), the access at 76-77 (MAP 0, PATCH 1, PRIM 2,
@@ -1262,7 +1553,8 @@ static int may_write(const Sm86Insn* in, u32 r) {
         case SM86_R2P: case SM86_BMOV_B: case SM86_BMOV_BI: case SM86_BMOV_BL: case SM86_ISBEWR:
             return 0;
         case SM86_TEX: case SM86_TEX_B: case SM86_TLD: case SM86_TLD_B: case SM86_TLD4: case SM86_TLD4_B:
-        case SM86_TMML: case SM86_TMML_B: case SM86_TXD: case SM86_TXD_B: case SM86_TXQ: case SM86_TXQ_B: {
+        case SM86_TMML: case SM86_TMML_B: case SM86_TXD: case SM86_TXD_B: case SM86_TXQ: case SM86_TXQ_B:
+        case SM86_TEX_U: case SM86_TLD_U: case SM86_TLD4_U: case SM86_TXQ_U: {
             u32 d1 = sm86_field(in, 64, 8);
             if (d1 < SM86_RZ && r >= d1 && r < d1 + 4) return 1;
             return in->dst < SM86_RZ && r >= in->dst && r < in->dst + 4u;
@@ -1387,7 +1679,7 @@ static int tex_slot(Ctx* c, u32 bank, u32 off, u32 type, u32 array, u32 shadow, 
     for (int i = 0; i < si->ntex; i++) {
         const ShTex* t = &si->tex[i];
         if (t->bl_cbuf == bank && t->cbuf_off == off / 4 && t->type == type && t->array == array &&
-            t->shadow == shadow && !!(t->flags & 2) == !!ms && !(t->flags & SNX_TEX_INDEXED))
+            t->shadow == shadow && !!(t->flags & 2) == !!ms && !(t->flags & (SNX_TEX_INDEXED | SNX_TEX_MEMORY)))
             return i;
     }
     if (si->ntex >= SH_MAXTEX) {
@@ -1583,7 +1875,12 @@ static u32 coord_vector(Ctx* c, const u32* f, u32 count) {
     return spv_emit_vec4_construct(&c->e, c->t_v4f, f);
 }
 static void texture(Ctx* c, const Sm86Insn* in) {
-    int bindless = in->op == SM86_TEX_B, op = bindless ? SM86_TEX : in->op;
+    /* a handle from memory (TEX and TLD4 with it in a uniform register) has its slot from memory_handles and none in
+       the operand list, as a constant buffer handle */
+    int memory = in->op == SM86_TEX_U || in->op == SM86_TLD4_U;
+    int bindless = in->op == SM86_TEX_B, op = bindless || in->op == SM86_TEX_U ? SM86_TEX
+                                              : in->op == SM86_TLD4_U       ? SM86_TLD4
+                                                                            : in->op;
     u32 type, array, coords;
     if (!tex_dim(sm86_field(in, 61, 3), &type, &array, &coords)) {
         fail(c, "%s dimension 6", sm86_ops[op].name);
@@ -1607,8 +1904,8 @@ static void texture(Ctx* c, const Sm86Insn* in) {
         return;
     }
     u32 handle = sm86_field(in, 40, 19);
-    int slot = bindless ? (int)c->handle[c->cur].slot - 1
-                        : tex_slot(c, (handle >> 14) & 31, (handle & 0x3fff) * 4, type, array, shadow, 0);
+    int slot = bindless || memory ? (int)c->handle[c->cur].slot - 1
+                                  : tex_slot(c, (handle >> 14) & 31, (handle & 0x3fff) * 4, type, array, shadow, 0);
     if (slot < 0) return;
     /* list1: a TEX.B's handle (prepare_handles), the LOD or bias, the offset, the depth reference
        (nak_nir_lower_tex.c) */
@@ -1731,6 +2028,39 @@ static void texture(Ctx* c, const Sm86Insn* in) {
     }
     tex_results(c, in, result, c->t_f32);
 }
+static int writes_uniform(const Sm86Insn* w, u32 r);
+/* A texture instruction whose handle is in a uniform register (TEX_U and the others): refused, with where the handle
+   comes from, the writers of the register followed back through UMOV and R2UR in program order. Only a handle in a
+   constant buffer has a slot the renderer binds (tex_slot): one game's are an LDG.64 of a table of handles in memory
+   each, the texture chosen at run time, which a slot can't name */
+static void uniform_handle(Ctx* c, const Sm86Insn* in) {
+    u32 r = sm86_field(in, 40, 6), uniform = 1, at = c->cur;
+    const char* from = "nothing";
+    for (u32 depth = 0; depth < 8 && r < (uniform ? SM86_URZ : SM86_RZ); depth++) {
+        int k = -1;
+        for (u32 j = at; j-- > 0 && k < 0;) {
+            /* a register's: of the other instructions than loads and the ALU's, the one named alone (may_write takes
+               an IPA's for two) */
+            const Sm86Insn* w = &c->in[j];
+            int loads = w->op == SM86_LDG || w->op == SM86_LDG_NOU || w->op == SM86_LDS || w->op == SM86_LDL ||
+                        w->op == SM86_LDC || sm86_ops[w->op].kind == SM86_K_ALU;
+            if (uniform ? writes_uniform(w, r) : writes_word(w, r) && (loads || w->dst == r)) k = (int)j;
+        }
+        if (k < 0) break;
+        const Sm86Insn* w = &c->in[k];
+        from = sm86_ops[w->op].name;
+        at = (u32)k;
+        if (w->op == SM86_UMOV && w->b.kind == SM86_SRC_UREG)
+            r = w->b.reg;
+        else if (w->op == SM86_R2UR)
+            r = sm86_field(w, 24, 8), uniform = 0;
+        else if (w->op == SM86_MOV && w->b.kind == SM86_SRC_REG)
+            r = w->b.reg;
+        else
+            break;
+    }
+    fail(c, "%s whose handle comes from %s", sm86_ops[in->op].name, from);
+}
 /* TXD: a sample with explicit gradients. Unlike TEX's, its registers are in the order of Maxwell's TXD: from a the
    coordinates and then the layer, from b each coordinate's change along x and along y in turn */
 static void texture_grad(Ctx* c, const Sm86Insn* in) {
@@ -1783,7 +2113,8 @@ static void texel_fetch(Ctx* c, const Sm86Insn* in) {
         return;
     }
     u32 handle = sm86_field(in, 40, 19);
-    int slot = tex_slot(c, (handle >> 14) & 31, (handle & 0x3fff) * 4, type, array, 0, ms);
+    int slot = in->op == SM86_TLD_U ? (int)c->handle[c->cur].slot - 1 /* memory_handles' */
+                                    : tex_slot(c, (handle >> 14) & 31, (handle & 0x3fff) * 4, type, array, 0, ms);
     if (slot < 0) return;
     /* list1: the level, the offset (four bits a component), then the sample, as Maxwell's TLD orders them */
     u32 n0 = array + coords, n1 = (lod_mode == 3) + offset + ms, regs[8];
@@ -1801,6 +2132,7 @@ static void texel_fetch(Ctx* c, const Sm86Insn* in) {
             v[k] = spv_emit_iadd_u32(&c->e, c->t_u32, v[k],
                                      spv_emit_bitcast(&c->e, c->t_u32,
                                                       offset_part(c, 0, 0, rd(c, regs[n0 + (lod_mode == 3)]), k, 4)));
+    if (c->stage == ST_FS && type == 1) scaled_fetch(c, slot, &v[0], &v[1]);
     if (array) v[count++] = spv_emit_bitwise_and_u32(&c->e, c->t_u32, rd(c, regs[0]), cu(c, 0xffff));
     u32 ivec = spv_emit_type_vector(&c->e, c->t_i32, count);
     u32 uvec = spv_emit_type_vector(&c->e, c->t_u32, count);
@@ -1822,15 +2154,16 @@ static void texture_query(Ctx* c, const Sm86Insn* in) {
         return;
     }
     u32 handle = sm86_field(in, 40, 19), bank = (handle >> 14) & 31, off = handle & 0x3fff;
-    int slot = -1;
-    for (int i = 0; i < c->si->ntex && slot < 0; i++)
-        if (c->si->tex[i].bl_cbuf == bank && c->si->tex[i].cbuf_off == off && !(c->si->tex[i].flags & SNX_TEX_INDEXED))
+    int slot = in->op == SM86_TXQ_U ? (int)c->handle[c->cur].slot - 1 : -1; /* memory_handles' */
+    for (int i = 0; i < c->si->ntex && slot < 0 && in->op != SM86_TXQ_U; i++)
+        if (c->si->tex[i].bl_cbuf == bank && c->si->tex[i].cbuf_off == off &&
+            !(c->si->tex[i].flags & (SNX_TEX_INDEXED | SNX_TEX_MEMORY)))
             slot = i;
     /* a TLD of a multisampled 2D texture with the handle, anywhere in the program, names its view */
     u32 ms = 0;
-    for (u32 k = 0; k < c->n && slot < 0 && !ms; k++)
+    for (u32 k = 0; k < c->n && slot < 0 && !ms && in->op != SM86_TXQ_U; k++)
         ms = c->in[k].op == SM86_TLD && sm86_field(&c->in[k], 78, 1) && sm86_field(&c->in[k], 40, 19) == handle;
-    if (slot < 0) slot = tex_slot(c, bank, off * 4, 1, 0, 0, ms);
+    if (slot < 0 && in->op != SM86_TXQ_U) slot = tex_slot(c, bank, off * 4, 1, 0, 0, ms);
     if (slot < 0) return;
     const ShTex* t = &c->si->tex[slot];
     ms = t->flags & 2;
@@ -1844,6 +2177,7 @@ static void texture_query(Ctx* c, const Sm86Insn* in) {
     u32 v[4];
     for (u32 k = 0; k < 3; k++) v[k] = k < dims ? SPV(&c->e, SPV_OP_COMPOSITE_EXTRACT, c->t_u32, size, k) : cu(c, 1);
     if (t->type == 0) v[1] = cu(c, 1);
+    if (c->stage == ST_FS && t->type == 1) scaled_size(c, slot, &v[0], &v[1]);
     v[3] = ms ? cu(c, 1) : spv_emit_image_query_levels(&c->e, c->t_u32, c->tex_sampled[slot], c->tex[slot]);
     tex_results(c, in, spv_emit_vec4_construct(&c->e, c->t_v4u, v), c->t_u32);
 }
@@ -2361,6 +2695,16 @@ static u32 system_value(Ctx* c, u32 sr) {
                    : sr == 0x3b ? spv_emit_not_u32(&c->e, c->t_u32, le)
                                 : spv_emit_not_u32(&c->e, c->t_u32, lt);
         }
+        case 0x84:
+            /* NAK's NAK_SV_VARIABLE_RATE, a fragment's shading rate: its width in pixels in bits 8-15 and its height
+               in bits 16-23 (1, 2 or 4), which nak_nir.c reads for load_frag_shading_rate. The runtime shades every
+               pixel at the full rate (nvn_cmd.c), so each fragment is 1 by 1. One game's fragment programs take its
+               width with PRMT R, R, 0x7771, RZ */
+            if (c->stage != ST_FS) {
+                fail(c, "S2R system register 0x84 outside a fragment program");
+                return c->zero;
+            }
+            return cu(c, 1u << 8 | 1u << 16);
         default: fail(c, "S2R system register 0x%x", sr); return c->zero;
     }
 }
@@ -2670,11 +3014,14 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
                 cmp = spv_emit_fcompare(&c->e, c->t_bool, sm86_field(in, 76, 4), ftz(c, src_f(c, &in->a), on),
                                         ftz(c, src_f(c, &in->b), on));
             } else {
-                cmp = int_compare(c, sm86_field(in, 76, 3), (int)sm86_field(in, 73, 1), src_int(c, &in->a),
-                                  src_int(c, &in->b));
+                /* no negation: bit 72, a's negation in the decoder's fields, is .EX, and 73 the signedness (NAK's
+                   OpISetP, whose sources take no modifiers). As a's negation, .EX compared -a: one game's
+                   ISETP.NE.AND.EX of a pointer's high word, R-ff (RZ) its a, didn't show it */
+                cmp = int_compare(c, sm86_field(in, 76, 3), (int)sm86_field(in, 73, 1), src_bits(c, &in->a),
+                                  src_bits(c, &in->b));
                 if (sm86_field(in, 72, 1)) { /* .EX: equal high words take the low words' comparison */
                     u32 low = prd(c, sm86_field(in, 68, 3), sm86_field(in, 71, 1), uniform);
-                    u32 equal = spv_emit_i_equal(&c->e, c->t_bool, src_int(c, &in->a), src_int(c, &in->b));
+                    u32 equal = spv_emit_i_equal(&c->e, c->t_bool, src_bits(c, &in->a), src_bits(c, &in->b));
                     u32 cmp_op = sm86_field(in, 76, 3);
                     if (cmp_op != 0 && cmp_op != 7) cmp = spv_emit_select(&c->e, c->t_bool, equal, low, cmp);
                 }
@@ -2825,6 +3172,38 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
                 v = spv_emit_select(&c->e, c->t_u32, high, cu(c, 0xffffffffu), v);
             }
             dwr(c, in, spv_emit_select(&c->e, c->t_u32, nan, c->zero, v));
+            return;
+        }
+        case SM86_F2IP: {
+            /* F2IP.U8.F32.NTZ d, a, b, c: the floats a and b each rounded to the nearest even integer and saturated
+               to 8 bits, a NaN 0 (.NTZ), packed as PTX's cvt.pack packs I2IP's: d = c << 16 | a' << 8 | b'. Bits
+               72-79 (CuAssembler's sm_86 records): 0x04 .U8.F32.NTZ, bit 76 .S8 (-128 to 127), bit 75 .RELU (0 to
+               127). One game's compute programs pack colours with F2IP.U8 then PRMT */
+            u32 flags = sm86_field(in, 72, 8);
+            if ((flags & ~0x18u) != 0x04 || sm86_field(in, 78, 2)) {
+                fail(c, "F2IP with flags 0x%x", flags);
+                return;
+            }
+            int s8 = (flags >> 4) & 1, relu = (flags >> 3) & 1;
+            float lo = s8 && !relu ? -128.0f : 0.0f, hi = s8 ? 127.0f : 255.0f;
+            u32 part[2];
+            for (u32 k = 0; k < 2; k++) {
+                u32 x = to_f(c, rd(c, sm86_field(in, k ? 32 : 24, 8)));
+                u32 nan = spv_emit_isnan(&c->e, c->t_bool, x);
+                u32 r = spv_emit_glsl_unary(&c->e, c->t_f32, c->glsl, SPV_GLSL_ROUND_EVEN, x);
+                r = spv_emit_glsl_binary(&c->e, c->t_f32, c->glsl, SPV_GLSL_N_MIN,
+                                         spv_emit_glsl_binary(&c->e, c->t_f32, c->glsl, SPV_GLSL_N_MAX, r, cf(c, lo)),
+                                         cf(c, hi));
+                r = s8 ? to_u(c, spv_emit_convert_f_to_s(&c->e, c->t_i32, r))
+                       : spv_emit_convert_f_to_u(&c->e, c->t_u32, r);
+                r = spv_emit_bitwise_and_u32(&c->e, c->t_u32, r, cu(c, 0xff));
+                part[k] = spv_emit_select(&c->e, c->t_u32, nan, c->zero, r);
+            }
+            u32 v = spv_emit_bitwise_or_u32(&c->e, c->t_u32,
+                                            spv_emit_shift_left_u32(&c->e, c->t_u32, part[0], cu(c, 8)), part[1]);
+            v = spv_emit_bitwise_or_u32(
+                &c->e, c->t_u32, spv_emit_shift_left_u32(&c->e, c->t_u32, rd(c, sm86_field(in, 64, 8)), cu(c, 16)), v);
+            wr(c, in->dst, v);
             return;
         }
         case SM86_I2F:
@@ -3081,21 +3460,29 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
         case SM86_SHFL_RR: {
             /* PTX's shfl.sync: c's bits 8-12 split the 32 lanes into segments, its bits 0-4 clamp the lane. Mode
                (58-59) 0 IDX, 1 UP, 2 DOWN, 3 BFLY. The lane is at 53-57 (an immediate) or 32 (a register), c at
-               40-52 (an immediate) or 64 (a register, which the translation does not take) */
-            if (op == SM86_SHFL_IR || op == SM86_SHFL_RR) {
-                fail(c, "SHFL with c in a register");
-                return;
-            }
-            u32 mode = sm86_field(in, 58, 2), cc = sm86_field(in, 40, 13);
-            u32 seg = (cc >> 8) & 31, clamp = cc & 31;
-            u32 b = op == SM86_SHFL_II ? cu(c, sm86_field(in, 53, 5)) : rd(c, sm86_field(in, 32, 8));
+               40-52 (an immediate) or 64 (a register: SHFL (imm, reg) 0x989 and SHFL (reg, reg) 0x389, as
+               CuAssembler's sm_86 records "SHFL.UP PT, R7, R8, 0x1, RZ" and "SHFL.DOWN P1, R32, R33, R32, R31"
+               show). One game's prefix sums are SHFL.UP P0, R12, R19, 0x1, RZ */
+            u32 mode = sm86_field(in, 58, 2), cc = sm86_field(in, 40, 13), seg, not_seg = 0, clamp_bits;
+            int c_reg = op == SM86_SHFL_IR || op == SM86_SHFL_RR;
+            u32 creg = c_reg ? rd(c, sm86_field(in, 64, 8)) : 0;
+            u32 b =
+                op == SM86_SHFL_II || op == SM86_SHFL_IR ? cu(c, sm86_field(in, 53, 5)) : rd(c, sm86_field(in, 32, 8));
             u32 id = system_value(c, 0), lane = spv_emit_bitwise_and_u32(&c->e, c->t_u32, id, cu(c, 31));
-            u32 min_lane = spv_emit_bitwise_and_u32(&c->e, c->t_u32, lane, cu(c, seg));
-            u32 max_lane = spv_emit_bitwise_or_u32(&c->e, c->t_u32, min_lane, cu(c, clamp & ~seg & 31));
+            if (c_reg) { /* c's fields as the immediate's, at run time */
+                seg = spv_emit_bitwise_and_u32(&c->e, c->t_u32,
+                                               spv_emit_shift_right_u32(&c->e, c->t_u32, creg, cu(c, 8)), cu(c, 31));
+                not_seg = spv_emit_bitwise_and_u32(&c->e, c->t_u32, spv_emit_not_u32(&c->e, c->t_u32, seg), cu(c, 31));
+            } else
+                seg = cu(c, (cc >> 8) & 31);
+            u32 min_lane = spv_emit_bitwise_and_u32(&c->e, c->t_u32, lane, seg);
+            clamp_bits = c_reg ? spv_emit_bitwise_and_u32(&c->e, c->t_u32, creg, not_seg) : cu(c, cc & ~(cc >> 8) & 31);
+            u32 max_lane = spv_emit_bitwise_or_u32(&c->e, c->t_u32, min_lane, clamp_bits);
             u32 j, ok;
             if (mode == 0) {
+                if (!c_reg) not_seg = cu(c, ~(cc >> 8) & 31);
                 j = spv_emit_bitwise_or_u32(&c->e, c->t_u32, min_lane,
-                                            spv_emit_bitwise_and_u32(&c->e, c->t_u32, b, cu(c, ~seg & 31)));
+                                            spv_emit_bitwise_and_u32(&c->e, c->t_u32, b, not_seg));
                 ok = op2(c, SPV_OP_U_LESS_THAN_EQUAL, c->t_bool, j, max_lane);
             } else if (mode == 1) {
                 j = spv_emit_isub_u32(&c->e, c->t_u32, lane, b);
@@ -3174,10 +3561,13 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
         case SM86_ATOMG:
         case SM86_ATOMG_NOU:
         case SM86_RED: {
-            /* NAK's OpAtom on global memory: atomic_opcode's operation at 87-90, the data at 32; RED returns nothing */
+            /* NAK's OpAtom on global memory: atomic_opcode's operation at 87-90, the data at 32; RED returns nothing.
+               Of type 3 (F32, .FTZ.RN) the ADD alone, atomic_fadd: one game's compute programs sum positions into a
+               buffer with RED.E.ADD.F32.FTZ.RN */
             u32 how = sm86_field(in, 87, op == SM86_RED ? 3 : 4), type = sm86_field(in, 73, 3);
             u32 opcode = atomic_opcode(type, how);
-            if (!opcode) {
+            int fadd = type == 3 && how == 0;
+            if (!opcode && !fadd) {
                 fail(c, "%s of type %u, operation %u", sm86_ops[op].name, type, how);
                 return;
             }
@@ -3185,8 +3575,9 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
             if (!buffer) return;
             mark_read(c, c->gkey);
             mark_written(c, c->gkey, address, 4);
-            u32 old = spv_emit_atomic_u32(&c->e, c->t_u32, opcode, mem_ptr(c, buffer, address, 0),
-                                          rd(c, sm86_field(in, 32, 8)));
+            u32 old = fadd ? atomic_fadd(c, buffer, address, rd(c, sm86_field(in, 32, 8)))
+                           : spv_emit_atomic_u32(&c->e, c->t_u32, opcode, mem_ptr(c, buffer, address, 0),
+                                                 rd(c, sm86_field(in, 32, 8)));
             if (op != SM86_RED) wr(c, in->dst, old);
             return;
         }
@@ -3499,25 +3890,36 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
             return;
         }
         case SM86_ULDC_IDX: {
-            /* ULDC UR, c[bank][UR + offset]: the uniform register at 24, the offset 38-53 signed */
+            /* ULDC UR, c[bank][UR + offset]: the uniform register at 24, the offset 38-53 signed. Of NAK's MemType
+               (73-75) as LDC's: a byte or a halfword (0 to 3) as cbuf_subword reads it, a word, or a pair. One game's
+               compute program walks a byte code in a constant buffer with ULDC.U8 UR, c[0x4][UR15 + k] */
             u32 type = sm86_field(in, 73, 3), bank = sm86_field(in, 54, 5), off = sm86_field(in, 38, 16);
-            if (type != 4 && type != 5) {
+            if (type > 5) {
                 fail(c, "ULDC (indexed) of type %u", type);
                 return;
             }
             u32 bias = off & 0x8000u ? off | 0xffff0000u : off, d = sm86_field(in, 16, 6);
             u32 index = urd(c, sm86_field(in, 24, 6));
+            if (type < 4) {
+                uwr(c, d, cbuf_subword(c, bank, bias, index, type));
+                return;
+            }
             uwr(c, d, cbuf_load(c, bank, bias, index));
             if (type == 5 && d < SM86_URZ) uwr(c, d + 1, cbuf_load(c, bank, bias + 4, index));
             return;
         }
         case SM86_ULDC: {
+            /* the types as ULDC.IDX's: CuAssembler's sm_86 records give ULDC.U8, .S8 and .U16 too */
             u32 type = sm86_field(in, 73, 3), bank = sm86_field(in, 54, 5), off = sm86_field(in, 38, 16);
-            if (sm86_field(in, 91, 1) || (type != 4 && type != 5)) {
+            if (sm86_field(in, 91, 1) || type > 5) {
                 fail(c, "ULDC of type %u", type);
                 return;
             }
             u32 d = sm86_field(in, 16, 6);
+            if (type < 4) {
+                uwr(c, d, cbuf_subword(c, bank, off, 0, type));
+                return;
+            }
             uwr(c, d, cbuf_load(c, bank, off, 0));
             if (type == 5 && d < SM86_URZ) uwr(c, d + 1, cbuf_load(c, bank, off + 4, 0));
             return;
@@ -3537,16 +3939,7 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
                 spv_emit_store(&c->e, h->var, op2(c, SPV_OP_U_DIV, c->t_u32, at, cu(c, h->stride)));
             }
             if (type < 4) {
-                /* NAK's MemType U8 (0), I8 (1), U16 (2), I16 (3): a byte or a halfword of the word at the address,
-                   zero or sign extended, as mem_load takes one from memory */
-                u32 at = index ? spv_emit_iadd_u32(&c->e, c->t_u32, index, cu(c, off)) : cu(c, off);
-                u32 shift = spv_emit_shift_left_u32(
-                    &c->e, c->t_u32, spv_emit_bitwise_and_u32(&c->e, c->t_u32, at, cu(c, type < 2 ? 3 : 2)), cu(c, 3));
-                u32 word = cbuf_load(c, bank, off, index), bits = cu(c, type < 2 ? 8 : 16);
-                wr(c, in->dst,
-                   type & 1 ? to_u(c, spv_emit_bitfield_sextract(&c->e, c->t_i32,
-                                                                 spv_emit_bitcast(&c->e, c->t_i32, word), shift, bits))
-                            : spv_emit_bitfield_uextract(&c->e, c->t_u32, word, shift, bits));
+                wr(c, in->dst, cbuf_subword(c, bank, off, index, type));
                 return;
             }
             wr(c, in->dst, cbuf_load(c, bank, off, index));
@@ -3558,9 +3951,8 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
         case SM86_LDG_NOU:
         case SM86_STG_NOU: {
             int load = op == SM86_LDG || op == SM86_LDG_NOU;
-            u32 from = c->addr_key[c->n + 1 + c->cur];
-            if (!c->addr_key[c->cur] && (from == SM86_LDG || from == SM86_LDG_NOU || from == SM86_LDS ||
-                                         from == SM86_LDL)) { /* a pointer from memory */
+            /* a pointer from memory, or derived from one, that no buffer key names */
+            if (!c->addr_key[c->cur] && c->addr_key[2 * (c->n + 1) + c->cur]) {
                 global_dynamic(c, in, op == SM86_LDG || op == SM86_STG, load);
                 return;
             }
@@ -3673,6 +4065,21 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
             wr(c, in->dst, v);
             return;
         }
+        case SM86_TEX_U:
+        case SM86_TLD_U:
+        case SM86_TLD4_U:
+        case SM86_TXQ_U:
+            if (!c->handle || !c->handle[c->cur].slot) { /* memory_handles found no slot */
+                uniform_handle(c, in);
+                return;
+            }
+            if (op == SM86_TLD_U)
+                texel_fetch(c, in);
+            else if (op == SM86_TXQ_U)
+                texture_query(c, in);
+            else
+                texture(c, in);
+            return;
         case SM86_TEX:
         case SM86_TEX_B:
         case SM86_TLD4:
@@ -4224,15 +4631,425 @@ static int src_const(Ctx* c, u32 at, const Sm86Src* s, u32* value) {
     }
     return s->kind == SM86_SRC_REG && reg_const_at(c, at, s->reg, value);
 }
+/* ---- texture handles from memory ---- */
+
+/* An Ounce program may load a texture's handle from memory: one game's material programs read it from a table of
+   materials in a storage buffer (LDG.64 [R + UR], UR a ULDC.64 of cbuf 0), at a record that the draw's constant
+   buffers pick (c[4][0x88] & 0xfffff plus c[5][0x2ec], times 32, plus 0x18), then R2UR it into the uniform register
+   pair of a TEX whose handle is in a uniform register (the texture's word, then its >> 20, the sampler's index), or
+   into a TEX.B's handle register. Where every value the address takes is the same for the whole draw (constant
+   buffer words, immediates, and words loaded from such addresses), the translation keeps the instructions that make
+   the handle (ShaderInfo.memh) and the slot names the handle's value (SNX_TEX_MEMORY, SH_PROBE): the renderer runs
+   them on the draw's constant buffers and memory (sm86_eval) and binds what they give as a constant buffer's handle.
+   The program still runs them itself, for what else it does with the words (a test of the handle against 0) */
+enum { MH_R, MH_UR, MH_P, MH_UP }; /* the files of a value: registers, uniform registers, predicates, uniform ones */
+typedef struct MhDep {
+    u32 at, file, reg, writer; /* instruction at reads the value, which writer wrote */
+} MhDep;
+/* the words an instruction that sm86_eval runs writes from its destination: a pair's two, a load's by its type */
+static u32 mh_words(const Sm86Insn* in) {
+    u32 type = sm86_field(in, 73, 3);
+    switch (in->op) {
+        case SM86_LDG:
+        case SM86_LDG_NOU: return type == 5 ? 2 : type == 6 ? 4 : 1;
+        case SM86_LDC:
+        case SM86_ULDC:
+        case SM86_ULDC_IDX: return type == 5 ? 2 : 1;
+        case SM86_IMAD_WIDE:
+        case SM86_UIMAD_WIDE: return 2;
+        case SM86_CS2R: return sm86_field(in, 80, 1) ? 2 : 1;
+        case SM86_ISETP:
+        case SM86_UISETP:
+        case SM86_PLOP3:
+        case SM86_UPLOP3: return 0;
+        default: return 1;
+    }
+}
+static int mh_uniform_dst(const Sm86Insn* in) {
+    return sm86_ops[in->op].kind == SM86_K_UALU || in->op == SM86_ULDC || in->op == SM86_ULDC_IDX ||
+           in->op == SM86_R2UR;
+}
+/* whether an instruction may write value r of the file: exactly for those sm86_eval runs, else as far as the
+   translation knows (writes_word, writes_uniform, and the fields of the instructions that write predicates) */
+static int mh_may_write(const Sm86Insn* in, int file, u32 r) {
+    int uk = sm86_ops[in->op].kind == SM86_K_UALU;
+    if (file == MH_P || file == MH_UP) {
+        int u = file == MH_UP, p81 = sm86_field(in, 81, 3) == r, p84 = sm86_field(in, 84, 3) == r;
+        switch (in->op) {
+            case SM86_IADD3:
+            case SM86_UIADD3:
+            case SM86_ISETP:
+            case SM86_UISETP:
+            case SM86_FSETP:
+            case SM86_DSETP:
+            case SM86_HSETP2: return uk == u && (p81 || p84);
+            case SM86_PLOP3: return !u && (p81 || p84);
+            case SM86_UPLOP3: return u && (p81 || p84);
+            case SM86_LEA:
+            case SM86_ULEA:
+            case SM86_LOP3:
+            case SM86_ULOP3: return uk == u && p81;
+            case SM86_UVOTE: return u && p81;
+            case SM86_R2P: return !u;
+            case SM86_VOTE:
+            case SM86_MATCH:
+            case SM86_SHFL_II:
+            case SM86_SHFL_RI:
+            case SM86_SHFL_IR:
+            case SM86_SHFL_RR:
+            /* the fault predicates of the texture and surface loads */
+            case SM86_TEX:
+            case SM86_TEX_B:
+            case SM86_TLD:
+            case SM86_TLD_B:
+            case SM86_TLD4:
+            case SM86_TLD4_B:
+            case SM86_TEX_U:
+            case SM86_TLD_U:
+            case SM86_TLD4_U:
+            case SM86_SULD_P:
+            case SM86_SULD_D:
+            case SM86_SULD_P_B:
+            case SM86_SULD_D_B: return !u && p81;
+            default: return 0;
+        }
+    }
+    if (sm86_eval_takes(in)) {
+        int u = mh_uniform_dst(in);
+        u32 d = u && sm86_ops[in->op].kind != SM86_K_UALU ? sm86_field(in, 16, 6) : in->dst;
+        return u == (file == MH_UR) && d < (u ? SM86_URZ : SM86_RZ) && r >= d && r < d + mh_words(in);
+    }
+    if (file == MH_UR) {
+        for (u32 k = 0; k < 4 && k <= r; k++)
+            if (writes_uniform(in, r - k) && (k == 0 || in->op == SM86_ULDCG)) return 1;
+        return 0;
+    }
+    if (in->op == SM86_IPA || in->op == SM86_S2R) return in->dst == r; /* one word, where may_write takes two */
+    return writes_word(in, r);
+}
+#define MH_FLOW_PREDS(k)                                                                                               \
+    do {                                                                                                               \
+        if ((k) == 0) ok = 0;                                                                                          \
+        if ((k) > 0 && falls_through(&c->in[(k) - 1]) && !seen[(k) - 1]) seen[(k) - 1] = 1, stack[top++] = (k) - 1;    \
+        for (u32 j = c->jump_first[k]; j < c->jump_first[(k) + 1]; j++)                                                \
+            if (!seen[c->jump_from[j]]) seen[c->jump_from[j]] = 1, stack[top++] = c->jump_from[j];                     \
+    } while (0)
+/* The one instruction whose write of value r of the file reaches instruction i on every path there, unguarded, as
+   reaching_write finds a register's: -1 when that can't be shown, -2 for RZ, URZ and PT, which no one writes */
+static int mh_writer(Ctx* c, u32 i, int file, u32 r) {
+    if ((file == MH_R && r >= SM86_RZ) || (file == MH_UR && r >= SM86_URZ) || (file >= MH_P && r >= SM86_PT))
+        return -2;
+    if (!flow_sources(c)) return -1;
+    u32 n = c->n, *stack = malloc(((size_t)n + 1) * sizeof *stack), top = 0;
+    u8* seen = calloc((size_t)n + 1, 1);
+    int ok = stack && seen, found = -1;
+    if (ok) MH_FLOW_PREDS(i);
+    while (ok && top) {
+        u32 k = stack[--top];
+        const Sm86Insn* in = &c->in[k];
+        if (!mh_may_write(in, file, r)) {
+            MH_FLOW_PREDS(k);
+            continue;
+        }
+        if (!sm86_always(in) || (found >= 0 && (u32)found != k)) ok = 0;
+        found = (int)k;
+    }
+    free(stack);
+    free(seen);
+    return ok ? found : -1;
+}
+#undef MH_FLOW_PREDS
+static const char* mh_file_name(int file) { return file == MH_R ? "R" : file == MH_UR ? "UR" : file == MH_P ? "P" : "UP"; }
+/* why a handle's instructions can't be found, which memory_handles takes, the program going on */
+static int mh_fail(Ctx* c, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(c->mh_why, sizeof c->mh_why, fmt, ap);
+    va_end(ap);
+    return 0;
+}
+static int mh_add(Ctx* c, u32 k, u32 reader);
+/* instruction at, of ShaderInfo.memh or the texture instruction, reads value r of the file: its writer joins them */
+static int mh_need(Ctx* c, u32 at, int file, u32 r) {
+    int k = mh_writer(c, at, file, r);
+    if (k == -2) return 1;
+    if (k < 0 || (u32)k >= at)
+        return mh_fail(c, "a texture handle from memory whose %s%u at %u has no one writer before", mh_file_name(file),
+                       r, at);
+    if (c->nmh_dep == c->mh_dep_cap) {
+        u32 cap = c->mh_dep_cap ? 2 * c->mh_dep_cap : 64;
+        MhDep* grown = realloc(c->mh_dep, cap * sizeof *grown);
+        if (!grown) {
+            fail(c, "out of memory");
+            return 0;
+        }
+        c->mh_dep = grown, c->mh_dep_cap = cap;
+    }
+    c->mh_dep[c->nmh_dep++] = (MhDep){at, (u32)file, r, (u32)k};
+    return mh_add(c, (u32)k, at);
+}
+static int mh_src(Ctx* c, u32 at, const Sm86Src* s) {
+    if (s->kind == SM86_SRC_REG) return mh_need(c, at, MH_R, s->reg);
+    if (s->kind == SM86_SRC_UREG) return mh_need(c, at, MH_UR, s->reg);
+    if (s->kind == SM86_SRC_CBUF && (s->bindless || s->bank >= 18))
+        return mh_fail(c, "a texture handle from memory made with constant buffer %u", s->bank);
+    return 1;
+}
+static int mh_pred(Ctx* c, u32 at, int uniform, u32 field) {
+    return mh_need(c, at, uniform ? MH_UP : MH_P, sm86_field(&c->in[at], field, 3));
+}
+/* instruction k, which reader reads, joins ShaderInfo.memh, with the writers of what it reads */
+static int mh_add(Ctx* c, u32 k, u32 reader) {
+    if (c->mh_mark[k]) return 1;
+    const Sm86Insn* in = &c->in[k];
+    if (!sm86_eval_takes(in))
+        return mh_fail(c, "a texture handle from memory made with %s at %u (for %u)", sm86_ops[in->op].name, k,
+                       reader);
+    if (c->nmh >= SH_MEMH_MAX)
+        return mh_fail(c, "texture handles from memory made with more than %u instructions", SH_MEMH_MAX);
+    c->nmh++;
+    c->mh_mark[k] = 1;
+    c->mh_new[c->nmh_new++] = k;
+    int op = in->op, u = sm86_ops[op].kind == SM86_K_UALU;
+    switch (op) {
+        case SM86_MOV:
+        case SM86_UMOV: return mh_src(c, k, &in->b);
+        case SM86_R2UR: return mh_need(c, k, MH_R, sm86_field(in, 24, 8));
+        case SM86_CS2R: return 1;
+        case SM86_IADD3:
+        case SM86_UIADD3:
+            return mh_src(c, k, &in->a) && mh_src(c, k, &in->b) && mh_src(c, k, &in->c) &&
+                   (!sm86_field(in, 74, 1) || (mh_pred(c, k, u, 87) && mh_pred(c, k, u, 77)));
+        case SM86_IMAD:
+        case SM86_UIMAD:
+        case SM86_LEA:
+        case SM86_ULEA:
+            return mh_src(c, k, &in->a) && mh_src(c, k, &in->b) &&
+                   ((op != SM86_IMAD && op != SM86_UIMAD && !sm86_field(in, 80, 1)) || mh_src(c, k, &in->c)) &&
+                   (!sm86_field(in, 74, 1) || mh_pred(c, k, u, 87));
+        case SM86_IMAD_WIDE:
+        case SM86_UIMAD_WIDE:
+            if (!mh_src(c, k, &in->a) || !mh_src(c, k, &in->b) || !mh_src(c, k, &in->c)) return 0;
+            if (in->c.kind == SM86_SRC_REG) return mh_need(c, k, MH_R, in->c.reg >= SM86_RZ ? SM86_RZ : in->c.reg + 1);
+            if (in->c.kind == SM86_SRC_UREG)
+                return mh_need(c, k, MH_UR, in->c.reg >= SM86_URZ ? SM86_URZ : in->c.reg + 1);
+            return 1;
+        case SM86_LOP3:
+        case SM86_ULOP3:
+        case SM86_SHF:
+        case SM86_USHF:
+        case SM86_PRMT:
+        case SM86_UPRMT: return mh_src(c, k, &in->a) && mh_src(c, k, &in->b) && mh_src(c, k, &in->c);
+        case SM86_SEL:
+        case SM86_USEL:
+        case SM86_IMNMX:
+        case SM86_UIMNMX: return mh_src(c, k, &in->a) && mh_src(c, k, &in->b) && mh_pred(c, k, u, 87);
+        case SM86_ISETP:
+        case SM86_UISETP:
+            return mh_src(c, k, &in->a) && mh_src(c, k, &in->b) && mh_pred(c, k, u, 87) &&
+                   (!sm86_field(in, 72, 1) || mh_pred(c, k, u, 68));
+        case SM86_PLOP3:
+        case SM86_UPLOP3: {
+            int up = op == SM86_UPLOP3;
+            return mh_pred(c, k, up, 87) && mh_pred(c, k, up, 77) && mh_pred(c, k, up || sm86_field(in, 67, 1), 68);
+        }
+        case SM86_ULDC:
+        case SM86_ULDC_IDX:
+        case SM86_LDC:
+            if (sm86_field(in, 54, 5) >= 18)
+                return mh_fail(c, "a texture handle from memory made with constant buffer %u", sm86_field(in, 54, 5));
+            if (op == SM86_ULDC_IDX) return mh_need(c, k, MH_UR, sm86_field(in, 24, 6));
+            if (op == SM86_LDC) return mh_need(c, k, MH_R, sm86_field(in, 24, 8));
+            return 1;
+        case SM86_LDG:
+        case SM86_LDG_NOU: {
+            int uniform_form = op == SM86_LDG;
+            u32 reg = sm86_field(in, 24, 8), ur = uniform_form ? sm86_field(in, 32, 6) : SM86_URZ;
+            if (!mh_need(c, k, MH_R, reg)) return 0;
+            if (sm86_field(in, uniform_form ? 90 : 72, 1) && reg < SM86_RZ && !mh_need(c, k, MH_R, reg + 1)) return 0;
+            if (ur < SM86_URZ && !mh_need(c, k, MH_UR, ur)) return 0;
+            if (ur < SM86_URZ && sm86_field(in, 72, 1) && !mh_need(c, k, MH_UR, ur + 1)) return 0;
+            return 1;
+        }
+        default: return mh_fail(c, "a texture handle from memory made with %s", sm86_ops[op].name);
+    }
+}
+/* the probe (SH_PROBE, by instruction index until mh_finish) of value r of the file at texture instruction at, whose
+   writer joins ShaderInfo.memh: ~0 when it can't */
+static u32 mh_probe(Ctx* c, u32 at, int file, u32 r) {
+    int k = mh_writer(c, at, file, r);
+    if (k < 0 || (u32)k >= at) {
+        mh_fail(c, "a texture handle from memory whose %s%u at %u has no one writer before", mh_file_name(file), r, at);
+        return SH_PROBE_NONE;
+    }
+    if (!mh_add(c, (u32)k, at)) return SH_PROBE_NONE;
+    return SH_PROBE(k, file == MH_UR, r);
+}
+/* ShaderInfo.memh in program order. Each value an instruction there reads must be the one its writer left: no other
+   instruction of the list between the two may write it, as the renderer runs only the list, in order */
+static int mh_finish(Ctx* c) {
+    u32 pos = 0;
+    for (u32 k = 0; k < c->n; k++) {
+        if (!c->mh_mark[k]) continue;
+        c->mh_pos[k] = pos + 1;
+        c->si->memh[pos][0] = c->in[k].lo;
+        c->si->memh[pos][1] = c->in[k].hi;
+        pos++;
+    }
+    c->si->nmemh = pos;
+    for (u32 d = 0; d < c->nmh_dep; d++) {
+        const MhDep* x = &c->mh_dep[d];
+        for (u32 j = x->writer + 1; j < x->at; j++)
+            if (c->mh_mark[j] && mh_may_write(&c->in[j], (int)x->file, x->reg)) {
+                fail(c, "a texture handle from memory whose %s%u another of its instructions writes", mh_file_name((int)x->file),
+                     x->reg);
+                return 0;
+            }
+    }
+    return 1;
+}
+static u32 mh_final(Ctx* c, u32 probe) {
+    if (probe == SH_PROBE_NONE) return probe;
+    return SH_PROBE(c->mh_pos[SH_PROBE_INSN(probe)] - 1, SH_PROBE_UNIFORM(probe), SH_PROBE_REG(probe));
+}
+/* the slot of a handle from memory (SNX_TEX_MEMORY): its texture word's probe, and with smp its sampler word's, with
+   that view (as tex_slot's) */
+static int tex_slot_memory(Ctx* c, u32 tex_probe, int smp, u32 smp_probe, u32 type, u32 array, u32 shadow, u32 ms) {
+    ShaderInfo* si = c->si;
+    for (int i = 0; i < si->ntex; i++) {
+        const ShTex* t = &si->tex[i];
+        if ((t->flags & SNX_TEX_MEMORY) && t->cbuf_off == tex_probe && t->bl2 == smp && (!smp || t->bl2_off == smp_probe) &&
+            t->type == type && t->array == array && t->shadow == shadow && !!(t->flags & 2) == !!ms)
+            return i;
+    }
+    if (si->ntex >= SH_MAXTEX) {
+        fail(c, "more than %d textures", SH_MAXTEX);
+        return -1;
+    }
+    int i = si->ntex++;
+    ShTex t = {0};
+    t.cbuf_off = tex_probe;
+    t.type = (u8)type;
+    t.array = (u8)array;
+    t.shadow = (u8)shadow;
+    t.bindless = 1;
+    t.bl2 = (u8)smp;
+    t.bl2_off = smp ? smp_probe : 0;
+    t.flags = (u8)(SNX_TEX_MEMORY | (ms ? 2 : 0));
+    si->tex[i] = t;
+    c->tex[i] = spv_emit_sampler_image(&c->e, c->t_f32, (u32)shader_vk_set(c->stage), SNX_VKB_TEX + (u32)i,
+                                       type == 0 ? 1 : type, (int)array, (int)shadow, ms ? 1 : 0, &c->tex_sampled[i]);
+    add_interface(c, c->tex[i]);
+    return i;
+}
+static int tex_operands(const Sm86Insn* in, u32 n0, u32 n1, u32* regs);
+/* the register of a TEX.B's handle, the first of list1 (as prepare_handles finds it): RZ when it can't tell */
+static u32 tex_b_handle_reg(const Sm86Insn* in) {
+    u32 type, array, coords, regs[8], lod = sm86_field(in, 87, 3);
+    if (!tex_dim(sm86_field(in, 61, 3), &type, &array, &coords)) return SM86_RZ;
+    u32 n0 = array + coords, n1 = 1 + (lod == 2 || lod == 3) + sm86_field(in, 76, 1) + sm86_field(in, 78, 1);
+    return tex_operands(in, n0, n1, regs) ? regs[n0] : SM86_RZ;
+}
+/* whether a TEX.B's handle is a constant buffer word's, which prepare_handles binds: a MOV of one, or an LDC. A handle
+   with no one writer is memory_handles' too (one game's lights take theirs from memory in a loop, as a TEX.B's
+   handle from an LDG was before), which then samples it as no texture */
+static int tex_b_cbuf_handle(Ctx* c, u32 i, u32 reg) {
+    int k = reaching_write(c, i, reg);
+    for (u32 depth = 0; k >= 0 && depth < 8 && c->in[k].op == SM86_MOV && c->in[k].b.kind == SM86_SRC_REG; depth++)
+        k = reaching_write(c, (u32)k, c->in[k].b.reg);
+    if (k < 0) return 0;
+    const Sm86Insn* w = &c->in[k];
+    return (w->op == SM86_MOV && w->b.kind == SM86_SRC_CBUF && !w->b.bindless) || w->op == SM86_LDC;
+}
+/* The handles from memory: TEX, TLD, TLD4 and TXQ with the handle in a uniform register pair (URn the texture's word,
+   URn + 1 the sampler's), and TEX.B whose handle register no constant buffer word gives. Their slots go in
+   c->handle (the slot + 1), and the instructions that make them in ShaderInfo.memh */
+static void memory_handles(Ctx* c) {
+    u32 n = c->n, any = 0;
+    for (u32 i = 0; i < n; i++) {
+        int op = c->in[i].op;
+        any |= op == SM86_TEX_U || op == SM86_TLD_U || op == SM86_TLD4_U || op == SM86_TXQ_U ||
+               (op == SM86_TEX_B && tex_b_handle_reg(&c->in[i]) < SM86_RZ &&
+                !tex_b_cbuf_handle(c, i, tex_b_handle_reg(&c->in[i])));
+    }
+    if (!any) return;
+    c->mh_mark = calloc((size_t)n + 1, 1);
+    c->mh_pos = calloc((size_t)n + 1, sizeof *c->mh_pos);
+    c->mh_new = calloc((size_t)n + 1, sizeof *c->mh_new);
+    u32(*probe)[2] = malloc(((size_t)n + 1) * sizeof *probe); /* ~0 for none */
+    if (!c->handle) c->handle = calloc((size_t)n + 1, sizeof *c->handle);
+    if (!c->mh_mark || !c->mh_pos || !c->mh_new || !probe || !c->handle) {
+        free(probe);
+        fail(c, "out of memory");
+        return;
+    }
+    memset(probe, 0xff, ((size_t)n + 1) * sizeof *probe);
+    /* the values, each with the instructions that make it. One whose instructions can't be run before the draw (its
+       address differs from invocation to invocation: the program loads it at a cell of a grid in world space, say)
+       is sampled as no texture (SH_PROBE_NONE): its instructions are unmarked, and the draw goes on without it */
+    for (u32 i = 0; i < n && !c->failed; i++) {
+        const Sm86Insn* in = &c->in[i];
+        int op = in->op, u = op == SM86_TEX_U || op == SM86_TLD_U || op == SM86_TLD4_U || op == SM86_TXQ_U;
+        u32 reg = op == SM86_TEX_B ? tex_b_handle_reg(in) : SM86_RZ;
+        if (!u && !(op == SM86_TEX_B && reg < SM86_RZ && !tex_b_cbuf_handle(c, i, reg))) continue;
+        u32 ur = sm86_field(in, 40, 6), nmh = c->nmh, ndep = c->nmh_dep;
+        if (u && ur + 1 >= SM86_URZ) {
+            fail(c, "%s of UR%u", sm86_ops[op].name, ur);
+            break;
+        }
+        c->nmh_new = 0;
+        c->mh_why[0] = 0;
+        probe[i][0] = mh_probe(c, i, u ? MH_UR : MH_R, u ? ur : reg);
+        if (u && probe[i][0] != SH_PROBE_NONE) probe[i][1] = mh_probe(c, i, MH_UR, ur + 1);
+        if (probe[i][0] == SH_PROBE_NONE || (u && probe[i][1] == SH_PROBE_NONE)) {
+            for (u32 k = 0; k < c->nmh_new; k++) c->mh_mark[c->mh_new[k]] = 0;
+            c->nmh = nmh, c->nmh_dep = ndep;
+            probe[i][0] = SH_PROBE_NONE, probe[i][1] = u ? SH_PROBE_NONE : ~0u;
+            c->si->memh_none++;
+            if (!c->si->memh_why[0]) snprintf(c->si->memh_why, sizeof c->si->memh_why, "%s", c->mh_why);
+        }
+    }
+    if (c->failed || !mh_finish(c)) {
+        free(probe);
+        return;
+    }
+    /* the slots, the TXQs after the others: a query takes the view of a sample of the same handle */
+    for (u32 pass = 0; pass < 2 && !c->failed; pass++)
+        for (u32 i = 0; i < n && !c->failed; i++) {
+            const Sm86Insn* in = &c->in[i];
+            int op = in->op, slot = -1;
+            if (probe[i][0] == ~0u || (op == SM86_TXQ_U) != (pass == 1)) continue;
+            if (op != SM86_TEX_U && op != SM86_TLD_U && op != SM86_TLD4_U && op != SM86_TXQ_U && op != SM86_TEX_B)
+                continue;
+            u32 tex = mh_final(c, probe[i][0]), smp = probe[i][1] == ~0u ? 0 : mh_final(c, probe[i][1]);
+            int has_smp = probe[i][1] != ~0u;
+            if (op == SM86_TXQ_U) {
+                for (int k = 0; k < c->si->ntex && slot < 0; k++) {
+                    const ShTex* t = &c->si->tex[k];
+                    if ((t->flags & SNX_TEX_MEMORY) && t->cbuf_off == tex && t->bl2 == has_smp && t->bl2_off == smp)
+                        slot = k;
+                }
+                if (slot < 0) slot = tex_slot_memory(c, tex, has_smp, smp, 1, 0, 0, 0);
+            } else {
+                u32 type, array, coords;
+                if (!tex_dim(sm86_field(in, 61, 3), &type, &array, &coords)) continue; /* refused where it's written */
+                u32 shadow = op == SM86_TLD_U ? 0 : sm86_field(in, 78, 1), ms = op == SM86_TLD_U && sm86_field(in, 78, 1);
+                slot = tex_slot_memory(c, tex, has_smp, smp, type, array, shadow, ms);
+            }
+            if (slot >= 0) c->handle[i].slot = (u32)slot + 1;
+        }
+    free(probe);
+}
 /* The handle of each TEX.B is in a register. A MOV or an LDC of a constant buffer word gives a slot as any other. An
    LDC whose address has a register in it picks from a table: one game's lights keep 32 records each, in a constant
    buffer, and a program finds the lights of a pixel with FLO on a mask, then an IMAD of that index by the record's
    size makes the LDC's address, c[bank][x * stride + base + offset]. So the texture is chosen for each pixel, from
    an array, and the table's elements are stride bytes apart, whatever the stride (they aren't a power of two) */
 static void prepare_handles(Ctx* c) {
+    memory_handles(c);
     for (u32 i = 0; i < c->n && !c->failed; i++) {
         const Sm86Insn* in = &c->in[i];
-        if (in->op != SM86_TEX_B) continue;
+        if (in->op != SM86_TEX_B || (c->handle && c->handle[i].slot)) continue; /* memory_handles' */
         u32 type, array, coords, regs[8], lod = sm86_field(in, 87, 3);
         if (!tex_dim(sm86_field(in, 61, 3), &type, &array, &coords)) {
             fail(c, "TEX.B dimension 6");
@@ -4501,6 +5318,11 @@ u32* sm86_to_spirv_ftz(const u8* code, u32 bytes, int stage, const u32* sph, Sha
                     e, spv_emit_type_function_pointer(e, spv_emit_type_array_u32(e, c->t_u32, c->local_words)));
             }
         for (u32 r = 0; r < SM86_URZ; r++) c->ureg[r] = spv_emit_function_variable_init(e, reg_ptr, c->zero);
+        /* atomic_fadd's loop's word, where the device has no float atomics */
+        for (u32 i = 0; i < n && !c->cas_var && !g_shader_float_atomic_add; i++)
+            if ((insn[i].op == SM86_RED || insn[i].op == SM86_ATOMG || insn[i].op == SM86_ATOMG_NOU) &&
+                sm86_field(&insn[i], 73, 3) == 3)
+                c->cas_var = spv_emit_function_variable_init(e, reg_ptr, c->zero);
         for (u32 p = 0; p < SM86_PT; p++) {
             c->pred[p] = spv_emit_function_variable_init(e, pred_ptr, c->false_v);
             c->upred[p] = spv_emit_function_variable_init(e, pred_ptr, c->false_v);
@@ -4616,6 +5438,10 @@ u32* sm86_to_spirv_ftz(const u8* code, u32 bytes, int stage, const u32* sph, Sha
     free(st);
     free(c->addr_key);
     free(c->handle);
+    free(c->mh_mark);
+    free(c->mh_pos);
+    free(c->mh_dep);
+    free(c->mh_new);
     free(c->jump_first);
     free(insn);
     free(words);

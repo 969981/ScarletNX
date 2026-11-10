@@ -566,6 +566,11 @@ static u32 f2u(float f) {
     memcpy(&u, &f, 4);
     return u;
 }
+static float u2f(u32 u) {
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+}
 /* the fragment program code (n instructions, its SPH writing color 0 from R0-R3) translated and run at lane, with
    bank 1 as cb1 (cb1_words of it, NULL for none): its color 0 into out, 1 when it ran */
 static int run_fs_at(const u8* code, u32 n, u32 lane, const u32* cb1, u32 cb1_words, u32 out[4]) {
@@ -1650,6 +1655,138 @@ static void test_ipa_uniform(const char* dir) {
     (void)dir;
 }
 
+/* A fragment program at a resolution scale (SNX_VKB_RS: 1 / the scale twice, then the scale). Its position is
+   FragCoord over the scale, the guest's pixels. TLD.LZ of c[2][0x40] at texel p fetches p where the push constants do
+   not mark the slot as bound to a scaled target; where they do, the pixel of texel p that lies where the fragment lies
+   in its guest pixel: at 2x texel (5, 3) is (10, 6) for the fragment at (6, 4) and (11, 7) for the one at (7, 5); at
+   1.5x texel 4 is pixel 6 alone, where the fragment's place would give 7; at 0.5x texel (5, 3) is (2, 1). TXQ answers
+   a scaled target's 32x16 image over the scale, and another texture's as it is. A compute program fetches the texel as
+   it is and takes no push constant: the renderer gives it scaled targets at the guest's size */
+static Word scale_fetch(void) {
+    Word x = fix(0xb66); /* TLD.LZ R8-R11, R4, R5, c[2][0x40], 2D */
+    set(&x, 16, 8, 8);
+    set(&x, 24, 8, 4);
+    set(&x, 32, 8, 255);
+    set(&x, 40, 19, 2u << 14 | 0x40 >> 2);
+    set(&x, 61, 3, 1);
+    set(&x, 64, 8, 255);
+    set(&x, 72, 4, 0xf);
+    set(&x, 87, 3, 1);
+    return x;
+}
+static void test_resolution_scale(const char* dir) {
+    static const struct {
+        float scale, fx, fy; /* the fragment's FragCoord */
+        u32 px, py, scaled;  /* the texel fetched, and whether its slot is bound to a scaled target */
+        u32 x, y, w, h;      /* the coordinates fetched and the size answered */
+    } cases[] = {
+        {2.0f, 7.5f, 5.5f, 5, 3, 1, 11, 7, 16, 8}, {2.0f, 6.5f, 4.5f, 5, 3, 1, 10, 6, 16, 8},
+        {2.0f, 7.5f, 5.5f, 5, 3, 0, 5, 3, 32, 16}, {1.5f, 5.5f, 3.5f, 4, 3, 1, 6, 5, 21, 11},
+        {0.5f, 2.5f, 1.5f, 5, 3, 1, 2, 1, 64, 32},
+    };
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    for (u32 k = 0; k < sizeof cases / sizeof *cases; k++) {
+        u8 code[16 * 12] = {0};
+        u32 n = 0;
+        for (u32 i = 0; i < 2; i++) {
+            Word x = fix(0x326); /* IPA R0, a[0x70] and IPA R1, a[0x74] */
+            set(&x, 16, 8, i);
+            set(&x, 32, 8, 255);
+            set(&x, 64, 8, (0x70 + 4 * i) >> 2);
+            set(&x, 81, 3, 7);
+            put(code, n++, x);
+        }
+        put(code, n++, mov_imm(4, cases[k].px));
+        put(code, n++, mov_imm(5, cases[k].py));
+        put(code, n++, scale_fetch());
+        Word x = fix(0xb6f); /* TXQ R2, R3, RZ, c[2][0x40]: the width and the height */
+        set(&x, 16, 8, 2);
+        set(&x, 24, 8, 255);
+        set(&x, 40, 19, 2u << 14 | 0x40 >> 2);
+        set(&x, 64, 8, 255);
+        set(&x, 72, 4, 3);
+        put(code, n++, x);
+        put(code, n, exit_insn());
+        n++;
+        put(code, n, bra(n, n, 7, 0));
+        n++;
+        ShaderInfo si = {0};
+        size_t count = 0;
+        u32* spv = sm86_to_spirv(code, n * 16, ST_FS, fsph, &si, &count);
+        CHECK(spv != NULL);
+        if (!spv) {
+            fprintf(stderr, "resolution scale: %s\n", si.first_unsupported);
+            return;
+        }
+        if (!k) CHECK(keep_module(dir, "fs_resolution_scale", spv, count));
+        CHECK(si.ntex == 1);
+        float s = cases[k].scale;
+        u32 scale[4] = {f2u(1.0f / s), f2u(1.0f / s), f2u(s), 0};
+        SpvEvalEnv env = {0};
+        env.builtin[15][0] = f2u(cases[k].fx); /* FragCoord */
+        env.builtin[15][1] = f2u(cases[k].fy);
+        env.ubo[SNX_VKB_RS] = scale;
+        env.ubo_words[SNX_VKB_RS] = 4;
+        env.push[4] = cases[k].scaled; /* the uvec4 after the fragment stage's vec4: slot 0's bit */
+        env.image_size[SNX_VKB_TEX][0] = 32;
+        env.image_size[SNX_VKB_TEX][1] = 16;
+        const char* why = spv_eval(spv, count, &env);
+        if (why) fprintf(stderr, "resolution scale: the evaluator stops at %s\n", why);
+        CHECK(!why && env.out_written[0]);
+        free(spv);
+        const char* bound = cases[k].scaled ? "bound to" : "that is not";
+        float gx = cases[k].fx / s, gy = cases[k].fy / s;
+        float dx = u2f(env.out[0][0]) - gx, dy = u2f(env.out[0][1]) - gy;
+        int near = dx > -1e-5f && dx < 1e-5f && dy > -1e-5f && dy < 1e-5f;
+        if (!near)
+            fprintf(stderr,
+                    "resolution scale: the fragment at (%g, %g) of a target at %gx reads its position as "
+                    "(%g, %g), not the guest's (%g, %g)\n",
+                    (double)cases[k].fx, (double)cases[k].fy, (double)s, (double)u2f(env.out[0][0]),
+                    (double)u2f(env.out[0][1]), (double)gx, (double)gy);
+        CHECK(near);
+        int fetched = env.fetched[SNX_VKB_TEX][0] == cases[k].x && env.fetched[SNX_VKB_TEX][1] == cases[k].y;
+        if (!fetched)
+            fprintf(stderr,
+                    "resolution scale: at %gx the fragment at (%g, %g) fetches texel (%u, %u) of a texture %s "
+                    "a scaled target at (%u, %u), not (%u, %u)\n",
+                    (double)s, (double)cases[k].fx, (double)cases[k].fy, cases[k].px, cases[k].py, bound,
+                    env.fetched[SNX_VKB_TEX][0], env.fetched[SNX_VKB_TEX][1], cases[k].x, cases[k].y);
+        CHECK(fetched);
+        if (env.out[0][2] != cases[k].w || env.out[0][3] != cases[k].h)
+            fprintf(stderr,
+                    "resolution scale: at %gx the 32x16 image of a texture %s a scaled target has the size "
+                    "%ux%u, not %ux%u\n",
+                    (double)s, bound, env.out[0][2], env.out[0][3], cases[k].w, cases[k].h);
+        CHECK(env.out[0][2] == cases[k].w && env.out[0][3] == cases[k].h);
+    }
+    /* the same fetch in a compute program: the texel as it is, and no push constant block */
+    u8 compute[16 * 5] = {0};
+    put(compute, 0, mov_imm(4, 5));
+    put(compute, 1, mov_imm(5, 3));
+    put(compute, 2, scale_fetch());
+    put(compute, 3, exit_insn());
+    put(compute, 4, bra(4, 4, 7, 0));
+    ShaderInfo si = {0};
+    size_t count = 0;
+    u32* spv = sm86_to_spirv(compute, 5 * 16, ST_CS, NULL, &si, &count);
+    CHECK(spv != NULL);
+    if (!spv) {
+        fprintf(stderr, "resolution scale, compute: %s\n", si.first_unsupported);
+        return;
+    }
+    u32 vars[64], nv = spv_find(spv, count, 59 /* OpVariable */, vars, 64), pushed = 0;
+    for (u32 k = 0; k < nv && k < 64; k++) pushed += spv[vars[k] + 3] == 9; /* PushConstant */
+    CHECK(!pushed);
+    SpvEvalEnv env = {0};
+    const char* why = spv_eval(spv, count, &env);
+    if (why) fprintf(stderr, "resolution scale, compute: the evaluator stops at %s\n", why);
+    CHECK(!why && env.fetched[SNX_VKB_TEX][0] == 5 && env.fetched[SNX_VKB_TEX][1] == 3);
+    free(spv);
+}
+
 /* TXQ R4, R5 of the handle c[2][0x20] before TLD.LZ.MS R0-R3, R4, R5, sample R9 of it, as a game's resolve programs
    do: one multisampled 2D slot (ShTex.flags bit 1) for both, the sample fetched with the Sample operand from R9, and
    the size queried without a level, as a multisampled image has none */
@@ -1971,6 +2108,190 @@ static void test_flow_operand(const char* dir) {
     (void)dir;
 }
 
+/* F2IP dst, a, b, c with the flags of bits 72-79 (0x04 .U8.F32.NTZ, 0x14 .S8, 0x1c .S8.RELU), CuAssembler's sm_86
+   records' encoding (0x243) */
+static Word f2ip(u32 dst, u32 a, u32 b, u32 c, u32 flags) {
+    Word x = alu(0x043, 1, dst, a);
+    set(&x, 32, 8, b);
+    set(&x, 64, 8, c);
+    set(&x, 72, 8, flags);
+    return x;
+}
+/* F2IP packs two floats as bytes, rounded to the nearest even, saturated, NaN 0, with c's low half above them (PTX's
+   cvt.pack: d = c << 16 | a << 8 | b). R0: .U8 of 1.5 (2) and 300 (255) under c 0xabcd1234; R1: .U8 of 2.5 (2, a
+   tie) and -3 (0); R2: .S8 of -200 (-128) and NaN (0); R3: .S8.RELU of -5 (0) and 126.6 (127) */
+static void test_f2ip(const char* dir) {
+    u8 code[16 * 20] = {0};
+    u32 n = 0;
+    static const float in[8] = {1.5f, 300.0f, 2.5f, -3.0f, -200.0f, 0.0f, -5.0f, 126.6f};
+    for (u32 k = 0; k < 8; k++) put(code, n++, mov_imm(4 + k, k == 5 ? 0x7fc00000u : f2u(in[k])));
+    put(code, n++, mov_imm(12, 0xabcd1234u));
+    put(code, n++, f2ip(0, 4, 5, 12, 0x04));
+    put(code, n++, f2ip(1, 6, 7, 255, 0x04));
+    put(code, n++, f2ip(2, 8, 9, 255, 0x14));
+    put(code, n++, f2ip(3, 10, 11, 255, 0x1c));
+    put(code, n++, exit_insn());
+    put(code, n, bra(n, n, 7, 0));
+    n++;
+    Sm86Insn d = dec(f2ip(0, 4, 5, 12, 0x04));
+    CHECK(d.op == SM86_F2IP && d.form == 1);
+    u32 out[4];
+    int ran = run_fs_at(code, n, 0, NULL, 0, out);
+    int ok = ran && out[0] == 0x123402ffu && out[1] == 0x200u && out[2] == 0x8000u && out[3] == 0x7fu;
+    CHECK(ok);
+    if (!ok) fprintf(stderr, "f2ip: %08x %08x %08x %08x\n", out[0], out[1], out[2], out[3]);
+    /* a flag it doesn't know (bit 73) is refused */
+    put(code, 13, f2ip(3, 10, 11, 255, 0x06));
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    ShaderInfo si = {0};
+    size_t count = 0;
+    u32* spv = sm86_to_spirv(code, n * 16, ST_FS, fsph, &si, &count);
+    CHECK(!spv && strstr(si.first_unsupported, "F2IP with flags 0x6"));
+    free(spv);
+    put(code, 13, f2ip(3, 10, 11, 255, 0x1c));
+    si = (ShaderInfo){0};
+    spv = sm86_to_spirv(code, n * 16, ST_FS, fsph, &si, &count);
+    if (spv) CHECK(keep_module(dir, "fs_f2ip", spv, count));
+    free(spv);
+}
+
+/* ULDC of a byte or a halfword (types 0-3, NAK's MemType as LDC's), indexed by a uniform register or not, into UR, then
+   MOV R, UR. Bank 1's words 4 and 5 are 0x80f1e2d3 and 0xc4b5a697. R0: ULDC.U8 c[1][0x11] (0xe2); R1: ULDC.IDX.S8
+   c[1][UR4 + 0x12] with UR4 = 1 (0x80 sign extended); R2: ULDC.IDX.U16 c[1][UR4 - 1 + 0x16] (0xc4b5, the signed
+   offset of 0xffff); R3: ULDC.S16 c[1][0x14] (0xa697 sign extended), as one game's compute program walks a byte code */
+static Word uldc_small(u32 ud, u32 bank, u32 off, u32 type, int indexed, u32 ur) {
+    Word x = fix(indexed ? 0xabb : 0xab9);
+    set(&x, 16, 6, ud);
+    if (indexed) set(&x, 24, 6, ur);
+    cbuf(&x, bank, off);
+    set(&x, 73, 3, type);
+    return x;
+}
+static Word mov_ur(u32 dst, u32 ur) {
+    Word x = alu(0x002, 6, dst, 255);
+    set(&x, 32, 6, ur);
+    set(&x, 91, 1, 1);
+    return x;
+}
+static void test_uldc_small(const char* dir) {
+    u8 code[16 * 14] = {0};
+    u32 n = 0;
+    put(code, n++, ualu(0x082, 4, 0, 1)); /* UMOV UR4, 1 */
+    put(code, n++, uldc_small(5, 1, 0x11, 0, 0, 63));
+    put(code, n++, uldc_small(6, 1, 0x12, 1, 1, 4));
+    put(code, n++, uldc_small(7, 1, 0x16 + 0xffffu, 2, 1, 4));
+    put(code, n++, uldc_small(8, 1, 0x14, 3, 0, 63));
+    for (u32 k = 0; k < 4; k++) put(code, n++, mov_ur(k, 5 + k));
+    put(code, n++, exit_insn());
+    put(code, n, bra(n, n, 7, 0));
+    n++;
+    static const u32 cb1[6] = {0, 0, 0, 0, 0x80f1e2d3u, 0xc4b5a697u};
+    u32 out[4];
+    int ran = run_fs_at(code, n, 0, cb1, 6, out);
+    int ok = ran && out[0] == 0xe2 && out[1] == 0xffffff80u && out[2] == 0xc4b5 && out[3] == 0xffffa697u;
+    CHECK(ok);
+    if (!ok) fprintf(stderr, "uldc small: %08x %08x %08x %08x\n", out[0], out[1], out[2], out[3]);
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    ShaderInfo si = {0};
+    size_t count = 0;
+    u32* spv = sm86_to_spirv(code, n * 16, ST_FS, fsph, &si, &count);
+    if (spv) CHECK(keep_module(dir, "fs_uldc_small", spv, count));
+    free(spv);
+}
+
+/* SHFL with c in a register (0x989 the lane an immediate, 0x389 a register, the register at 64): c's bits 8-12 split
+   the lanes into segments and bits 0-4 clamp the lane, as the immediate's. The evaluator runs one lane, so a shuffle
+   that holds reads its own value: what is checked is the predicate, which says whether the source lane is inside,
+   R0 1.0 where it is. Cases: SHFL.UP by 1 with c 0x1800 (segments of 8) at lane 8, whose lane 7 is the segment
+   before (false), and at lane 9 (true); SHFL.IDX of R6 = 5 with c 0x1f03 (every lane a segment of its own) at lane 2,
+   which reads lane 2 (true); SHFL.UP by 1 with c RZ at lane 0 (false); SHFL.IDX of R6 = 30 with c 4 (lanes 0 to 4)
+   at lane 20 (false); SHFL.DOWN by 2 with c 7 at lane 3, lane 5 (true) */
+static Word shfl_creg(u32 dst, u32 pd, u32 value, int lane_reg, u32 lane, u32 creg, u32 mode) {
+    Word x = fix(lane_reg ? 0x389 : 0x989);
+    set(&x, 16, 8, dst);
+    set(&x, 24, 8, value);
+    if (lane_reg)
+        set(&x, 32, 8, lane);
+    else
+        set(&x, 53, 5, lane);
+    set(&x, 58, 2, mode);
+    set(&x, 64, 8, creg);
+    set(&x, 81, 3, pd);
+    return x;
+}
+static Word sel_reg(u32 dst, u32 a, u32 pred) { /* SEL dst, a, RZ, pred: a where pred holds */
+    Word x = alu(0x007, 1, dst, a);
+    set(&x, 32, 8, 255);
+    set(&x, 87, 3, pred);
+    return x;
+}
+static void test_shfl_creg(const char* dir) {
+    static const struct {
+        u32 lane, lane_reg, lane_value, creg_value, mode, want;
+    } cases[] = {
+        {8, 0, 1, 0x1800, 1, 0}, {9, 0, 1, 0x1800, 1, 1},   {2, 1, 5, 0x1f03, 0, 1},
+        {0, 0, 1, 0, 1, 0},      {20, 1, 30, 0x0004, 0, 0}, /* IDX lane 30 past the clamp 4 of one segment of 32 */
+        {3, 0, 2, 0x0007, 2, 1},                            /* DOWN by 2 from lane 3: 5 <= 7 */
+    };
+    for (u32 i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        u8 code[16 * 12] = {0};
+        u32 n = 0;
+        put(code, n++, mov_imm(4, 0x1234));
+        put(code, n++, mov_imm(5, cases[i].creg_value));
+        put(code, n++, mov_imm(6, cases[i].lane_value));
+        put(code, n++, mov_imm(9, f2u(1.0f)));
+        put(code, n++,
+            shfl_creg(8, 0, 4, (int)cases[i].lane_reg, cases[i].lane_reg ? 6 : cases[i].lane_value,
+                      cases[i].creg_value ? 5 : 255, cases[i].mode));
+        put(code, n++, sel_reg(0, 9, 0));
+        put(code, n++, exit_insn());
+        put(code, n, bra(n, n, 7, 0));
+        n++;
+        u32 out[4];
+        int ran = run_fs_at(code, n, cases[i].lane, NULL, 0, out);
+        u32 want = cases[i].want ? f2u(1.0f) : 0;
+        CHECK(ran && out[0] == want);
+        if (!ran || out[0] != want) fprintf(stderr, "shfl c register, case %u: %08x, %08x expected\n", i, out[0], want);
+        if (i == 0) {
+            u32 fsph[32] = {0};
+            fsph[0] = sph0(2, 5);
+            fsph[18] = 0xf;
+            ShaderInfo si = {0};
+            size_t count = 0;
+            u32* spv = sm86_to_spirv(code, n * 16, ST_FS, fsph, &si, &count);
+            if (spv) CHECK(keep_module(dir, "fs_shfl_creg", spv, count));
+            free(spv);
+        }
+    }
+}
+
+/* S2R R0, SR 0x84 (NAK's NAK_SV_VARIABLE_RATE): a fragment's width in bits 8-15 and height in bits 16-23, 1 and 1 as
+   the runtime shades every pixel, which the game's PRMT R, R, 0x7771, RZ takes the width of. A vertex program's is
+   refused */
+static void test_shading_rate(const char* dir) {
+    u8 code[16 * 4] = {0};
+    Word x = fix(0x919);
+    set(&x, 16, 8, 0);
+    set(&x, 72, 8, 0x84);
+    put(code, 0, x);
+    put(code, 1, exit_insn());
+    put(code, 2, bra(2, 2, 7, 0));
+    u32 out[4];
+    CHECK(run_fs_at(code, 3, 0, NULL, 0, out) && out[0] == 0x10100u);
+    u32 vsph[32] = {0};
+    vsph[0] = sph0(1, 1);
+    ShaderInfo si = {0};
+    size_t count = 0;
+    u32* spv = sm86_to_spirv(code, 3 * 16, ST_VS, vsph, &si, &count);
+    CHECK(!spv && strstr(si.first_unsupported, "0x84 outside a fragment program"));
+    free(spv);
+    (void)dir;
+}
+
 /* LDG.E (no uniform) of type 4 (32 bits) or 5 (64 bits) into dst from [addr + imm], and STG.E of data */
 static Word ldg_nou(u32 dst, u32 addr, u32 imm, u32 type) {
     Word x = fix(0x381);
@@ -1990,31 +2311,50 @@ static Word stg_nou(u32 addr, u32 imm, u32 data) {
     set(&x, 73, 3, 4);
     return x;
 }
+/* IADD3 dst, a, b, RZ with no carries (form 1) */
+static Word iadd3(u32 dst, u32 a, u32 b) {
+    Word x = alu(0x010, 1, dst, a);
+    set(&x, 32, 8, b);
+    set(&x, 64, 8, 255);
+    set(&x, 81, 3, 7);
+    set(&x, 84, 3, 7);
+    set(&x, 87, 4, 7);
+    set(&x, 77, 4, 7);
+    return x;
+}
 /* Pointers from memory, as one game's vertex program that clears indirect draws: R2 is the buffer that c[0][0x110]
    holds (0x1_0000_1000), whose words 0-5 are three pointers. The first, base + 0x40, is inside it: the STG through
    it writes word 0x12 and the LDG reads word 0x10. The second, below the base, and the third, base + 0x1_0000_0040
-   (the same low word of the difference), are in no buffer: the STG is dropped and the LDG reads 0 */
+   (the same low word of the difference), are in no buffer: the STG is dropped and the LDG reads 0. The pointers are
+   read at R14 = R2 + R15 (0), which isn't the base itself: an address the program computes, which global_dynamic
+   compares with its buffers (an LDG.64 at the base itself plus an offset names a buffer of its own:
+   test_global_indirect) */
 static void test_global_pointer(const char* dir) {
-    u8 code[16 * 16] = {0};
+    u8 code[16 * 18] = {0};
     Word m = alu(0x002, 5, 2, 255);
     cbuf(&m, 0, 0x110);
     put(code, 0, m);
     m = alu(0x002, 5, 3, 255);
     cbuf(&m, 0, 0x114);
     put(code, 1, m);
-    put(code, 2, ldg_nou(4, 2, 0, 5));
-    put(code, 3, ldg_nou(8, 2, 8, 5));
-    put(code, 4, ldg_nou(12, 2, 16, 5));
-    put(code, 5, mov_imm(6, 7));
-    put(code, 6, mov_imm(7, 9));
-    put(code, 7, mov_imm(11, 5));
-    put(code, 8, stg_nou(4, 8, 6));
-    put(code, 9, stg_nou(12, 0xc, 7));
-    put(code, 10, ldg_nou(10, 4, 0, 4));
-    put(code, 11, ldg_nou(11, 8, 0, 4));
-    put(code, 12, ast(0x70, 10, 2));
-    put(code, 13, exit_insn());
-    put(code, 14, bra(14, 14, 7, 0));
+    put(code, 2, mov_imm(15, 0));
+    put(code, 3, iadd3(14, 2, 15));
+    m = alu(0x002, 1, 15, 255); /* MOV R15, R3 */
+    set(&m, 32, 8, 3);
+    put(code, 4, m);
+    put(code, 5, ldg_nou(4, 14, 0, 5));
+    put(code, 6, ldg_nou(8, 14, 8, 5));
+    put(code, 7, ldg_nou(12, 14, 16, 5));
+    put(code, 8, mov_imm(6, 7));
+    put(code, 9, mov_imm(7, 9));
+    put(code, 10, mov_imm(11, 5));
+    put(code, 11, stg_nou(4, 8, 6));
+    put(code, 12, stg_nou(12, 0xc, 7));
+    put(code, 13, ldg_nou(10, 4, 0, 4));
+    put(code, 14, ldg_nou(11, 8, 0, 4));
+    put(code, 15, ast(0x70, 10, 2));
+    put(code, 16, exit_insn());
+    put(code, 17, bra(17, 17, 7, 0));
     u32 vsph[32] = {0};
     vsph[0] = sph0(1, 1);
     static u32 bank0[1024], buffer[64];
@@ -2034,7 +2374,7 @@ static void test_global_pointer(const char* dir) {
     for (u32 k = 0; k < 16; k++) smap[k] = ~0u;
     env.ubo[SNX_VKB_SMAP] = smap;
     env.ubo_words[SNX_VKB_SMAP] = 48;
-    int ran = run_stage(ST_VS, code, 15, vsph, &env);
+    int ran = run_stage(ST_VS, code, 18, vsph, &env);
     int ok = ran && buffer[0x12] == 7 && buffer[0x13] == 0 && env.position[0] == 0x1234 && env.position[1] == 0;
     CHECK(ok);
     if (!ok)
@@ -2042,9 +2382,534 @@ static void test_global_pointer(const char* dir) {
                 env.position[1]);
     ShaderInfo si = {0};
     size_t count = 0;
-    u32* spv = sm86_to_spirv(code, 15 * 16, ST_VS, vsph, &si, &count);
+    u32* spv = sm86_to_spirv(code, 18 * 16, ST_VS, vsph, &si, &count);
     CHECK(spv && si.ngbuf == 1 && si.gbuf_cbuf_off[0] == 0x110 && (si.gbuf_wmask & 1));
     if (spv) CHECK(keep_module(dir, "global_pointer", spv, count));
+    free(spv);
+}
+
+/* LDG.E.64 (the uniform form) into dst from [UR + imm], RZ the register */
+static Word ldg_uniform64(u32 dst, u32 ur, u32 imm) {
+    Word x = fix(0x981);
+    set(&x, 16, 8, dst);
+    set(&x, 24, 8, 255);
+    set(&x, 32, 6, ur);
+    set(&x, 40, 24, imm);
+    set(&x, 72, 1, 1);
+    set(&x, 73, 3, 5);
+    set(&x, 81, 3, 7);
+    set(&x, 91, 1, 1);
+    return x;
+}
+/* MOV dst, src under the predicate (negated with negate) */
+static Word mov_if(u32 dst, u32 src, u32 pred, int negate) {
+    Word x = alu(0x002, 1, dst, 255);
+    set(&x, 32, 8, src);
+    set(&x, 12, 3, pred);
+    set(&x, 15, 1, (u64)negate);
+    return x;
+}
+/* Pointers loaded from a table, as one game's material and compute programs do: c[0][0x40] holds the table's address
+   (0x1_0000_0000), whose words 2-3 and 4-5 hold A (0x3_2000_0000) and B (0x5_0000_0000), far from it. An LDG.64 at the
+   table's address itself plus 8 or 16 names a buffer of its own whose address is in memory (SH_GBUF_INDIRECT, the
+   renderer binds the memory mapped from the pointer). R4 = A and R6 = B: R14 = A[0x20] and the stores to B + 4 and
+   B + 8 reach them by their own buffers. P0 picks R8:R9 = P0 ? B : A, then IMAD.WIDE R10 = 3 * 16 + R8:R9 and the
+   LDG of [R10 + 4]: either pointer, so the address is compared with each buffer when it runs (global_dynamic), the
+   two indirect ones among them. Word 13 of A holds 0xabc and of B 0xdef: B's word 1 gets the one P0 picks */
+static void test_global_indirect(const char* dir) {
+    for (u32 pick_b = 0; pick_b < 2; pick_b++) {
+        u8 code[16 * 18] = {0};
+        u32 n = 0;
+        put(code, n++, uldc64(0x40));
+        put(code, n++, ldg_uniform64(4, 4, 8));
+        put(code, n++, ldg_uniform64(6, 4, 16));
+        put(code, n++, mov_imm(12, 3));
+        put(code, n++, setp_const(0, pick_b ? 0 : 1));
+        put(code, n++, mov_if(8, 4, 0, 1));
+        put(code, n++, mov_if(9, 5, 0, 1));
+        put(code, n++, mov_if(8, 6, 0, 0));
+        put(code, n++, mov_if(9, 7, 0, 0));
+        Word w = alu(0x025, 4, 10, 12); /* IMAD.WIDE.U32 R10, R12, 16, R8 */
+        set(&w, 32, 32, 16);
+        set(&w, 64, 8, 8);
+        put(code, n++, w);
+        put(code, n++, ldg_nou(13, 10, 4, 4));
+        put(code, n++, ldg_nou(14, 4, 0x20, 4));
+        Word st = stg_nou(6, 4, 13);
+        put(code, n++, st);
+        st = stg_nou(6, 8, 14);
+        put(code, n++, st);
+        put(code, n++, exit_insn());
+        put(code, n, bra(n, n, 7, 0));
+        n++;
+        ShaderInfo si = {0};
+        size_t count = 0;
+        u32* spv = sm86_to_spirv(code, n * 16, ST_CS, NULL, &si, &count);
+        CHECK(spv != NULL);
+        if (!spv) {
+            fprintf(stderr, "global indirect: %s\n", si.first_unsupported);
+            continue;
+        }
+        u32 want[3] = {0x40, 0x40u | 1u << 31 | 1u << 21, 0x40u | 1u << 31 | 2u << 21};
+        CHECK(si.ngbuf == 3 && si.gbuf_wmask == 4);
+        for (int k = 0; k < 3 && k < si.ngbuf; k++) CHECK(si.gbuf_cbuf_off[k] == want[k]);
+        CHECK(SH_GBUF_INDIRECT(si.gbuf_cbuf_off[2]) && SH_GBUF_CELL(si.gbuf_cbuf_off[2]) == 16 &&
+              SH_GBUF_PARENT(si.gbuf_cbuf_off[2]) == 0x40);
+        static u32 bank0[1024], table[64], a[64], b[64], log[2 * SH_WLOG_PART];
+        memset(table, 0, sizeof table);
+        memset(a, 0, sizeof a);
+        memset(b, 0, sizeof b);
+        bank0[0x40 / 4] = 0, bank0[0x44 / 4] = 1;
+        table[2] = 0x20000000, table[3] = 3;
+        table[4] = 0, table[5] = 5;
+        a[13] = 0xabc, a[8] = 0x777;
+        b[13] = 0xdef;
+        SpvEvalEnv env = {0};
+        env.ubo[SNX_VKB_CB] = bank0;
+        env.ubo_words[SNX_VKB_CB] = 1024;
+        env.ubo[SNX_VKB_SSBO] = table;
+        env.ubo_words[SNX_VKB_SSBO] = 64;
+        env.ubo[SNX_VKB_SSBO + 1] = a;
+        env.ubo_words[SNX_VKB_SSBO + 1] = 64;
+        env.ubo[SNX_VKB_SSBO + 2] = b;
+        env.ubo_words[SNX_VKB_SSBO + 2] = 64;
+        env.ubo[SNX_VKB_WPAGES] = log;
+        env.ubo_words[SNX_VKB_WPAGES] = 2 * SH_WLOG_PART;
+        const char* why = spv_eval(spv, count, &env);
+        int ok = !why && b[1] == (pick_b ? 0xdefu : 0xabcu) && b[2] == 0x777 && a[1] == 0;
+        CHECK(ok);
+        if (!ok)
+            fprintf(stderr, "global indirect (%s): %s, B words %x %x\n", pick_b ? "B" : "A", why ? why : "ran", b[1],
+                    b[2]);
+        CHECK(keep_module(dir, pick_b ? "global_indirect_b" : "global_indirect_a", spv, count));
+        free(spv);
+    }
+}
+
+/* TEX, TLD, TLD4 and TXQ with the handle in a uniform register (0xf60, 0xf66, 0xf63, 0xf6f), as CuAssembler's sm_86
+   records encode "TEX.SCR.LL.DC R34, R8, R2, R6, UR4, 2D", "TLD.SCR.LZ R4, R14, R6, UR4, 2D", "TLD4.SCR.A
+   R16, R2, R48, UR4, 2D" and "TXQ R35, R20, UR12, TEX_HEADER_DIMENSION, 0x2": the register at 40-45. A handle that
+   a program loads from memory (LDG.64, R2UR, UMOV) names no slot: refused with where it comes from */
+/* ---- texture handles from memory (sm86_eval) ---- */
+
+/* the constant buffers and the memory of the handle tests: c[0][0x520] = 0x2_0000_1000 (the table), c[4][0x88] =
+   0xc0000003 and c[5][0x2ec] = 4, so the record (3 + 4) * 32 + 0x18 = 0xf8 holds 0x12300abc; [0x2_0000_1010] holds
+   0x00402345. The loads it was asked for, in order */
+static u64 g_mh_loads[8];
+static u32 g_mh_nloads;
+static u32 mh_cbuf(void* user, u32 bank, u32 off) {
+    (void)user;
+    return bank == 0 && off == 0x520   ? 0x00001000u
+           : bank == 0 && off == 0x524 ? 0x2u
+           : bank == 4 && off == 0x88  ? 0xc0000003u
+           : bank == 5 && off == 0x2ec ? 4u
+           : bank == 1                 ? 0x11111111u * (off / 4 + 1)
+                                       : 0;
+}
+static int mh_mem(void* user, u64 address, u32* words, u32 count) {
+    (void)user;
+    if (g_mh_nloads < 8) g_mh_loads[g_mh_nloads++] = address;
+    for (u32 k = 0; k < count; k++)
+        words[k] = address + 4 * k == 0x2000010f8ull   ? 0x12300abcu
+                   : address + 4 * k == 0x200001010ull ? 0x00402345u
+                                                       : 0xdeadbeefu;
+    return 1;
+}
+/* LDG.E.64 dst, [reg.U32 + UR.64 + imm] (the uniform form, the register 32-bit) */
+static Word ldg_reg_ur64(u32 dst, u32 reg, u32 ur, u32 imm) {
+    Word x = ldg_uniform64(dst, ur, imm);
+    set(&x, 24, 8, reg);
+    return x;
+}
+static Word r2ur(u32 ud, u32 r) {
+    Word x = fix(0x3c2);
+    set(&x, 16, 6, ud);
+    set(&x, 24, 8, r);
+    return x;
+}
+/* MOV dst, c[bank][off] */
+static Word mov_cbuf(u32 dst, u32 bank, u32 off) {
+    Word x = alu(0x002, 5, dst, 255);
+    cbuf(&x, bank, off);
+    return x;
+}
+/* LOP3 dst, a, imm, c with the truth table lut (no predicate out) */
+static Word lop3_imm(u32 dst, u32 a, u32 imm, u32 c, u32 lut) {
+    Word x = alu(0x012, 4, dst, a);
+    set(&x, 32, 32, imm);
+    set(&x, 64, 8, c);
+    set(&x, 72, 8, lut);
+    set(&x, 81, 3, 7);
+    set(&x, 87, 4, 0xf);
+    return x;
+}
+/* LOP3 dst, a, b, c (registers) */
+static Word lop3_reg(u32 dst, u32 a, u32 b, u32 c, u32 lut) {
+    Word x = lop3_imm(dst, a, 0, c, lut);
+    set(&x, 9, 3, 1);
+    set(&x, 32, 32, b);
+    return x;
+}
+/* SHF dst, a, imm, c: dtype (73-74: 0 S64, 1 U64, 2 S32, 3 U32), right (76), wrap (75), high (80) */
+static Word shf_imm(u32 dst, u32 a, u32 shift, u32 c, u32 dtype, int right, int wrap, int high) {
+    Word x = alu(0x019, 4, dst, a);
+    set(&x, 32, 32, shift);
+    set(&x, 64, 8, c);
+    set(&x, 73, 2, dtype);
+    set(&x, 75, 1, (u64)wrap);
+    set(&x, 76, 1, (u64)right);
+    set(&x, 80, 1, (u64)high);
+    return x;
+}
+/* IADD3 dst, a, imm, RZ */
+static Word iadd3_imm(u32 dst, u32 a, u32 imm) {
+    Word x = alu(0x010, 4, dst, a);
+    set(&x, 32, 32, imm);
+    set(&x, 64, 8, 255);
+    set(&x, 81, 3, 7);
+    set(&x, 84, 3, 7);
+    set(&x, 87, 4, 7);
+    set(&x, 77, 4, 7);
+    return x;
+}
+/* USHF.R.U32.HI ud, URZ, imm, uc: uc >> imm, as the game's handle programs take the sampler's index */
+static Word ushf_r(u32 ud, u32 uc, u32 shift) {
+    Word x = ualu(0x099, ud, 63, shift);
+    set(&x, 64, 6, uc);
+    set(&x, 73, 2, 3);
+    set(&x, 76, 1, 1);
+    set(&x, 80, 1, 1);
+    return x;
+}
+/* the handle of a TEX whose handle is in a uniform register pair (TEX_U) and of a TEX.B, loaded from memory as one
+   game's material programs do: the record's address (c[0][0x520] + ((c[4][0x88] & 0xfffff) + c[5][0x2ec]) * 32 +
+   0x18) made of constant buffer words, LDG.E.64 R4, R2UR UR8 = R4, UR9 = UR8 >> 20. The translation keeps those
+   instructions (ShaderInfo.memh), and sm86_eval runs them as the renderer does: it loads the record at 0x2_0000_10f8
+   and gives the texture's word and the sampler's index. The TEX.B takes its handle register R6 from an LDG.64 at
+   [UR4 + 0x10]. A handle whose address depends on the invocation (S2R of the lane), or whose register has another
+   writer on a path (a guarded MOV), is no texture (SH_PROBE_NONE), and the program translates */
+static void test_uniform_handle(const char* dir) {
+    static const struct {
+        u64 hi, lo;
+        u32 op, ur;
+    } forms[] = {{0x00000000099e4f08ull, 0x3000040602227f60ull, SM86_TEX_U, 4},
+                 {0x00000000089e0f04ull, 0x30000406060e7f66ull, SM86_TLD_U, 4},
+                 {0x00000000099e0f10ull, 0x3000043030027f63ull, SM86_TLD4_U, 4},
+                 {0x00000000080002ffull, 0x00000c0014237f6full, SM86_TXQ_U, 12}};
+    for (u32 i = 0; i < sizeof forms / sizeof forms[0]; i++) {
+        Sm86Insn in;
+        CHECK(sm86_decode(forms[i].lo, forms[i].hi, &in) && in.op == forms[i].op &&
+              sm86_field(&in, 40, 6) == forms[i].ur && sm86_field(&in, 91, 1));
+    }
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    for (u32 variant = 0; variant < 4; variant++) {
+        u8 code[16 * 20] = {0};
+        u32 n = 0;
+        put(code, n++, uldc64(0x520));
+        put(code, n++, mov_cbuf(2, 4, 0x88));
+        put(code, n++, lop3_imm(2, 2, 0xfffff, 255, 0xc0)); /* a & b */
+        put(code, n++, mov_cbuf(3, 5, 0x2ec));
+        put(code, n++, iadd3(2, 2, 3));
+        if (variant == 2) { /* the lane: the address differs from invocation to invocation */
+            Word x = fix(0x919);
+            set(&x, 16, 8, 3);
+            set(&x, 72, 8, 0);
+            put(code, n++, x);
+            put(code, n++, iadd3(2, 2, 3));
+        }
+        if (variant == 3) put(code, n++, mov_if(2, 3, 0, 0)); /* @P0 MOV R2, R3: two writers reach the LDG */
+        put(code, n++, shf_imm(2, 2, 5, 255, 3, 0, 0, 0)); /* SHF.L.U32 R2, R2, 5, RZ */
+        put(code, n++, iadd3_imm(2, 2, 0x18));
+        put(code, n++, ldg_reg_ur64(4, 2, 4, 0));
+        u32 first = n;
+        put(code, n++, r2ur(8, 4));
+        put(code, n++, ushf_r(9, 8, 20));
+        Word t = {{forms[0].lo, forms[0].hi}};
+        set(&t, 40, 6, 8);
+        put(code, n++, t);
+        if (variant == 1) { /* a TEX.B, its handle R6 from [UR4 + 0x10] */
+            put(code, n++, ldg_uniform64(6, 4, 0x10));
+            Word b = fix(0x361);
+            set(&b, 16, 8, 0);
+            set(&b, 24, 8, 8);
+            set(&b, 32, 8, 6);
+            set(&b, 61, 3, 1);
+            set(&b, 64, 8, 255);
+            set(&b, 72, 4, 0xf);
+            set(&b, 81, 3, 7);
+            put(code, n++, b);
+        }
+        put(code, n++, exit_insn());
+        put(code, n, bra(n, n, 7, 0));
+        n++;
+        ShaderInfo si = {0};
+        size_t count = 0;
+        u32* spv = sm86_to_spirv(code, n * 16, ST_FS, fsph, &si, &count);
+        if (variant >= 2) { /* no texture (SH_PROBE_NONE), the draw going on, and nothing kept to run */
+            const char* want = variant == 2 ? "made with S2R" : "has no one writer";
+            int ok = spv && si.ntex == 1 && (si.tex[0].flags & SNX_TEX_MEMORY) && si.tex[0].cbuf_off == SH_PROBE_NONE &&
+                     si.tex[0].bl2_off == SH_PROBE_NONE && si.memh_none == 1 && strstr(si.memh_why, want) &&
+                     si.nmemh == 0;
+            CHECK(ok);
+            if (!ok)
+                fprintf(stderr, "memory handle, variant %u: %s, %s\n", variant, si.first_unsupported, si.memh_why);
+            if (spv) CHECK(keep_module(dir, "fs_memory_handle_none", spv, count));
+            free(spv);
+            continue;
+        }
+        CHECK(spv != NULL);
+        if (!spv) {
+            fprintf(stderr, "memory handle: %s\n", si.first_unsupported);
+            continue;
+        }
+        CHECK(keep_module(dir, variant ? "fs_memory_handle_b" : "fs_memory_handle", spv, count));
+        free(spv);
+        /* the slot names UR8 and UR9 as the R2UR and the USHF leave them, and memh is the instructions up to them */
+        u32 want_slots = variant ? 2 : 1;
+        CHECK(si.ntex == (int)want_slots && (si.tex[0].flags & SNX_TEX_MEMORY) && si.tex[0].bl2 &&
+              si.tex[0].shadow && si.nmemh == first + 2 + variant);
+        if (si.ntex < 1) continue;
+        CHECK(SH_PROBE_UNIFORM(si.tex[0].cbuf_off) && SH_PROBE_REG(si.tex[0].cbuf_off) == 8 &&
+              SH_PROBE_INSN(si.tex[0].cbuf_off) == first && SH_PROBE_REG(si.tex[0].bl2_off) == 9 &&
+              SH_PROBE_INSN(si.tex[0].bl2_off) == first + 1);
+        u32 probes[3] = {si.tex[0].cbuf_off, si.tex[0].bl2_off, variant ? si.tex[1].cbuf_off : si.tex[0].cbuf_off};
+        u32 values[3] = {0, 0, 0};
+        Sm86EvalIo io = {NULL, mh_cbuf, mh_mem};
+        g_mh_nloads = 0;
+        int ran = sm86_eval((const u64(*)[2])si.memh, si.nmemh, &io, probes, 3, values);
+        int ok = ran && values[0] == 0x12300abcu && values[1] == 0x123u && g_mh_loads[0] == 0x2000010f8ull &&
+                 (!variant || (values[2] == 0x00402345u && !SH_PROBE_UNIFORM(si.tex[1].cbuf_off) &&
+                               SH_PROBE_REG(si.tex[1].cbuf_off) == 6 && !si.tex[1].bl2));
+        CHECK(ok);
+        if (!ok)
+            fprintf(stderr, "memory handle %u: ran %d, %08x %08x %08x, load %llx\n", variant, ran, values[0], values[1],
+                    values[2], (unsigned long long)g_mh_loads[0]);
+    }
+}
+/* An address's base through a ULDC of one word to the register before it: UR4 = c[0][0x530] (64 bits), UR7 = UR4 +
+   0x30, then a ULDC UR6 of one word of bank 3, UMOV UR4 = UR7, and the LDG at [UR4 + 0x5c]. UR7 keeps its key: the
+   word's ULDC took the key of UR7 as a 64-bit one's high word, and one game's material program was refused for "a
+   global address whose base no constant buffer holds (from UMOV)" */
+static void test_uldc_word_key(const char* dir) {
+    u8 code[16 * 8] = {0};
+    u32 n = 0;
+    put(code, n++, uldc64(0x530));
+    put(code, n++, ualu(0x090, 7, 4, 0x30)); /* UIADD3 UR7, UR4, 0x30, URZ */
+    put(code, n++, uldc_small(6, 3, 0x958, 4, 0, 63));
+    Word x = ualu(0x082, 4, 0, 0); /* UMOV UR4, UR7 (form 6) */
+    set(&x, 9, 3, 6);
+    set(&x, 32, 6, 7);
+    set(&x, 64, 6, 63);
+    put(code, n++, x);
+    put(code, n++, ldg_uniform64(2, 4, 0x5c));
+    put(code, n++, exit_insn());
+    put(code, n, bra(n, n, 7, 0));
+    n++;
+    ShaderInfo si = {0};
+    size_t count = 0;
+    u32* spv = sm86_to_spirv(code, n * 16, ST_CS, NULL, &si, &count);
+    CHECK(spv != NULL && si.ngbuf == 1 && si.gbuf_cbuf_off[0] == 0x530);
+    if (!spv) fprintf(stderr, "uldc word key: %s\n", si.first_unsupported);
+    if (spv) CHECK(keep_module(dir, "uldc_word_key", spv, count));
+    free(spv);
+}
+/* bank 1 of mh_cross: the four words user points to */
+static u32 mh_cbuf1(void* user, u32 bank, u32 off) { return bank == 1 && off < 16 ? ((const u32*)user)[off / 4] : 0; }
+/* MOV R4-R7 from bank 1 (its words 0-3), the instructions, then R0-R3 out: the translation run on the CPU
+   (support/spv_eval.c) and sm86_eval take the same values, so that what the renderer computes for a handle is what
+   the program computes */
+static void mh_cross(const char* name, const Word* insns, u32 count, const u32* cb1) {
+    u8 code[16 * 32] = {0};
+    u64 words[32][2];
+    u32 n = 0;
+    for (u32 k = 0; k < 4; k++) put(code, n++, mov_cbuf(4 + k, 1, 4 * k));
+    for (u32 k = 0; k < count; k++) put(code, n++, insns[k]);
+    for (u32 k = 0; k < n; k++) words[k][0] = snx_ld_le64(code + 16 * k), words[k][1] = snx_ld_le64(code + 16 * k + 8);
+    u32 last = n - 1, gpu[4] = {0}, cpu[4] = {0}, probes[4];
+    put(code, n++, exit_insn());
+    put(code, n, bra(n, n, 7, 0));
+    n++;
+    for (u32 k = 0; k < 4; k++) probes[k] = SH_PROBE(last, 0, k);
+    int ran = run_fs_at(code, n, 0, cb1, 4, gpu);
+    Sm86EvalIo io = {(void*)cb1, mh_cbuf1, mh_mem};
+    int evaluated = sm86_eval((const u64(*)[2])words, last + 1, &io, probes, 4, cpu);
+    int same = ran && evaluated && !memcmp(gpu, cpu, sizeof gpu);
+    CHECK(same);
+    if (!same)
+        fprintf(stderr, "%s: ran %d %d, the program %08x %08x %08x %08x, sm86_eval %08x %08x %08x %08x\n", name, ran,
+                evaluated, gpu[0], gpu[1], gpu[2], gpu[3], cpu[0], cpu[1], cpu[2], cpu[3]);
+}
+/* IADD3 dst, a, b, c (registers) with its carries out p and q, .X with carries in p_in (87-90) and q_in (77-80) */
+static Word iadd3_x(u32 dst, u32 a, u32 b, u32 c, u32 p, u32 q, int x, u32 p_in, u32 q_in) {
+    Word w = alu(0x010, 1, dst, a);
+    set(&w, 32, 8, b);
+    set(&w, 64, 8, c);
+    set(&w, 74, 1, (u64)x);
+    set(&w, 81, 3, p);
+    set(&w, 84, 3, q);
+    set(&w, 87, 4, p_in);
+    set(&w, 77, 4, q_in);
+    return w;
+}
+/* LEA dst, a, b, c (registers): (a << shift, or with high the high word of c:a << shift) + b */
+static Word lea(u32 dst, u32 a, u32 b, u32 c, u32 shift, int high) {
+    Word w = alu(0x011, 1, dst, a);
+    set(&w, 32, 8, b);
+    set(&w, 64, 8, c);
+    set(&w, 75, 5, shift);
+    set(&w, 80, 1, (u64)high);
+    set(&w, 81, 3, 7);
+    set(&w, 87, 4, 7);
+    return w;
+}
+/* ISETP p, q, a, b (registers) by cmp (76-78), signed (73), .EX (72) with low (68-71), and acc (87-90) by set_op */
+static Word isetp(u32 p, u32 q, u32 a, u32 b, u32 cmp, int is_signed, int ex, u32 low, u32 set_op, u32 acc) {
+    Word w = alu(0x00c, 1, 0, a);
+    set(&w, 32, 8, b);
+    set(&w, 64, 8, 255);
+    set(&w, 68, 4, low);
+    set(&w, 72, 1, (u64)ex);
+    set(&w, 73, 1, (u64)is_signed);
+    set(&w, 74, 2, set_op);
+    set(&w, 76, 3, cmp);
+    set(&w, 81, 3, p);
+    set(&w, 84, 3, q);
+    set(&w, 87, 4, acc);
+    return w;
+}
+/* SEL dst, a, b (registers) by the predicate (87-90) */
+static Word sel(u32 dst, u32 a, u32 b, u32 pred) {
+    Word w = alu(0x007, 1, dst, a);
+    set(&w, 32, 8, b);
+    set(&w, 87, 4, pred);
+    return w;
+}
+/* sm86_eval against the translation, for the instructions it runs: a 64-bit sum by IADD3's carries, LEA and its high
+   word, SHF's types, sizes and wraps, IMAD and IMAD.WIDE (signed), PRMT's sign spread, ISETP (signed, unsigned,
+   .EX of a 64-bit compare, its accumulator), SEL, IMNMX, PLOP3 and LOP3 */
+static void test_memory_eval(void) {
+    static const u32 cb1[4] = {0xfffffff0u, 0x20u, 0x80000005u, 0x7fffffffu};
+    /* R5:R4 + R7:R6 by IADD3 then IADD3.X with the carry; LEA R4 << 3 + R5; LEA.HI of R6:R4 << 4 plus R5 */
+    Word add[] = {iadd3_x(0, 4, 6, 255, 0, 7, 0, 7, 7), iadd3_x(1, 5, 7, 255, 7, 7, 1, 0, 0xf), lea(2, 4, 5, 255, 3, 0),
+                  lea(3, 4, 5, 6, 4, 1)};
+    mh_cross("sm86_eval: IADD3 and LEA", add, 4, cb1);
+    /* SHF.R.U64 R5:R4 >> 7, SHF.R.S32.HI of R6:R4 >> 3, SHF.L.U32 R4 << 33 (clamped to 32), SHF.L.W R4 << 33 */
+    Word shf[] = {shf_imm(0, 4, 7, 5, 1, 1, 0, 0), shf_imm(1, 4, 3, 6, 2, 1, 0, 1), shf_imm(2, 4, 33, 255, 3, 0, 0, 0),
+                  shf_imm(3, 4, 33, 255, 3, 0, 1, 0)};
+    mh_cross("sm86_eval: SHF", shf, 4, cb1);
+    /* IMAD.WIDE R0:R1 = R4 * R6 (signed) + R7:R5, PRMT R2 = R4 bytes by 0x9c40, IMAD R3 = R4 * R5 + R6 */
+    Word wide = alu(0x025, 1, 0, 4);
+    set(&wide, 32, 8, 6);
+    set(&wide, 64, 8, 5);
+    set(&wide, 73, 1, 1);
+    Word prmt = alu(0x016, 4, 2, 4);
+    set(&prmt, 32, 32, 0x9c40);
+    set(&prmt, 64, 8, 6);
+    Word imad = alu(0x024, 1, 3, 4);
+    set(&imad, 32, 8, 5);
+    set(&imad, 64, 8, 6);
+    Word mul[] = {wide, prmt, imad};
+    mh_cross("sm86_eval: IMAD and PRMT", mul, 3, cb1);
+    /* P0 = R4 < R5 (unsigned), P1 = R4 > R6 (signed) and P0; R0 = P0 ? R4 : R5, R1 = signed min of R4 and R6, P2 =
+       P0 ^ P1 (PLOP3), R2 = P2 ? R5 : R6, R3 = R4 ^ R5 ^ R6 */
+    Word mnmx = alu(0x017, 1, 1, 4);
+    set(&mnmx, 32, 8, 6);
+    set(&mnmx, 73, 1, 1);
+    set(&mnmx, 87, 4, 7);
+    Word plop = fix(0x81c);
+    set(&plop, 87, 4, 0);
+    set(&plop, 77, 4, 1);
+    set(&plop, 68, 4, 7);
+    set(&plop, 64, 3, 0x3c & 7); /* lut 0x3c: x ^ y */
+    set(&plop, 72, 5, 0x3c >> 3);
+    set(&plop, 16, 8, 0);
+    set(&plop, 81, 3, 2);
+    set(&plop, 84, 3, 7);
+    Word cmp[] = {isetp(0, 7, 4, 5, 1, 0, 0, 7, 0, 7), isetp(1, 7, 4, 6, 4, 1, 0, 7, 0, 0), sel(0, 4, 5, 0), mnmx, plop,
+                  sel(2, 5, 6, 2), lop3_reg(3, 4, 5, 6, 0x96)};
+    mh_cross("sm86_eval: ISETP, SEL, IMNMX, PLOP3, LOP3", cmp, 7, cb1);
+    /* R5:R4 < R7:R6 unsigned, by the low words' ISETP then the high words' .EX: R0 = P0 ? R5 : R6 */
+    Word ex[] = {isetp(0, 7, 4, 6, 1, 0, 0, 7, 0, 7), isetp(0, 7, 5, 7, 1, 0, 1, 0, 0, 7), sel(0, 5, 6, 0)};
+    mh_cross("sm86_eval: ISETP.EX", ex, 3, cb1);
+}
+/* a global access of the uniform form at [UR + imm] (RZ the register, UR a pair: bit 72): RED (0x98e), ATOMG (0x9a8)
+   or STG (0x986) of the register data, of type (bits 73-75) and operation (87-90) */
+static Word global_uniform(u32 opcode, u32 dst, u32 ur, u32 imm, u32 data, u32 type, u32 how) {
+    Word x = fix(opcode);
+    set(&x, 16, 8, dst);
+    set(&x, 24, 8, 255);
+    set(&x, 32, 8, data);
+    set(&x, 40, 24, imm);
+    set(&x, 64, 6, ur);
+    set(&x, 72, 1, 1);
+    set(&x, 73, 3, type);
+    set(&x, 87, opcode == 0x98e ? 3 : 4, how);
+    set(&x, 91, 1, 1);
+    return x;
+}
+/* RED.E.ADD.F32.FTZ.RN [UR4 + 4], R2 and ATOMG.E.ADD.F32.FTZ.RN R5, [UR4 + 8], R3, then STG [UR4 + 0xc], R5 (NAK's
+   AtomType F32 is 3), as one game's compute programs sum positions: words 1 and 2 of the buffer go from 0.5 and 1.0
+   to 2.0 and 3.25, and word 3 gets 1.0, the word ATOMG found. With the device's float atomics an OpAtomicFAddEXT,
+   else a loop of compare and exchange (one lane alone here: the GPU test races many) */
+static void test_atomic_fadd(const char* dir) {
+    for (int native = 0; native < 2; native++) {
+        u8 code[16 * 8] = {0};
+        u32 n = 0;
+        put(code, n++, uldc64(0x20));
+        put(code, n++, mov_imm(2, f2u(1.5f)));
+        put(code, n++, mov_imm(3, f2u(2.25f)));
+        put(code, n++, global_uniform(0x98e, 0, 4, 4, 2, 3, 0));
+        put(code, n++, global_uniform(0x9a8, 5, 4, 8, 3, 3, 0));
+        put(code, n++, global_uniform(0x986, 0, 4, 0xc, 5, 4, 0));
+        put(code, n++, exit_insn());
+        put(code, n, bra(n, n, 7, 0));
+        n++;
+        g_shader_float_atomic_add = native;
+        ShaderInfo si = {0};
+        size_t count = 0;
+        u32* spv = sm86_to_spirv(code, n * 16, ST_CS, NULL, &si, &count);
+        g_shader_float_atomic_add = 0;
+        CHECK(spv != NULL);
+        if (!spv) {
+            fprintf(stderr, "atomic fadd: %s\n", si.first_unsupported);
+            continue;
+        }
+        u32 at[4];
+        CHECK(spv_find(spv, count, 6035 /* OpAtomicFAddEXT */, at, 4) == (native ? 2u : 0u));
+        CHECK(spv_find(spv, count, 230 /* OpAtomicCompareExchange */, at, 4) == (native ? 0u : 2u));
+        CHECK(si.ngbuf == 1 && si.gbuf_cbuf_off[0] == 0x20 && si.gbuf_wmask == 1 && si.gbuf_rmask == 1);
+        static u32 bank0[1024], buffer[16], log[SH_WLOG_PART];
+        memset(buffer, 0, sizeof buffer);
+        bank0[0x20 / 4] = 0x1000, bank0[0x24 / 4] = 2;
+        buffer[1] = f2u(0.5f), buffer[2] = f2u(1.0f);
+        SpvEvalEnv env = {0};
+        env.ubo[SNX_VKB_CB] = bank0;
+        env.ubo_words[SNX_VKB_CB] = 1024;
+        env.ubo[SNX_VKB_SSBO] = buffer;
+        env.ubo_words[SNX_VKB_SSBO] = 16;
+        env.ubo[SNX_VKB_WPAGES] = log;
+        env.ubo_words[SNX_VKB_WPAGES] = SH_WLOG_PART;
+        const char* why = spv_eval(spv, count, &env);
+        int ok = !why && buffer[1] == f2u(2.0f) && buffer[2] == f2u(3.25f) && buffer[3] == f2u(1.0f);
+        CHECK(ok);
+        if (!ok)
+            fprintf(stderr, "atomic fadd (%s): %s, words %08x %08x %08x\n", native ? "native" : "loop",
+                    why ? why : "ran", buffer[1], buffer[2], buffer[3]);
+        CHECK(keep_module(dir, native ? "cs_fadd_native" : "cs_fadd_loop", spv, count));
+        free(spv);
+    }
+    /* another operation of an F32 atomic is refused by name */
+    u8 code[16 * 4] = {0};
+    put(code, 0, uldc64(0x20));
+    put(code, 1, global_uniform(0x98e, 0, 4, 4, 2, 3, 1));
+    put(code, 2, exit_insn());
+    put(code, 3, bra(3, 3, 7, 0));
+    ShaderInfo si = {0};
+    size_t count = 0;
+    u32* spv = sm86_to_spirv(code, 4 * 16, ST_CS, NULL, &si, &count);
+    CHECK(!spv && strstr(si.first_unsupported, "RED of type 3, operation 1"));
     free(spv);
 }
 
@@ -2151,9 +3016,11 @@ static void test_mesh(const char* dir) {
         static u32 position[40 * 4], generic1[40 * 4], generic0[2 * 4], indices[2 * 3];
         memset(position, 0xee, sizeof position);
         SpvEvalEnv env = {0};
+        static u32 first_ubo[4]; /* SNX_VKB_RS, which only an indirect draw's flag reads (test_task) */
         env.builtin[26][0] = 2; /* WorkgroupId.x, after the draw's first group 5 */
         env.push[0] = 5;
         env.push[1] = fix_depth ? f2u(1.0f) : 0;
+        env.ubo[SNX_VKB_RS] = first_ubo, env.ubo_words[SNX_VKB_RS] = 4;
         env.arrays[32] = position, env.array_words[32] = 40 * 4;
         env.arrays[1] = generic1, env.array_words[1] = 40 * 4;
         env.arrays[0] = generic0, env.array_words[0] = 2 * 4;
@@ -2194,7 +3061,10 @@ static void test_task(const char* dir) {
     n++;
     u32 sph[32] = {0};
     sph[0] = sph0(1, 1);
-    for (u32 first = 0; first < 6; first += 5) {
+    /* the draw's first group 0 and 5 in the push constant's x, then 5 as an indirect draw's: from the uniform buffer at
+       SNX_VKB_RS, where the push constant's z says so (its x is then not read) */
+    for (u32 variant = 0; variant < 3; variant++) {
+        u32 first = variant ? 5 : 0;
         ShaderInfo si = {0};
         si.mesh.threads = 1;
         si.mesh.payload = 0x20;
@@ -2207,8 +3077,11 @@ static void test_task(const char* dir) {
         }
         if (!first) CHECK(keep_module(dir, "ts", spv, count));
         SpvEvalEnv env = {0};
+        u32 first_ubo[4] = {variant == 2 ? first : 0x777, 0, 0, 0};
         env.builtin[26][0] = 2;
-        env.push[0] = first;
+        env.push[0] = variant == 2 ? 99 : first;
+        env.push[2] = variant == 2 ? SH_PUSH_GPU_MESH_FIRST : 0;
+        env.ubo[SNX_VKB_RS] = first_ubo, env.ubo_words[SNX_VKB_RS] = 4;
         env.payload[1] = 77;
         const char* why = spv_eval(spv, count, &env);
         free(spv);
@@ -2710,11 +3583,21 @@ int main(int argc, char** argv) {
     test_brxu(dir);
     test_ipa_uniform(dir);
     test_tld_multisample(dir);
+    test_resolution_scale(dir);
     test_tex_f16(dir);
     test_output_defaults(dir);
     test_fragment_depth(dir);
     test_flow_operand(dir);
     test_global_pointer(dir);
+    test_global_indirect(dir);
+    test_f2ip(dir);
+    test_uldc_small(dir);
+    test_shfl_creg(dir);
+    test_shading_rate(dir);
+    test_atomic_fadd(dir);
+    test_uniform_handle(dir);
+    test_memory_eval();
+    test_uldc_word_key(dir);
     test_mesh(dir);
     test_task(dir);
     test_mesh_after_task(dir);

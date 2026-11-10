@@ -535,6 +535,11 @@ typedef struct App {
        them; and the one a run plays (--program, the run's --game= on a phone), 0 for the game's own */
     int programs[SNX_PROGRAMS_MAX], programs_count, play_program;
     bool* cheats_on;     /* each of cheats': run, not in cheats_off= */
+    /* a drag of several files: SDL gives a drop each, between its DROP_BEGIN and DROP_COMPLETE (dropping). Once one
+       of them went to the queue, whose tab shows then (drop_queued), the others open with drop_item, the load it was
+       dropped on */
+    bool dropping, drop_queued;
+    int drop_item;
     Uint32 addon_picked; /* the event the system's picker answers Add Mod's folder or Add Cheats' file with */
     int addon_adding;    /* the row it was opened for, ROW_ADD_MOD or ROW_ADD_CHEATS; 0 while none waits */
     char* adding_game;   /* and the game whose box it was, which the answer goes to only while that box shows */
@@ -11454,29 +11459,28 @@ static int form_room(const App* app, int width) {
 }
 /* a numeric setting's value right-aligned in four slots (0.25, 16.0), the group's numbers in a column */
 #define GUI_NUMBER_VALUE 4
+/* after the value of a setting's row that is not at its default: where Del has something to put back */
+#define GUI_CHANGED_MARK "*"
 /* a row of a form as its box shows it, its marker first: its label, the value past the widest label (labels
    columns), in room columns; a value typed is typed in its dialog (render_typed) */
 static void form_line(App* app, const GuiEditor* e, int r, int labels, int room, char* line, size_t size) {
     char label[256], value[400];
     const GuiThemeKey* k = gui_editor_key_of(e, r);
     const char* path;
-    int pad, srow = -1;
+    int pad, row = -1;
     gui_editor_label(e, r, label, sizeof label);
-    if (k && k->numeric && !k->whole && e->object == (char*)app->settings.values)
-        srow = e->keys == app->view_keys   ? app->view_rows[k - app->view_keys]
-               : e->keys == app->peek_keys ? app->peek_rows[k - app->peek_keys]
-                                           : (int)(k - app->settings.keys);
-    if (srow >= 0) { /* its value right in four slots */
-        const GuiSetting* s = &app->settings.values[srow];
+    if (k && e->object == (char*)app->settings.values)
+        row = e->keys == app->view_keys   ? app->view_rows[k - app->view_keys]
+              : e->keys == app->peek_keys ? app->peek_rows[k - app->peek_keys]
+                                          : (int)(k - app->settings.keys);
+    if (row >= 0 && k->numeric && !k->whole) { /* its value right in four slots */
+        const GuiSetting* s = &app->settings.values[row];
         const char* picked = gui_settings_value(&app->settings, s->key);
         const char* number = picked ? picked : s->fallback ? s->fallback : "";
         int cols = gui_text_cols(number);
         snprintf(value, sizeof value, "%*s%.*s%s%s", SDL_max(GUI_NUMBER_VALUE - cols, 0), "",
                  SDL_min(cols, GUI_NUMBER_VALUE), number, picked ? "" : " ", picked ? "" : snx_tr("[default]"));
-    } else if (k && e->object == (char*)app->settings.values) { /* a setting: a pick, else its default and [default] */
-        int row = e->keys == app->view_keys   ? app->view_rows[k - app->view_keys]
-                  : e->keys == app->peek_keys ? app->peek_rows[k - app->peek_keys]
-                                              : (int)(k - app->settings.keys);
+    } else if (row >= 0) { /* a setting: a pick, else its default and [default] */
         gui_settings_shown(&app->settings, row, value, sizeof value);
         if (player_key(app->settings.values[row].key, "device") && !app->settings.values[row].text[0])
             snprintf(value, sizeof value, "%s", snx_tr("Any [default]")); /* the next to connect */
@@ -11485,6 +11489,8 @@ static void form_line(App* app, const GuiEditor* e, int r, int labels, int room,
                      app->settings.values[row].text[0] ? snx_tr("Custom >") : snx_tr("As All >"));
     } else
         gui_editor_value(e, r, value, sizeof value);
+    if (row >= 0 && !gui_settings_at_start(&app->settings, row)) /* a page's and an All's: for any of their rows */
+        snprintf(value + strlen(value), sizeof value - strlen(value), "%s" GUI_CHANGED_MARK, value[0] ? " " : "");
     if (k && e->keys == app->folder_keys && (path = folder_row_path(app, r)) != NULL) {
         /* its folder, then what it is at the row's end; with no room for both the folder stays whole and what it is
            goes, and one too long alone is cut in its middle (whole under the boxes) */
@@ -15975,7 +15981,10 @@ static bool drop_elsewhere(App* app, const char* path) {
     return true;
 }
 static void drop(App* app, const char* value, bool text_drop) {
-    if ((app->menu.view != GUI_LOAD_DROP && app->menu.view != GUI_LOAD_KEYS) || app->menu.running || app->finished)
+    /* a drag's next file, its first in the queue: the Compile tab took the load's place (queue_show) */
+    bool next = app->drop_queued && app->menu.view == GUI_LOAD_RECOMPILE;
+    if ((app->menu.view != GUI_LOAD_DROP && app->menu.view != GUI_LOAD_KEYS && !next) || app->menu.running ||
+        app->finished)
         return;
     char* path = gui_drop_path(value, text_drop);
     if (!path) {
@@ -15991,11 +16000,13 @@ static void drop(App* app, const char* value, bool text_drop) {
         free(absolute);
     } else {
         /* Hovering another main item must not change the driver for this drop. */
-        app->menu.selected = app->menu.active;
+        app->menu.selected = next ? app->drop_item : app->menu.active;
+        app->drop_item = app->menu.selected;
         if (!drop_elsewhere(app, absolute))
             launch(app, absolute, false);
         else
             free(absolute);
+        if (app->dropping && app->menu.view == GUI_LOAD_RECOMPILE) app->drop_queued = true;
     }
 }
 static void picked(App* app, const char* uri);
@@ -17748,6 +17759,12 @@ static void event_take(App* app, const SDL_Event* e) {
         return;
     }
     if (app->closing_ms) return; /* closing: nothing else is taken */
+    /* a drag's first and last event, whatever shows: no screen takes them */
+    if (e->type == SDL_EVENT_DROP_BEGIN || e->type == SDL_EVENT_DROP_COMPLETE) {
+        app->dropping = e->type == SDL_EVENT_DROP_BEGIN;
+        app->drop_queued = false;
+        return;
+    }
     /* the setup, while it shows, takes the keys and the typing; the pointer goes to it through pointer() */
     if (app->setup_on && !app->splash && setup_event(app, e)) return;
     /* what Clean Old Settings did, and the box of an older version's files: Up/Down and the wheel go over their files,
@@ -18244,6 +18261,8 @@ static bool initialize(App* app, const char* self) {
     SDL_SetRenderVSync(app->renderer, 1);
     SDL_SetEventEnabled(SDL_EVENT_DROP_FILE, true);
     SDL_SetEventEnabled(SDL_EVENT_DROP_TEXT, true);
+    SDL_SetEventEnabled(SDL_EVENT_DROP_BEGIN, true); /* a drag of several files, from its first to its last */
+    SDL_SetEventEnabled(SDL_EVENT_DROP_COMPLETE, true);
     if (!create_font(app)) {
         char why[256];
         SDL_strlcpy(why, SDL_GetError(), sizeof why); /* SDL_SetError writes over the text it formats */

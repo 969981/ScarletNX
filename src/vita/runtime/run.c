@@ -12,6 +12,7 @@
 #include "vita/runtime/lockstep.h"
 #include "vita/runtime/watch.h"
 #include "vita/hle/hle.h"
+#include "vita/gpu/render.h"
 #include "common/utilities/common.h"
 #include "snx_settings.h"
 #include <inttypes.h>
@@ -29,6 +30,8 @@
 
 /* blocks between the scheduler's looks: a few milliseconds of a game's code */
 #define SLICE_BLOCKS 20000u
+/* the backward edges the blocks a slice chains through may take, which ends it when they run out */
+#define SLICE_EDGES  2048
 #define VBLANK_NS    16683333u /* 59.94 Hz */
 #define CACHE_SLOTS  65536u
 
@@ -257,9 +260,15 @@ static bool wait_try(VitaProcess* p, VitaThread* t, uint64_t now) {
     }
     return false;
 }
-/* the thread to run next, or NULL when none can now: *wake is then when one may (UINT64_MAX: never by time) */
+/* how long a ready thread waits behind the others before it goes first */
+#define STARVE_NS 24000000u
+/* the thread to run next, or NULL when none can now. *wake is then when one may (UINT64_MAX for never by time). The
+   highest priority goes first (a smaller number, and a relative one such as 0x10000100 counts as the default's 160).
+   Among equals the thread that paces the frames goes first, whose work ends them, and then the one that waited
+   longest, as the others run on cores of their own on the console. A thread ready for STARVE_NS goes before all */
 static VitaThread* schedule(VitaProcess* p, uint64_t now, uint64_t* wake) {
-    VitaThread* best = NULL;
+    VitaThread *top = NULL, *starved = NULL;
+    uint32_t top_rank = 0;
     *wake = UINT64_MAX;
     for (unsigned i = 0; i < VITA_THREADS; ++i) {
         VitaThread* t = &p->threads[i];
@@ -271,10 +280,32 @@ static VitaThread* schedule(VitaProcess* p, uint64_t now, uint64_t* wake) {
             t->state = VITA_THREAD_READY;
         }
         if (t->state == VITA_THREAD_WAITING && t->wait.deadline && t->wait.deadline < *wake) *wake = t->wait.deadline;
-        if (t->state == VITA_THREAD_READY && (!best || t->seq < best->seq)) best = t;
+        if (t->state != VITA_THREAD_READY) {
+            t->ready_ns = 0;
+            continue;
+        }
+        if (!t->ready_ns) t->ready_ns = now;
+        if (now - t->ready_ns > STARVE_NS && (!starved || t->ready_ns < starved->ready_ns)) starved = t;
+        uint32_t rank = t->priority >= 0x10000000u ? 160u : t->priority;
+        if (!top || rank < top_rank || (rank == top_rank && (t == p->pacer || (top != p->pacer && t->seq < top->seq))))
+            top = t, top_rank = rank;
     }
-    return best;
+    return starved ? starved : top;
 }
+/* the longest a due vblank waits for a frame that is nearly ready */
+#define VBLANK_SLACK_NS 3000000u
+/* a vblank that is due, and that the game's next wait ends at, waits up to VBLANK_SLACK_NS while a frame is nearly ready: the thread that paces
+   the frames still runs its frame (it has not yet waited for this vblank), or the display queue has a scene on its
+   way (vita_gxm_frame_coming). A frame that ends a little after the vblank then makes it, where otherwise it waits
+   a whole extra vblank (a game at 60 frames a second drops to 30) */
+static bool vblank_waits(const VitaProcess* p, uint64_t now) {
+    if (now >= p->display.next_ns + VBLANK_SLACK_NS) return false;
+    /* only the vblank that the game's next wait ends at: the others of a game at 30 frames a second are not its own */
+    if (p->display.vblanks + 1 < p->display.due + p->display.due_count) return false;
+    const VitaThread* pacer = p->pacer;
+    return (pacer && pacer->state == VITA_THREAD_READY) || vita_gxm_frame_coming((VitaProcess*)p);
+}
+#define GPU_POLL_NS 200000u /* the longest sleep with a submission on the GPU */
 static void sleep_until(uint64_t when) {
     uint64_t now = plat_ns();
     if (when > now) plat_sleep_ns((int64_t)(when - now));
@@ -362,11 +393,14 @@ int vita_run(VitaProcess* p, double seconds) {
     SetUnhandledExceptionFilter(crash_filter);
 #endif
     if (!vita_watch_init(p)) printf("vita: guest memory's writes aren't watched: the GPU copies its memory each time\n");
+    bool vblank_late = false; /* this vblank waited for a frame: the next one is due a period after it */
     while (!p->exited) {
         uint64_t now = plat_ns(), wake;
-        if (now >= p->display.next_ns) {
+        if (now >= p->display.next_ns && vblank_waits(p, now)) vblank_late = true;
+        else if (now >= p->display.next_ns) {
             ++p->display.vblanks;
-            p->display.next_ns += VBLANK_NS;
+            p->display.next_ns = vblank_late ? now + VBLANK_NS : p->display.next_ns + VBLANK_NS;
+            vblank_late = false;
             if (p->display.next_ns < now) p->display.next_ns = now + VBLANK_NS;
             if (!vita_display_vblank(p)) {
                 closed = true;
@@ -377,7 +411,10 @@ int vita_run(VitaProcess* p, double seconds) {
         VitaThread* t = schedule(p, now, &wake);
         if (!t) {
             if (!live(p)) break; /* every thread ended */
-            sleep_until(wake < p->display.next_ns ? wake : p->display.next_ns);
+            uint64_t until = wake < p->display.next_ns ? wake : p->display.next_ns;
+            /* a thread may be waiting for the GPU, which nothing here announces: look again soon, not at the vblank */
+            if (vita_render_pending(p) && now + GPU_POLL_NS < until) until = now + GPU_POLL_NS;
+            sleep_until(until);
             continue;
         }
         /* a thread resumed after another ran: its exclusive monitor cleared, as the kernel's context switch clears it
@@ -386,10 +423,12 @@ int vita_run(VitaProcess* p, double seconds) {
         if (t != last) t->cpu.exclusive_valid = 0;
         p->current = running = last = t;
         t->seq = ++p->seq;
+        t->ready_ns = 0;
 #ifndef _WIN32
         fault_armed = 1;
 #endif
-        for (unsigned n = 0; n < SLICE_BLOCKS && p->current == t; ++n) {
+        t->poll = SLICE_EDGES;
+        for (unsigned n = 0; n < SLICE_BLOCKS && p->current == t && t->poll > 0; ++n) {
             uint32_t pc = t->cpu.r[15];
             bool thumb = !!(t->cpu.cpsr & SNX_ARM_T);
             VitaLockstep checked = vita_lockstep_step(p, t);

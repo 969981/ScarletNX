@@ -148,6 +148,8 @@ const char* vk_spirv_unavailable(const u32* spv, size_t words) {
             return "shaderMixedFloatDotProductFloat16AccFloat32 is unavailable";
         if (width == 2 && (spv[at + 1] == 6022 || spv[at + 1] == 5345 || spv[at + 1] == 5346) && !g_shader_hmma_coop)
             return "cooperativeMatrix or the Vulkan memory model is unavailable";
+        if (width == 2 && spv[at + 1] == 6033 && !g_shader_float_atomic_add)
+            return "shaderBufferFloat32AtomicAdd is unavailable";
         at += width;
     }
     return NULL;
@@ -791,6 +793,12 @@ static VkSh* sh_make(const u8* code, u32 mlen, u64 h, int stage, const u32 mask[
         free(spv);
     } else
         s->failed = 1;
+    /* an Ounce program's texture handles that it loads at addresses that differ from invocation to invocation: no
+       texture each (SH_PROBE_NONE), which the log says once a program */
+    if (!s->failed && s->si.memh_none)
+        LOG_LIMIT(64, "vulkan: program %016llx samples %u texture%s as none, whose handles it loads from memory at "
+                      "addresses no draw gives (%s)\n",
+                  (unsigned long long)h, s->si.memh_none, s->si.memh_none == 1 ? "" : "s", s->si.memh_why);
     /* a mesh program's outputs against maxMeshOutputMemorySize, which a pipeline must not go past: such a program
        fails, and its draws are skipped with the reason (mesh_shaders) */
     if (stage == ST_MS && !s->failed) {
@@ -1095,9 +1103,10 @@ static struct {
     u32 icap, nidx;
     u64* scans; /* the PF_SCAN records, scan_key's, open addressing (scap a power of two) */
     u32 scap, nscans;
-    PMutex note_lock; /* the pass's lines, for the screen: the latest, round */
+    PMutex note_lock; /* the pass's lines, for the screen: the latest, round; and the file it looks in */
     char note[RENDERER_NOTES][RENDERER_NOTE_SIZE];
-    u32 nnote; /* the lines so far */
+    u32 nnote;                        /* the lines so far */
+    char walk_at[RENDERER_FILE_SIZE]; /* the file or segment the pass looks in now (ShipSink's at) */
     /* atomics, written by the reading thread */
     ShipProgress progress;
     u32 ship_new;                   /* the pass's new shaders */
@@ -2894,10 +2903,16 @@ static void ship_note(void* ctx, const char* line, int shown) {
     else
         LOG("vulkan: %s\n", line);
 }
+static void ship_at(void* ctx, const char* name) {
+    (void)ctx;
+    pm_lock(&g_pf.note_lock);
+    snprintf(g_pf.walk_at, sizeof g_pf.walk_at, "%s", name);
+    pm_unlock(&g_pf.note_lock);
+}
 /* on the reading thread, once the files were read: the programs the game ships translated into the shipped file. The
    draws translate their own meanwhile, and find these once it ends (ship_ready) */
 static void pf_ship_pass(void) {
-    static const ShipSink sink = {NULL, ship_scanned, ship_mark, ship_program, ship_stopped, ship_note};
+    static const ShipSink sink = {NULL, ship_scanned, ship_mark, ship_program, ship_stopped, ship_note, ship_at};
     u64 t0 = plat_ns();
     pf_unseal(&g_pf.ship);
     /* a file that takes no more (its limit, which the smallest record would pass): every program would be counted,
@@ -2949,6 +2964,7 @@ void vk_pipeline_prepare(RendererPrepare* p) {
     p->notes = g_pf.nnote < RENDERER_NOTES ? (int)g_pf.nnote : RENDERER_NOTES;
     for (int i = 0; i < p->notes; i++) /* oldest first */
         memcpy(p->note[i], g_pf.note[(g_pf.nnote - (u32)p->notes + (u32)i) % RENDERER_NOTES], sizeof p->note[i]);
+    memcpy(p->file, g_pf.walk_at, sizeof p->file);
     pm_unlock(&g_pf.note_lock);
 }
 

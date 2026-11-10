@@ -1660,6 +1660,8 @@ if(Python3_Interpreter_FOUND)
     endif()
     # the game tools/run_game.py finds by its name (recompiled/, else an older version's games/)
     add_test(NAME run_game COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/run_game_test.py")
+    # the tag a game goes by in place of its title and title ID (tools/game_tag.py): the HMAC, the key, which and scan
+    add_test(NAME game_tag COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/game_tag_test.py")
     # the nightly release's title and notes (scripts/nightly-notes.py)
     add_test(NAME nightly_notes COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/nightly_notes_test.py")
     # the builds published as releases and on Discord (scripts/publish-builds.py), against fakes. Where publish.yml
@@ -2124,8 +2126,10 @@ if(NOT SNX_TOOLS_ONLY)
     target_link_libraries(snx-test-vk-vertex-input PRIVATE snx_nx_flags)
     add_test(NAME vk_vertex_input COMMAND snx-test-vk-vertex-input)
     # graphics pipeline libraries (gpu/vk/pipeline_parts.c): the choice from the setting and stand-in devices, each
-    # condition that turns them off named, and the dynamic pre-rasterization state each device member gives
-    add_executable(snx-test-vk-pipeline-parts vk_pipeline_parts.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/pipeline_parts.c")
+    # condition that turns them off named, and the dynamic pre-rasterization state each device member gives where the
+    # table of bans holds none for it
+    add_executable(snx-test-vk-pipeline-parts vk_pipeline_parts.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/pipeline_parts.c"
+                   ${snx_vk_extension_bans_sources})
     snx_test_target(snx-test-vk-pipeline-parts 23)
     target_link_libraries(snx-test-vk-pipeline-parts PRIVATE snx_nx_flags)
     add_test(NAME vk_pipeline_parts COMMAND snx-test-vk-pipeline-parts)
@@ -2647,13 +2651,13 @@ else()
     add_test(NAME a64_ported_cases COMMAND snx-test-a64-ported)
 endif()
 
-add_executable(snx-test-astc astc_decode.c support/astc.c)
+add_executable(snx-test-astc astc_decode.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/astc_cpu.c")
 snx_test_target(snx-test-astc 23)
 add_test(NAME astc_decode COMMAND snx-test-astc)
 # the generated MiiModel archive (hle/filesystem/mii_model.c, which the test includes): its tables against the
 # console's part list and layout, every part's zlib stream, its textures decoded by the CPU references against what
 # they were drawn from, its shapes' attributes and triangles, each file no bigger than the console's
-add_executable(snx-test-mii-model mii_model.c support/astc.c support/bcn.c
+add_executable(snx-test-mii-model mii_model.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/astc_cpu.c" support/bcn.c
                "${PROJECT_SOURCE_DIR}/src/common/utilities/mii_db.c"
                "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/blocklinear.c") # g_gob_native, which the layout reads
 snx_test_target(snx-test-mii-model 99)
@@ -2676,7 +2680,7 @@ if(NOT WIN32)
 endif()
 add_test(NAME mii_cfl COMMAND snx-test-mii-cfl)
 # the ASTC shader's GLSL run on the CPU (tests/glsl/glsl.hpp) against the same decoder: no GPU needed
-add_executable(snx-test-astc-glsl glsl/astc_glsl.cpp support/astc.c)
+add_executable(snx-test-astc-glsl glsl/astc_glsl.cpp "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/astc_cpu.c")
 snx_test_target(snx-test-astc-glsl 23)
 target_include_directories(snx-test-astc-glsl PRIVATE glsl)
 add_test(NAME astc_glsl COMMAND snx-test-astc-glsl)
@@ -2759,7 +2763,7 @@ target_include_directories(snx-test-texconv-glsl PRIVATE glsl)
 add_test(NAME texconv_glsl COMMAND snx-test-texconv-glsl)
 
 # single blocks from rEden's ASTC decoder tests, against edenprobe's and astcenc's texels (astc_blocks.c)
-add_executable(snx-test-astc-blocks astc_blocks.c support/astc.c)
+add_executable(snx-test-astc-blocks astc_blocks.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/astc_cpu.c")
 snx_test_target(snx-test-astc-blocks 23)
 add_test(NAME astc_blocks COMMAND snx-test-astc-blocks)
 
@@ -2806,6 +2810,12 @@ else()
     endif()
     add_test(NAME audio_opus COMMAND snx-test-audio-opus)
 endif()
+
+# a 5.1 game's PCM mixed to stereo for a host output of two channels (runtime/platform/audio_downmix.c)
+add_executable(snx-test-audio-downmix audio_downmix.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/audio_downmix.c")
+snx_test_target(snx-test-audio-downmix 99)
+target_link_libraries(snx-test-audio-downmix PRIVATE scarletnx-common)
+add_test(NAME audio_downmix COMMAND snx-test-audio-downmix)
 
 if(UNIX)
     add_executable(snx-test-audren audren_render.c)
@@ -3297,6 +3307,10 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     add_executable(snx-test-vk-uma-budget vk_uma_budget.c)
     snx_test_target(snx-test-vk-uma-budget 99)
     add_test(NAME vk_uma_budget COMMAND snx-test-vk-uma-budget)
+    # vk_gpu_profile as a device runs it: 0 on a portability driver (src/nx/gpu/vk/gpuprof_setting.h)
+    add_executable(snx-test-vk-gpuprof-setting vk_gpuprof_setting.c)
+    snx_test_target(snx-test-vk-gpuprof-setting 99)
+    add_test(NAME vk_gpuprof_setting COMMAND snx-test-vk-gpuprof-setting)
     add_executable(snx-test-vk-descriptor-key vk_descriptor_key.c)
     snx_test_target(snx-test-vk-descriptor-key 11)
     target_link_libraries(snx-test-vk-descriptor-key PRIVATE Vulkan::Headers)

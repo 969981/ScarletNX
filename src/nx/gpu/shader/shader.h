@@ -35,6 +35,22 @@ typedef struct {
     u16 stride, count;
 } ShTex;
 #define SH_HANDLE_IMM 255 /* ShTex.bl2_cbuf of a handle's half that is a constant (the sampler's, from a MOV32I) */
+/* An Ounce program's handle that it loads from memory (ShTex.flags): one game's material programs take each texture's
+   handle from a table whose address is in cbuf 0 (LDG.64, then R2UR into the uniform register pair of a TEX whose
+   handle is in a uniform register, or a TEX.B's handle register). The translation keeps the instructions that compute
+   it (ShaderInfo.memh) where all they read is the draw's, and the slot names the value the handle is, a probe
+   (SH_PROBE): cbuf_off the texture's word, and with bl2 set, bl2_off the sampler's index, a separate word (the uniform
+   register after the texture's). The renderer runs them (sm86_eval) and binds the handle as a constant buffer's */
+#define SNX_TEX_MEMORY   8
+/* a value of ShaderInfo.memh: the register (uniform or not) as instruction insn of the list leaves it */
+#define SH_PROBE(insn, uniform, reg) ((u32)(insn) << 9 | (u32)(uniform) << 8 | (u32)(reg))
+#define SH_PROBE_INSN(p)    ((p) >> 9)
+#define SH_PROBE_UNIFORM(p) ((p) >> 8 & 1u)
+#define SH_PROBE_REG(p)     ((p) & 0xffu)
+#define SH_MEMH_MAX         64 /* instructions of ShaderInfo.memh */
+/* the probe of a handle whose instructions the renderer can't run before the draw (its address differs from invocation
+   to invocation): the slot is bound as no texture, which samples zeros (ShaderInfo.memh_none counts them) */
+#define SH_PROBE_NONE       0xFFFFFFFEu
 /* whether two indexed slots read the same handle table the same way */
 static inline int shader_same_indexed_table(const ShTex* a, const ShTex* b) {
     return a->bl_cbuf == b->bl_cbuf && a->cbuf_off == b->cbuf_off && a->flags == b->flags && a->type == b->type &&
@@ -54,9 +70,18 @@ static inline int shader_same_indexed_kind(const ShTex* tex, u64 int_mask, u64 s
    address in a constant buffer of its own, with nothing after it: one game's terrain vertex programs read their patch
    data through such an address in cbuf 6, as Eden tracks them when no NVN descriptor holds the base
    (global_memory_to_storage_buffer_pass.cpp's Track without the NVN bias). The renderer sizes those by the memory
-   mapped from the address on. The vertex stage's cbuf 0 at 0xb0 is a bare pointer of 16 bytes. */
-#define SH_GBUF_BANK(d)   ((d) >> 16)
-#define SH_GBUF_OFFSET(d) ((d) & 0xFFFFu)
+   mapped from the address on. The vertex stage's cbuf 0 at 0xb0 is a bare pointer of 16 bytes.
+   An Ounce program may also reach a buffer through a pointer in memory (SH_GBUF_INDIRECT, bit 31): the 64-bit address
+   stored at byte SH_GBUF_CELL (bits 21-30, in 8-byte units) of the buffer whose address the constant buffer word of
+   bits 0-20 holds (SH_GBUF_PARENT, itself one of the program's buffers). One game's material programs load pointers
+   from a table whose address is in cbuf 0, then index the tables they point to (vk/render.c binds the memory mapped
+   from the pointer, which it reads from guest memory, as a bare address's) */
+#define SH_GBUF_BANK(d)     ((d) >> 16 & 31u)
+#define SH_GBUF_OFFSET(d)   ((d) & 0xFFFFu)
+#define SH_GBUF_INDIRECT(d) ((d) >> 31)
+#define SH_GBUF_CELL(d)     (((d) >> 21 & 1023u) * 8u)
+#define SH_GBUF_PARENT(d)   ((d) & 0x1FFFFFu)
+#define SH_GBUF_CELL_MAX    8184u
 static inline int shader_gbuf_sized(int stage, u32 d) { return d >= 0x110 && d < (stage == ST_CS ? 0x410u : 0x830u); }
 /* Transform feedback (key of the last program before rasterization): for each of the 4 buffers, the attribute word
    each 4-byte word of a vertex there holds (its ISA attribute address / 4: the position's x is 28, generic i's
@@ -180,6 +205,12 @@ typedef struct {
     u32 late_depth; /* key: ordered GPU depth/stencil shadow operations after guest fragment code */
     u32 capture_outputs; /* key: capture validity location2..7; zero retains the original location1 interface */
     int primitive_split_safe; /* proof: vertex values do not depend on subgroup/lane/clock invocation groups */
+    /* An Ounce program's instructions that compute its texture handles from memory (SNX_TEX_MEMORY slots), in program
+       order, each its lo and hi words: the integer ALU, constant buffer and global loads that sm86_eval runs */
+    u64 memh[SH_MEMH_MAX][2];
+    u32 nmemh;
+    u32 memh_none;     /* texture instructions whose handle from memory is SH_PROBE_NONE, */
+    char memh_why[64]; /* and why the first is */
 } ShaderInfo;
 /* The graphics cache packs these explicit fragment-only fields above its eight image-format bits. */
 enum { SH_FS_LATE_DEPTH = 1u, SH_FS_CAPTURE_SHIFT = 1, SH_FS_CONFIG_MASK = 15u };
@@ -294,6 +325,11 @@ extern int g_shader_xfb_stores;
 #define SH_CB0_BASE_INSTANCE      0x644u
 #define SH_PUSH_GPU_BASE_VERTEX   1u
 #define SH_PUSH_GPU_BASE_INSTANCE 2u
+/* An Ounce's indirect mesh draw (DrawMeshTasksIndirect): its first workgroup is in its record, on the GPU. Where the
+   push constant's z has this bit, a task program, or a mesh program without one, adds the word at SNX_VKB_RS (a
+   uniform buffer the renderer copies the record's first word into, vk/render.c's mesh_indirect) to its workgroup ID in
+   place of the push constant's x */
+#define SH_PUSH_GPU_MESH_FIRST    4u
 /* quad operations in fragment programs (the subgroup's QUAD bit): SHFL within a quad reads its helper lanes. 1 offline */
 extern int g_shader_quad;
 /* quad operations in compute programs (the QUAD bit, compute among the subgroup stages): an SM86 HMMA reads its A
@@ -313,6 +349,9 @@ extern int g_shader_hmma_coop;
    the less of them): a task program's count, read from its payload's header, is clamped to it, as a count past it is
    undefined behavior that can hang the GPU. 0 offline: not clamped */
 extern u32 g_shader_mesh_tasks_max;
+/* VK_EXT_shader_atomic_float's shaderBufferFloat32AtomicAdd: an SM86 RED.ADD.F32 or ATOMG.ADD.F32 on global memory is
+   one OpAtomicFAddEXT, else a compare and exchange loop on the word's bits (sm86_translate.c's atomic_fadd). 0 offline */
+extern int g_shader_float_atomic_add;
 /* the Tessellation capability, which also gives a fragment program PrimitiveId without Geometry */
 extern int g_shader_tessellation;
 /* VK_KHR_shader_clock's scopes: bit 0 subgroup, bit 1 device */

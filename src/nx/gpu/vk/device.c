@@ -568,6 +568,10 @@ static int create_device(void) {
                      VK_SUBGROUP_FEATURE_ARITHMETIC_BIT)
             ? subgroup.supportedStages
             : 0;
+    /* a driver that lists the stage and gives wrong ballot and shuffle results there (Turnip's geometry stage, as
+       Eden found): its programs take the path of a device that does not list it */
+    if (vk_ban("VK_SHADER_STAGE_GEOMETRY_BIT", (g_vk_subgroup_stages & VK_SHADER_STAGE_GEOMETRY_BIT) != 0, ban_say))
+        g_vk_subgroup_stages &= ~(VkShaderStageFlags)VK_SHADER_STAGE_GEOMETRY_BIT;
     g_shader_quad = (g_vk_subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
                     (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT);
     /* compute has quad operations wherever the bit is and the stage has subgroup operations at all (the quad limit,
@@ -701,10 +705,13 @@ static int create_device(void) {
     int has_maintenance8 = 0;
     int has_vertex_input = 0;
     int has_gpl = 0, has_eds2 = 0, has_eds3 = 0; /* the extensions of pipeline libraries and their dynamic state */
+    int has_depth_clip_control = 0;              /* and of the depth range as one of those states */
     int has_mesh = 0;
     int has_mixed_dot = 0; /* VK_VALVE_shader_mixed_float_dot_product: HMMA's pairs of f16 products in one instruction */
     int has_coop = 0;      /* VK_KHR_cooperative_matrix: HMMA on the matrix unit (g_shader_hmma_coop) */
-    int has_fault = 0;     /* VK_EXT_device_fault: what the GPU reports of a fault, at a lost device */
+    /* VK_EXT_shader_atomic_float: RED.ADD.F32 in one instruction (g_shader_float_atomic_add) */
+    int has_atomic_float = 0;
+    int has_fault = 0; /* VK_EXT_device_fault: what the GPU reports of a fault, at a lost device */
     const char* index8_ext = NULL; /* VK_KHR_index_type_uint8, or the EXT it was promoted from */
     const char* store_none_ext = NULL; /* a 1.2 device's store op NONE (vk12_store_none) */
     if (!g_opt_headless) ext[next++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
@@ -738,6 +745,7 @@ static int create_device(void) {
                   snx_vk_extensions_has(&e, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
         has_eds2 = snx_vk_extensions_has(&e, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
         has_eds3 = snx_vk_extensions_has(&e, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+        has_depth_clip_control = snx_vk_extensions_has(&e, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
         g_vk.has_xfb = snx_vk_extensions_has(&e, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
         g_vk.has_mixed_samples = snx_vk_extensions_has(&e, VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME);
         g_vk.has_nv_checkpoints = snx_vk_extensions_has(&e, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
@@ -764,6 +772,7 @@ static int create_device(void) {
         has_mixed_dot = snx_vk_extensions_has(&e, VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME);
         has_coop = snx_vk_extensions_has(&e, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
         has_list_restart = snx_vk_extensions_has(&e, VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME);
+        has_atomic_float = snx_vk_extensions_has(&e, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
         g_vk.has_conservative = snx_vk_extensions_has(&e, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
         g_vk.has_depth_range_unrestricted = snx_vk_extensions_has(&e, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
         has_pipeline_robustness = snx_vk_extensions_has(&e, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
@@ -776,6 +785,7 @@ static int create_device(void) {
         /* a portability driver's subset must be enabled when it has one (MoltenVK) */
         has_portability = snx_vk_extensions_has(&e, "VK_KHR_portability_subset");
         if (has_portability) ext[next++] = "VK_KHR_portability_subset";
+        g_vk.has_portability = has_portability;
         video_exts = snx_vk_extensions_has(&e, VK_KHR_VIDEO_QUEUE_EXTENSION_NAME) +
                      snx_vk_extensions_has(&e, VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME) +
                      snx_vk_extensions_has(&e, VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME);
@@ -878,6 +888,8 @@ static int create_device(void) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE};
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR qcoop = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT qatomic_float = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
     VkPhysicalDevicePipelineRobustnessFeaturesEXT qpipeline = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
     VkPhysicalDeviceRobustness2FeaturesEXT qrobust = {.sType =
@@ -932,6 +944,8 @@ static int create_device(void) {
     /* qeds2 above: a 1.2 device's, and the pipeline libraries' patch control points (has_eds2) */
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT qeds3 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+    VkPhysicalDeviceDepthClipControlFeaturesEXT qclip_control = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
     /* with the subset enabled, each of its features is off until the device asks for it: a view's swizzle, for one */
     PortabilityFeatures qport = {.sType = PORTABILITY_FEATURES_STYPE};
     VkPhysicalDevicePresentIdFeaturesKHR qpid = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
@@ -978,6 +992,7 @@ static int create_device(void) {
                            has_vertex_input ? &qvertex_input : NULL,
                            has_gpl ? &qgpl : NULL,
                            has_eds3 ? &qeds3 : NULL,
+                           has_depth_clip_control ? &qclip_control : NULL,
                            has_portability ? &qport : NULL,
                            has_reconvergence ? &qreconv : NULL,
                            robustness ? &qpipeline : NULL,
@@ -990,6 +1005,7 @@ static int create_device(void) {
                            has_shader_clock ? &qclock : NULL,
                            has_mixed_dot ? &qmixdot : NULL,
                            has_coop ? &qcoop : NULL,
+                           has_atomic_float ? &qatomic_float : NULL,
                            has_fault ? &qfault : NULL};
     snx_vk_chain(query, sizeof query / sizeof *query);
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &f2);
@@ -1107,9 +1123,12 @@ static int create_device(void) {
                           .conservative_mode = qeds3.extendedDynamicState3ConservativeRasterizationMode,
                           .conservative_size = qeds3.extendedDynamicState3ExtraPrimitiveOverestimationSize,
                           .patch = qeds2.extendedDynamicState2PatchControlPoints,
+                          .depth_range = qeds3.extendedDynamicState3DepthClipNegativeOneToOne,
+                          .depth_clip_control = qclip_control.depthClipControl,
                           .has_provoking_last = g_vk.has_provoking_last,
                           .has_conservative = g_vk.has_conservative};
         char line[400];
+        vk_gpl_bans(&gd, ban_say);
         g_vk.has_gpl = vk_gpl_choose(&gd, &g_vk.dyn_pr, line, sizeof line);
         LOG("%s\n", line);
         /* a ban that holds took the extension out of the list (vk_bans_filter): its line says why */
@@ -1119,6 +1138,8 @@ static int create_device(void) {
             vk_ban_why(ban_line, ban, sizeof ban);
             LOG("%s\n", ban);
         }
+        vk_depth_range_line(&gd, g_vk.dyn_pr, line, sizeof line);
+        LOG("%s\n", line);
     }
     g_vk.has_xfb = g_vk.has_xfb && fxfb.transformFeedback;
     g_vk.has_geometry_streams = g_vk.has_xfb && fxfb.geometryStreams;
@@ -1230,6 +1251,7 @@ static int create_device(void) {
     g_shader_float16 = q12.shaderFloat16 != 0;
     /* its f16 vectors are Float16's, so shaderFloat16 too */
     g_shader_mixed_dot = has_mixed_dot && qmixdot.shaderMixedFloatDotProductFloat16AccFloat32 && g_shader_float16;
+    g_shader_float_atomic_add = has_atomic_float && qatomic_float.shaderBufferFloat32AtomicAdd;
     /* its f16 matrices are Float16's, its modules the Vulkan memory model's, and its matrices span a subgroup of 32 */
     g_shader_hmma_coop = has_coop && qcoop.cooperativeMatrix && g_shader_float16 && q12.vulkanMemoryModel &&
                                  q12.vulkanMemoryModelDeviceScope && g_vk.has_cs_warp32 && coop_f16_f32(g_vk.phys)
@@ -1401,6 +1423,14 @@ static int create_device(void) {
         chain = &fcoop;
         ext[next++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
     }
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT fatomic_float = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
+        .pNext = chain,
+        .shaderBufferFloat32AtomicAdd = VK_TRUE};
+    if (g_shader_float_atomic_add) {
+        chain = &fatomic_float;
+        ext[next++] = VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME;
+    }
     /* a lost device's fault, which vk_checkpoint_dump logs */
     VkPhysicalDeviceFaultFeaturesEXT ffault = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .pNext = chain, .deviceFault = VK_TRUE};
@@ -1511,7 +1541,10 @@ static int create_device(void) {
         .extendedDynamicState3DepthClampEnable = (g_vk.dyn_pr & VK_DYN_PR_DEPTH_CLAMP) != 0,
         .extendedDynamicState3ProvokingVertexMode = (g_vk.dyn_pr & VK_DYN_PR_PROVOKING) != 0,
         .extendedDynamicState3ConservativeRasterizationMode = (g_vk.dyn_pr & VK_DYN_PR_CONSERVATIVE) != 0,
-        .extendedDynamicState3ExtraPrimitiveOverestimationSize = (g_vk.dyn_pr & VK_DYN_PR_CONSERVATIVE) != 0};
+        .extendedDynamicState3ExtraPrimitiveOverestimationSize = (g_vk.dyn_pr & VK_DYN_PR_CONSERVATIVE) != 0,
+        .extendedDynamicState3DepthClipNegativeOneToOne = (g_vk.dyn_pr & VK_DYN_PR_DEPTH_RANGE) != 0};
+    VkPhysicalDeviceDepthClipControlFeaturesEXT fclip_control = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, .depthClipControl = VK_TRUE};
     if (g_vk.has_gpl) {
         chain = &fgpl;
         ext[next++] = VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME;
@@ -1527,6 +1560,11 @@ static int create_device(void) {
             feds3.pNext = chain;
             chain = &feds3;
             ext[next++] = VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME;
+        }
+        if (g_vk.dyn_pr & VK_DYN_PR_DEPTH_RANGE) {
+            fclip_control.pNext = chain;
+            chain = &fclip_control;
+            ext[next++] = VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME;
         }
     }
     VkPhysicalDeviceIndexTypeUint8FeaturesKHR findex8 = {

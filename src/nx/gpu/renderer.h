@@ -21,6 +21,8 @@ typedef struct RendererPrepare {
     int scanning;                /* the pass runs */
     int loaded;                  /* the shader files of earlier runs are read */
     int done;
+#define RENDERER_FILE_SIZE 96      /* a name's bytes, as the pass keeps them (shipped_pass.c's Source) */
+    char file[RENDERER_FILE_SIZE]; /* the file or segment the pass looks in now, "" once it has looked in every one */
 #define RENDERER_NOTES     48
 #define RENDERER_NOTE_SIZE 256                     /* a line's bytes: as wide as a wide window's row, which cuts it */
     char note[RENDERER_NOTES][RENDERER_NOTE_SIZE]; /* the pass's latest lines, oldest first (the log has every one) */
@@ -127,11 +129,12 @@ typedef struct Renderer {
     int (*release_read)(u64 a, void* dst, u64 n);
     u32 (*release_value)(u32 id); /* completed and queued increments, read consistently */
     /* the render enable (3D 0x556 IF_EQUAL when equal is set, else IF_NOT_EQUAL) compares the count at a with the one
-       at a + 16, one side a samples-passed count not known yet, the other zero: NVN's occlusion test. Values that
-       results the GPU hasn't landed hold (a compute program's) are compared on the GPU as well. -1 when neither is so
-       here (the caller reads both and compares, waiting for what is pending); 0 or 1, the comparison's result when the
-       count is known to be zero or not without the GPU; 2 when the GPU makes it, *pred the predicate the draws and
-       clears under it run on (the channel's render_pred), held until render_predicate_drop */
+       at a + 16, one side a samples-passed count not known yet, the other zero or a count of the same counter not
+       known yet either: NVN's occlusion test. Values that results the GPU hasn't landed hold (a compute program's)
+       are compared on the GPU as well. -1 when neither is so here (the caller reads both and compares, waiting for
+       what is pending); 0 or 1, the comparison's result when it is known without the GPU; 2 when the GPU makes it,
+       *pred the predicate the draws and clears under it run on (the channel's render_pred), held until
+       render_predicate_drop */
     int (*render_predicate)(u64 a, int equal, u32* pred);
     void (*render_predicate_drop)(u32 pred);
     /* the 3D engine's samples-passed counter (occlusion queries), one per draw owner (DsState.owner: a channel's

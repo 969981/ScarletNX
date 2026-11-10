@@ -32,7 +32,8 @@ The window's title tells which build it is, as `ScarletNX <branch> <commit> (<co
 `ScarletNX main 43bf71a (clang 22.1.8, Linux x86_64)`; the commit ends in `-dirty` when the tree had changes, a
 build of a detached checkout outside CI says `detached`, and both read `unknown` outside a git checkout. A game's window carries the same line after the game's name.
 The logs' line adds the day that commit was made (UTC), `ScarletNX main 43bf71a, committed 2026-11-02 (clang 22.1.8,
-Linux x86_64)`, `committed unknown` outside a git checkout.
+Linux x86_64)`, `committed unknown` outside a git checkout. A game's log then says when its run began, `run: started 2026-11-05 14:03:10
+UTC`: the log's summary counts the days from the build's commit to that, and no longer needs the file's date.
 
 It opens on a splash: Wimsy, or Fuddles (`dist/splash/`), picked at random each start, a third of the window's
 shorter side on the theme's `[splash] page` for its `ms`; a key, a click or a finger ends it. The drawings are SVGs
@@ -254,7 +255,9 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   what was changed, by the `.ini`'s sections and keys, in `settings.ini` of the config folder on
   Linux (`~/.config/scarletnx/`), else the data folder's `config/`. A run takes a setting from what that
   run picks, then from the game's own picks (to come), then from these, and last from the game's
-  `.ini`. Del puts a setting back to its default, and App's **Reset to Defaults** every one. **Fullscreen** and
+  `.ini`. A row not at its default has `*` after its value (*On \**, *2 \**), a page's row and an **All** while
+  any of their rows has; Del puts a setting back to its default, and App's **Reset to Defaults** every one.
+  **Fullscreen** and
   **Show controls** are the launcher's own choices, Off or On, passed to every run over the `.ini`; `[default]` marks
   the one the launcher starts with: Off on a computer, On on a phone, where Fullscreen puts the launcher itself on the
   whole screen too.

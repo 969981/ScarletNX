@@ -141,6 +141,45 @@ landed with no byte written by both.
 The translator declares the global buffers `Aliased` and `Coherent`: one game binds a range and a part of it to the
 same program, writes through one and waits for the value through the other.
 
+A program may also reach a buffer through a pointer in memory. One game's material programs load the addresses of
+five tables from a table whose own address is in cbuf 0 (`LDG.E.64 R, [UR + 8]`), then index them (`IMAD.WIDE`), and
+its compute programs pick one of two such pointers with a predicate. The tables are gigabytes away from the table
+that points to them, outside its 16 MiB. The translator names such a buffer by its pointer's cell (`SH_GBUF_INDIRECT`
+in `shader.h`, the cell's offset in the buffer of a constant buffer word): the renderer reads the pointer from guest
+memory when it binds the draw or dispatch, a pending write there landed first (`gbuf_pointer` in `vk/render.c`), and
+binds the memory mapped from it as a bare address's, and the program finds the buffer's base by loading the cell
+itself. An address that may be either of two pointers is compared with each buffer when it runs
+(`global_dynamic`). A cell that the GPU writes later in the stream than the bind would be read too early: the program
+would then index the window bound from the older pointer. Each such buffer is another window of up to 16 MiB bound for
+the draw, with the in-place bookkeeping of its pages. A general path (physical storage buffers,
+`VK_KHR_buffer_device_address`) would need every guest page a pointer can reach imported and tracked, which the
+import limits and the ownership model above don't allow.
+
+`RED` and `ATOMG` of `F32` add (`.FTZ.RN`) are one `OpAtomicFAddEXT` where the device has
+`shaderBufferFloat32AtomicAdd`, else a loop of compare and exchange on the word's bits.
+
+A texture's handle may come from memory too. One game's material programs take each texture's from a table of
+materials in a storage buffer: an `LDG.E.64` at a record that the draw's constant buffers pick (in one program
+`c[0][0x520] + ((c[4][0x88] & 0xfffff) + c[5][0x2ec]) * 32 + 0x18`, with a `SEL` on an `ISETP` of the index's top
+bits), then `R2UR` into the uniform register pair of a `TEX`, `TLD`, `TLD4` or `TXQ` whose handle is in a uniform
+register (0xf60, 0xf66, 0xf63, 0xf6f: the texture's word, then the sampler's index, the word `>> 20`), or into a
+`TEX.B`'s handle register. The translator refused these programs: about 320 draws a frame of the first 3D scene, which
+was then a white screen. It now keeps the instructions that make each such handle in `ShaderInfo.memh`, where every
+value they read is the draw's (constant buffer words, immediates, and words loaded from addresses made of them), and
+the slot names the value that is the handle (`SNX_TEX_MEMORY`, `SH_PROBE` in `shader.h`): a register as one of those
+instructions leaves it. Each value one of them reads has one unguarded writer before it on every path, and no other
+kept instruction between the two writes it, so the list run in program order gives what the program computes. The
+renderer runs it on the CPU for each draw (`sm86_eval` in `gpu/shader/sm86_eval.c`, the translation's arithmetic,
+which a test checks against the translated program), on the draw's constant buffers and guest memory, a pending write
+there landed first, and binds the handle as a constant buffer's (`memh_handle` in `vk/render.c`, `vk_memory_handles`
+for dispatches). As with `gbuf_pointer`, a word the GPU writes later in the stream than the draw is recorded is read
+as it was then: the material tables are the CPU's, but a table a program wrote in the same frame would give the
+older handles. A handle whose address differs from invocation to invocation (one game's lights and decals: a cell of
+a grid in world space, then the cell's list, in a loop) is bound as no texture, which samples zeros
+(`SH_PROBE_NONE`), and the log names the program once: the draw goes on without it. An array of the pool's textures
+indexed on the GPU would sample them, but the renderer would have to make each texture such a handle can name, which
+no draw tells it.
+
 ## Surfaces
 
 An Ounce game's block linear surfaces use another GOB: bits 5 and 6 of a byte's offset in it are swapped, so x
@@ -311,9 +350,14 @@ separate textures at 0x168 + 8 r, separate samplers at 0x568 + 8 r. One mesh pro
 vertex stage's: the draw state keeps them apart (`DS_TASK` and `DS_MESH` in `gpu/draw_state.h`), and bank 0 of each
 stage is 0x870 bytes.
 
-`DrawMeshTasksIndirect` gives the GPU two words of the indirect buffer (a GPFIFO entry of 2 words after macro 0x31).
-Vulkan's indirect mesh draw reads three, x, y and z, and has no first workgroup, so the renderer skips the indirect
-forms and logs it once.
+`DrawMeshTasksIndirect` gives the GPU two words of the indirect buffer (a GPFIFO entry of 2 words after macro 0x31),
+`{count, first}` as `NV_mesh_shader`'s `DrawMeshTasksIndirectCommandNV` has them. A compute program writes them in the
+same frame. Vulkan's indirect mesh draw reads three, x, y and z, and has no first workgroup, so the renderer copies
+the record on the GPU into one of the frame's staging, `{count, 1, 1}` and the first workgroup a uniform buffer's
+alignment after it (`mesh_indirect` in `vk/render.c`), which it binds at `SNX_VKB_RS` of the task or mesh stage: where
+the push constant's z has `SH_PUSH_GPU_MESH_FIRST`, the task program, or the mesh program without one, takes its first
+workgroup from there. The copy ends the rendering pass. In the first 3D scene of one game about 30 mesh draws a frame
+are indirect; the 3D form's and the multi-draws, which no run calls, are still skipped.
 
 With `mesh_draws` on, an RTX 2080 faulted in most menu runs: Xid 31 (`GPCCLIENT_GCC`, reads of addresses that no
 memory backs), then Xid 109 and a lost device. NV diagnostic checkpoints put each hang in a draw with a task program,
@@ -386,6 +430,13 @@ the game asks for.
    x. The periodic `vulkan:` stats line counts the mesh draws and those skipped. The storage writes of the two
    stages are in the barriers before their results land (`buffer.c`'s `out_stages`).
 
+On a Radeon 890M (RADV, Mesa 26.2.5) the mesh draws, direct and indirect, ran without a fault in every run so far,
+the menus and the first 3D scene. With `RADV_DEBUG=hang`, which waits for each draw (`syncshaders`), the first mesh
+draws of the menus hung the GPU twice, once with every task draw of 0 workgroups (the gfx ring, then a compute ring
+timed out; the dump's compute IB held an `ACQUIRE_MEM` and `NOP`s, with the shader engines idle): a task program's
+draw is a gang submission, its task stage on an ACE queue, which that option's waits stall. Don't take it to a run
+with mesh draws.
+
 With `mesh_draws=1` the draws translate and draw, with no `not translated` line and no validation message of their
 own, but 6 of 7 runs through the menus on an RTX 2080 (driver 615.78.08) ended in a GPU fault: Xid 109 (context switch
 timeout) and Xid 31 (MMU faults of `GPCCLIENT_GCC`, reads at addresses such as `0xfffff079_ad3f2000`), then
@@ -405,7 +456,8 @@ sure. So the setting stays off.
 - The cause of the GPU faults with `mesh_draws=1`. Next checks: the per-primitive outputs and the fragment
   program's `PerPrimitiveEXT` inputs (with their interpolation decorations), the primitive indices against the vertex
   count, and a RenderDoc capture of the first faulting draw.
-- The record of `DrawMeshTasksIndirect` (two words, probably count and first) and the 3D forms' (x, y, z), for a
-  pass on the GPU that makes Vulkan's records of them. No run so far calls them.
+- The 3D form's indirect record (x, y, z), and whether `DrawMeshTasksIndirect`'s is `{count, first}`, as the
+  renderer takes it, or the other way round (a GPU-written record, which the CPU can't see when it records the draw;
+  the pictures with it look right).
 - The texture keys of task and mesh programs: their integer, rectangle and queried textures do not key a variant yet,
   as the vertex program's do (`vs_tex_variant`).

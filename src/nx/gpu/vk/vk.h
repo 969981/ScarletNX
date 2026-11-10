@@ -85,7 +85,7 @@ typedef struct {
        asks for it (experimental): FFmpeg's Vulkan decoder decodes on it (vk/nvdec.c), told of the device by the
        extensions and features enabled */
     u32 video_family;
-    const char* dev_ext[64]; /* create_device enables 64 at most, were every one it can enable there */
+    const char* dev_ext[65]; /* create_device enables 65 at most, were every one it can enable there */
     u32 dev_ext_n;
     VkPhysicalDeviceFeatures2 feat2; /* feat, with the 1.1 to 1.3 features enabled chained (to 1.2 on a 1.2 device) */
     VkPhysicalDeviceVulkan11Features feat11;
@@ -131,6 +131,7 @@ typedef struct {
     int has_vertex_robustness2; /* exact zero/default components for out-of-range mesh fetches */
     int has_calibrated_host;    /* VK_EXT_calibrated_timestamps with CLOCK_MONOTONIC_RAW: the GPU's clock goes next to
                                 the client's, one driver call (gpuprof.c's calibration) */
+    int has_portability;        /* a portability driver (MoltenVK): the device lists VK_KHR_portability_subset */
     int has_xfb;                /* VK_EXT_transform_feedback (without it, g_shader_xfb_stores) */
     int has_mixed_samples;      /* VK_NV_framebuffer_mixed_samples: coverage at more samples than color storage */
     /* VK_NV_device_diagnostic_checkpoints, enabled where the device has it: the draw or dispatch a GPU fault hangs on
@@ -525,6 +526,13 @@ int vk_wait_fence(VkFence fence);
 void vk_submit_for_readback(void);
 /* the same without waiting for the recording thread: the commands being recorded, if any, handed to it (vk_lock) */
 void vk_submit_open(void);
+/* the commands being recorded, if any, handed to the GPU as a submission of their own between two pieces of one long
+   piece of work (astc.c's strips), so that no submission runs past the driver's job timeout. Nothing lands and the
+   frame keeps its slot, so a draw's or a dispatch's setup can call it (they set themselves up again after a submit).
+   The caller records the rest in the next vk_cmd, a new command buffer */
+void vk_submit_split(void);
+/* the same for a piece of a background encode, after a present's submission (astc.c), counted apart */
+void vk_submit_background(void);
 /* the renderer's ready (renderer.h): the GPU's work on the slot the next frame records in, waited for without vk_lock
    (none when this thread holds it) */
 void vk_frame_ready(void);
@@ -623,6 +631,8 @@ void rec_CmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, 
 void rec_CmdDraw(VkCommandBuffer cb, u32 count, u32 instances, u32 first, u32 first_instance);
 void rec_CmdDrawIndexed(VkCommandBuffer cb, u32 count, u32 instances, u32 first, i32 vertex_offset, u32 first_instance);
 void rec_CmdDrawMeshTasks(VkCommandBuffer cb, u32 groups); /* vkCmdDrawMeshTasksEXT(groups, 1, 1) */
+/* vkCmdDrawMeshTasksIndirectEXT of the one record at off */
+void rec_CmdDrawMeshTasksIndirect(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off);
 /* the programs of the draws recorded next (the vertex or mesh program's hash, the fragment program's), which their
    checkpoints name in vk_checkpoint_dump */
 void rec_draw_tag(u64 first, u64 second);
@@ -667,6 +677,7 @@ void rec_CmdSetProvokingVertexModeEXT(VkCommandBuffer cb, VkProvokingVertexModeE
 void rec_CmdSetConservativeRasterizationModeEXT(VkCommandBuffer cb, VkConservativeRasterizationModeEXT mode);
 void rec_CmdSetExtraPrimitiveOverestimationSizeEXT(VkCommandBuffer cb, float size);
 void rec_CmdSetPatchControlPointsEXT(VkCommandBuffer cb, u32 points);
+void rec_CmdSetDepthClipNegativeOneToOneEXT(VkCommandBuffer cb, VkBool32 on);
 void rec_CmdResetQueryPool(VkCommandBuffer cb, VkQueryPool pool, u32 first, u32 count);
 void rec_CmdWriteTimestamp2(VkCommandBuffer cb, VkPipelineStageFlags2 stage, VkQueryPool pool, u32 query);
 void rec_CmdBeginQuery(VkCommandBuffer cb, VkQueryPool pool, u32 query, VkQueryControlFlags flags);
@@ -835,6 +846,8 @@ typedef struct Surf {
                          DONT_CARE while nothing wrote it since */
     u8 discarded;
     u32 drawn_at;  /* render targets: g_vk_present when last drawn to */
+    u8 compared;   /* depth targets: a draw sampled it with a compare while shadows=0 (render.c shadow_map_sampled) */
+    u32 compared_at; /* g_vk_present at the last such sample */
     u64 draw_wseq; /* render targets: wseq at its last draw or clear (vk_rt_drawn), 0 before one */
     int in_drawn;  /* in surface.c's list of drawn targets, entered at drawn_from */
     int take_seen; /* render targets: vk_rt_drawn_in gave it to a texture's search since its last write */
@@ -1273,7 +1286,8 @@ int vk_bc7_encode_image(VkCommandBuffer cb, VkImage src, VkImage dst, u32 level,
 /* A level of ASTC encoded again as BC7 with VK_BC7_FAST_TEXELS texels or more takes the encoder's fast build, which
    keeps mode 6 where it is close and tries every mode on the other blocks, and one of VK_BC7_MODE6_TEXELS or more its
    build of mode 6 alone (bc7_encode.glsl's SNX_BC7_FAST). vk_bc7_build: the build for a level of w x h texels and d
-   slices of a volume (1 else): 0 the full one, 1 the fast one, 2 mode 6 alone. VK_BC7_FAST_TEXELS 0: every level takes
+   slices of a volume (1 else): 0 the full one, 1 the fast one, 2 mode 6 alone (3, the quick one, is astc.c's for a very
+   large level: vk_astc_quick). VK_BC7_FAST_TEXELS 0: every level takes
    the fast build, which a batch of small levels encoded with the full one held a frame for seconds without. The fast
    build is about 15 times faster than the full one, for the loss that docs/layers/gpu/astc.md measures (50.7 vs 53.8
    dB) */
@@ -1332,6 +1346,29 @@ int vk_bc7_cache_level(VkCommandBuffer cb, VkImage img, const u64 key[2], u32 le
 int vk_bc7_capture_level(VkCommandBuffer cb, VkImage img, const u64 key[2], u32 level, u32 w, u32 h, u32 slices,
                          int is3d);
 u64 vk_astc_dispatches(void); /* the BC7 encoder's dispatches so far */
+/* A very large level (astc_quick_mtexels or more megatexels, every layer of a 2D array and slice of a 3D level
+   counted) held as BC7 at load takes the encoder's quick build in the frame that uploads it, and its fast build is made
+   in the background (astc.c). vk_astc_quick: whether a level of w x h texels and depth slices or layers is one, with
+   the BC7 cache open, whose fast build goes into the cache in pieces whatever its size (texture.c keys it as it keys a
+   level vk_astc_cached takes). vk_astc_background: after a present's submission (vk_lock), the pieces the workers
+   encoded stored, the levels whose pieces are all stored ended (their snapshots freed), and with astc_background=2 a
+   piece encoded on the GPU in a submission of its own once the last one is done. vk_astc_background_drain: until every
+   background encode is done (tests: there are no presents). vk_astc_forget: t's image no longer holds what the upload
+   of a level wrote there (another upload of it), or of any (~0u: t is freed), so the background encodes of those
+   levels go on into the cache alone. g_vk_astc_hit_ns: the time a very large level's hit may take reading its pieces,
+   ns (astc.c's BG_HIT_NS; tests set it) */
+int vk_astc_quick(u32 w, u32 h, u32 depth);
+void vk_astc_background(void);
+void vk_astc_background_drain(void);
+void vk_astc_forget(const Surf* t, u32 level);
+/* very large levels encoded quickly, those given to the background and those it finished, those still in it, and
+   those whose fast build came from the cache; the pieces stored, the workers' CPU time, the pieces the GPU encoded,
+   those loaded from the cache after a hit ran out of time, and the workers started */
+typedef struct {
+    u64 quick, made, finished, pending, hits, stored, cpu_ns, gpu_pieces, loaded, threads;
+} VkAstcBackground;
+void vk_astc_background_stats(VkAstcBackground* s);
+extern u64 g_vk_astc_hit_ns;
 /* Internal ASTC, BC7, block-linear, conversion, multisample and depth-packing pipelines, apart from guest shaders.
    Both functions run under vk_lock. Cumulative time is in nanoseconds, including time inside the driver. */
 void vk_texture_pipeline_made(u64 ns);
@@ -1415,6 +1452,10 @@ Surf* vk_tex_from_tic_storage(const u32* tic);
    targets drew into it. NULL when it can't be drawn now */
 Surf* vk_tex_recheck(Surf* t);
 Surf* vk_tex_from_tic_raw(const u32* tic); /* UINT view of raw RGBA8 texel bytes */
+/* vk_tex_from_tic, or with raw vk_tex_from_tic_raw, for a compute program, whose fetches, size queries and storage
+   images count the guest's texels: a scaled render target (resolution= other than 1) comes as a copy of the guest's
+   size, and as the scaled image itself only where no such copy can be made */
+Surf* vk_tex_from_tic_guest(const u32* tic, int raw);
 /* a view of s as the shader declares it, sRGB or linear (color formats that have both), with a component mapping;
    VK_NULL_HANDLE when the image can't be viewed that way */
 /* stencil: a depth/stencil surface's stencil aspect instead of its depth */
@@ -1688,7 +1729,8 @@ extern u64 g_vk_counts_on_gpu; /* statistics: the counts vk_query_counts wrote *
    a predicate slot, held once, that the next vk_query_pred_flush writes (2, *slot set), or its count is known now: 1
    not zero, 0 zero. -1 when there can be no predicate: the device can't make them, or there's no memory for the
    batch. The reports of a counter come in their queue order, each with what the one before it in its epoch, still
-   queued, is known to be (prev, ending at prev_end): the count up to there, which it goes on from */
+   queued, is known to be (prev, ending at prev_end): the count up to there, which it goes on from. first may be the
+   end of an earlier report of the epoch: the predicate is then whether the two reports' counts differ */
 enum { VK_PRED_PREV_NONE, VK_PRED_PREV_ZERO, VK_PRED_PREV_NONZERO, VK_PRED_PREV_SLOT };
 int vk_query_pred_ok(void); /* the device makes predicates (VK_EXT_conditional_rendering); makes the shader */
 int vk_query_pred_job(u32 counter, u64 first, u64 end, u64 prev_end, int prev, u32 prev_slot, u32* slot);
@@ -2073,6 +2115,12 @@ VkImageView vk_storage_image_view(Surf* t, const ShaderInfo* si, int i, u64* byt
 /* the view type of storage image slot i of si: 3D for a volume, 2D array for an array (1D too), else 2D */
 VkImageViewType vk_storage_image_type(const ShaderInfo* si, int i);
 u32 vk_gbuf_desc(int stage, u32 off, const u32* v, u64* addr);
+/* The handles of si's texture slots that the program loads from memory (SNX_TEX_MEMORY), into out[i] for slot i (0 for
+   the others): ShaderInfo.memh run by sm86_eval with io (sm86.h). Returns how many. vk_memh_mem is io's guest memory
+   reader, a pending write landed first */
+struct Sm86EvalIo;
+u32 vk_memory_handles(const ShaderInfo* si, const struct Sm86EvalIo* io, u32* out);
+int vk_memh_mem(void* user, u64 address, u32* words, u32 count);
 /* the access a storage image is moved to GENERAL with: image atomics read it as well as write it, and only the
    accesses a barrier names see the writes before it */
 #define VK_STORAGE_IMAGE_ACCESS (VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)
@@ -2101,8 +2149,19 @@ extern u64 g_vk_passes, g_vk_clear_cmds, g_vk_clear_loads, g_vk_dontcare_loads;
 void vk_gpuprof_pass_begin(VkCommandBuffer cb, const Surf* rt, const Surf* zt);
 void vk_gpuprof_pass_end(VkCommandBuffer cb);
 /* why cmd.c submitted the frame's commands: a present, a vk_finish, the 1 ms of recording a submission holds at most
-   (vk_frame_check), a readback of GPU-owned memory, the end of a frame's slot, or anything else */
-enum { VK_SUB_OTHER, VK_SUB_PRESENT, VK_SUB_FINISH, VK_SUB_PERIODIC, VK_SUB_READBACK, VK_SUB_FRAME, VK_SUB_N };
+   (vk_frame_check), a readback of GPU-owned memory, the end of a frame's slot, a long piece of work cut into
+   submissions (vk_submit_split), a background encode's piece (vk_submit_background), or anything else */
+enum {
+    VK_SUB_OTHER,
+    VK_SUB_PRESENT,
+    VK_SUB_FINISH,
+    VK_SUB_PERIODIC,
+    VK_SUB_READBACK,
+    VK_SUB_FRAME,
+    VK_SUB_SPLIT,
+    VK_SUB_BACKGROUND,
+    VK_SUB_N
+};
 /* what the GPU thread waits for the graphics timeline for: a vk_finish, a frame slot's previous use, or one submission
    (a release's gate, a result's landing: vk_wait_submit) */
 enum { VK_WAIT_FINISH, VK_WAIT_RECYCLE, VK_WAIT_SUBMIT, VK_WAIT_N };
@@ -2125,6 +2184,7 @@ enum {
     VK_PROF_NONE,
     VK_PROF_ASTC,            /* the ASTC decode (astc.comp) */
     VK_PROF_BC7,             /* its BC7 encode (bc7.comp) */
+    VK_PROF_BC7_BACKGROUND,  /* a very large level's decode and fast build in the background (astc.c) */
     VK_PROF_MIRROR_FOLD,     /* a dispatch's write log into the GPU mirror's mask (mirror_fold.comp) */
     VK_PROF_MIRROR_HARVEST,  /* the mirror's pages written in a submit, out for landing (mirror_harvest.comp) */
     VK_PROF_WLOG_MERGE,      /* a logged result written back on the GPU (wlog_merge.comp) */

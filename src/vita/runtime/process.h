@@ -99,6 +99,8 @@ typedef struct {
 } VitaCallFrame;
 typedef struct VitaThread {
     SnxArmCPU cpu;
+    /* backward edges the chained blocks may still take this slice, counted down by the blocks themselves */
+    int32_t poll;
     uint32_t state, uid;
     char name[32];
     uint32_t entry, priority, attr, stack, stack_size, stack_block, tls;
@@ -122,7 +124,13 @@ typedef struct VitaThread {
     bool signal_pending;
     VitaWait wait;
     uint64_t seq; /* when it last ran: the scheduler takes the ready thread that waited longest */
+    /* the vblank its last sceDisplayWaitVblankStart wait ended at, or 0 before the first. The next such wait counts
+       from there, so a frame that ran late loses none of its next wait */
+    uint64_t vblank_wake;
+    /* when the scheduler first saw it ready, 0 while it is not, for the guard against starving a thread */
+    uint64_t ready_ns;
 } VitaThread;
+_Static_assert(offsetof(VitaThread, poll) == VITA_POLL_OFFSET, "the blocks find the poll count by this offset");
 
 enum {
     VITA_OBJ_FREE,
@@ -211,12 +219,15 @@ typedef struct VitaProcess {
     VitaAllocation allocations[VITA_ALLOCATIONS];
     VitaRegion user, cdram;
     VitaThread* current;
+    /* the thread that last waited for a vblank, which paces the frames */
+    VitaThread* pacer;
     uint64_t seq;
     uint64_t start_ns;
-    /* the display: the framebuffer sceDisplaySetFrameBuf last set, the vblanks so far and the next one's time */
+    /* the display: the framebuffer sceDisplaySetFrameBuf last set, the vblanks so far and the next one's time, and
+       the vblank the game's last wait for one ended at (due) with its count: the next frame is due at due + due_count */
     struct {
-        uint32_t base, pitch, format, width, height;
-        uint64_t vblanks, next_ns;
+        uint32_t base, pitch, format, width, height, due_count;
+        uint64_t vblanks, next_ns, due;
     } display;
     struct VitaGxm* gxm;
     struct VitaAudio* audio;

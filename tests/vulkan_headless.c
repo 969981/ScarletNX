@@ -14,6 +14,7 @@
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/descriptors.h"
 #include "nx/gpu/vk/extension_bans.h"
+#include "nx/gpu/vk/pipeline_parts.h"
 #include "nx/gpu/shader/shader.h"
 #include "nx/gpu/maxwell/kepler_compute_regs.h"
 #include "nx/gpu/maxwell/engines_int.h"
@@ -5278,6 +5279,7 @@ static int check_uma_page_changes(void) {
 #include "vulkan_index_draws.inc"
 #include "vulkan_pass_breaks.inc"
 #include "vulkan_storage_formats.inc"
+#include "vulkan_scaled_compute.inc"
 #include "vulkan_storage_atomics.inc"
 #include "vulkan_surface_loads.inc"
 #include "vulkan_rect_textures.inc"
@@ -5306,6 +5308,7 @@ static int check_uma_page_changes(void) {
 #include "vulkan_mixed_coverage.inc"
 #include "vulkan_alpha_coverage.inc"
 #include "vulkan_indexed_feedback.inc"
+#include "vulkan_scaled_fragment.inc"
 #include "vulkan_targetless_stores.inc"
 #include "vulkan_storage_image_keep.inc"
 #include "vulkan_uma_imports.inc"
@@ -5841,6 +5844,14 @@ static int run_headless(int argc, char** argv) {
         printf("PASS headless Vulkan trim only: %u validation messages\n", g_vk_validation_messages);
         return 0;
     }
+    if (getenv("SNX_TEST_SCALED_ONLY")) { /* the resolution scale's checks alone, for their mutants */
+        CHECK(!check_scaled_compute());
+        CHECK(!check_scaled_fragment());
+        vk_finish();
+        vk_pipeline_quiesce();
+        printf("PASS headless Vulkan resolution scale only: %u validation messages\n", g_vk_validation_messages);
+        return 0;
+    }
     if (getenv("SNX_TEST_PASS_BREAKS_ONLY")) { /* vulkan_pass_breaks.inc's checks alone */
         CHECK(!check_pass_breaks());
         vk_pipeline_quiesce();
@@ -5975,6 +5986,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_nvn_fixed_state());
     CHECK(!check_maxwell_point_size());
     CHECK(!check_maxwell_depth_bounds());
+    CHECK(!check_maxwell_depth_range());
     CHECK(!check_maxwell_viewport_swizzle());
     CHECK(!check_nvn_default_tessellation());
     CHECK(!check_nvn_advanced_blend());
@@ -6012,6 +6024,8 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_capture_cap());
     CHECK(!check_shader_float_rounding());
     CHECK(!check_storage_image_formats());
+    CHECK(!check_scaled_compute());
+    CHECK(!check_scaled_fragment());
     CHECK(!check_volume_surface_atomics());
     CHECK(!check_layered_surface_loads());
     CHECK(!check_rect_textures());
