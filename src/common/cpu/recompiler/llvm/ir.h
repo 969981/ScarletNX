@@ -77,6 +77,8 @@ typedef struct {
     unsigned arm_crc : 1;                /* AArch64 CRC32 extension */
     unsigned ppc : 1, ppc_vsx : 1;       /* PowerPC64 target, and its VSX: AltiVec alone flushes single-precision
                                             denormals and has no vector double arithmetic */
+    unsigned ppc_fsqrt : 1;              /* and its fsqrt: without it (the e5500, the baseline new_ir takes for a
+                                            CPU LLVM names none) llvm.sqrt is a call to libm, which no module links */
     unsigned riscv : 1, riscv_v : 1;     /* RISC-V target, and the V extension: per-lane variable shifts, gathers */
     unsigned loongarch : 1, la_lsx : 1;  /* LoongArch target, and LSX: 128-bit vectors */
     unsigned mips64 : 1, mips_msa : 1;   /* MIPS64 target, and MSA: 128-bit vectors (not "mips", which GNU C on
@@ -187,10 +189,16 @@ typedef struct SnxIr {
     unsigned long fallbacks;
     SnxU32 fallback_word;
     SnxU64 fallback_pc;
-    /* the runtime JIT's: nonzero when a target outside the codegen has an AOT module's function, called directly as
-       snx_aot_<target> (the JIT's loader resolves it), 0 for CALLDYN. NULL in the AOT build */
+    /* the runtime JIT's, and an NRO's module's: nonzero when a target outside the codegen has an AOT module's
+       function, called directly as snx_aot_<target> (the JIT's loader resolves it; an NRO's module defines it over
+       its import of the game's function), 0 for CALLDYN. NULL in the game module's build */
     SnxU64 (*direct)(void* user, SnxU64 target);
     void* direct_user;
+    /* the function the BR at address reaches once the program's linker has bound it (a PLT stub's), 0 for a BR
+       nothing is known of: the code compares the register with it, calls it as a BL to it would be called when they
+       are equal, and goes through CPU.disp when they are not. NULL: every BR through CPU.disp */
+    SnxU64 (*bound)(void* user, SnxU64 address);
+    void* bound_user;
     /* the AOT build's (snx_ir_stale_checks): snx_stale, the module's byte per function, which each function reads
        first and, once the runtime has set it, runs its entry through dispatch (SNX_ABI 14). NULL elsewhere */
     LLVMValueRef stale;
