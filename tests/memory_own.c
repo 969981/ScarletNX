@@ -12,6 +12,7 @@
    On Windows (platform/plat_win32.c) the traps are page protection and a vectored exception handler on the
    reservation's own pages, with no pool: landings write in place, a view is a copy, and ReadFile or WriteFile over an
    owned page fails with ERROR_NOACCESS until it is acquired */
+#include "common/utilities/common.h"
 #include "nx/memory/mem.h"
 #include "nx/runtime/nce/nce.h"
 #include "nx/memory/own.h"
@@ -135,6 +136,17 @@ static void release(void* res) {
     if (g_release_touch) g_release_read = *(volatile u8*)GP(g_release_touch);
 }
 static u32 busy_tid(void) { return g_busy_tid; }
+/* the producer's answer to a watch (own_watch): g_resolve_res published over [g_resolve_lo, + g_resolve_size), or
+   nothing when it is NULL. Called with the producer's lock held, as own_begin needs */
+static int g_resolves; /* atomic */
+static void* g_resolve_res;
+static u64 g_resolve_lo, g_resolve_size;
+static void resolve(u64 addr, u64 size) {
+    (void)addr;
+    (void)size;
+    __atomic_add_fetch(&g_resolves, 1, __ATOMIC_RELAXED);
+    if (g_resolve_res) CHECK(own_begin(g_resolve_lo, g_resolve_size, g_resolve_res, 0) == 0);
+}
 /* the producer's lock: recursive, as the renderer's */
 static pthread_mutex_t g_producer;
 static void producer_lock(void) { pthread_mutex_lock(&g_producer); }
@@ -703,6 +715,109 @@ static void test_let_go_watched(void) {
     res_free(r);
 }
 
+/* a watch: trapped pages that no resource holds. own_lookup skips it, own_stage reads its CPU bytes (through the
+   mirror, or in place the shadows that own_watch took), own_trapped and own_hash see it. The first access asks the
+   producer once (resolve), and lands what it published there. own_drop and own_unwatch open its pages with no resolve,
+   and a thread that holds the producer's lock drops it with no resolve and goes on. A watch never cuts an owner */
+static void test_watch(void) {
+    u64 a = region(R0 + 0xC00000, 0x10000), h = 0;
+    Res* r = res_new(0x2000, 0xA0);
+    OwnRange o[4];
+    u8 buf[0x4000];
+    int resolves = g_resolves, lands = g_lands;
+    CHECK(own_watch(a + 0x1100, 0x2000) == 0);
+    CHECK(own_lookup(a, 0x10000, o, 4) == 0 && own_any());
+    CHECK(own_trapped(a + 0x1000, 1) && own_trapped(a + 0x30FF, 1) && !own_trapped(a + 0x4000, 0x1000));
+    CHECK(own_watched(a + 0x1100, 0x2000) && !own_watched(a + 0x1000, 0x2100) && !own_watched(a + 0x8000, 4));
+    CHECK(own_hash(a, 0x10000, &h) == 1 && h != 0);
+    CHECK(own_stage(a, sizeof buf, buf, o, 4) == 0);
+    for (u32 i = 0; i < sizeof buf; i++) CHECK(buf[i] == (u8)(0x11 + i));
+    CHECK(g_resolves == resolves);
+    /* the read faults: the producer publishes r over the watch, once, and the read lands it */
+    g_resolve_res = r;
+    g_resolve_lo = a + 0x1100;
+    g_resolve_size = 0x2000;
+    CHECK(GP(a)[0x1200] == (u8)(0xA0 + 0x100));
+    CHECK(refs(r) == 0 && g_resolves == resolves + 1 && g_lands == lands + 1);
+    CHECK(GP(a)[0x10FF] == (u8)(0x11 + 0x10FF) && GP(a)[0x30FF] == (u8)(0xA0 + 0x1FFF) && !own_trapped(a, 0x10000));
+    g_resolve_res = NULL;
+    /* dropped: the pages open, with no resolve */
+    CHECK(own_watch(a + 0x5000, 0x800) == 0);
+    own_drop(a + 0x5000, 0x800);
+    CHECK(GP(a)[0x5010] == (u8)(0x11 + 0x5010) && !own_trapped(a + 0x5000, 0x800) && g_resolves == resolves + 1);
+    /* a part let go: its page opens, the rest stays watched until an access, whose resolve publishes nothing */
+    CHECK(own_watch(a + 0x6000, 0x2000) == 0);
+    own_unwatch(a + 0x6000, 0x1000);
+    CHECK(!own_watched(a + 0x6000, 0x1000) && own_watched(a + 0x7000, 0x1000) && !own_trapped(a + 0x6000, 0x1000));
+    CHECK(GP(a)[0x6010] == (u8)(0x11 + 0x6010) && g_resolves == resolves + 1);
+    CHECK(GP(a)[0x7010] == (u8)(0x11 + 0x7010));
+    refs(r); /* the landing's thread done: it holds the producer's lock until then */
+    CHECK(g_resolves == resolves + 2 && !own_trapped(a + 0x7000, 0x1000));
+    /* the producer's lock holder: its own_acquire and its own read drop the watch, with no resolve and no fatal */
+    CHECK(own_watch(a + 0x9000, 0x1000) == 0);
+    g_busy_tid = plat_tid();
+    own_acquire(a + 0x9000, 0x10);
+    CHECK(!own_trapped(a + 0x9000, 0x1000));
+    CHECK(own_watch(a + 0x9000, 0x1000) == 0);
+    CHECK(GP(a)[0x9010] == (u8)(0x11 + 0x9010));
+    g_busy_tid = 0;
+    CHECK(!own_trapped(a + 0x9000, 0x1000) && g_resolves == resolves + 2);
+    /* a watch and an owner on one page: the watch goes into the gap before the owner, and leaves it whole. A read of
+       the owner's page answers the watch first (whole, its other page too), then lands the owner */
+    CHECK(own_begin(a + 0xB400, 0x800, r, 0) == 0);
+    CHECK(own_watch(a + 0xA800, 0x1400) == 0);
+    CHECK(own_lookup(a + 0xA000, 0x2000, o, 4) == 1 && o[0].addr == a + 0xB400 && o[0].size == 0x800);
+    CHECK(own_watched(a + 0xA800, 0xC00) && !own_watched(a + 0xA800, 0xD00) && !own_watched(a + 0xBC00, 0x200));
+    CHECK(GP(a)[0xB500] == (u8)(0xA0 + 0x100));
+    {
+        int left = refs(r), asked = g_resolves - resolves, trapped = own_trapped(a + 0xA000, 0x2000);
+        if (left || asked != 3 || trapped)
+            fprintf(stderr, "watch beside an owner: %d references left, %d resolves, pages trapped %d (A %d, B %d)\n",
+                    left, asked, trapped, own_trapped(a + 0xA000, 0x1000), own_trapped(a + 0xB000, 0x1000));
+        CHECK(left == 0);
+        CHECK(asked == 3);
+        CHECK(!trapped);
+    }
+    CHECK(GP(a)[0xA900] == (u8)(0x11 + 0xA900) && GP(a)[0xBD00] == (u8)(0x11 + 0xBD00));
+    /* a later owner over a watch replaces it; mem_unmap drops what is left */
+    CHECK(own_watch(a + 0xD000, 0x2000) == 0 && own_begin(a + 0xD800, 0x800, r, 0) == 0);
+    CHECK(own_lookup(a + 0xD000, 0x2000, o, 4) == 1 && !own_watched(a + 0xD000, 0x2000));
+    CHECK(own_watched(a + 0xD000, 0x800) && own_watched(a + 0xE000, 0x1000));
+    CHECK(mem_unmap(a, 0x10000) == 0);
+    CHECK(refs(r) == 0 && g_resolves == resolves + 3);
+    res_free(r);
+}
+
+/* a watch of many pages (more than the first slab of shadows holds, in place), with an owner's page inside it: the
+   watch goes around the owner, each of its pages is staged with the CPU's bytes, and the owner's with its own. Let go
+   and watched again after the CPU wrote, the pages are staged with the new bytes (a slot let go and taken again) */
+static void test_watch_many(void) {
+    const u64 size = 0x60000;
+    u64 a = region(R0 + 0xD00000, size);
+    Res* r = res_new(0x1000, 0x30);
+    OwnRange o[4];
+    u8* buf = (u8*)malloc((size_t)size);
+    CHECK(buf && own_begin(a + 0x20000, 0x1000, r, 0) == 0);
+    CHECK(own_watch(a, size) == 0);
+    CHECK(own_watched(a, 0x20000) && own_watched(a + 0x21000, size - 0x21000) && !own_watched(a, size));
+    CHECK(own_stage(a, size, buf, o, 4) == 1 && o[0].addr == a + 0x20000 && o[0].size == 0x1000);
+    for (u64 i = 0; i < size; i++)
+        if (i < 0x20000 || i >= 0x21000) CHECK(buf[i] == (u8)(0x11 + i));
+    own_unwatch(a, size);
+    own_acquire(a + 0x20000, 0x1000);
+    CHECK(refs(r) == 0 && !own_trapped(a, size));
+    for (u64 i = 0; i < size; i += 0x1000) GP(a)[i + 7] = (u8)(0xC0 + (i >> 12));
+    CHECK(own_watch(a, size) == 0 && own_stage(a, size, buf, o, 4) == 0);
+    for (u64 i = 0; i < size; i++) { /* the owner's page has its bytes, landed */
+        u8 was = i >= 0x20000 && i < 0x21000 ? (u8)(0x30 + (i - 0x20000)) : (u8)(0x11 + i);
+        CHECK(buf[i] == ((i & 0xFFF) == 7 ? (u8)(0xC0 + (i >> 12)) : was));
+    }
+    CHECK(mem_unmap(a, size) == 0);
+    CHECK(!own_trapped(a, size));
+    free(buf);
+    res_free(r);
+}
+
 /* many threads fault on many owned pages at once while the owners change between rounds. In place (no mirror:
    Windows) a page is open while a landing fills it, so a thread that reaches it then without faulting (a reader
    started late, its first read on a page already filling) can read its old bytes: those reads are noted, and each
@@ -728,6 +843,47 @@ static void* reader(void* arg) {
     }
     return NULL;
 }
+/* Readers that start while the publish a fault asked for arms the watched pages: each waits for the resolve, then a
+   spin longer than the one before, so that some reach a page while own_begin arms it. A page armed already must stay
+   armed through it: userfaultfd arms a page again by letting it go first (plat_trap_arm unregisters it before it
+   registers it), and a reader there maps the page with the bytes it had, the round before's. Each round's publish is
+   ready before its watch: a fault of the round before's readers can come late, and with none it would drop the watch */
+#define REARM_READERS 16
+static u64 g_rearm_at;
+static int g_rearm_round, g_rearm_seen, g_rearm_stale; /* g_rearm_stale atomic */
+static void* rearm_reader(void* arg) {
+    u32 k = (u32)(uintptr_t)arg;
+    while (__atomic_load_n(&g_resolves, __ATOMIC_ACQUIRE) == g_rearm_seen) {}
+    for (volatile u32 spin = 0; spin < k * 400; spin++) {}
+    for (u32 page = k % 4; page < 32; page += 4) {
+        u64 off = page * 0x1000 + 0x80 + k;
+        /* in place a page is open while the landing fills it, and its old byte can be read then (test_stress) */
+        if (GP(g_rearm_at)[off] != (u8)(g_rearm_round * 5 + off) && plat_alias_mirror())
+            __atomic_add_fetch(&g_rearm_stale, 1, __ATOMIC_RELAXED);
+    }
+    return NULL;
+}
+static void test_rearm(void) {
+    pthread_t t[REARM_READERS];
+    g_rearm_at = region(R0 + 0xE00000, 0x20000);
+    for (g_rearm_round = 1; g_rearm_round <= 40; g_rearm_round++) {
+        Res* r = res_new(0x20000, (u8)(g_rearm_round * 5));
+        g_resolve_res = r;
+        g_resolve_lo = g_rearm_at;
+        g_resolve_size = 0x20000;
+        g_rearm_seen = __atomic_load_n(&g_resolves, __ATOMIC_ACQUIRE);
+        CHECK(own_watch(g_rearm_at, 0x20000) == 0);
+        for (u32 i = 0; i < REARM_READERS; i++) pthread_create(&t[i], NULL, rearm_reader, (void*)(uintptr_t)i);
+        CHECK(GP(g_rearm_at)[0x7F] == (u8)(g_rearm_round * 5 + 0x7F)); /* the fault that asks for the publish */
+        for (u32 i = 0; i < REARM_READERS; i++) pthread_join(t[i], NULL);
+        g_resolve_res = NULL;
+        CHECK(refs(r) == 0 && !own_trapped(g_rearm_at, 0x20000));
+        res_free(r);
+    }
+    if (g_rearm_stale) fprintf(stderr, "rearm: %d reads of the round before's bytes in 40 rounds\n", g_rearm_stale);
+    CHECK(g_rearm_stale == 0);
+    CHECK(mem_unmap(g_rearm_at, 0x20000) == 0);
+}
 static void test_stress(void) {
     pthread_t t[THREADS];
     u64 i;
@@ -749,11 +905,33 @@ static void test_stress(void) {
         g_nstale = 0;
         res_free(r);
     }
+    /* the same over watches: the first fault publishes the round's owner over all of them, once */
+    for (; g_round < 30; g_round++) {
+        Res* r = res_new(0x20000, (u8)(g_round * 7));
+        int resolves = g_resolves;
+        /* the publish is ready before the watches: a fault of the round before's readers can come late, after them, and
+           with none it would drop them */
+        g_resolve_res = r;
+        g_resolve_lo = g_sa;
+        g_resolve_size = 0x20000;
+        for (i = 0; i < 0x20000; i += 0x1800)
+            CHECK(own_watch(g_sa + i, 0x20000 - i < 0x1800 ? 0x20000 - i : 0x1800) == 0);
+        for (i = 0; i < THREADS; i++) pthread_create(&t[i], NULL, reader, (void*)(uintptr_t)(i + 1));
+        for (i = 0; i < THREADS; i++) pthread_join(t[i], NULL);
+        own_acquire(g_sa, 0x20000);
+        g_resolve_res = NULL;
+        CHECK(refs(r) == 0 && g_resolves == resolves + 1 && !own_trapped(g_sa, 0x20000));
+        for (i = 0; i < (u64)g_nstale && i < STALE_MAX; i++)
+            CHECK(GP(g_sa)[g_stale[i]] == (u8)(g_round * 7 + g_stale[i]));
+        g_stale_total += g_nstale;
+        g_nstale = 0;
+        res_free(r);
+    }
     CHECK(mem_unmap(g_sa, 0x20000) == 0);
     if (g_stale_total)
         printf("memory_own: %d of %d reads reached a page while a landing filled it in place, and read its old byte "
                "(each the owner's once landed)\n",
-               g_stale_total, 20 * THREADS * 2000);
+               g_stale_total, 30 * THREADS * 2000);
 }
 
 int main(int argc, char** argv) {
@@ -762,7 +940,8 @@ int main(int argc, char** argv) {
                   .release = release,
                   .busy_tid = busy_tid,
                   .lock = producer_lock,
-                  .unlock = producer_unlock};
+                  .unlock = producer_unlock,
+                  .resolve = resolve};
     pthread_mutexattr_t recursive;
     pthread_mutexattr_init(&recursive);
     pthread_mutexattr_settype(&recursive, PTHREAD_MUTEX_RECURSIVE);
@@ -820,15 +999,23 @@ int main(int argc, char** argv) {
         test_busy(self, 1, 0);
     }
 #else
-    test_busy("/proc/self/exe", 0, 0);
-    test_busy("/proc/self/exe", 1, 0);
-    test_busy("/proc/self/exe", 0, 1);
+    { /* the system's name for this program: /proc/self/exe is Linux's, and FreeBSD mounts no /proc of itself */
+        char* self = snx_executable(argv[0]);
+        CHECK(self != NULL);
+        test_busy(self, 0, 0);
+        test_busy(self, 1, 0);
+        test_busy(self, 0, 1);
+        free(self);
+    }
 #endif
     test_release_order();
     test_republish_after_landing();
     test_busy_unowned();
     test_scan_owned();
     test_let_go_watched();
+    test_watch();
+    test_watch_many();
+    test_rearm();
     test_stress();
     CHECK(!own_any());
     printf("memory_own: %u checks passed (%d landings, %d bytes)\n", checks, g_lands, g_landed_bytes);

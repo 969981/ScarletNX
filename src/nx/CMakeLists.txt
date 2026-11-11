@@ -131,7 +131,7 @@ snx_decodetree(snx_shader OUTPUT decode-sm86.inc DECODE "${CMAKE_CURRENT_SOURCE_
 include("${PROJECT_SOURCE_DIR}/cmake/vk_extension_bans.cmake")
 snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/descriptors.c gpu/vk/descriptor_heaps.c gpu/vk/descriptor_objects.c gpu/vk/cmd.c gpu/vk/record.c gpu/vk/format.c gpu/vk/surface.c gpu/vk/texture.c
                  gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/writelog.c gpu/vk/mirror.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/xfb.c gpu/vk/display.c gpu/vk/compute.c
-                 gpu/vk/pending_pages.c gpu/vk/checkpoints.c gpu/vk/image_out.c gpu/vk/depth_pack.c gpu/vk/memory.c gpu/vk/resource_stats.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/bc7_cache.c gpu/texture/astc_cpu.c gpu/texture/bc7_encode_cpu.cpp gpu/vk/blocklinear.c gpu/vk/texconv.c gpu/vk/owned.c gpu/vk/nvdec.c gpu/vk/dma.c gpu/vk/blit.c gpu/vk/msaa.c gpu/vk/ui.c gpu/texture/blocklinear.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/vma.cpp gpu/vk/gpuprof.c gpu/vk/uma.c
+                 gpu/vk/pending_pages.c gpu/vk/checkpoints.c gpu/vk/image_out.c gpu/vk/depth_pack.c gpu/vk/memory.c gpu/vk/resource_stats.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/bc7_cache.c gpu/texture/astc_cpu.c gpu/texture/bc7_encode_cpu.cpp gpu/vk/blocklinear.c gpu/vk/texconv.c gpu/vk/owned.c gpu/vk/nvdec.c gpu/vk/dma.c gpu/vk/blit.c gpu/vk/msaa.c gpu/vk/ui.c gpu/vk/hdr_swapchain.c gpu/texture/blocklinear.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/vma.cpp gpu/vk/gpuprof.c gpu/vk/uma.c
                  gpu/vk/ftz_probe.c gpu/vk/vertex_input.c gpu/vk/pipeline_parts.c gpu/vk/extension_bans.c
                  "${PROJECT_BINARY_DIR}/generated/vk_extension_bans_text.c"
                  gpu/vk/draw_texture.c gpu/vk/draw_texture_shader.c gpu/vk/tess_passthrough.c gpu/vk/varying_geometry.c gpu/vk/present_quad.c gpu/vk/capture.c gpu/vk/depth_shadow.c
@@ -260,7 +260,8 @@ if(BUILD_TESTING)
         target_link_libraries(snx-test-shader-direct PRIVATE Threads::Threads m)
     endif()
     add_test(NAME shader_direct_structure COMMAND $<TARGET_FILE:snx-test-shader-direct> --check-only)
-    add_executable(snx-test-shader-direct-regressions "${PROJECT_SOURCE_DIR}/tests/shader_direct_regressions.c")
+    add_executable(snx-test-shader-direct-regressions "${PROJECT_SOURCE_DIR}/tests/shader_direct_regressions.c"
+                   "${PROJECT_SOURCE_DIR}/tests/support/spv_eval.c")
     snx_test_target(snx-test-shader-direct-regressions 11)
     target_link_libraries(snx-test-shader-direct-regressions PRIVATE snx_shader)
     if(NOT WIN32)
@@ -512,9 +513,9 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     # every check again with graphics descriptors in heaps (vk_descriptors_mode=2), which the default, Automatic, takes
     # only on a GPU that shares the system's memory: a discrete GPU runs the default with sets. A device without
-    # VK_EXT_descriptor_heap runs buffers or sets again
+    # VK_EXT_descriptor_heap skips it, as the buffers' tests do without VK_EXT_descriptor_buffer
     add_test(NAME vulkan_headless_descriptor_heaps COMMAND snx-test-vulkan -H --vk_descriptors_mode=2)
-    set_tests_properties(vulkan_headless_descriptor_heaps PROPERTIES TIMEOUT 120
+    set_tests_properties(vulkan_headless_descriptor_heaps PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     # every check again the Vulkan 1.2 way on a newer device, as a game's .ini with vk_api=1.2 asks (gpu/vk/device.c
     # vk12_extensions): the 1.3 commands by their extensions' names, shaders in SPIR-V 1.5, under the validation layer

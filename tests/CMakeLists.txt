@@ -461,7 +461,7 @@ if(TARGET snx_ctr_board)
 
     # the loader's probe of a game read where it lies, and a standalone update laid over its game
     if(Python3_Interpreter_FOUND)
-        add_executable(snx-test-3ds-container 3ds_container.c)
+        add_executable(snx-test-3ds-container 3ds_container.c support/3ds_guest.c)
         snx_test_target(snx-test-3ds-container 11)
         target_link_libraries(snx-test-3ds-container PRIVATE snx_ctr_process)
         add_test(NAME 3ds_update COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_update.py"
@@ -638,6 +638,7 @@ if(TARGET hactool_internals)
         add_test(NAME filesystem_dump COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> dump)
         add_test(NAME filesystem_dump_source COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> dump-source)
         add_test(NAME filesystem_dump_none COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> dump-none)
+        add_test(NAME filesystem_data_link COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> data-link)
         add_test(NAME filesystem_dump_gone COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> dump-gone)
         add_test(NAME filesystem_dump_keys COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> dump-keys)
         add_test(NAME filesystem_dump_cut COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> dump-cut)
@@ -1170,7 +1171,8 @@ snx_hookgen(snx-test-nvn-nvrm-sync SPEC "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nv
 add_test(NAME nvn_nvrm_sync COMMAND snx-test-nvn-nvrm-sync)
 add_executable(snx-test-nvn-queue-lifetime nvn_queue_lifetime.c
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_replay.c"
-    "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_state.c" "${PROJECT_SOURCE_DIR}/src/nx/hle/hle.c")
+    "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_state.c" "${PROJECT_SOURCE_DIR}/src/nx/hle/hle.c"
+    own_stub.c)
 snx_test_target(snx-test-nvn-queue-lifetime 11)
 add_dependencies(snx-test-nvn-queue-lifetime snx_settings)
 target_include_directories(snx-test-nvn-queue-lifetime PRIVATE "${PROJECT_SOURCE_DIR}/src" "${PROJECT_BINARY_DIR}/settingsgen")
@@ -1418,6 +1420,13 @@ snx_test_target(snx-test-am-service 23)
 snx_service_swipc(snx-test-am-service hle/services/am.swipc hle/services/vi.swipc) # vi: grc's video proxy
 target_link_libraries(snx-test-am-service PRIVATE snx_test_common) # snx_nacp_aoc_base
 add_test(NAME am_service COMMAND snx-test-am-service)
+
+# gsv.c's display session: what a game is told of the display's HDR (GetHdrStatus, GetHdrPaperWhite, the HDR status
+# event), with the renderer stood in for
+add_executable(snx-test-gsv-hdr gsv_hdr.c)
+snx_test_target(snx-test-gsv-hdr 23)
+snx_service_swipc(snx-test-gsv-hdr hle/services/native_video.swipc hle/services/gsv.swipc hle/services/nvdrv.swipc)
+add_test(NAME gsv_hdr COMMAND snx-test-gsv-hdr)
 
 # am.c with a control.nacp: the desired language against its supported languages, its version and save sizes
 add_executable(snx-test-am-nacp am_nacp.c am_service_stubs.c)
@@ -1708,9 +1717,9 @@ if(Python3_Interpreter_FOUND)
                  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/publish_builds_test.py")
         # edenprobe's runs held against a baseline (scripts/edenprobe.py), with a fake runtime and game
         add_test(NAME edenprobe_script COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/edenprobe_test.py")
-        # a pull request made ready by someone without write access back to a draft, with one comment
-        # (scripts/pr-ready.py, pr-ready.yml), against the fake gh
-        add_test(NAME pr_ready COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/pr_ready_test.py")
+        # a Build run cancelled once a job of it failed, by the jobs still running (scripts/fail-fast.py), against a
+        # fake GitHub, and build.yml's jobs held to it
+        add_test(NAME fail_fast COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/fail_fast_test.py")
         # the pull request's comment linking its builds (scripts/pr-builds.sh), against a fake gh; 77 without jq
         add_test(NAME pr_builds COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/pr_builds_test.py")
         set_tests_properties(pr_builds PROPERTIES SKIP_RETURN_CODE 77)
@@ -3383,6 +3392,14 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
         snx_test_target(snx-test-vk-present-mode 11)
         target_link_libraries(snx-test-vk-present-mode PRIVATE snx_vk_common)
         add_test(NAME vk_present_mode COMMAND snx-test-vk-present-mode)
+        # a game's own HDR output: what a window's frames hold by its textures' format, and the swapchain image for
+        # each kind from a surface's formats
+        add_executable(snx-test-hdr-output hdr_output.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/hdr_swapchain.c"
+            "${volk_SOURCE_DIR}/volk.c")
+        snx_test_target(snx-test-hdr-output 11)
+        target_include_directories(snx-test-hdr-output PRIVATE "${PROJECT_SOURCE_DIR}/src")
+        target_link_libraries(snx-test-hdr-output PRIVATE snx_vk_common m)
+        add_test(NAME hdr_output COMMAND snx-test-hdr-output)
         # the submission ring's uploads run before the recording they belong to, on whatever device there is
         add_executable(snx-test-vk-ring-uploads vk_ring_uploads.c "${volk_SOURCE_DIR}/volk.c")
         snx_test_target(snx-test-vk-ring-uploads 11)

@@ -24,6 +24,7 @@
 #ifndef SNX_NVN_OBJ_H
 #define SNX_NVN_OBJ_H
 #include "common/cpu/aarch64/cpu.h"
+#include "nx/gpu/hdr_output.h"
 #include "nx/gpu/nvn/nvn.h"
 #include <stddef.h>
 
@@ -358,7 +359,8 @@ NVN_FITS(NvnWindowBuilderHdr, 0x60 - 0x2c);
    i is off the display (0: none), the present after its own, or its own while none came yet (shown: those);
    on_display[0], [1]: the presents' syncpoint value once the last present, and the one before it, are on the display
    (0: not waited for); released[i]: when the game could draw in texture i, as far as the window knows (for the
-   renderer's display times); shown_at[i]: the slot of texture i's last present on the pacer's clock (0: none), which
+   renderer's display times); shown_at[i]: the slot of texture i's last present on the pacer's clock (0: none), and
+   drawn_syncpt[i], drawn[i]: the point the replay reaches once it has drawn texture i's last present (0: none), which
    AcquireTexture waits for */
 typedef struct {
     u32 magic;
@@ -368,11 +370,25 @@ typedef struct {
     u32 syncpt[4], value[4], on_display[2], shown;
     i32 active; /* the textures acquired in turn: the first active ones (SetNumActiveTextures) */
     u64 native; /* the native window the builder named */
+    u32 drawn_syncpt[4], drawn[4];
 } NvnWindow;
 NVN_FITS(NvnWindow, 0x148);
 /* the Ounce's window (API 231): the builder's color space and HDR metadata, past NvnWindow */
 #define NVN_WIN_HDR(w) NVN_OBJ(NvnWindowBuilderHdr, (w) + 0x148)
 typedef char nvn_fits_NvnWindowHdr[sizeof(NvnWindowBuilderHdr) <= 0x180 - 0x148 ? 1 : -1];
+/* What the frames of a window hold (gpu/hdr_output.h), from the format of its textures: the Ounce's driver (API 231)
+   picks its native window's color space by that format alone when it makes the window, PQ in BT.2020's primaries for
+   RGB10A2 and scRGB for the two half float formats, and never reads the color space the builder was given
+   (nvnWindowBuilderSetColorSpace's value only comes back from its getter). An older driver's window is SDR */
+static inline u32 nvn_window_space(u32 api, i32 format) {
+    if (api < 231u << 16) return SNX_HDR_SPACE_SRGB;
+    switch (format) {
+        case NVN_FORMAT_RGB10A2: return SNX_HDR_SPACE_PQ;
+        case NVN_FORMAT_RGBA16F:
+        case NVN_FORMAT_RGBX16F: return SNX_HDR_SPACE_SCRGB;
+        default: return SNX_HDR_SPACE_SRGB;
+    }
+}
 
 /* ---- command buffers ---- */
 /* cur: where the next record goes (a guest address). begin: the recording's first record, its handle; last: its last

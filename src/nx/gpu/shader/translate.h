@@ -63,6 +63,12 @@ typedef struct {
     struct {
         u32 from, block, to, to_type;
     } cast_seen[512];
+    /* the stage's Input variables loaded whole in the block being written, by variable (a cache: one that collides
+       is loaded again), and each component taken of that load, 0 until taken. A stage's inputs don't change while it
+       runs */
+    struct {
+        u32 variable, block, value, part[4];
+    } input_seen[64];
     u32 scale_buffer, scale_pointer;
     u32 sampler[SH_MAXTEX], sampled_type[SH_MAXTEX];
     u32 tex_index[SH_MAXTEX], tex_map_buffer, tex_map_pointer, active_index;
@@ -100,8 +106,9 @@ static inline u32 shader_u32(DirectCtx* c, u32 value) {
     return c->small_u32[value];
 }
 
-/* Fragment fetches from a scaled render target (resolution=): texel p is at (p + 0.5) * scale, and TXQ answers the
-   size over the scale. The texture's bit is in the push constants' uvec4, x for slots 0-31, y for 32-63 */
+/* Fragment fetches from a scaled render target (resolution=): texel p is from pixel p * scale on (shader_scaled_fetch),
+   and TXQ answers the size over the scale. The texture's bit is in the push constants' uvec4, x for slots 0-31, y for
+   32-63 */
 _Static_assert(SH_MAXTEX <= 64, "the scaled textures' mask has a bit a slot");
 
 static const SpvGlsl450Op conversion_rounds[] = {SPV_GLSL_ROUND_EVEN, SPV_GLSL_FLOOR, SPV_GLSL_CEIL, SPV_GLSL_TRUNC};
@@ -197,6 +204,7 @@ u32 shader_sparse_predicate(u64 w, int op);
 /* dataflow.c */
 int shader_direct_own_pixel_fetch(const ShFlow* f, u32 index);
 int shader_direct_screen_uv(const ShFlow* f, u32 index, u32 x, u32 y);
+int shader_direct_screen_ndc_uv(const ShFlow* f, u32 index, u32 x, u32 y, int* yneg);
 u32 shader_direct_screen_out(const ShFlow* f, u32* yneg);
 int shader_direct_plain_uv(const ShFlow* f, u32 index, u32 x, u32 y);
 u32 shader_direct_uv_out(const ShFlow* f, u32* yneg);
@@ -267,7 +275,8 @@ u32 shader_indexed_is_depth(DirectCtx* c, int slot);
 u32 shader_dc_compare_indexed(DirectCtx* c, int slot, u32 reference, u32 texel);
 u32 shader_sample_dref(DirectCtx* c, const ShaderInfo* si, int slot, u32 vec4_type, u32 coords, u32 dref, int use_lod,
                        u32 lod);
-void shader_scaled_coords(DirectCtx* c, u32 push, int slot, int size, u32 i32_type, u32* x, u32* y);
+void shader_scaled_fetch(DirectCtx* c, u32 push, u32 fragcoord, u32 vec4, int slot, u32 i32_type, u32* x, u32* y);
+void shader_scaled_size(DirectCtx* c, u32 push, int slot, u32* x, u32* y);
 void shader_rect_coords(DirectCtx* c, u32 push, int scaled, int slot, u32 vec2_u32, u32 i32_type, u32* x, u32* y,
                         u32* gx, u32* gy);
 void shader_texel_row_coord(DirectCtx* c, u32 i32_type, u32* x, u32* y);
@@ -340,6 +349,29 @@ static inline u32 shader_cast(DirectCtx* c, u32 to_type, u32 value, u32 from_typ
     c->cast_seen[at].to = value;
     c->cast_seen[at].to_type = from_type;
     return result;
+}
+
+/* the cache entry of an Input variable of type, loaded in this block if it wasn't */
+static inline u32 shader_input_entry(DirectCtx* c, u32 type, u32 variable) {
+    u32 at = variable % (u32)(sizeof c->input_seen / sizeof *c->input_seen);
+    if (c->input_seen[at].variable == variable && c->input_seen[at].block == c->emit.block) return at;
+    c->input_seen[at].variable = variable;
+    c->input_seen[at].block = c->emit.block;
+    c->input_seen[at].value = spv_emit_load(&c->emit, type, variable);
+    for (u32 k = 0; k < 4; k++) c->input_seen[at].part[k] = 0;
+    return at;
+}
+/* an Input variable of type: its load in this block, made once */
+static inline u32 shader_input(DirectCtx* c, u32 type, u32 variable) {
+    return c->input_seen[shader_input_entry(c, type, variable)].value;
+}
+/* component (0 to 3) of an Input variable, a vector of vector_type whose components are of type: taken once a block
+   from the variable's load in it */
+static inline u32 shader_input_component(DirectCtx* c, u32 vector_type, u32 variable, u32 type, u32 component) {
+    u32 at = shader_input_entry(c, vector_type, variable);
+    if (!c->input_seen[at].part[component])
+        c->input_seen[at].part[component] = spv_emit_vec4_extract(&c->emit, type, c->input_seen[at].value, component);
+    return c->input_seen[at].part[component];
 }
 
 /* the Function variable of a register, predicate or flag (z, s, c, o) */

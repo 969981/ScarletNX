@@ -3,6 +3,7 @@
 #include "nx/gpu/shader/shader.h"
 #include "nx/gpu/vk/xfb_stores.h"
 #include "common/utilities/endian.h"
+#include "support/spv_eval.h"
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -154,6 +155,36 @@ static int float_round_trips(const u32* code, size_t words) {
     }
     return found;
 }
+/* The OpLoads of a whole Input variable in a module, of the variables decorated BuiltIn builtin (-1: those with no
+   BuiltIn, the generic inputs; -2: every Input variable), and in *again those of a variable its block already
+   loaded */
+static int input_loads(const u32* code, size_t words, int builtin, int* again) {
+    u32 inputs[96], loaded[96];
+    int count = 0, in_block = 0, loads = 0;
+    *again = 0;
+    for (size_t i = 5; i < words;) {
+        u32 width = code[i] >> 16, op = code[i] & 0xffff;
+        if (!width || i + width > words) return -1;
+        if (op == 59 && width >= 4 && code[i + 3] == 1 && count < 96) { /* OpVariable, Input */
+            int decorated = -1;
+            for (size_t k = 5; k < i; k += code[k] >> 16) /* OpDecorate variable BuiltIn */
+                if ((code[k] & 0xffff) == 71 && code[k] >> 16 == 4 && code[k + 1] == code[i + 2] && code[k + 2] == 11)
+                    decorated = (int)code[k + 3];
+            if (builtin == -2 || builtin == decorated) inputs[count++] = code[i + 2];
+        }
+        if (op == 248) in_block = 0; /* OpLabel */
+        if (op == 61 && width >= 4) {
+            int input = 0, seen = 0;
+            for (int k = 0; k < count; k++) input |= inputs[k] == code[i + 3];
+            for (int k = 0; k < in_block; k++) seen |= loaded[k] == code[i + 3];
+            loads += input;
+            *again += input && seen;
+            if (input && !seen && in_block < 96) loaded[in_block++] = code[i + 3];
+        }
+        i += width;
+    }
+    return loads;
+}
 static u32* spirv_of(const u64* code, size_t bytes, int stage, ShaderInfo* info, size_t* words, int flush,
                      int can_preserve, int can_preserve_f64, int can_subgroup) {
     u8* guest = guest_bytes(code, bytes);
@@ -165,6 +196,12 @@ static u32* spirv_of(const u64* code, size_t bytes, int stage, ShaderInfo* info,
         int trips = float_round_trips(result, *words);
         if (trips) fprintf(stderr, "a module of %zu words has %d float round trips through its bits\n", *words, trips);
         check(!trips, "no float is cast to its bits and back");
+        int again = 0;
+        input_loads(result, *words, -2, &again);
+        if (again)
+            fprintf(stderr, "a module of %zu words loads an Input variable its block has loaded %d times\n", *words,
+                    again);
+        check(!again, "an Input variable is loaded once a block");
     }
     return result;
 }
@@ -4020,21 +4057,92 @@ static void query_only_volume_stages(void) {
     }
 }
 
-/* fragment TLD and TXQ of a scaled target take the scale its texture's bit selects (issue #730) */
+/* A fragment program at a resolution scale (SNX_VKB_RS: 1 / the scale twice, then the scale). TLD.LZ at texel p
+   fetches p where the push constants do not mark the slot as bound to a scaled target. Where they do, and mark the
+   target as one of the size drawn to, the pixel of texel p that lies where the fragment lies in its guest pixel
+   (issues #730, #1579): at 2x texel (5, 3) is (10, 6) for the fragment at (6, 4) and (11, 7) for the one at (7, 5),
+   where the centre of the scaled texel gave (11, 7) to both; in a lower-left window, whose y counts up, the rows are
+   7 and 6; at 1.5x texel 4 is pixel 6 alone, where the fragment's place would give 7; at 0.5x texel (5, 3) is
+   (2, 1). A scaled target of another size (a table) gives every fragment the centre. TLDS and a surface load (SULD)
+   fetch the same pixel */
 static void scaled_texel_fetch(void) {
+    static const struct {
+        float scale, fx, fy; /* the fragment's FragCoord */
+        /* the texel fetched, its slot's bit, whether its target has the size drawn to, the window's origin */
+        u32 px, py, scaled, own, lower_left;
+        u32 x, y; /* the coordinates fetched */
+    } cases[] = {
+        {2.0f, 7.5f, 5.5f, 5, 3, 1, 1, 0, 11, 7}, {2.0f, 6.5f, 4.5f, 5, 3, 1, 1, 0, 10, 6},
+        {2.0f, 7.5f, 5.5f, 5, 3, 0, 0, 0, 5, 3},  {2.0f, 7.5f, 5.5f, 5, 3, 1, 1, 1, 11, 6},
+        {2.0f, 6.5f, 4.5f, 5, 3, 1, 1, 1, 10, 7}, {2.0f, 6.5f, 4.5f, 5, 3, 0, 1, 1, 5, 3},
+        {1.5f, 5.5f, 3.5f, 4, 3, 1, 1, 0, 6, 5},  {0.5f, 2.5f, 1.5f, 5, 3, 1, 1, 0, 2, 1},
+        {2.0f, 6.5f, 4.5f, 5, 3, 1, 0, 0, 11, 7}, {2.0f, 6.5f, 4.5f, 5, 3, 1, 0, 1, 11, 7},
+        {1.5f, 4.5f, 3.5f, 5, 3, 1, 0, 0, 8, 5},  {3.0f, 0.5f, 0.5f, 5, 3, 1, 0, 0, 16, 10},
+    };
     static const u64 tld_2d[] = {0xdc00000000000000ull | 7ull << 51 | 0xfull << 31 | 2ull << 28 | 0x10ull << 36 |
                                  0xffull << 20 | 7ull << 16 | 2ull << 8}; /* TLD.LZ R0, R2, RZ, 2D */
     /* TXQ.B: the handle in R4, the level in R5 */
     static const u64 txq_2d[] = {HANDLE_CBUF_R4, 0x5c9807800ff70005ull, 0xdf50000180470400ull};
     ShaderInfo info;
     size_t words = 0;
-    u32* code = translate(tld_2d, 1, ST_FS, &info, &words, 0);
-    check_translated(code, &info, "fragment TLD 2D translates");
-    if (code)
-        check(count_opcode(code, words, 111, 0xffffffffu) == 2 && count_opcode(code, words, 110, 0xffffffffu) == 2 &&
-                  count_opcode(code, words, 169, 0xffffffffu) == 1,
-              "fragment TLD 2D takes x and y at the scale its texture's bit selects");
-    free(code);
+    u32* code = NULL;
+    u32* constants = calloc(4096 * 4, sizeof *constants); /* the constant buffers SULD's handle comes from: zeros */
+    if (!constants) {
+        check(0, "scaled_texel_fetch: out of memory");
+        return;
+    }
+    for (u32 k = 0; k < 3 * sizeof cases / sizeof *cases; k++) {
+        u32 at = k / 3, form = k % 3;
+        const char* name = form == 0 ? "TLD" : form == 1 ? "TLDS" : "SULD.D.32";
+        /* x and y in R2 and R3, then the TLD, or TLDS.LZ R0, R2, R3, 2D (encoding 2: x in Ra, y in Rb), or the handle in
+           R4 and SULD.D.32 R8, R2, a raw load of a 2D surface */
+        const u64 fetch[] = {mov32i(2, cases[at].px), mov32i(3, cases[at].py),
+                             form == 0   ? tld_2d[0]
+                             : form == 1 ? 0xd200000000000000ull | 2ull << 53 | 0x10ull << 36 | 0xffull << 28 |
+                                               3ull << 20 | 7ull << 16 | 2ull << 8
+                                         : HANDLE_CBUF_R4,
+                             0xeb00000000070208ull | 3ull << 33 | 4ull << 39 | 1ull << 52 | 4ull << 20};
+        code = translate(fetch, form == 2 ? 4 : 3, ST_FS, &info, &words, 0);
+        check_translated(code, &info, "a fragment fetch of a 2D texture translates");
+        if (!code) continue;
+        float s = cases[at].scale;
+        u32 scale[4], bits;
+        const float values[3] = {1.0f / s, 1.0f / s, s};
+        memcpy(scale, values, sizeof values);
+        scale[3] = 0;
+        SpvEvalEnv env = {0};
+        memcpy(&bits, &cases[at].fx, 4);
+        env.builtin[15][0] = bits; /* FragCoord */
+        memcpy(&bits, &cases[at].fy, 4);
+        env.builtin[15][1] = bits;
+        for (u32 bank = 0; bank < 18; bank++) {
+            env.ubo[SNX_VKB_CB + bank] = constants;
+            env.ubo_words[SNX_VKB_CB + bank] = 4096 * 4;
+        }
+        env.ubo[SNX_VKB_RS] = scale;
+        env.ubo_words[SNX_VKB_RS] = 4;
+        env.push[4] = cases[at].scaled; /* the uvec4 after the fragment stage's vec4: slot 0's bit, then the origin */
+        env.push[6] = cases[at].lower_left;
+        env.push[7] = 8;
+        env.push[12] = cases[at].own; /* the uvec4 at byte 96: slot 0's target has the size drawn to */
+        const char* why = spv_eval(code, words, &env);
+        if (why) fprintf(stderr, "scaled fetch: the evaluator stops at %s\n", why);
+        int fetched = !why && env.fetched[SNX_VKB_TEX][0] == cases[at].x && env.fetched[SNX_VKB_TEX][1] == cases[at].y;
+        if (!fetched)
+            fprintf(stderr,
+                    "scaled fetch: at %gx the fragment at (%g, %g) of a%s window fetches (%s) texel (%u, %u) of a "
+                    "texture %s a scaled target at (%u, %u), not (%u, %u)\n",
+                    (double)s, (double)cases[at].fx, (double)cases[at].fy,
+                    cases[at].lower_left ? " lower-left" : "n upper-left", name, cases[at].px, cases[at].py,
+                    !cases[at].scaled ? "that is not"
+                    : cases[at].own   ? "bound to, of the size drawn to,"
+                                      : "bound to, of another size than the one drawn to,",
+                    env.fetched[SNX_VKB_TEX][0], env.fetched[SNX_VKB_TEX][1], cases[at].x, cases[at].y);
+        check(fetched,
+              "a fragment fetch of a scaled target reads the pixel where the fragment lies in its guest pixel");
+        free(code);
+    }
+    free(constants);
     code = translate(txq_2d, 3, ST_FS, &info, &words, 0);
     check_translated(code, &info, "fragment TXQ translates");
     if (code)
@@ -4369,6 +4477,55 @@ static void texture_unread_slots(void) {
     }
 }
 #undef UNREAD_TEXS
+
+/* ShaderInfo.screen_ndc: the program maps a generic's x / w and y / w from clip space onto [0, 1] itself, x / w / 2 +
+   1/2 and +-y / w / 2 + 1/2, each an FFMA by an immediate +-1/2 with 1/2 in a register: the own pixel's centre wherever
+   the vertex program wrote that generic as its position itself. Another factor or addend, a saturation, x mirrored,
+   or a slot also sampled at the unmapped x / w and y / w reads elsewhere */
+#define SCREEN_FFMA_HALF(d, a, c, neg)                                                                                 \
+    (0x3280000000070000ull | (u64)(neg) << 56 | (u64)(c) << 39 | 0x3f000ull << 20 | (u64)(a) << 8 | (u64)(d))
+static void screen_ndc_case(const u64* instructions, int count, u64 screen, u32 ndc, const char* what) {
+    size_t slots, words = 0;
+    u64* code = guest_program(instructions, count, NULL, &slots);
+    if (!code) return;
+    set_sph(code, 7, 0xaa00);
+    ShaderInfo info;
+    memset(&info, 0, sizeof info);
+    u32* spv = spirv_of(code, slots * sizeof *code, ST_FS, &info, &words, 0, 1, 1, 1);
+    free(code);
+    check_translated(spv, &info, what);
+    int ok = spv && info.tex_screen_mask == screen && !info.tex_own_pixel_mask &&
+             (!screen || (info.screen_in == 5 && info.screen_ndc == ndc));
+    if (spv && !ok)
+        fprintf(stderr, "  screen mask %#llx (generic %u, mapping %u), own pixel %#llx, expected %#llx (mapping %u)\n",
+                (unsigned long long)info.tex_screen_mask, info.screen_in, info.screen_ndc,
+                (unsigned long long)info.tex_own_pixel_mask, (unsigned long long)screen, ndc);
+    check(ok, what);
+    free(spv);
+}
+static void feedback_screen_ndc(void) {
+    const u64 ipa_w = SCREEN_IPA(0, 0x7c), rcp_w = SCREEN_RCP(0, 0), x = SCREEN_IPA_MUL(1, 0xd0, 0),
+              y = SCREEN_IPA_MUL(2, 0xd4, 0), w = SCREEN_IPA_MUL(3, 0xdc, 0), rcp = SCREEN_RCP(3, 3),
+              ux = SCREEN_FMUL(4, 1, 3), uy = SCREEN_FMUL(5, 2, 3), half = mov32i(6, 0x3f000000u),
+              quarter = mov32i(6, 0x3e800000u), tex = SCREEN_TEX(8, 4);
+    const u64 mx = SCREEN_FFMA_HALF(4, 4, 6, 0), my_down = SCREEN_FFMA_HALF(5, 5, 6, 1),
+              my_up = SCREEN_FFMA_HALF(5, 5, 6, 0);
+    const u64 down[] = {ipa_w, rcp_w, x, y, w, rcp, ux, uy, half, mx, my_down, tex};
+    const u64 up[] = {ipa_w, rcp_w, x, y, w, rcp, ux, uy, half, mx, my_up, tex};
+    const u64 mirrored[] = {ipa_w, rcp_w, x, y, w, rcp, ux, uy, half, SCREEN_FFMA_HALF(4, 4, 6, 1), my_down, tex};
+    const u64 addend[] = {ipa_w, rcp_w, x, y, w, rcp, ux, uy, quarter, mx, my_down, tex};
+    const u64 mx_quarter = (mx & ~(0x7ffffull << 20)) | 0x3e800ull << 20; /* x / w times 1/4 */
+    const u64 factor[] = {ipa_w, rcp_w, x, y, w, rcp, ux, uy, half, mx_quarter, my_down, tex};
+    const u64 saturated[] = {ipa_w, rcp_w, x, y, w, rcp, ux, uy, half, mx | 1ull << 50, my_down, tex};
+    const u64 mixed[] = {ipa_w, rcp_w, x, y, w, rcp, ux, uy, SCREEN_TEX(12, 4), half, mx, my_down, tex};
+    screen_ndc_case(down, 12, 1, 2, "TEX at x / w / 2 + 1/2 and -y / w / 2 + 1/2 samples the own pixel's centre");
+    screen_ndc_case(up, 12, 1, 1, "TEX at x / w / 2 + 1/2 and y / w / 2 + 1/2 samples the own pixel's centre");
+    screen_ndc_case(mirrored, 12, 0, 0, "TEX at -x / w / 2 + 1/2 reads elsewhere");
+    screen_ndc_case(addend, 12, 0, 0, "an addend of 1/4 reads elsewhere");
+    screen_ndc_case(factor, 12, 0, 0, "a factor of 1/4 reads elsewhere");
+    screen_ndc_case(saturated, 12, 0, 0, "a saturated mapping reads elsewhere");
+    screen_ndc_case(mixed, 13, 0, 0, "a slot sampled at the mapped and the unmapped x / w and y / w reads elsewhere");
+}
 
 /* ShaderInfo.screen_out_mask: the vertex program writes generic 5 as its position mapped onto [0, 1],
    ((w + x) / 2, (w - y) / 2, -, w), the y's sign in screen_out_yneg_mask, each word stored once with no guard, from
@@ -5186,6 +5343,111 @@ static void fragment_flow_derivatives(void) {
     }
 }
 
+/* An Input variable is loaded once in a block and each of its components taken once, however many instructions read
+   it (translate.h's input_seen); a later block, which the first need not dominate, loads it again */
+static void inputs_loaded_once_a_block(void) {
+#define INPUT_IPA(d, addr) (0xe000000000070000ull | (u64)(addr) << 28 | 0xff00ull | (u64)(d))
+#define INPUT_ALD(d, addr) ((0xefd9ff8000070000ull & ~(3ull << 47)) | (u64)(addr) << 20 | 0xff00ull | (u64)(d))
+    enum { EXTRACT = 81, FRAG_COORD = 15, LANE = 41 };
+    const u64 branch = 0xe24000000000000full | (16ull << 20); /* @P0 BRA over the next instruction */
+    const u64 al2p =
+        (0xefa070010607ff01ull & ~(0xffull | (0xffull << 8) | (0x7ffull << 20))) | 8ull | (2ull << 8) | (0x80ull << 20);
+    const u64 indexed = 0xe06000c800770800ull; /* IPA.IDX.MUL R0, a[R8], R7 */
+    const struct {
+        u64 instructions[5];
+        int count;
+        int generic, coord, extracts; /* the loads of the generic inputs and of FragCoord, and the components taken */
+        const char* what;
+    } fragment[] = {
+        {{0}, 0, 0, 0, 0, "a fragment program of an EXIT alone loads no input"},
+        {{INPUT_IPA(0, 0xc0), INPUT_IPA(1, 0xc4), INPUT_IPA(2, 0xc0)},
+         3,
+         1,
+         1,
+         3,
+         "a perspective input's x, y and x again: one load of it and one of FragCoord, and x, y and w taken once"},
+        {{INPUT_IPA(0, 0x70), INPUT_IPA(1, 0x74), INPUT_IPA(2, 0x7c), INPUT_IPA(3, 0x70)},
+         4,
+         0,
+         1,
+         3,
+         "the fragment's x, y, 1/w and x again: one load of FragCoord and three components"},
+        {{INPUT_IPA(0, 0xc0), INPUT_IPA(1, 0x7c)},
+         2,
+         1,
+         1,
+         2,
+         "a perspective input and a[0x7c] share FragCoord's load and its w"},
+        {{INPUT_IPA(0, 0xc0), branch, INPUT_IPA(1, 0xc0), INPUT_IPA(2, 0xc0)},
+         4,
+         3,
+         3,
+         6,
+         "an input read in three blocks is loaded in each, with FragCoord, and its x and w taken in each"},
+        {{mov32i(2, 0x10), al2p, indexed, indexed},
+         4,
+         -1,
+         1,
+         -1,
+         "two indexed IPAs in a block share FragCoord's load for their perspective inputs"},
+    };
+    int base_extracts = 0;
+    for (size_t i = 0; i < sizeof fragment / sizeof *fragment; i++) {
+        ShaderInfo info;
+        size_t words = 0, slots;
+        int again = 0;
+        u64* code = guest_program(fragment[i].instructions, fragment[i].count, NULL, &slots);
+        if (!code) return;
+        set_sph(code, 6, 0xaaaa); /* generic inputs 0 and 1, perspective: the indexed IPAs' candidates */
+        set_sph(code, 7, 0xaa);   /* generic input 4, perspective */
+        set_sph(code, 18, 0xf);
+        memset(&info, 0, sizeof info);
+        u32* spv = spirv_of(code, slots * sizeof *code, ST_FS, &info, &words, 0, 1, 1, 1);
+        free(code);
+        check_translated(spv, &info, "a fragment program reading its inputs translates");
+        if (!spv) continue;
+        int generic = input_loads(spv, words, -1, &again), coord = input_loads(spv, words, FRAG_COORD, &again);
+        int extracts = count_opcode(spv, words, EXTRACT, 0xffffffffu) - base_extracts;
+        if (!i) base_extracts = extracts;
+        if ((fragment[i].generic >= 0 && generic != fragment[i].generic) || coord != fragment[i].coord ||
+            (i && fragment[i].extracts >= 0 && extracts != fragment[i].extracts))
+            fprintf(stderr,
+                    "fragment inputs %zu: %d loads of generic inputs, %d of FragCoord, %d components, not %d, %d, %d\n",
+                    i, generic, coord, extracts, fragment[i].generic, fragment[i].coord, fragment[i].extracts);
+        check((fragment[i].generic < 0 || generic == fragment[i].generic) && coord == fragment[i].coord &&
+                  (!i || fragment[i].extracts < 0 || extracts == fragment[i].extracts),
+              fragment[i].what);
+        free(spv);
+    }
+    /* a vertex program: attribute 0's x, y and x again */
+    ShaderInfo info;
+    size_t words = 0;
+    int again = 0;
+    const u64 attribute[] = {INPUT_ALD(0, 0x80), INPUT_ALD(1, 0x84), INPUT_ALD(2, 0x80)};
+    u32* spv = translate(NULL, 0, ST_VS, &info, &words, 0);
+    int vertex_extracts = spv ? count_opcode(spv, words, EXTRACT, 0xffffffffu) : 0;
+    free(spv);
+    spv = translate(attribute, 3, ST_VS, &info, &words, 0);
+    check_translated(spv, &info, "a vertex program reading an attribute translates");
+    check(spv && input_loads(spv, words, -1, &again) == 1 &&
+              count_opcode(spv, words, EXTRACT, 0xffffffffu) == vertex_extracts + 2,
+          "an attribute's x, y and x again: one load of it, and x and y taken once");
+    free(spv);
+    /* two FSWZADD whose lanes differ read the subgroup's lane once */
+    const u64 swizzled[] = {fswzadd(0x99), fswzadd(0x99)};
+    size_t slots;
+    u64* code = guest_program(swizzled, 2, NULL, &slots);
+    if (!code) return;
+    memset(&info, 0, sizeof info);
+    spv = spirv_of(code, slots * sizeof *code, ST_FS, &info, &words, 0, 1, 1, 1);
+    free(code);
+    check_translated(spv, &info, "two FSWZADD translate");
+    check(spv && input_loads(spv, words, LANE, &again) == 1, "two FSWZADD in a block load the subgroup's lane once");
+    free(spv);
+#undef INPUT_IPA
+#undef INPUT_ALD
+}
+
 /* What the translator knows as it translates is settled there, not left for the driver's compiler: PT, the
    predicate most instructions name, is the constant true; a constant a register holds is a constant of the type it
    is read as; and a float a register holds is read back as that float, not through its bits */
@@ -5554,6 +5816,7 @@ int main(int argc, char** argv) {
     feedback_own_pixel();
     feedback_screen_uv();
     texture_unread_slots();
+    feedback_screen_ndc();
     vertex_screen_out();
     vertex_position_out();
     feedback_plain_uv();
@@ -5561,6 +5824,7 @@ int main(int argc, char** argv) {
     fragment_position_pass();
     per_vertex_pass();
     settled_when_translated();
+    inputs_loaded_once_a_block();
     check(!g_fixtures.failed, "shader fixture paths allocated");
     for (size_t i = 0; i < g_fixtures.count; i++) free(g_fixtures.paths[i]);
     free(g_fixtures.paths);

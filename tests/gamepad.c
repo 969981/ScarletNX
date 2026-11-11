@@ -11,6 +11,7 @@
 #include "nx/runtime/pause.h"
 #include "common/utilities/common.h"
 #include "common/utilities/pad_sdl.h" /* snx_pad_slot */
+#include "support/sdl_real_pads.h"
 #include <SDL3/SDL.h>
 #include <string.h>
 #include <stdio.h>
@@ -61,15 +62,13 @@ static int checks;
 
 /* HidNpadButton bits */
 enum { A = 1, B = 2, X = 4, Y = 8, ZL = 1 << 8, ZR = 1 << 9, PLUS = 1 << 10, LEFT = 1 << 12, UP = 1 << 13 };
-/* the virtual pads, by the vendor and product SDL tells their layout from: only they are read, a real pad plugged in
-   stays out */
+/* the virtual pads, by the vendor and product SDL tells their layout from */
 #define XBOX      0x045e, 0x02ea
 #define SWITCH    0x057e, 0x2009
 #define SONY      0x054c, 0x09cc
 #define GAMECUBE  0x057e, 0x0337
 #define JOY_LEFT  0x057e, 0x2006
 #define JOY_RIGHT 0x057e, 0x2007
-#define PADS_IDS  "0x045e/0x02ea,0x057e/0x2009,0x054c/0x09cc,0x057e/0x0337,0x057e/0x2006,0x057e/0x2007"
 
 /* the backend's event loop (sdl3.c's video_poll), for the gamepads */
 static void pump(void) {
@@ -86,6 +85,42 @@ static int pads;
 static bool SDLCALL rumble(void* pad, Uint16 low, Uint16 high) {
     *(Uint32*)pad = low | (Uint32)high << 16;
     return true;
+}
+/* the last rumble report a virtual Switch controller took, and how many */
+static Uint8 effected[10];
+static int effects;
+static bool SDLCALL effect(void* pad, const void* data, int size) {
+    (void)pad;
+    if (size != (int)sizeof effected) return false;
+    memcpy(effected, data, sizeof effected);
+    effects++;
+    return true;
+}
+/* nn::hid::VibrationValue's default frequencies, in Hz (left low, left high, right low, right high) */
+static const float SDK[4] = {160.0f, 320.0f, 160.0f, 320.0f};
+/* a virtual Switch controller that takes rumble reports, as SDL's HIDAPI driver gives them (product 0x2009: a Pro
+   Controller, 0x2006: a left Joy-Con), and its slot. With motor NULL it reports no rumble, as an input-only one */
+static int attach_switch(Uint16 product, Uint32* motor) {
+    SDL_VirtualJoystickDesc d;
+    int slot = -1;
+    SDL_INIT_INTERFACE(&d);
+    d.SendEffect = effect;
+    if (motor) {
+        d.Rumble = rumble;
+        d.userdata = motor;
+    }
+    d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+    d.naxes = SDL_GAMEPAD_AXIS_COUNT;
+    d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+    d.vendor_id = 0x057e;
+    d.product_id = product;
+    SDL_JoystickID id = SDL_AttachVirtualJoystick(&d);
+    CHECK(id && SDL_OpenJoystick(id));
+    pump();
+    for (int i = 0; i < SNX_GAMEPADS; i++)
+        if (gamepad_slot_id(i) == id) slot = i;
+    CHECK(slot >= 0);
+    return slot;
 }
 static bool SDLCALL sensors_enabled(void* pad, bool enabled) {
     (void)pad;
@@ -164,7 +199,7 @@ int main(void) {
     SDL_Window* w;
     i32 s[4];
     SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");
-    SDL_SetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT, PADS_IDS);
+    sdl_real_pads_hide();
     CHECK(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD));
     w = SDL_CreateWindow("gamepad", 64, 64, 0);
     CHECK(w != NULL && SDL_GetKeyboardFocus() == w);
@@ -325,6 +360,91 @@ int main(void) {
     gamepad_rumble(0, 0); /* the game stops it */
     CHECK(motors[0] == 0);
 
+    /* a Switch controller that takes rumble reports (SDL's HIDAPI driver) gets HD rumble: each actuator its own 4
+       bytes, with the frequencies the game asked for (dekuNukem's encoding). A report at most each 30 ms, on the
+       clock the caller gives */
+    {
+        Uint32 motor = 0;
+        int slot = attach_switch(0x2009, &motor);
+        const u64 ms = 1000000ull;
+        static const Uint8 LOW_FULL_LEFT[10] = {0x10, 0, 0x00, 0x01, 0x40, 0x72, 0x00, 0x01, 0x40, 0x40};
+        static const Uint8 HIGH_FULL_RIGHT[10] = {0x10, 0, 0x00, 0x01, 0x40, 0x40, 0xFC, 0xC9, 0x40, 0x40};
+        static const Uint8 HIGH_FLOOR_LEFT[10] = {0x10, 0, 0x04, 0xC8, 0x01, 0x40, 0x00, 0x01, 0x40, 0x40};
+        static const Uint8 NEUTRAL[10] = {0x10, 0, 0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40};
+        /* the left Joy-Con's half: the left side's high band at 1252 Hz, the right side's low band at 160 Hz */
+        static const Uint8 JOYCON_MIXED[10] = {0x10, 0, 0xFC, 0xC9, 0x40, 0x72, 0x00, 0x01, 0x40, 0x40};
+        float top[4] = {160.0f, 320.0f, 160.0f, 1252.0f}, none[4] = {NAN, 0.0f, 160.0f, 320.0f};
+        float mixed[4] = {40.0f, 1252.0f, 160.0f, 81.75f};
+        gamepad_rumble_slot(slot, 0xFFFFu, 0, SDK, 0); /* the low band at full on the left, 160 Hz */
+        CHECK(effects == 1 && !memcmp(effected, LOW_FULL_LEFT, 10));
+        /* a pulse shorter than the 30 ms between reports still plays, and then stops */
+        gamepad_rumble_slot(slot, 0, 0xFFFFu << 16, top, 16 * ms); /* the high band at full on the right, 1252 Hz */
+        CHECK(effects == 1);
+        gamepad_rumble_slot(slot, 0, 0, SDK, 33 * ms);
+        CHECK(effects == 2 && !memcmp(effected, HIGH_FULL_RIGHT, 10));
+        gamepad_rumble_slot(slot, 0, 0, SDK, 50 * ms);
+        CHECK(effects == 2);
+        gamepad_rumble_slot(slot, 0, 0, SDK, 66 * ms);
+        CHECK(effects == 3 && !memcmp(effected, NEUTRAL, 10));
+        gamepad_rumble_slot(slot, 0, 0, SDK, 100 * ms); /* stopped once, then nothing more */
+        CHECK(effects == 3);
+        gamepad_rumble_slot(slot, 0xFFFFu << 16, 0, none, 133 * ms); /* no frequency, nor a NaN: each band's lowest */
+        CHECK(effects == 4 && !memcmp(effected, HIGH_FLOOR_LEFT, 10));
+        /* a newer vibration goes in place of one that waited, and comes again before 50 ms go by */
+        gamepad_rumble_slot(slot, 0, 0xFFFFu << 16, top, 145 * ms);
+        gamepad_rumble_slot(slot, 0xFFFFu, 0, SDK, 170 * ms);
+        CHECK(effects == 5 && !memcmp(effected, LOW_FULL_LEFT, 10));
+        gamepad_rumble_slot(slot, 0xFFFFu, 0, SDK, 200 * ms);
+        CHECK(effects == 6 && !memcmp(effected, LOW_FULL_LEFT, 10));
+        CHECK(gamepad_ini("gamepad_rumble", "0")); /* never: stopped once */
+        gamepad_rumble_slot(slot, 0xFFFFu, 0xFFFFu, SDK, 233 * ms);
+        CHECK(effects == 7 && !memcmp(effected, NEUTRAL, 10));
+        gamepad_rumble_slot(slot, 0xFFFFu, 0xFFFFu, SDK, 266 * ms);
+        CHECK(effects == 7);
+        CHECK(gamepad_ini("gamepad_rumble", "100"));
+        /* a vibration that waits is dropped when the player mutes it or the game pauses, not when the game stops it */
+        gamepad_rumble_slot(slot, 0xFFFFu, 0, SDK, 300 * ms);
+        gamepad_rumble_slot(slot, 0, 0, SDK, 333 * ms);
+        CHECK(effects == 9 && !memcmp(effected, NEUTRAL, 10));
+        gamepad_rumble_slot(slot, 0, 0xFFFFu << 16, top, 345 * ms);
+        CHECK(gamepad_ini("gamepad_rumble", "0"));
+        gamepad_rumble_slot(slot, 0, 0, SDK, 366 * ms);
+        CHECK(effects == 9);
+        CHECK(gamepad_ini("gamepad_rumble", "100"));
+        gamepad_rumble_slot(slot, 0, 0, SDK, 400 * ms);
+        CHECK(effects == 9);
+        gamepad_rumble_slot(slot, 0xFFFFu, 0, SDK, 420 * ms);
+        CHECK(effects == 10 && !memcmp(effected, LOW_FULL_LEFT, 10));
+        gamepad_rumble_slot(slot, 0, 0xFFFFu << 16, top, 430 * ms);
+        paused++;
+        gamepad_rumble_slot(slot, 0, 0, SDK, 455 * ms); /* the paused frontend's: none */
+        CHECK(effects == 11 && !memcmp(effected, NEUTRAL, 10));
+        paused--;
+        /* a vibration that plays already and comes again within 30 ms does not wait: the stop after it goes at once */
+        gamepad_rumble_slot(slot, 0xFFFFu, 0, SDK, 500 * ms);
+        CHECK(effects == 12 && !memcmp(effected, LOW_FULL_LEFT, 10));
+        gamepad_rumble_slot(slot, 0xFFFFu, 0, SDK, 516 * ms);
+        gamepad_rumble_slot(slot, 0, 0, SDK, 533 * ms);
+        CHECK(effects == 13 && !memcmp(effected, NEUTRAL, 10));
+        SDL_DetachVirtualJoystick(gamepad_slot_id(slot));
+        pump();
+
+        /* a single Joy-Con has one actuator and plays only its own half: each band of the stronger side, at that
+           side's frequency */
+        slot = attach_switch(0x2006, &motor);
+        gamepad_rumble_slot(slot, 0xFFFFu << 16, 0xFFFFu, mixed, 600 * ms);
+        CHECK(effects == 14 && !memcmp(effected, JOYCON_MIXED, 10));
+        SDL_DetachVirtualJoystick(gamepad_slot_id(slot));
+        pump();
+
+        /* a Switch controller that reports no rumble (an input-only one) gets no report */
+        slot = attach_switch(0x2009, NULL);
+        gamepad_rumble_slot(slot, 0xFFFFu, 0, SDK, 700 * ms);
+        CHECK(effects == 14);
+        SDL_DetachVirtualJoystick(gamepad_slot_id(slot));
+        pump();
+    }
+
     /* the legacy combined state merges every pad, and the first stick that is pushed wins */
     SDL_SetJoystickVirtualButton(xbox, SDL_GAMEPAD_BUTTON_SOUTH, true);
     SDL_SetJoystickVirtualButton(pro, SDL_GAMEPAD_BUTTON_EAST, true);
@@ -459,10 +579,10 @@ int main(void) {
         CHECK(gamepad_ini("gamepad_p2_map", "south:Q") && with(second, SDL_GAMEPAD_BUTTON_SOUTH) == X); /* kept */
         CHECK(gamepad_ini("gamepad_p2_map", "") && with(second, SDL_GAMEPAD_BUTTON_SOUTH) == B); /* none: all's */
         CHECK(gamepad_ini("gamepad_p1_rumble", "0"));
-        gamepad_rumble_slot(0, 0xFFFFu, 0);
+        gamepad_rumble_slot(0, 0xFFFFu, 0, SDK, 0);
         CHECK(motors[0] == 0);
         CHECK(gamepad_ini("gamepad_p1_rumble", "-10"));
-        gamepad_rumble_slot(0, 0xFFFFu, 0);
+        gamepad_rumble_slot(0, 0xFFFFu, 0, SDK, 0);
         CHECK(motors[0] == 0xFFFFu);
         CHECK(gamepad_player_seen(1) && gamepad_ini("gamepad_p2_connected", "0") && !gamepad_player_seen(1));
         CHECK(gamepad_ini("gamepad_p1_connected", "0") && gamepad_player_seen(0)); /* player 1 always */

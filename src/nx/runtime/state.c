@@ -1146,6 +1146,7 @@ static void own_land_all(void) {
     u32 n, i;
     while ((n = own_lookup(AS_BASE, AS_END - AS_BASE, r, 64)) != 0)
         for (i = 0; i < n && i < 64; i++) own_acquire(r[i].addr, r[i].size);
+    own_unwatch(AS_BASE, AS_END - AS_BASE); /* the targets' pixels under watches stay the renderer's, as without them */
 }
 /* VIDEO: host1x's IOVA table, then each open NVDEC or VIC fd's channel after its index + 1, and 0 */
 static int video_save(StateIo* io) {
@@ -1284,6 +1285,13 @@ int state_load(const char* path, char* why, size_t whysize) {
        its frames' checksums checked, the state's g_hle made whole and checked, its GPU and video state read, the files
        it had open found and opened, and its guest memory read through once */
     if (state_check(&h, why, whysize)) goto refuse;
+    /* load_memory puts the state's pages in the alias pool, and its blocks map them from there */
+    if (!mem_pool_active()) {
+        snprintf(why, whysize,
+                 "guest memory has no alias pool here (alias_pool=0, or a host without one), and states load only "
+                 "into one yet");
+        goto refuse;
+    }
     if (section_read(r, "HLE", &schema, &hle) || hle.n != sizeof(Hle) || schema != state_schema()) {
         snprintf(why, whysize, "it holds the game's state in another layout, or is damaged");
         goto refuse;

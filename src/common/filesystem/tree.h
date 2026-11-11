@@ -28,6 +28,7 @@ typedef struct FsNode {
     struct FsNode *parent, *children, *next;
     uint64_t size;
     int is_dir, is_virtual, readonly, attached;
+    int linked; /* a symbolic link at the data directory's top, followed: host is the folder it points at */
     uint8_t* virtual_data;
     /* fd >= 0: a RomFS/ExeFS file opened and mapped read-only and shared (plat_file_share) for the rest of the run,
        its contents at map (NULL when empty): at startup, or by fs_tree_map when it is first read. Such nodes are
@@ -36,17 +37,25 @@ typedef struct FsNode {
     int fd;
     const uint8_t* map;
     unsigned refs; /* open handles; attached nodes are additionally owned by the tree */
-    char* host;    /* a graft's top (fs_tree_graft): the host folder its subtree is in, else NULL */
+    char* host;    /* a graft's top (fs_tree_graft, a followed link): the host folder its subtree is in, else NULL */
 } FsNode;
 
 typedef struct {
     char* base;   /* absolute game data directory, captured once at initialization */
     FsNode* root; /* the data directory; its child "root" represents the guest's / */
     PMutex lock;
+    /* where the last init, graft or overlay that failed stopped: the host path, and why, a phrase that follows it
+       ("is a symbolic link, which the index doesn't follow"). Both "" when it stopped at no path (fs_tree_why) */
+    char refused[FS_TREE_PATH_MAX];
+    char why[160];
 } FsTree;
 
 /* Initialization is the only operation that enumerates or probes host entries. A failed scan leaves no tree.
-   Symlinks, junctions, hardlinked regular files, and non-file/non-directory entries are rejected during scanning.
+   Symlinks, junctions, hardlinked regular files, and non-file/non-directory entries are rejected during scanning, and
+   where it stopped is kept in refused and why. One link is followed: a symbolic link (or a junction) to a folder at the
+   data directory's own top, its sdmc/ or save/ kept elsewhere, indexed as a writable graft of the folder it points at
+   (linked). That folder is apart from the data directory and from every other link's and graft's, and no call removes
+   or renames the link or its folder: fs_tree_remove empties it.
    All other calls and direct node access require tree->lock to be held. Children are sorted by strcmp(name).
    Close open handles before destroy; retain/release keep removed entries alive while their handles exist. */
 FsTreeResult fs_tree_init(FsTree* tree, const char* directory);
@@ -72,6 +81,9 @@ FsTreeResult fs_tree_graft_new(FsTree* tree, const char* name, const char* direc
 FsTreeResult fs_tree_overlay(FsTree* tree, const char* directory, const char* const* whole,
                              const char* const* merged);
 void fs_tree_destroy(FsTree* tree);
+/* why the last init, graft or overlay of tree that ended with r failed: the phrase that follows tree->refused, or, when
+   it stopped at no path, r's own ("is in the index already"), to follow the path the caller gave it */
+const char* fs_tree_why(const FsTree* tree, FsTreeResult r);
 /* With no scope, accepts drive:/path, /path (under root/), or paths relative to the data directory.
    A scope makes paths relative to that directory; drive prefixes and traversal above scope are rejected. */
 FsTreeResult fs_tree_lookup(FsTree* tree, FsNode* scope, const char* path, FsNode** out);

@@ -80,6 +80,17 @@ SNX_RECOMPILER_API int snx_recompiler_set_optimization(struct snx_recompiler* r,
 SNX_RECOMPILER_API int snx_recompiler_set_a64_target(struct snx_recompiler* r, int target);
 /* Code units compiled at once, on host threads; 0, the default, uses one per processor */
 SNX_RECOMPILER_API void snx_recompiler_set_jobs(struct snx_recompiler* r, unsigned jobs);
+/* How far a recompile is, for a caller's progress bar: called once with the totals and nothing done, then as each code
+   unit finishes, from the thread that compiled it, with the recompiler's queue locked (so it must be quick). The weight
+   is the units' instructions plus four per basic block, which follows the work better than the function count. Not called for a module the
+   cache folder already had. NULL, the default, reports nothing */
+typedef void (*snx_progress_fn)(void* user, unsigned long long weight_done, unsigned long long weight_total,
+                                unsigned long long functions_done, unsigned long long functions_total);
+SNX_RECOMPILER_API void snx_recompiler_set_progress(struct snx_recompiler* r, snx_progress_fn fn, void* user);
+/* The modules' JIT reads the code ranges where the caller has them instead of a copy made at recompile time, so code the
+   guest changes later (and reports with IC IVAU, RtAPI.code_changed) is compiled as it is then. The ranges must outlive
+   the modules. Off by default */
+SNX_RECOMPILER_API void snx_recompiler_set_live_code(struct snx_recompiler* r, int enabled);
 /* Route calls between recompiled functions through CPU.disp so code invalidation can retire callees safely */
 SNX_RECOMPILER_API void snx_recompiler_set_hook_direct_calls(struct snx_recompiler* r, int enabled);
 /* Progress lines on stdout, as the scarletnx command prints them; off by default */

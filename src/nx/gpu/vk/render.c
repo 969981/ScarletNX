@@ -52,8 +52,9 @@ static struct {
     int srgb_write;
     int zt_ro; /* the depth target is read-only in this pass: draws also sample it */
     /* feedback loops (feedback_order): the color slots in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL, those of them written
-       since the pass began or its last barrier, and those sampled since then */
-    u32 fb, fb_written, fb_read;
+       since the pass began or its last barrier, and those sampled since then. due_*: those of them written or sampled
+       before the guest's last fragment barrier (vk_render_fragment_barrier), which a draw must see ordered */
+    u32 fb, fb_written, fb_read, due_written, due_read;
     /* A pass is begun (vkCmdBeginRendering) only when its first command is recorded (rp_record): a clear of whole
        attachments before that is the pass's load op (vk_render_clear), as a discard is (vk_render_discard). Its
        attachments, with the load ops it begins with, and its layers */
@@ -320,7 +321,7 @@ static int render_begin(Surf** rt, Surf* zt, u32 n, int zt_ro, int srgb_write, u
     g_rp.zt_ro = zt_ro;
     g_rp.srgb_write = srgb_write;
     g_rp.fb = loops;
-    g_rp.fb_written = g_rp.fb_read = 0;
+    g_rp.fb_written = g_rp.fb_read = g_rp.due_written = g_rp.due_read = 0;
     g_rp.open = 1;
     return 1;
 }
@@ -361,7 +362,7 @@ static int render_begin_empty_area(VkExtent2D ext, u32 layers) {
     g_rp.ext = ext;
     g_rp.zt_ro = 0;
     g_rp.srgb_write = 0;
-    g_rp.fb = g_rp.fb_written = g_rp.fb_read = 0;
+    g_rp.fb = g_rp.fb_written = g_rp.fb_read = g_rp.due_written = g_rp.due_read = 0;
     g_rp.open = 1;
     return 1;
 }
@@ -511,9 +512,15 @@ static void xfb_bind_done(DrawOwner* o, const XfbBind* x) {
    reading the pixel under the fragment and writing it back, in hundreds of draws a frame. With
    VK_EXT_attachment_feedback_loop_layout the target stays the pass's attachment, in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL,
    which the draw's descriptor names too, and the draw enables the loop for color (dynamic state, or a pipeline flag).
-   Each draw still sees the target as all earlier draws left it: before a draw samples a slot written since the last
-   barrier, or writes a slot sampled since then, a barrier orders the color attachment writes and fragment shader
-   reads before it against those after it, both ways.
+   A barrier orders the color attachment writes and fragment shader reads before it against those after it, both ways.
+   A draw gets one where the guest ordered it: NVN's ORDER_FRAGMENTS or INVALIDATE_TEXTURE, the 3D engine's fragment
+   barrier or texture cache invalidation (vk_render_fragment_barrier), came after a draw that wrote a slot this one
+   samples, or sampled a slot this one writes. Between those, the console doesn't order a texture read of the target
+   against the writes of earlier draws either: the texture cache is not coherent with the ROP's writes until the
+   invalidation, and the game asks for one where it needs the result. In one game's open world, 2,679 draws a frame
+   sampled the G-buffer targets they drew to with 134 fragment barriers a frame, none between them: a barrier before
+   each one, as before, took 4.1 of the GPU's 10.9 ms a frame. A clear (vkCmdClearAttachments) of a slot that a draw
+   sampled keeps the barrier: strict.
 
    Within a vkCmdBeginRendering pass a barrier is allowed only with dynamicRenderingLocalRead
    (VUID-vkCmdPipelineBarrier2-None-09553), with framebuffer-space stages only (-srcStageMask-09556), by region
@@ -530,12 +537,14 @@ static void xfb_bind_done(DrawOwner* o, const XfbBind* x) {
    BarrierFeedbackLoop). Before this, the target was copied for each draw (vk_rt_snapshot), which stays for devices
    without the extension, for stages before the fragment shader, and for a depth target the draw writes.
 
-   Orders a command of the open pass that samples the color slots in read and writes those in write. 0 when the pass
-   could not be begun again */
-static int feedback_order(u32 read, u32 write) {
+   Orders a command of the open pass that samples the color slots in read and writes those in write: against every
+   earlier command of the pass where strict, else against those before the guest's last fragment barrier. 0 when the
+   pass could not be begun again */
+static int feedback_order(u32 read, u32 write, int strict) {
     read &= g_rp.fb;
     write &= g_rp.fb;
-    if (!(read & g_rp.fb_written) && !(write & g_rp.fb_read)) return 1;
+    u32 written = strict ? g_rp.fb_written : g_rp.due_written, sampled = strict ? g_rp.fb_read : g_rp.due_read;
+    if (!(read & written) && !(write & sampled)) return 1;
     if (!g_vk.has_local_read) {
         Surf* rt[8];
         SNX_ZONE(z, "vk pass restart");
@@ -557,9 +566,14 @@ static int feedback_order(u32 read, u32 write) {
                            .pMemoryBarriers = &mb};
     rp_record(); /* the barrier is the pass's, after what began it */
     rec_CmdPipelineBarrier2(vk_cmd(), &di);
-    g_rp.fb_written = g_rp.fb_read = 0;
+    g_rp.fb_written = g_rp.fb_read = g_rp.due_written = g_rp.due_read = 0;
     g_vk_fb_barriers++;
     return 1;
+}
+void vk_render_fragment_barrier(void) {
+    if (!g_rp.open) return;
+    g_rp.due_written |= g_rp.fb_written;
+    g_rp.due_read |= g_rp.fb_read;
 }
 /* a command of the open pass sampled the color slots in read and wrote those in write */
 static void feedback_done(u32 read, u32 write) {
@@ -768,7 +782,7 @@ static void clear_targets(const DsState* ds, const DrawClear* c, const DrawOwner
     }
     /* the color slot it writes, after the pass's draws that sampled it */
     u32 written = mask && slot < g_rp.n && g_rp.rt[slot] ? 1u << slot : 0;
-    if (!feedback_order(0, written)) return;
+    if (!feedback_order(0, written, 1)) return;
     feedback_done(0, written);
     int color = mask && slot < g_rp.n && g_rp.rt[slot], color_clear = color && mask == 15;
     VkImageAspectFlags za = 0; /* the depth target's aspects it clears */
@@ -2304,7 +2318,7 @@ static int screen_covers(const VkViewport* vp, const Surf* t) {
     return vp && vp->x == 0.0f && vp->width == w &&
            (vp->height > 0 ? vp->y == 0.0f && vp->height == h : vp->y == h && vp->height == -h);
 }
-/* scaled: a bit for each texture slot bound to a scaled render target (shader_scaled_coords in shader/emit_texture.c),
+/* scaled: a bit for each texture slot bound to a scaled render target (shader_scaled_fetch in shader/emit_texture.c),
    and in scaled[1] the ones of those whose target has the size of the draw's (own_size) */
 /* screen: the slots sampled at the own pixel's centre where the draw's viewport covers their target (render_draw), NULL
    for none.
@@ -2452,7 +2466,12 @@ static VkDescriptorSet stage_set_(const DsState* ds, int stage, VkSh* s, Surf** 
                       ds_msaa_samples(t->msaa), ms ? "samples" : "pixels");
             t = NULL;
         }
-        if (st->flags & 1) t = vk_tex_from_tic_raw(x->tic);
+        /* a stage before the fragment's has no fragment to place a fetch by: its fetches, its size queries and its
+           raw loads count the guest's texels, as a compute program's do, so a scaled target comes to it as a copy
+           of the guest's size (vk_tex_from_tic_guest), and as its scaled image only where none can be made */
+        int guest = stage != ST_FS && t && t->is_rt && (t->sw != t->w || t->sh != t->h);
+        if (guest) t = vk_tex_from_tic_guest(x->tic, 0);
+        if (st->flags & 1) t = stage != ST_FS ? vk_tex_from_tic_guest(x->tic, 1) : vk_tex_from_tic_raw(x->tic);
         /* a raw load's header without 4-byte texels, or no header at all, reads zeros through the null view, as a
            missing texture does: the draw still runs (it was dropped, from one game's movie and gameplay passes) */
         if ((st->flags & 1) && !t)
@@ -4380,15 +4399,18 @@ retry:
        the last stage, writes that generic as the position mapped onto [0, 1] with the y of the viewport's sign:
        stage_set_ checks the viewport covers the target. Its samples at a generic's (x, y) do when the vertex program
        writes its position from that generic, [0, 1] mapped onto the viewport with a w of 1, the y by the same sign.
-       Not under a swizzle the program applies, which moves the position and not the generic */
+       Samples at the x / w and y / w the fragment program maps onto [0, 1] itself (screen_ndc) do when the vertex
+       program writes the generic as the position itself, its y mapped the same way: (w - y) / 2 and -y / w / 2 + 1/2
+       are one value. Not under a swizzle the program applies, which moves the position and not the generic */
     ScreenSlots screen = {0};
     if (fs && vs && !tcs && !tes && !sh.gs && !vs->si.writes_viewport && ds->vp.transform_on && !sh.swizzle) {
-        int by_w = fs->si.tex_screen_mask && (vs->si.screen_out_mask >> fs->si.screen_in & 1);
+        u32 ndc = fs->si.screen_ndc;
+        int by_w =
+            fs->si.tex_screen_mask && ((ndc ? vs->si.pos_out_mask : vs->si.screen_out_mask) >> fs->si.screen_in & 1);
         int by_uv = fs->si.tex_uv_mask && (vs->si.uv_out_mask >> fs->si.uv_in & 1);
+        int yneg = ndc ? ndc == 2 : (int)(vs->si.screen_out_yneg_mask >> fs->si.screen_in & 1);
         if (by_w || by_uv) screen.vp = vk_viewport_from(&ds->dyn, &ds->vp, 0);
-        if (by_w &&
-            ((vs->si.screen_out_yneg_mask >> fs->si.screen_in & 1) ? screen.vp.height < 0 : screen.vp.height > 0))
-            screen.slots |= fs->si.tex_screen_mask;
+        if (by_w && (yneg ? screen.vp.height < 0 : screen.vp.height > 0)) screen.slots |= fs->si.tex_screen_mask;
         if (by_uv && ((vs->si.uv_out_yneg_mask >> fs->si.uv_in & 1) ? screen.vp.height < 0 : screen.vp.height > 0))
             screen.slots |= fs->si.tex_uv_mask;
     }
@@ -4677,7 +4699,7 @@ retry:
     }
     if (programmable_blend ? !programmable_pass
         : !n && !zt ? !render_begin_empty()
-                    : !render_begin(rt, zt, n, zt_ro, ds->tgt.srgb_write, fb, bound) || !feedback_order(fb, writes)) {
+                    : !render_begin(rt, zt, n, zt_ro, ds->tgt.srgb_write, fb, bound) || !feedback_order(fb, writes, 0)) {
         draw_images_discard(&images);
         if (late_depth) vk_depth_shadow_cancel();
         return;
@@ -4935,8 +4957,9 @@ retry:
         pc[22] = viewport[0].width;
         pc[23] = viewport[0].height;
     }
-    rec_CmdPushConstants(cb, g_vk_playout, VK_PUSH_STAGES, 0,
-                         g_vk.has_descriptor_heaps && capture ? sizeof pc : 28 * sizeof pc[0], pc);
+    /* the whole block: a Maxwell fragment program declares every member up to the capture's at byte 112
+       (spirv_translate.c), and with descriptor heaps the validation layer wants each declared member pushed */
+    rec_CmdPushConstants(cb, g_vk_playout, VK_PUSH_STAGES, 0, sizeof pc, pc);
     if (texture) {
         Surf* source = fres[0].t;
         if (!source || !rt[0]) {
@@ -4978,8 +5001,15 @@ retry:
         rec_CmdBindTransformFeedbackBuffersEXT(cb, 0, xcount, xbuf, xoff, xsize);
         rec_CmdBeginTransformFeedbackEXT(cb, 0, xcount, from, counter_offs);
     }
-    pred_begin(cb, o->pred);
     rec_draw_tag(vs ? vs->hash : 0, fs ? fs->hash : 0); /* the vertex or mesh program, the fragment program */
+    /* outside the predication: a predicated region writes no timestamp. Only a Tracy client times a draw
+       (gpuprof.c), so a build without Tracy makes no call per draw */
+#if defined(SNX_TRACY)
+    int zoned = vk_gpuprof_op_begin(cb, VK_OP_DRAW, (vs ? vs->hash : 0) * 31 + (fs ? fs->hash : 0), 0);
+#else
+    const int zoned = 0;
+#endif
+    pred_begin(cb, o->pred);
     if (mesh && dc->indirect)
         rec_CmdDrawMeshTasksIndirect(cb, abuf, aoff);
     else if (mesh)
@@ -4993,6 +5023,7 @@ retry:
     } else
         rec_CmdDraw(cb, count, instances, first, base_instance);
     pred_end(cb, o->pred);
+    if (zoned) vk_gpuprof_op_end(cb);
     rec_draw_tag(0, 0); /* the runtime's own draws after it (clears, blits) name no program */
     if (xcount) {
         rec_CmdEndTransformFeedbackEXT(cb, 0, xcount, counters, counter_offs);

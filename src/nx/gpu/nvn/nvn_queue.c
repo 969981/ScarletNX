@@ -423,10 +423,15 @@ int nvn_WindowInitialize(CPU* c, u64 w, u64 b) {
     memcpy(o.texture, s->texture, sizeof o.texture);
     memcpy(GP(w), &o, sizeof o);
     if (g_nvn.loader.api >= 231u << 16) *NVN_WIN_HDR(w) = *NVN_WB_HDR(b);
-    LOG("nvn: window %llx: %d textures, first %dx%d format %#x, present interval %d\n", (unsigned long long)w, o.count,
-        o.count && o.texture[0] ? (int)NVN_OBJ(NvnTexture, o.texture[0])->d.width : 0,
-        o.count && o.texture[0] ? (int)NVN_OBJ(NvnTexture, o.texture[0])->d.height : 0,
-        o.count && o.texture[0] ? NVN_OBJ(NvnTexture, o.texture[0])->d.format : 0, o.interval);
+    {
+        static const char* const spaces[SNX_HDR_SPACES] = {"SDR", "HDR10 (PQ, BT.2020)",
+                                                           "scRGB (linear, 1.0 at 80 nits)"};
+        i32 format = o.count && o.texture[0] ? NVN_OBJ(NvnTexture, o.texture[0])->d.format : 0;
+        LOG("nvn: window %llx: %d textures, first %dx%d format %#x, %s, present interval %d\n", (unsigned long long)w,
+            o.count, o.count && o.texture[0] ? (int)NVN_OBJ(NvnTexture, o.texture[0])->d.width : 0,
+            o.count && o.texture[0] ? (int)NVN_OBJ(NvnTexture, o.texture[0])->d.height : 0, format,
+            spaces[nvn_window_space(g_nvn.loader.api, format)], o.interval);
+    }
     return 1;
 }
 void nvn_WindowSetCrop(CPU* c, u64 w, i32 x, i32 y, i32 width, i32 height) {
@@ -439,11 +444,16 @@ void nvn_WindowSetCrop(CPU* c, u64 w, i32 x, i32 y, i32 width, i32 height) {
     o->crop[2] = width;
     o->crop[3] = height;
 }
-/* The Ounce's color space and HDR metadata (API 231), which the window keeps for its getters. The runtime presents
-   in SDR: a game that asks for another color space is logged */
+/* The Ounce's color space and HDR metadata (API 231). The color space is kept for its getter alone, as the console's
+   driver keeps it: what a window's frames hold comes from its textures' format (nvn_obj.h nvn_window_space), and
+   the metadata goes to the display with each present */
 void nvn_WindowBuilderSetColorSpace(CPU* c, u64 b, i32 space) {
     (void)c;
-    if (space) LOG_LIMIT(1, "nvn: a window of color space %d is presented in SDR\n", space);
+    if (space)
+        LOG_LIMIT(1,
+                  "nvn: a window builder's color space %d is kept for its getter: the format of the window's "
+                  "textures says what its frames hold\n",
+                  space);
     NVN_WB_HDR(b)->color_space = space;
 }
 i32 nvn_WindowBuilderGetColorSpace(CPU* c, u64 b) {
@@ -533,19 +543,28 @@ static u64 present_period(const NvnWindow* o, int* paced) {
    that waits for its earlier frames' fences within the frame) then lost a refresh most frames: with the last frame
    left out, a frame has two periods to get to its refresh, and is held there.
 
-   The one wait in AcquireTexture is for a texture whose last present's slot hasn't come yet: the game's driver
-   takes the texture from the display's buffer queue there, which never hands back a buffer the display hasn't taken,
-   so a game is never more than its window's textures ahead of the display. A game that waits for its syncs isn't
-   held there (one that renders a frame ahead acquires about a period before the texture's sync signals, after its
-   present's slot), but one whose GPU alone waits for them (nvnCommandBufferWaitSync), and which never waits for the
-   GPU on the CPU, ran on without it: one game presented 141 frames a second with an interval of 1, its presents'
-   slots a minute ahead of the clock. Only the pacer's slot is waited for: the display's showing of the frame is the
-   sync's (on_display), which such a game's queue carries to its fences */
+   AcquireTexture waits for two things, as the game's driver takes the texture from the display's buffer queue there,
+   which never hands back a buffer the display hasn't taken, so a game is never more than its window's textures ahead
+   of the display. The first is the texture's last present's slot on the pacer's clock. A game that waits for its syncs
+   isn't held there (one that renders a frame ahead acquires about a period before the texture's sync signals, after
+   its present's slot), but one whose GPU alone waits for them (nvnCommandBufferWaitSync), and which never waits for
+   the GPU on the CPU, ran on without it: one game presented 141 frames a second with an interval of 1, its presents'
+   slots a minute ahead of the clock. The display's showing of the frame is the sync's (on_display), which such a game's
+   queue carries to its fences.
+
+   The second is the replay of the texture's last present (drawn): the display can't take a frame the GPU hasn't
+   drawn. The pacer's clock runs on when the replay falls behind it, and one game that only polls its frame's fence
+   (a timeout of 0) and goes on when it hasn't signalled ran ahead of the replay, its queue some hundred submissions
+   long after a minute. It wrote its next frames' uniforms over the ones of frames still queued: a post-process pass
+   read a scale and offset of another frame and drew rows of one texel. Its own present's replay, not the one after
+   it, keeps the game's next frame and the replay of its last one at the same time */
 static void slot_wait(const NvnWindow* o, i32 i) {
     u64 now = nvn_now();
-    if (o->shown_at[i] <= now) return;
+    int drawn = !o->drawn_syncpt[i] || syncpt_wait(o->drawn_syncpt[i], o->drawn[i], 0);
+    if (o->shown_at[i] <= now && drawn) return;
     nvn_wait_begin();
-    plat_sleep_ns((i64)(o->shown_at[i] - now));
+    if (o->shown_at[i] > now) plat_sleep_ns((i64)(o->shown_at[i] - now));
+    if (!drawn) syncpt_wait(o->drawn_syncpt[i], o->drawn[i], -1); /* the present is queued: the replay reaches it */
     nvn_wait_end();
 }
 static void acquire(NvnWindow* o, NvnSync* s, u64 index) {
@@ -596,6 +615,11 @@ static u32 vi_format(u32 format) {
         case NVN_FORMAT_BGRA8:
         case NVN_FORMAT_BGRA8_SRGB: return 5; /* BGRA_8888 */
     }
+    /* the Ounce's HDR windows, which the renderer shows from their render target alone (renderer.h present_buffer) */
+    switch (nvn_window_space(g_nvn.loader.api, (i32)format)) {
+        case SNX_HDR_SPACE_PQ: return RENDERER_FORMAT_RGBA_1010102;
+        case SNX_HDR_SPACE_SCRGB: return RENDERER_FORMAT_RGBA_FP16;
+    }
     return 0;
 }
 /* The frame is shown: the window's texture, once the replay has reached the present, the way vi shows a buffer (the
@@ -626,6 +650,8 @@ void nvn_QueuePresentTexture(CPU* c, u64 q, u64 w, i32 index) {
     if (tex && t.magic == NVN_MAGIC('T', 'E', 'X', 0)) {
         p.fmt = vi_format(t.d.format);
         if (!p.fmt) LOG_LIMIT(1, "nvn: a window texture of format %#x, which vi doesn't show\n", t.d.format);
+        p.hdr.space = nvn_window_space(g_nvn.loader.api, t.d.format);
+        if (p.hdr.space != SNX_HDR_SPACE_SRGB) memcpy(p.hdr.metadata, NVN_WIN_HDR(w)->hdr, sizeof p.hdr.metadata);
     }
     if (p.fmt) { /* else nothing vi shows: black */
         unsigned th = 0, td = 0;
@@ -653,6 +679,8 @@ void nvn_QueuePresentTexture(CPU* c, u64 q, u64 w, i32 index) {
                 o->value[i] = value;
             }
         o->shown = 1u << index;
+        o->drawn_syncpt[index] = id; /* its own present, drawn */
+        o->drawn[index] = value;
     }
     if (!o->presents++) LOG("nvn: first present, texture %d of window %llx\n", index, (unsigned long long)w);
     if (!(o->presents % 1800))

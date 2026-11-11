@@ -26,6 +26,7 @@
 #include "nx/runtime/guest_stats.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/descriptors.h"
+#include "nx/gpu/vk/hdr_swapchain.h"
 #include "nx/gpu/vk/resource_stats.h"
 #include "nx/memory/mem.h"
 #include "nx/memory/own.h"
@@ -85,7 +86,7 @@ static void alias_seen(void* ctx, u64 gva, u64 n) {
 static int guest_held(u64 a, u64 size) {
     u64 page = plat_vm_page(), lo = a & ~(page - 1), hi = (a + size + page - 1) & ~(page - 1);
     int mapped = 0;
-    if (pend_hit_guest(&g_pend_any, a, size) || own_lookup(lo, hi - lo, NULL, 0)) return 1;
+    if (pend_hit_guest(&g_pend_any, a, size) || own_trapped(lo, hi - lo)) return 1;
     gmmu_aliases(a, size, alias_seen, &mapped);
     return mapped;
 }
@@ -273,7 +274,8 @@ static void vkr_method_barrier(int kind)
 	 * A fragment barrier (NVN's ORDER_FRAGMENTS and INVALIDATE_TEXTURE)
 	 * mostly orders what the renderer orders itself: a target sampled after
 	 * it was drawn gets its barrier when it is bound (vk_surf_use), one
-	 * sampled while it is drawn gets one in the pass (feedback_order), and
+	 * sampled while it is drawn gets one in the pass after this barrier
+	 * (vk_render_fragment_barrier, feedback_order), and
 	 * draws that read results of earlier ones get one there (buffer.c
 	 * gfx_gpu_src). Ended here, the pass ended about 120 times a frame in one
 	 * game's open world. Writes that none of those track (stores into guest
@@ -282,7 +284,13 @@ static void vkr_method_barrier(int kind)
 	 * vk_descriptors_mode setting asks for: a device that has neither draws with
 	 * descriptor sets and keeps every fragment barrier.
 	 */
-	if (kind == 1 || kind == 3 || (kind == 0 && (g_vk.has_descriptor_buffers || g_vk.has_descriptor_heap_support)))
+	if (kind == 0 && (g_vk.has_descriptor_buffers || g_vk.has_descriptor_heap_support)) {
+		vk_lock();
+		vk_render_fragment_barrier();
+		vk_unlock();
+		return;
+	}
+	if (kind == 1 || kind == 3)
 		return;
 
 	vk_lock();
@@ -453,10 +461,37 @@ static int is_srgb(VkFormat f) {
     return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_A8B8G8R8_SRGB_PACK32;
 }
 
+static int g_sc_kind; /* the VK_SC_ kind the swapchain was asked for (the surface may not have it) */
+/* what the next present's frame holds (vkr_present_hdr), and what the last frame shown does, for its refreshes */
+static SnxHdrFrame g_next_hdr, g_last_hdr;
+/* the swapchain for a frame: an HDR frame's own kind, else the 8-bit one every other frame's bytes go to as they are */
+static int frame_kind(const SnxHdrFrame* hdr) {
+    return hdr->space == SNX_HDR_SPACE_PQ ? VK_SC_PQ : hdr->space == SNX_HDR_SPACE_SCRGB ? VK_SC_SCRGB : VK_SC_UNORM;
+}
 /* the window's surface: lost while the app is in the background (Android), made anew when it comes back */
 static u32 g_generation;
 static int g_lost;
 static u64 g_shown_ns; /* when the game last gave the window a frame (atomic: vkr_refresh reads it unlocked) */
+/* The HDR metadata of the game's window, given to the swapchain made for its frames: once the swapchain is made,
+   and again whenever the game's window names other values */
+static void hdr_metadata(const SnxHdrFrame* hdr) {
+    static u32 told; /* the swapchain (g_vk.sc_made) that has sent */
+    static f32 sent[12];
+    const f32* m = hdr->metadata;
+    int given;
+    if (g_vk.sc_space == SNX_HDR_SPACE_SRGB || hdr->space != g_vk.sc_space) return;
+    if (told == g_vk.sc_made && !memcmp(sent, m, sizeof sent)) return;
+    told = g_vk.sc_made;
+    memcpy(sent, m, sizeof sent);
+    pm_lock(&g_vk.sc_lock);
+    given = vk_hdr_metadata_set(g_vk.dev, g_vk.swapchain, hdr);
+    pm_unlock(&g_vk.sc_lock);
+    LOG_LIMIT(16,
+              "vulkan: the window's HDR metadata %s: red %g,%g green %g,%g blue %g,%g white %g,%g, %g to %g nits, "
+              "content up to %g nits and %g a frame on average\n",
+              given ? "given to the swapchain" : "names no display, and the swapchain is given none", m[0], m[1], m[2],
+              m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
+}
 /* a blit's source flipped as the frame's Android transform says (FlipH 1, FlipV 2): the endpoints swapped */
 static void flip_src(VkImageBlit* b, u32 transform) {
     if (transform & 1) {
@@ -496,13 +531,14 @@ static void host_memory_plots(void) {
    black alone, with the on-screen controls and the game's menu over it; then the frame's commands are submitted and
    the image presented. A game's frame (game, which the game released at released_ns, 0 unknown, at its pace of a
    frame every period_ns, 0 none) also moves the per-present bookkeeping, and without src shows nothing; its
-   shown_syncpt (0 none) goes up once it is displayed, or known not to be (renderer.h). Under vk_lock */
-static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game, u64 released_ns, u64 period_ns,
-                 u32 shown_syncpt) {
+   shown_syncpt (0 none) goes up once it is displayed, or known not to be (renderer.h). hdr says what src holds
+   (g_last_hdr). Under vk_lock */
+static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transform, int game, u64 released_ns,
+                 u64 period_ns, u32 shown_syncpt) {
     SNX_ZONE(z_show, "vk show");
     if (transform & 4) { u32 w = fw; fw = fh; fh = w; }
     /* the size the swapchain was made for, not the extent the surface clamped it to: that can stay different */
-    int ww, wh, shown = backend_window_shown();
+    int ww, wh, kind = src ? frame_kind(hdr) : g_sc_kind, shown = backend_window_shown();
     backend_window_size(&ww, &wh);
     if (shown && (g_lost || backend_window_generation() != g_generation)) {
         vk_finish();
@@ -511,18 +547,21 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game, u64 release
     }
     shown = shown && !g_lost;
     int tried = 0; /* a create already ran this frame: one that failed waits for the next frame */
-    /* a new vsync in the .ini takes a new swapchain, as a new size does */
+    /* a new vsync in the .ini takes a new swapchain, as a new size does, and a frame of another kind: a game's HDR
+       frames after its SDR ones, or back */
     if (shown && ww > 0 && wh > 0 &&
-        (ww != g_vk.sc_win_w || wh != g_vk.sc_win_h ||
+        (ww != g_vk.sc_win_w || wh != g_vk.sc_win_h || kind != g_sc_kind ||
          __atomic_load_n(&g_settings.vsync, __ATOMIC_RELAXED) != g_vk.sc_vsync)) {
         vk_finish();
-        vk_swapchain_create(0);
+        g_sc_kind = kind;
+        vk_swapchain_create(kind);
         tried = 1;
     }
     VkSemaphore wait = VK_NULL_HANDLE, signal = VK_NULL_HANDLE;
     u32 idx = 0;
     int recreate = 0;
-    if (shown && (src || !game) && (g_vk.swapchain || (!tried && vk_swapchain_create(0)))) {
+    if (shown && (src || !game) && (g_vk.swapchain || (!tried && vk_swapchain_create(kind)))) {
+        if (src) hdr_metadata(hdr);
         VkCommandBuffer cb = vk_cmd(); /* waits for this frame slot, so its acquire semaphore is free */
         VkSemaphore acq = g_acquired[vk_frame_id() % VK_FRAMES];
         /* no wait: vk_lock is held (guest threads mapping memory take it too), and the game's pace is present_pace's.
@@ -855,8 +894,11 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game, u64 release
             vk_descriptors_stats();
             /* what the GPU engines keep on the GPU (docs/layers/gpu/ownership.md), and what the CPU had to wait for */
             LOG("vulkan: GPU-owned guest memory landed for the CPU %llu times, render targets written back for an "
-                "engine %llu times\n",
-                (unsigned long long)own_landings(), (unsigned long long)g_vk_rt_readbacks);
+                "engine %llu times; block linear targets watched %llu times, published for a CPU access %llu times "
+                "and at a release %llu times\n",
+                (unsigned long long)own_landings(), (unsigned long long)g_vk_rt_readbacks,
+                (unsigned long long)g_vk_rt_watch.arms, (unsigned long long)g_vk_rt_watch.hits,
+                (unsigned long long)g_vk_rt_watch.publishes);
         }
     }
     /* Offscreen frames still submit and advance the frame ring. g_last remains available for readback. */
@@ -883,7 +925,7 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game, u64 release
     vk_tex_later_frame();
     if (recreate && !g_lost && !g_vk.sc_lost) { /* not when this frame's create found the surface lost */
         vk_finish();
-        vk_swapchain_create(0);
+        vk_swapchain_create(kind);
     }
     if (g_vk.sc_lost) { /* a create found the surface lost: the next frame makes it anew */
         g_vk.sc_lost = 0;
@@ -902,7 +944,14 @@ static void vkr_present_buffer(u64 cpu_addr, u32 w, u32 h, u32 pitch, u32 layout
     Surf* src = NULL;
     if (w && h && w <= g_vk.props.limits.maxImageDimension2D && h <= g_vk.props.limits.maxImageDimension2D) {
         src = vk_rt_for_cpu(cpu_addr, w, h);
-        if (!src || src->f.is_int) src = cpu_frame(cpu_addr, w, h, pitch, layout, bhl, fmt);
+        if (src && !src->f.is_int) {
+        } else if (fmt == RENDERER_FORMAT_RGBA_1010102 || fmt == RENDERER_FORMAT_RGBA_FP16) {
+            /* cpu_frame converts vi's 8-bit and 16-bit formats to RGBA8, which holds neither of these */
+            LOG_LIMIT(4, "vulkan: a %ux%u frame of format %#x with no render target over its buffer is shown black\n",
+                      w, h, fmt);
+            src = NULL;
+        } else
+            src = cpu_frame(cpu_addr, w, h, pitch, layout, bhl, fmt);
     }
     /* the part of the buffer shown: vi's crop, or all of it */
     u32 x0 = 0, y0 = 0, x1 = w, y1 = h;
@@ -921,17 +970,29 @@ static void vkr_present_buffer(u64 cpu_addr, u32 w, u32 h, u32 pitch, u32 layout
             y1 = h < src->h ? h : src->h;
         }
     }
+    SnxHdrFrame hdr = g_next_hdr; /* this present's alone: the next one's is an SDR frame's until it is said */
+    g_next_hdr = (SnxHdrFrame){0};
     if (src) { /* in its pixels: targets are scaled */
         g_last = src;
+        g_last_hdr = hdr;
         g_last_transform = transform;
         g_last_x = (u32)((u64)src->sw * x0 / src->w);
         g_last_y = (u32)((u64)src->sh * y0 / src->h);
         g_last_w = (u32)((u64)src->sw * x1 / src->w) - g_last_x;
         g_last_h = (u32)((u64)src->sh * y1 / src->h) - g_last_y;
     }
-    show(src, x1 - x0, y1 - y0, transform, 1, released_ns, period_ns, shown_syncpt);
+    show(src, &hdr, x1 - x0, y1 - y0, transform, 1, released_ns, period_ns, shown_syncpt);
     __atomic_store_n(&g_shown_ns, plat_ns(), __ATOMIC_RELAXED);
     vk_unlock();
+}
+/* the presenting thread's, before its present: nothing else reads g_next_hdr */
+static void vkr_present_hdr(const SnxHdrFrame* frame) { g_next_hdr = *frame; }
+/* what the display session tells a game (vi2's GetHdrStatus and GetHdrPaperWhite), any thread */
+static int vkr_hdr_display(u32* peak, u32* paper_white) {
+    if (!__atomic_load_n(&g_vk.hdr_display, __ATOMIC_RELAXED)) return 0;
+    *peak = (u32)g_settings.hdr_peak;
+    *paper_white = snx_hdr_paper_white(g_settings.hdr_paper_white);
+    return 1;
 }
 
 /* whether the window needs its picture drawn again though the game gave no frame: the on-screen layer is another
@@ -962,7 +1023,7 @@ static void vkr_refresh(void) {
     last = now;
     if (refresh_due()) {
         vk_render_end();
-        show(g_last, g_last_w, g_last_h, g_last_transform, 0, 0, 0, 0);
+        show(g_last, &g_last_hdr, g_last_w, g_last_h, g_last_transform, 0, 0, 0, 0);
     }
     vk_unlock();
 }
@@ -1199,6 +1260,8 @@ const Renderer vk_renderer = {
     .samples_report = vkr_samples_report,
     .stream_end = vk_release_submit,
     .present_buffer = vkr_present_buffer,
+    .present_hdr = vkr_present_hdr,
+    .hdr_display = vkr_hdr_display,
     .display_wait = vk_display_wait,
     .screenshot = vkr_screenshot,
     .capture = vk_renderdoc_capture,

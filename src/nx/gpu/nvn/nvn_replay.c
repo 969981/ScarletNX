@@ -20,6 +20,7 @@
 #include "nx/hle/pool.h"
 #include "nx/runtime/options.h"
 #include "nx/gpu/renderer.h"
+#include "nx/memory/own.h"
 #include "nx/hle/services/nvdrv.h"
 #include "nx/runtime/clock.h"
 #include "nx/runtime/platform/log.h"
@@ -58,6 +59,8 @@ static void walk(u64 p, RecordFn fn, void* ctx, int depth, int sync_only) {
     for (;;) {
         NvnRecHdr h;
         u32 op;
+        /* the submitting game thread, without the renderer's lock: what the GPU holds of the record lands first */
+        if (own_any()) own_acquire(p, sizeof h);
         memcpy(&h, GP(p), sizeof h);
         __atomic_thread_fence(__ATOMIC_ACQUIRE); /* a JUMP's target is written before its header (nvn_cmd.c) */
         op = NVN_REC_OP(h.op);
@@ -283,11 +286,13 @@ static int wait_over(const NvnJob* j, u32 op, u64 pc, u32 size, NvnReplayWait* s
     *sync = (NvnReplayWait){0};
     if (op == OP_WAIT_SYNC) {
         if (!j->snapshot || size < sizeof(NvnRecHdr) + sizeof *sync) fatal("nvn: invalid captured sync wait");
+        if (own_any()) own_acquire(pc + 8, sizeof *sync);
         memcpy(sync, GP(pc + 8), sizeof *sync);
         return sync_over(sync);
     }
     if (size < sizeof(NvnRecHdr) + sizeof(NvnPWaitEvent)) fatal("nvn: truncated event wait");
     NvnPWaitEvent event;
+    if (own_any()) own_acquire(pc + 8, sizeof event);
     memcpy(&event, GP(pc + 8), sizeof event);
     /* A preceding signal in this recording must be submitted before its wait can see it. Other NVN
        queues can then signal the event while this job stays at its cursor. */
@@ -315,6 +320,7 @@ static int replay_records(NvnJob* j, NvnReplayQueue* q) {
                 continue;
             }
             NvnRecHdr h;
+            if (own_any()) own_acquire(pc, sizeof h);
             memcpy(&h, GP(pc), sizeof h);
             __atomic_thread_fence(__ATOMIC_ACQUIRE);
             u32 op = NVN_REC_OP(h.op);
@@ -394,6 +400,7 @@ static int settled(void) {
         else {
             u64 pc = w->cursor[w->depth - 1].pc;
             NvnRecHdr h;
+            if (own_any()) own_acquire(pc, sizeof h);
             memcpy(&h, GP(pc), sizeof h);
             over = wait_over(w, NVN_REC_OP(h.op), pc, h.size, &sync);
         }
@@ -438,10 +445,11 @@ static int run(void* arg) {
             if (j->present_order != g_nvn.replay.present_walked + 1) return 0;
             const NvnReplayPresent* p = &j->present;
             u64 cpu = p->gva ? gmmu_translate(p->gva) : 0;
-            if (g_renderer_up && cpu)
+            if (g_renderer_up && cpu) {
+                if (g_renderer->present_hdr) g_renderer->present_hdr(&p->hdr);
                 g_renderer->present_buffer(cpu, p->w, p->h, p->pitch, p->linear ? 0 : 3, p->bhl, p->fmt, p->crop,
                                            p->transform, p->released_ns, p->period_ns, g_nvn.replay.shown);
-            else if (g_renderer_up) /* nothing to show: black, which still ends the renderer's frame */
+            } else if (g_renderer_up) /* nothing to show: black, which still ends the renderer's frame */
                 g_renderer->present_buffer(0, 0, 0, 0, 0, 0, 0, p->crop, 0, p->released_ns, p->period_ns,
                                            g_nvn.replay.shown);
             else /* no display to reach */

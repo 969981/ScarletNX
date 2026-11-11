@@ -87,7 +87,7 @@ typedef struct {
        and features enabled */
     u32 video_family;
     VkVideoCodecOperationFlagsKHR video_codecs;
-    const char* dev_ext[66]; /* create_device enables 66 at most, were every one it can enable there */
+    const char* dev_ext[67]; /* create_device enables 67 at most, were every one it can enable there */
     u32 dev_ext_n;
     VkPhysicalDeviceFeatures2 feat2; /* feat, with the 1.1 to 1.3 features enabled chained (to 1.2 on a 1.2 device) */
     VkPhysicalDeviceVulkan11Features feat11;
@@ -98,6 +98,10 @@ typedef struct {
     VkExtent2D sc_extent;
     int sc_win_w, sc_win_h; /* the window size it was made for (sc_extent: that as the surface takes it) */
     int sc_srgb;            /* its format is sRGB: what presented frames in sRGB formats are blitted to */
+    u32 sc_space;           /* what its images take (gpu/hdr_output.h): SNX_HDR_SPACE_SRGB unless it was made for a
+                               game's HDR frames, whose values the present's pass then writes as they are */
+    u32 sc_made;            /* the swapchains made so far: what one was given (its HDR metadata) is the next one's
+                               to be given again */
     VkFormat sc_format;     /* its images' format, which the on-screen controls draw to (gpu/vk/ui.c) */
     int sc_vsync;  /* the vsync setting it was made for (1: FIFO; 0 is FIFO too on a surface with nothing else) */
     int sc_turned; /* upright on a display held another way: Android calls each present suboptimal for it */
@@ -214,6 +218,14 @@ typedef struct {
        GPU profile's idle times are put on there (gpuprof.c) */
     int has_calibrated_qpc;
     int has_surface_caps2;   /* the instance's VK_KHR_get_surface_capabilities2, which present timing is asked by */
+    /* VK_EXT_swapchain_colorspace (the instance's) and VK_EXT_hdr_metadata (the device's): an HDR10 swapchain, and
+       the light level its metadata names */
+    int has_swapchain_colorspace;
+    int has_hdr_metadata;
+    /* A game is told the display is HDR, and its HDR frames get a swapchain of their own space: the hdr_game setting
+       with both extensions on a surface that lists both HDR spaces (hdr_swapchain.h vk_hdr_display), as the last
+       vk_swapchain_create found it. Atomic: the display session's thread reads it */
+    int hdr_display;
     u32 gfx_timestamp_bits;  /* the graphics queue family's timestampValidBits: 0 where it writes no timestamps */
     /* VK_EXT_memory_budget: the driver tells each heap's use and budget (VMA reads them, and guesses without it) */
     int has_budget;
@@ -243,11 +255,13 @@ u32 vk_1_2_missing(const SnxVkExtensions* e, char* out, size_t size);
 /* the vk_api setting's text as the most Vulkan version the renderer takes, *cap (0 for auto, the device's up to 1.3):
    1, or 0 with why (n bytes) naming the value and the ones it takes */
 int vk_api_setting(const char* text, u32* cap, char* why, size_t n);
-/* (re)creates the swapchain at the window's size, in an sRGB format when srgb is set and the surface has one, with
-   the present mode the vsync setting asks for, recorded in sc_vsync (show() makes a new one when the setting moves).
-   0 while the window has no area (minimized) or its surface can't be queried, the old swapchain staying, or when the
-   create failed: then there is none. A lost surface sets sc_lost; the next present tries again */
-int vk_swapchain_create(int srgb);
+/* (re)creates the swapchain at the window's size, of a kind: 8 bits a channel in a UNORM format, or in an sRGB one
+   where the surface has one, or for a game's HDR10 or scRGB frames where hdr_display holds (else the UNORM one, said
+   in the log), with the present mode the vsync setting asks for, recorded in sc_vsync (show() makes a new one when the
+   setting moves). 0 while the window has no area (minimized) or its surface can't be queried, the old swapchain
+   staying, or when the create failed: then there is none. A lost surface sets sc_lost; the next present tries again */
+enum { VK_SC_UNORM, VK_SC_SRGB, VK_SC_PQ, VK_SC_SCRGB };
+int vk_swapchain_create(int kind);
 int vk_surface_recreate(void);
 int vk_window_release(void); /* Renderer.release_window */
 /* logs a failed call with where it happened; evaluates to 1 on success */
@@ -881,6 +895,7 @@ typedef struct Surf {
     int in_drawn;  /* in surface.c's list of drawn targets, entered at drawn_from */
     int take_seen; /* render targets: vk_rt_drawn_in gave it to a texture's search since its last write */
     int in_linear; /* a pitch-linear color target in surface.c's list of those drawn since the last release */
+    int in_bl;     /* a block linear color target in surface.c's other list of those */
     u64 drawn_from;
     u64 draw_gw;    /* guest-memory generation at the first draw this present or since a full replacement */
     u64 draw_hash;  /* fallback guest-memory hash at that baseline */
@@ -1044,8 +1059,19 @@ int vk_surf_publish(Surf* s);
    NULL when they couldn't be read back) */
 int vk_surf_keep_begin(Surf* s, VkImageKeep* k);
 int vk_surf_keep_end(Surf* s, const VkImageKeep* k, u8** original);
-/* a release: the pitch-linear color targets drawn since the last one published, for the CPU to read */
-void vk_rt_publish_linear(void);
+/* a release: the pitch-linear color targets drawn since the last one published, for the CPU to read. The block linear
+   color targets drawn since then, which the CPU reads only now and then, are watched (own_watch): the CPU's first
+   access publishes them (vk_rt_watch_hit). One the CPU read lately is published at once, as the pitch-linear ones */
+void vk_rt_publish_drawn(void);
+/* own.c's resolve: the CPU touched watched guest memory [cpu, cpu + size): the targets pending there are published
+   over it (vk_lock held, by a thread that did not hold it before) */
+void vk_rt_watch_hit(u64 cpu, u64 size);
+/* the watches that releases armed over targets, the CPU accesses that published them, and the targets that releases
+   published at once because the CPU read them lately: the statistics, and the tests */
+typedef struct {
+    u64 arms, hits, publishes;
+} VkRtWatchStats;
+extern VkRtWatchStats g_vk_rt_watch;
 void vk_surf_wrote(Surf* s); /* its image changed: its copies are out of date (wgen), and it is the newest (wseq) */
 u32 vk_surf_gen(void);       /* a write generation no image has held yet */
 /* vk_surf_flush in two halves, the GPU not waited for: the bytes a write-back of s copies (0 for none), its copy
@@ -1180,6 +1206,9 @@ int vk_rec_unsafe(void);
 /* mirror.c: guest memory [cpu, cpu + size) landed from an owner: the mirror's shadow of its pages goes */
 void vk_mirror_landed(u64 cpu, u64 size);
 int vk_own_init(void);
+/* guest memory [cpu, cpu + size) watched for the CPU (own_watch), as vk_own_publish traps an owner's: 0, or -1 where it
+   can't be (no traps, memory an import holds, memory not in the pool). vk_lock held */
+int vk_own_watch(u64 cpu, u64 size);
 /* whether the CPU made GPU-owned bytes of guest memory [cpu, cpu + size) land within the last presents presents, or
    touched them under a draw's storage image kept on the GPU (vk_own_cpu_touched) */
 int vk_own_cpu_read(u64 cpu, u64 size, u32 presents);
@@ -1483,9 +1512,9 @@ Surf* vk_tex_from_tic_storage(const u32* tic);
    targets drew into it. NULL when it can't be drawn now */
 Surf* vk_tex_recheck(Surf* t);
 Surf* vk_tex_from_tic_raw(const u32* tic); /* UINT view of raw RGBA8 texel bytes */
-/* vk_tex_from_tic, or with raw vk_tex_from_tic_raw, for a compute program, whose fetches, size queries and storage
-   images count the guest's texels: a scaled render target (resolution= other than 1) comes as a copy of the guest's
-   size, and as the scaled image itself only where no such copy can be made */
+/* vk_tex_from_tic, or with raw vk_tex_from_tic_raw, for a compute program or a stage before the fragment's, whose
+   fetches, size queries and storage images count the guest's texels: a scaled render target (resolution= other than
+   1) comes as a copy of the guest's size, and as the scaled image itself only where no such copy can be made */
 Surf* vk_tex_from_tic_guest(const u32* tic, int raw);
 /* a view of s as the shader declares it, sRGB or linear (color formats that have both), with a component mapping;
    VK_NULL_HANDLE when the image can't be viewed that way */
@@ -2087,6 +2116,9 @@ u64 vk_cs_skipped(char* why, size_t size);
    stats every 600 presents name (vk_pass_ends_log): what splits a frame into many passes */
 void vk_render_end_at(const char* file, int line);
 #define vk_render_end() vk_render_end_at(__FILE__, __LINE__)
+/* the guest's fragment barrier (NVN's ORDER_FRAGMENTS or INVALIDATE_TEXTURE, the 3D engine's): the open pass's later
+   draws in a feedback loop see what its earlier draws wrote (feedback_order) */
+void vk_render_fragment_barrier(void);
 void vk_pass_ends_log(void);
 /* the on-screen controls and the game's menu over a swapchain image in TRANSFER_DST_OPTIMAL, which it stays in;
    safe is the picture's part clear of the system's bars (gpu/vk/ui.c) */
@@ -2222,11 +2254,33 @@ int vk_gpuprof_dispatch_begin(VkCommandBuffer cb);
 void vk_gpuprof_dispatch_end(VkCommandBuffer cb);
 void vk_gpuprof_tag(u64 key);
 /* any operation the same way: kind VK_OP_*, key what it is (a copy's: where it was recorded, from vk_gpuprof_base) */
-enum { VK_OP_DISPATCH, VK_OP_COPY, VK_OP_TO_IMAGE, VK_OP_TO_BUFFER, VK_OP_IMAGE, VK_OP_N };
+enum { VK_OP_DISPATCH, VK_OP_COPY, VK_OP_TO_IMAGE, VK_OP_TO_BUFFER, VK_OP_IMAGE, VK_OP_DRAW, VK_OP_N };
+typedef struct {
+    u32 qi;
+    u32 kind; /* VK_OP_* */
+    u64 key, bytes;
+    u16 q0, q1;
+    u64 ep;
+} GpOp;
+/* a batch lands after the frame slot that would hold it may be reused: it has a pool of its own */
+typedef struct {
+    GpOp* op;
+    u32 cap, nop;
+    VkQueryPool pool;
+    u32 queries, used;
+    int reset;
+    u16 span0, span1;
+    u64 span_ep;
+} GpOps;
+#define VK_GP_OPS 256
+#define VK_GP_QUERIES (2 + 2 * VK_GP_OPS)
+void vk_gpuprof_compute_begin(GpOps* o, VkCommandBuffer cb);
+void vk_gpuprof_compute_submit(GpOps* o, VkCommandBuffer cb);
+void vk_gpuprof_compute_land(GpOps* o);
 int vk_gpuprof_op_begin(VkCommandBuffer cb, u32 kind, u64 key, u64 bytes);
 void vk_gpuprof_op_end(VkCommandBuffer cb);
 const void* vk_gpuprof_base(void);
-int vk_gpuprof_profiled(VkCommandBuffer cb); /* cb is the frame's command buffer the profile times */
+int vk_gpuprof_profiled(VkCommandBuffer cb); /* cb is one of the command buffers the profile times */
 /* the renderer's own compute pipelines, a tag each, which gpuprof.c names: small numbers, which no program's key is in
    practice. A dispatch recorded with no tag counts as VK_PROF_NONE */
 enum {

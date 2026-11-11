@@ -4,6 +4,7 @@
 #include "common/utilities/ascii.h"
 #include <errno.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -475,7 +476,8 @@ static FsTreeResult remove_node(FsTree* tree, FsNode* n, int recursive, int keep
         FsTreeResult rc = remove_node(tree, n->children, 1, 0, host);
         if (rc) return rc; /* successful earlier removals are already reflected in the tree */
     }
-    if (keep) return FS_TREE_OK;
+    /* a followed link stays, emptied: the link is the player's, and so is the folder it points at */
+    if (keep || n->linked) return FS_TREE_OK;
     if (!n->is_virtual) {
         FsTreeResult rc = fs_tree_path(tree, n, host, FS_TREE_PATH_MAX);
         if (rc) return rc;
@@ -545,7 +547,8 @@ FsTreeResult fs_tree_rename(FsTree* tree, FsNode* scope, const char* src, const 
     if (rc) return rc;
     if (n->is_dir != !!is_dir) return FS_TREE_NOTFOUND;
     if (n->readonly) return FS_TREE_READONLY;
-    if (n == tree->root || n == scope || (n->parent == tree->root && !strcmp(n->name, "root"))) return FS_TREE_INVALID;
+    if (n == tree->root || n == scope || n->linked || (n->parent == tree->root && !strcmp(n->name, "root")))
+        return FS_TREE_INVALID;
     rc = resolve_parent(tree, scope, dst, &parent, name);
     if (rc) return rc;
     if (child_find(parent, name)) return FS_TREE_EXISTS;
@@ -717,37 +720,153 @@ int fs_tree_map(FsTree* tree, FsNode* node, FsShare* share) {
 }
 int fs_tree_mapped(const FsNode* node) { return __atomic_load_n(&node->fd, __ATOMIC_ACQUIRE) >= 0; }
 
+/* rc, with what the caller says (fs_tree_why): the host path where the index stopped, directory and name (NULL when the
+   path is directory alone), and why, a phrase after it ("is a symbolic link, which the index doesn't follow") */
+static FsTreeResult refuse(FsTree* tree, FsTreeResult rc, const char* directory, const char* name, const char* why, ...)
+    __attribute__((format(printf, 5, 6)));
+static FsTreeResult refuse(FsTree* tree, FsTreeResult rc, const char* directory, const char* name, const char* why,
+                           ...) {
+    va_list a;
+    if (name)
+        snprintf(tree->refused, sizeof tree->refused, "%s/%s", directory, name);
+    else
+        snprintf(tree->refused, sizeof tree->refused, "%s", directory);
+    va_start(a, why);
+    vsnprintf(tree->why, sizeof tree->why, why, a);
+    va_end(a);
+    return rc;
+}
+static void refused_none(FsTree* tree) { tree->refused[0] = tree->why[0] = 0; }
+#define NO_LINK "is a symbolic link, which the index doesn't follow"
+#define NO_LINK_BELOW                                                                                                  \
+    "is a symbolic link, which the index follows only as a folder at the top of the game's data folder"
+#define NO_LINK_TWICE "is a symbolic link to a folder the index already holds, or to one in it or around it"
+
+/* whether one of the host folders a and b, both absolute and resolved, is the other or holds it */
+static int host_overlap(const char* a, const char* b) {
+    size_t la = strlen(a), lb = strlen(b), n = la < lb ? la : lb;
+    const char *in = la < lb ? a : b, *out = la < lb ? b : a;
+#if defined(_WIN32)
+    if (_strnicmp(in, out, n)) return 0;
+#else
+    if (strncmp(in, out, n)) return 0;
+#endif
+    return !out[n] || out[n] == '/' || (n && in[n - 1] == '/');
+}
+/* host, a symbolic link (on Windows a junction too) among the entries of a folder depth levels below the data
+   directory: the folder it points at into *linked, resolved and owned, which the index takes in its place as a
+   writable graft. Only at the top of the data directory, where nothing scanned under it can lead back (a link below
+   is refused), only to a folder, and to one apart from the data directory and from every other link's: two names for
+   one file would each keep a size of their own, as hard links would */
+static FsTreeResult link_folder(FsTree* tree, const FsNode* parent, const char* host, unsigned depth, char** linked) {
+    char* target;
+    if (depth) return refuse(tree, FS_TREE_INVALID, host, NULL, NO_LINK_BELOW);
+#if defined(_WIN32)
+    BY_HANDLE_FILE_INFORMATION info;
+    DWORD length, start;
+    HANDLE folder = CreateFileA(host, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                                FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (folder == INVALID_HANDLE_VALUE)
+        return refuse(tree, FS_TREE_IO, host, NULL, "is a link whose folder can't be opened (Windows error %lu)",
+                      GetLastError());
+    target = malloc(FS_TREE_PATH_MAX);
+    if (!target) {
+        CloseHandle(folder);
+        return refuse(tree, FS_TREE_NOMEM, host, NULL, "can't be indexed: out of memory");
+    }
+    length = GetFinalPathNameByHandleA(folder, target, FS_TREE_PATH_MAX, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (!length || length >= FS_TREE_PATH_MAX || !GetFileInformationByHandle(folder, &info)) {
+        unsigned long error = GetLastError();
+        CloseHandle(folder);
+        free(target);
+        return length >= FS_TREE_PATH_MAX
+                   ? refuse(tree, FS_TREE_TOOLONG, host, NULL, "is a link to a path longer than %d bytes",
+                            FS_TREE_PATH_MAX - 1)
+                   : refuse(tree, FS_TREE_IO, host, NULL,
+                            "is a link whose folder can't be resolved (Windows error %lu)", error);
+    }
+    CloseHandle(folder);
+    if (!(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        free(target);
+        return refuse(tree, FS_TREE_INVALID, host, NULL, NO_LINK_BELOW);
+    }
+    /* the path comes with a prefix, two backslashes, ?, one more, and UNC and one more for a share: as C:/folder
+       and //server/share/folder */
+    start = !strncmp(target, "\\\\?\\UNC\\", 8) ? 6 : !strncmp(target, "\\\\?\\", 4) ? 4 : 0;
+    if (start == 6) target[6] = '\\';
+    memmove(target, target + start, length - start + 1);
+    for (char* p = target; *p; p++)
+        if (*p == '\\') *p = '/';
+#else
+    struct stat st;
+    target = realpath(host, NULL);
+    if (!target || stat(target, &st)) {
+        int error = errno;
+        free(target);
+        return refuse(tree, FS_TREE_IO, host, NULL, "is a symbolic link whose folder can't be read (%s)",
+                      strerror(error));
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        free(target);
+        return refuse(tree, FS_TREE_INVALID, host, NULL, NO_LINK_BELOW);
+    }
+    if (strlen(target) >= FS_TREE_PATH_MAX) {
+        free(target);
+        return refuse(tree, FS_TREE_TOOLONG, host, NULL, "is a symbolic link to a path longer than %d bytes",
+                      FS_TREE_PATH_MAX - 1);
+    }
+#endif
+    int twice = host_overlap(tree->base, target);
+    for (const FsNode* other = parent->children; other && !twice; other = other->next)
+        twice = other->host && host_overlap(other->host, target);
+    if (twice) {
+        free(target);
+        return refuse(tree, FS_TREE_INVALID, host, NULL, NO_LINK_TWICE);
+    }
+    *linked = target;
+    return FS_TREE_OK;
+}
+
 /* whether name is one of names (NULL-terminated, or NULL for none) */
 static int named(const char* const* names, const char* name) {
     for (size_t i = 0; names && names[i]; i++)
         if (!strcmp(names[i], name)) return 1;
     return 0;
 }
+static FsTreeResult scan_linked(FsTree* tree, FsNode* n);
 /* The initial scan uses native directory APIs: a full index has to tell the end of a folder from a failure to read
-   it, and must not follow symlinks or skip entries whose stat failed.
+   it, and must not follow symlinks, but a folder's at the data directory's top (link_folder), or skip entries whose
+   stat failed. Where it stops is said (refuse).
    host's entries named in skipped are left out, as if they weren't there; its folders' are all scanned */
 static FsTreeResult scan_directory(FsTree* tree, FsNode* parent, char* host, unsigned depth,
                                    const char* const* skipped) {
-    if (depth > FS_TREE_DEPTH_MAX) return FS_TREE_TOOLONG;
+    if (depth > FS_TREE_DEPTH_MAX)
+        return refuse(tree, FS_TREE_TOOLONG, host, NULL, "is more than %d folders below the data folder",
+                      FS_TREE_DEPTH_MAX);
     size_t parent_len = strlen(host);
     FsTreeResult rc = FS_TREE_OK;
 #if defined(_WIN32)
-    if (parent_len + 3 >= FS_TREE_PATH_MAX) return FS_TREE_TOOLONG;
+    if (parent_len + 3 >= FS_TREE_PATH_MAX)
+        return refuse(tree, FS_TREE_TOOLONG, host, NULL, "is a path too long for its entries: %d bytes at most",
+                      FS_TREE_PATH_MAX - 1);
     strcpy(host + parent_len, "/*");
     WIN32_FIND_DATAA entry;
     HANDLE dir = FindFirstFileA(host, &entry);
     host[parent_len] = 0;
-    if (dir == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND ? FS_TREE_OK : FS_TREE_IO;
+    if (dir == INVALID_HANDLE_VALUE)
+        return GetLastError() == ERROR_FILE_NOT_FOUND
+                   ? FS_TREE_OK
+                   : refuse(tree, FS_TREE_IO, host, NULL, "can't be opened (Windows error %lu)", GetLastError());
     for (;;) {
         const char* name = entry.cFileName;
 #else
     DIR* dir = opendir(host);
-    if (!dir) return FS_TREE_IO;
+    if (!dir) return refuse(tree, FS_TREE_IO, host, NULL, "can't be opened (%s)", strerror(errno));
     for (;;) {
         errno = 0;
         struct dirent* entry = readdir(dir);
         if (!entry) {
-            if (errno) rc = FS_TREE_IO;
+            if (errno) rc = refuse(tree, FS_TREE_IO, host, NULL, "can't be read (%s)", strerror(errno));
             break;
         }
         const char* name = entry->d_name;
@@ -755,21 +874,31 @@ static FsTreeResult scan_directory(FsTree* tree, FsNode* parent, char* host, uns
         if (strcmp(name, ".") && strcmp(name, "..") && !named(skipped, name)) {
             size_t len = strlen(name);
             if (!valid_name(name, len)) {
-                rc = FS_TREE_INVALID;
+                rc = refuse(tree, FS_TREE_INVALID, host, name, "has a name the console's files can't have");
                 break;
             }
             if (parent_len + 1 + len >= FS_TREE_PATH_MAX) {
-                rc = FS_TREE_TOOLONG;
+                rc = refuse(tree, FS_TREE_TOOLONG, host, name, "is a path longer than %d bytes", FS_TREE_PATH_MAX - 1);
                 break;
             }
             host[parent_len] = '/';
             memcpy(host + parent_len + 1, name, len + 1);
             int is_dir;
             uint64_t size;
+            char* linked = NULL;
 #if defined(_WIN32)
-            if (entry.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE)) {
-                rc = FS_TREE_INVALID;
+            if (entry.dwFileAttributes & FILE_ATTRIBUTE_DEVICE) {
+                rc = refuse(tree, FS_TREE_INVALID, host, NULL, "is a device, which the index doesn't take");
                 break;
+            }
+            if (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                /* a symbolic link's or a junction's folder; any other reparse point is no link to follow */
+                if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                    (entry.dwReserved0 == IO_REPARSE_TAG_SYMLINK || entry.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT))
+                    rc = link_folder(tree, parent, host, depth, &linked);
+                else
+                    rc = refuse(tree, FS_TREE_INVALID, host, NULL, NO_LINK_BELOW);
+                if (rc) break;
             }
             is_dir = !!(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
             size = ((uint64_t)entry.nFileSizeHigh << 32) | entry.nFileSizeLow;
@@ -780,91 +909,122 @@ static FsTreeResult scan_directory(FsTree* tree, FsNode* parent, char* host, uns
                     CreateFileA(host, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                 NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
                 if (file == INVALID_HANDLE_VALUE) {
-                    rc = FS_TREE_IO;
+                    rc = refuse(tree, FS_TREE_IO, host, NULL, "can't be opened (Windows error %lu)", GetLastError());
                     break;
                 }
                 BY_HANDLE_FILE_INFORMATION info;
                 if (!GetFileInformationByHandle(file, &info))
-                    rc = FS_TREE_IO;
-                else if (info.nNumberOfLinks > 1 ||
-                         (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)))
-                    rc = FS_TREE_INVALID;
+                    rc = refuse(tree, FS_TREE_IO, host, NULL, "can't be read (Windows error %lu)", GetLastError());
+                else if (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY))
+                    rc = refuse(tree, FS_TREE_INVALID, host, NULL, "changed into a link or a folder as it was read");
+                else if (info.nNumberOfLinks > 1)
+                    rc = refuse(tree, FS_TREE_INVALID, host, NULL,
+                                "is a file of %lu names (hard links), and the index takes a file of one name only",
+                                (unsigned long)info.nNumberOfLinks);
                 else
                     size = ((uint64_t)info.nFileSizeHigh << 32) | info.nFileSizeLow;
-                if (!CloseHandle(file) && !rc) rc = FS_TREE_IO;
+                if (!CloseHandle(file) && !rc)
+                    rc = refuse(tree, FS_TREE_IO, host, NULL, "can't be closed (Windows error %lu)", GetLastError());
                 if (rc) break;
             }
 #else
             struct stat st;
             if (lstat(host, &st)) {
-                rc = FS_TREE_IO;
+                rc = refuse(tree, FS_TREE_IO, host, NULL, "can't be read (%s)", strerror(errno));
                 break;
             }
-            if ((!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) || st.st_size < 0 ||
-                (S_ISREG(st.st_mode) && st.st_nlink > 1)) {
-                rc = FS_TREE_INVALID;
+            if (S_ISLNK(st.st_mode) && (rc = link_folder(tree, parent, host, depth, &linked))) break;
+            if (!linked && ((!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) || st.st_size < 0)) {
+                rc = refuse(tree, FS_TREE_INVALID, host, NULL, "is neither a file nor a folder");
                 break;
             }
-            is_dir = S_ISDIR(st.st_mode);
+            if (S_ISREG(st.st_mode) && st.st_nlink > 1) {
+                rc = refuse(tree, FS_TREE_INVALID, host, NULL,
+                            "is a file of %lu names (hard links), and the index takes a file of one name only",
+                            (unsigned long)st.st_nlink);
+                break;
+            }
+            is_dir = S_ISDIR(st.st_mode) || linked;
             size = (uint64_t)st.st_size;
 #endif
             FsNode* n = node_new(name, is_dir);
             if (!n) {
-                rc = FS_TREE_NOMEM;
+                free(linked);
+                rc = refuse(tree, FS_TREE_NOMEM, host, NULL, "can't be indexed: out of memory");
                 break;
             }
             n->size = is_dir ? 0 : size;
+            n->host = linked; /* its subtree's paths start in the folder the link points at */
+            n->linked = linked != NULL;
             n->parent = parent;
             n->attached = 1;
             n->next = parent->children;
             parent->children = n;
-            if (is_dir) rc = scan_directory(tree, n, host, depth + 1, NULL);
+            if (is_dir) rc = linked ? scan_linked(tree, n) : scan_directory(tree, n, host, depth + 1, NULL);
             host[parent_len] = 0;
             if (rc) break;
         }
 #if defined(_WIN32)
         if (!FindNextFileA(dir, &entry)) {
-            if (GetLastError() != ERROR_NO_MORE_FILES) rc = FS_TREE_IO;
+            if (GetLastError() != ERROR_NO_MORE_FILES)
+                rc = refuse(tree, FS_TREE_IO, host, NULL, "can't be read (Windows error %lu)", GetLastError());
             break;
         }
 #endif
     }
-#if defined(_WIN32)
-    if (!FindClose(dir) && !rc) rc = FS_TREE_IO;
-#else
-    if (closedir(dir) && !rc) rc = FS_TREE_IO;
-#endif
     host[parent_len] = 0;
+#if defined(_WIN32)
+    if (!FindClose(dir) && !rc)
+        rc = refuse(tree, FS_TREE_IO, host, NULL, "can't be closed (Windows error %lu)", GetLastError());
+#else
+    if (closedir(dir) && !rc) rc = refuse(tree, FS_TREE_IO, host, NULL, "can't be closed (%s)", strerror(errno));
+#endif
     if (!rc) parent->children = nodes_sort(parent->children);
     return rc;
 }
 
-/* directory as an absolute path without symlinks (no junction on Windows), into absolute */
-static FsTreeResult host_directory(const char* directory, char* absolute) {
+/* n, a followed link at the data directory's top: the entries of the folder it points at (n->host), as a graft's */
+static FsTreeResult scan_linked(FsTree* tree, FsNode* n) {
+    char host[FS_TREE_PATH_MAX];
+    memcpy(host, n->host, strlen(n->host) + 1);
+    return scan_directory(tree, n, host, 1, NULL);
+}
+
+/* directory as an absolute path without symlinks (no junction on Windows), into absolute; where it fails is said
+   (refuse) */
+static FsTreeResult host_directory(FsTree* tree, const char* directory, char* absolute) {
 #if defined(_WIN32)
     DWORD len = GetFullPathNameA(directory, FS_TREE_PATH_MAX, absolute, NULL);
-    if (!len) return FS_TREE_IO;
-    if (len >= FS_TREE_PATH_MAX) return FS_TREE_TOOLONG;
+    if (!len) return refuse(tree, FS_TREE_IO, directory, NULL, "can't be resolved (Windows error %lu)", GetLastError());
+    if (len >= FS_TREE_PATH_MAX)
+        return refuse(tree, FS_TREE_TOOLONG, directory, NULL, "is a path longer than %d bytes", FS_TREE_PATH_MAX - 1);
     for (char* p = absolute; *p; p++)
         if (*p == '\\') *p = '/';
     while (len > 3 && absolute[len - 1] == '/') absolute[--len] = 0;
     DWORD attributes = GetFileAttributesA(absolute);
-    if (attributes == INVALID_FILE_ATTRIBUTES) return FS_TREE_IO;
-    if (!(attributes & FILE_ATTRIBUTE_DIRECTORY) || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return FS_TREE_INVALID;
+    if (attributes == INVALID_FILE_ATTRIBUTES)
+        return refuse(tree, FS_TREE_IO, absolute, NULL, "can't be read (Windows error %lu)", GetLastError());
+    if (attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+        return refuse(tree, FS_TREE_INVALID, absolute, NULL, "is a link or a junction, which the index doesn't follow");
+    if (!(attributes & FILE_ATTRIBUTE_DIRECTORY))
+        return refuse(tree, FS_TREE_INVALID, absolute, NULL, "is not a folder");
 #else
     struct stat st;
     size_t input_len = strnlen(directory, FS_TREE_PATH_MAX);
-    if (input_len >= FS_TREE_PATH_MAX) return FS_TREE_TOOLONG;
+    if (input_len >= FS_TREE_PATH_MAX)
+        return refuse(tree, FS_TREE_TOOLONG, directory, NULL, "is a path longer than %d bytes", FS_TREE_PATH_MAX - 1);
     memcpy(absolute, directory, input_len + 1);
     while (input_len > 1 && absolute[input_len - 1] == '/') absolute[--input_len] = 0;
-    if (lstat(absolute, &st)) return FS_TREE_IO;
-    if (!S_ISDIR(st.st_mode)) return FS_TREE_INVALID;
+    if (lstat(absolute, &st)) return refuse(tree, FS_TREE_IO, absolute, NULL, "can't be read (%s)", strerror(errno));
+    if (S_ISLNK(st.st_mode)) return refuse(tree, FS_TREE_INVALID, absolute, NULL, NO_LINK);
+    if (!S_ISDIR(st.st_mode)) return refuse(tree, FS_TREE_INVALID, absolute, NULL, "is not a folder");
     char* resolved = realpath(directory, NULL);
-    if (!resolved) return FS_TREE_IO;
+    if (!resolved) return refuse(tree, FS_TREE_IO, absolute, NULL, "can't be resolved (%s)", strerror(errno));
     size_t len = strlen(resolved);
     if (len >= FS_TREE_PATH_MAX) {
         free(resolved);
-        return FS_TREE_TOOLONG;
+        return refuse(tree, FS_TREE_TOOLONG, absolute, NULL, "resolves to a path longer than %d bytes",
+                      FS_TREE_PATH_MAX - 1);
     }
     memcpy(absolute, resolved, len + 1);
     free(resolved);
@@ -881,16 +1041,22 @@ static void make_readonly(FsNode* n) {
    before), else none (one made now), and readonly or not */
 static FsTreeResult graft(FsTree* tree, const char* name, const char* directory, int scan, int readonly) {
     if (!tree || !tree->root || !name || !directory || !valid_name(name, strlen(name))) return FS_TREE_INVALID;
+    refused_none(tree);
     if (child_find(tree->root, name)) return FS_TREE_EXISTS;
     char absolute[FS_TREE_PATH_MAX];
-    FsTreeResult rc = host_directory(directory, absolute);
+    FsTreeResult rc = host_directory(tree, directory, absolute);
     if (rc) return rc;
+    for (const FsNode* other = tree->root->children; other; other = other->next)
+        if (other->linked && host_overlap(other->host, absolute))
+            return refuse(tree, FS_TREE_INVALID, absolute, NULL,
+                          "is, holds or is in the folder a symbolic link of the data folder points at, which the index "
+                          "already holds");
     FsNode* n = node_new(name, 1);
-    if (!n) return FS_TREE_NOMEM;
+    if (!n) return refuse(tree, FS_TREE_NOMEM, absolute, NULL, "can't be indexed: out of memory");
     n->host = strdup(absolute);
     if (!n->host) {
         node_free(n);
-        return FS_TREE_NOMEM;
+        return refuse(tree, FS_TREE_NOMEM, absolute, NULL, "can't be indexed: out of memory");
     }
     n->attached = 1;
     rc = scan ? scan_directory(tree, n, absolute, 1, NULL) : FS_TREE_OK;
@@ -918,20 +1084,37 @@ FsTreeResult fs_tree_forget(FsTree* tree, const char* path) {
 }
 FsTreeResult fs_tree_graft_new(FsTree* tree, const char* name, const char* directory) {
     if (!tree || !tree->root || !name || !directory || !valid_name(name, strlen(name))) return FS_TREE_INVALID;
+    refused_none(tree);
     if (child_find(tree->root, name)) return FS_TREE_EXISTS;
     char absolute[FS_TREE_PATH_MAX];
-    if (plat_mkdir(directory)) return host_directory(directory, absolute) ? FS_TREE_IO : FS_TREE_EXISTS;
+    if (plat_mkdir(directory)) { /* something there already, a folder or what host_directory says it is; else why */
+#if defined(_WIN32)
+        unsigned long made = GetLastError();
+        int there = made == ERROR_ALREADY_EXISTS;
+#else
+        int made = errno, there = made == EEXIST;
+#endif
+        if (!host_directory(tree, directory, absolute)) return FS_TREE_EXISTS;
+#if defined(_WIN32)
+        if (!there) refuse(tree, FS_TREE_IO, directory, NULL, "can't be made (Windows error %lu)", made);
+#else
+        if (!there) refuse(tree, FS_TREE_IO, directory, NULL, "can't be made (%s)", strerror(made));
+#endif
+        return FS_TREE_IO;
+    }
     FsTreeResult rc = graft(tree, name, directory, 0, 0);
     if (rc) host_unlink(directory, 1); /* nothing made stays */
     return rc;
 }
 
 /* src's children (an overlay's scan, host its host folder) laid over dst's: see fs_tree_overlay. src is left empty */
-static FsTreeResult overlay_merge(FsNode* dst, FsNode* src, char* host, const char* const* whole,
+static FsTreeResult overlay_merge(FsTree* tree, FsNode* dst, FsNode* src, char* host, const char* const* whole,
                                   const char* const* merged, unsigned depth) {
     size_t host_len = strlen(host);
     FsTreeResult rc = FS_TREE_OK;
-    if (depth > FS_TREE_DEPTH_MAX) return FS_TREE_TOOLONG;
+    if (depth > FS_TREE_DEPTH_MAX)
+        return refuse(tree, FS_TREE_TOOLONG, host, NULL, "is more than %d folders below the data folder",
+                      FS_TREE_DEPTH_MAX);
     while (src->children && !rc) {
         FsNode *c = src->children, *under = child_find(dst, c->name);
         size_t len = strlen(c->name);
@@ -942,7 +1125,8 @@ static FsTreeResult overlay_merge(FsNode* dst, FsNode* src, char* host, const ch
             subtree_discard(c);
             continue;
         }
-        if (host_len + 1 + len >= FS_TREE_PATH_MAX) return FS_TREE_TOOLONG;
+        if (host_len + 1 + len >= FS_TREE_PATH_MAX)
+            return refuse(tree, FS_TREE_TOOLONG, host, c->name, "is a path longer than %d bytes", FS_TREE_PATH_MAX - 1);
         host[host_len] = '/';
         memcpy(host + host_len + 1, c->name, len + 1);
         node_unlink(c);
@@ -951,13 +1135,13 @@ static FsTreeResult overlay_merge(FsNode* dst, FsNode* src, char* host, const ch
             if (!c->host) {
                 c->attached = 0;
                 subtree_discard(c);
-                rc = FS_TREE_NOMEM;
+                rc = refuse(tree, FS_TREE_NOMEM, host, NULL, "can't be indexed: out of memory");
             } else {
                 if (under) subtree_discard(under);
                 node_attach(dst, c);
             }
         } else {
-            rc = overlay_merge(under, c, host, whole, merged, depth + 1);
+            rc = overlay_merge(tree, under, c, host, whole, merged, depth + 1);
             c->attached = 0;
             subtree_discard(c);
         }
@@ -969,11 +1153,12 @@ static FsTreeResult overlay_merge(FsNode* dst, FsNode* src, char* host, const ch
 FsTreeResult fs_tree_overlay(FsTree* tree, const char* directory, const char* const* whole,
                              const char* const* merged) {
     if (!tree || !tree->root || !directory) return FS_TREE_INVALID;
+    refused_none(tree);
     char absolute[FS_TREE_PATH_MAX];
-    FsTreeResult rc = host_directory(directory, absolute);
+    FsTreeResult rc = host_directory(tree, directory, absolute);
     if (rc) return rc;
     FsNode* top = node_new("", 1);
-    if (!top) return FS_TREE_NOMEM;
+    if (!top) return refuse(tree, FS_TREE_NOMEM, absolute, NULL, "can't be indexed: out of memory");
     top->attached = 1;
     char host[FS_TREE_PATH_MAX];
     memcpy(host, absolute, strlen(absolute) + 1);
@@ -981,7 +1166,7 @@ FsTreeResult fs_tree_overlay(FsTree* tree, const char* directory, const char* co
     if (!rc) {
         make_readonly(top);
         memcpy(host, absolute, strlen(absolute) + 1);
-        rc = overlay_merge(tree->root, top, host, whole, merged, 0);
+        rc = overlay_merge(tree, tree->root, top, host, whole, merged, 0);
     }
     top->attached = 0;
     subtree_discard(top);
@@ -994,23 +1179,24 @@ FsTreeResult fs_tree_init_skipping(FsTree* tree, const char* directory, const ch
     *tree = (FsTree){0};
     pm_init(&tree->lock);
     char absolute[FS_TREE_PATH_MAX];
-    FsTreeResult rc = host_directory(directory, absolute);
+    FsTreeResult rc = host_directory(tree, directory, absolute);
     if (rc) return rc;
     tree->base = strdup(absolute);
     tree->root = node_new("", 1);
     if (!tree->base || !tree->root) {
         fs_tree_destroy(tree);
-        return FS_TREE_NOMEM;
+        return refuse(tree, FS_TREE_NOMEM, absolute, NULL, "can't be indexed: out of memory");
     }
     tree->root->attached = 1;
     rc = scan_directory(tree, tree->root, absolute, 0, skipped);
     if (!rc) {
         FsNode* root = child_find(tree->root, "root");
-        if (root && !root->is_dir) rc = FS_TREE_INVALID;
+        if (root && !root->is_dir)
+            rc = refuse(tree, FS_TREE_INVALID, absolute, "root", "is a file where the guest's / goes");
         if (!root) {
             root = node_new("root", 1);
             if (!root)
-                rc = FS_TREE_NOMEM;
+                rc = refuse(tree, FS_TREE_NOMEM, absolute, "root", "can't be indexed: out of memory");
             else {
                 root->is_virtual = 1;
                 node_attach(tree->root, root);
@@ -1019,4 +1205,22 @@ FsTreeResult fs_tree_init_skipping(FsTree* tree, const char* directory, const ch
     }
     if (rc) fs_tree_destroy(tree);
     return rc;
+}
+
+const char* fs_tree_why(const FsTree* tree, FsTreeResult r) {
+    if (tree && tree->why[0]) return tree->why;
+    switch (r) {
+        case FS_TREE_OK: return "is indexed";
+        case FS_TREE_NOTFOUND: return "is not there";
+        case FS_TREE_EXISTS: return "is in the index already";
+        case FS_TREE_NOTEMPTY: return "is not empty";
+        case FS_TREE_INVALID: return "is no file or folder the index takes";
+        case FS_TREE_TOOLONG: return "is a path too long";
+        case FS_TREE_IO: return "can't be read";
+        case FS_TREE_NOMEM: return "can't be indexed: out of memory";
+        case FS_TREE_READONLY: return "is read-only";
+        case FS_TREE_NOTDELETABLE: return "can't be deleted";
+        case FS_TREE_NOTRENAMABLE: return "can't be renamed";
+    }
+    return "can't be indexed";
 }

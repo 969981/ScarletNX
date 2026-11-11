@@ -420,6 +420,149 @@ static void run32(struct snx_recompiler* r, uint8_t* mem) {
     snx_recompiled32_free(m);
 }
 
+/* snx_recompiler_set_progress: the totals first with nothing done, then each unit's work as it finishes, ending at the
+   totals; nothing once the callback is cleared */
+typedef struct {
+    int calls, ordered;
+    unsigned long long first_done, first_total, done, total, functions_done, functions_total;
+} Progress;
+static void progress(void* user, unsigned long long weight_done, unsigned long long weight_total,
+                     unsigned long long functions_done, unsigned long long functions_total) {
+    Progress* p = (Progress*)user;
+    if (!p->calls++) {
+        p->first_done = weight_done | functions_done;
+        p->first_total = weight_total;
+    } else if (weight_done < p->done || weight_total != p->total || functions_total != p->functions_total)
+        p->ordered = 0;
+    p->done = weight_done;
+    p->total = weight_total;
+    p->functions_done = functions_done;
+    p->functions_total = functions_total;
+}
+static void progress64(struct snx_recompiler* r, uint8_t* mem) {
+    Progress p = {0, 1, 0, 0, 0, 0, 0, 0};
+    snx_recompiler_set_progress(r, progress, &p);
+    struct snx_recompiled* m = snx_recompile(r, CODE64, mem + CODE64, A64_SIZE);
+    check(m != NULL, "progress: a module");
+    check(p.calls >= 2 && p.first_done == 0 && p.first_total > 0, "progress: the totals first, nothing done");
+    check(p.ordered && p.done == p.total && p.total == p.first_total, "progress: the work grows to the totals");
+    check(m && p.functions_done == p.functions_total && p.functions_total == snx_recompiled_functions(m),
+          "progress: every function counted");
+    snx_recompiled_free(m);
+    int calls = p.calls;
+    snx_recompiler_set_progress(r, NULL, NULL);
+    m = snx_recompile(r, CODE64, mem + CODE64, A64_SIZE);
+    check(m != NULL && p.calls == calls, "progress: nothing reported once cleared");
+    snx_recompiled_free(m);
+}
+
+/* The order of the code units: the heaviest first, by instructions plus four per leader. entry calls wide, 4501
+   instructions in one block, then branchy, 2001 instructions in about 2000 blocks (cbz x1,.+8; add x0,x0,#1, a
+   thousand times). With 4 jobs the units are {entry, wide} and {branchy}: branchy weighs about 10000 to wide's 4500,
+   so it is unit 0 (code_000), though it has fewer instructions and comes later in the code */
+#define SCHEDULE64   0x100000u
+#define WIDE_WORDS   4501u
+#define BRANCH_PAIRS 1000u
+/* whether the unit's saved IR defines the guest function at address */
+static int unit_defines(const char* folder, const char* unit, uint64_t address) {
+    char *path = snx_path_join(folder, unit), symbol[40];
+    size_t size = 0;
+    char* text = path ? (char*)snx_read_file(path, &size) : NULL;
+    int found = 0;
+    snprintf(symbol, sizeof symbol, "@F_%llX(", (unsigned long long)address);
+    for (size_t at = 0; text && at < size;) {
+        char* line = text + at;
+        char* end = memchr(line, '\n', size - at);
+        size_t length = end ? (size_t)(end - line) : size - at;
+        if (length > 7 && !strncmp(line, "define ", 7)) {
+            char* hit = strstr(line, symbol);
+            found |= hit && hit < line + length;
+        }
+        at += length + 1;
+    }
+    free(text);
+    free(path);
+    return found;
+}
+static void schedule64(struct snx_recompiler* r) {
+    const uint64_t wide = SCHEDULE64 + 3 * 4, branchy = wide + WIDE_WORDS * 4;
+    const size_t words = 3 + WIDE_WORDS + 2 * BRANCH_PAIRS + 1;
+    uint32_t* code = (uint32_t*)calloc(words, sizeof *code);
+    uint8_t* bytes = (uint8_t*)calloc(words, 4);
+    char* folder = snx_temp_dir(NULL);
+    check(code && bytes && folder, "schedule: memory and a folder");
+    if (!code || !bytes || !folder) {
+        free(code);
+        free(bytes);
+        free(folder);
+        return;
+    }
+    size_t n = 0;
+    code[n++] = 0x94000000u | (uint32_t)((wide - SCHEDULE64) / 4);          /* bl wide */
+    code[n++] = 0x94000000u | (uint32_t)((branchy - (SCHEDULE64 + 4)) / 4); /* bl branchy */
+    code[n++] = 0xd65f03c0u;                                                /* ret */
+    for (uint32_t i = 0; i + 1 < WIDE_WORDS; ++i) code[n++] = 0x91000400u;  /* add x0,x0,#1 */
+    code[n++] = 0xd65f03c0u;
+    for (uint32_t i = 0; i < BRANCH_PAIRS; ++i) {
+        code[n++] = 0xb4000041u; /* cbz x1,.+8 */
+        code[n++] = 0x91000400u;
+    }
+    code[n++] = 0xd65f03c0u;
+    for (size_t i = 0; i < n; ++i) {
+        bytes[4 * i] = (uint8_t)code[i];
+        bytes[4 * i + 1] = (uint8_t)(code[i] >> 8);
+        bytes[4 * i + 2] = (uint8_t)(code[i] >> 16);
+        bytes[4 * i + 3] = (uint8_t)(code[i] >> 24);
+    }
+    snx_recompiler_set_jobs(r, 4);
+    check(!snx_recompiler_set_keep_ir(r, folder), "schedule: set_keep_ir");
+    struct snx_recompiled* m = snx_recompile(r, SCHEDULE64, bytes, n * 4);
+    check(m != NULL && snx_recompiled_functions(m) == 3, "schedule: entry, wide and branchy found");
+    check(unit_defines(folder, "code_000.ll", branchy) && !unit_defines(folder, "code_000.ll", wide),
+          "schedule: the branchy function's unit, the heavier, is unit 0");
+    check(unit_defines(folder, "code_001.ll", wide) && unit_defines(folder, "code_001.ll", SCHEDULE64),
+          "schedule: entry and the wide function are unit 1");
+    snx_recompiled_free(m);
+    snx_recompiler_set_keep_ir(r, NULL);
+    snx_recompiler_set_jobs(r, 2);
+    snx_remove_tree(folder);
+    free(folder);
+    free(bytes);
+    free(code);
+}
+
+/* snx_recompiler_set_live_code: the JIT compiles far as its bytes are when it is first reached, after the recompile
+   (here mov x0,#42 instead of #99), not as they were when the module was made; without it, the module's copy */
+static void live64(struct snx_recompiler* r, uint8_t* mem) {
+    const uint32_t mov99 = 0xd2800c60, mov42 = 0xd2800540;
+    for (int live = 0; live < 2; ++live) {
+        struct snx_recompiled* m;
+        RtAPI rt;
+        CPU cpu = {0};
+        Seen seen = {0};
+        snx_recompiler_set_live_code(r, live);
+        m = snx_recompile(r, CODE64, mem + CODE64, A64_SIZE);
+        check(m != NULL, "live code: a module");
+        if (!m) continue;
+        memcpy(mem + FAR, &mov42, 4);
+        snx_runtime_defaults(&rt);
+        rt.svc = svc64;
+        rt.undef = undef64;
+        rt.brk = brk64;
+        cpu.mem = mem;
+        cpu.rt = &rt;
+        cpu.thread = &seen;
+        check(snx_recompiled_bind(m, &cpu) == 0, "live code: bind");
+        cpu.x[30] = STOP;
+        snx_recompiled_run(m, &cpu, FAR, STOP);
+        check(seen.brks == 1 && cpu.x[0] == (live ? 42u : 99u),
+              live ? "live code: the JIT compiles far as it is now" : "a module's JIT compiles far from its copy");
+        memcpy(mem + FAR, &mov99, 4);
+        snx_recompiled_free(m);
+    }
+    snx_recompiler_set_live_code(r, 0);
+}
+
 int main(int argc, char** argv) {
     uint8_t* mem = (uint8_t*)calloc(MEMORY, 1);
     struct snx_recompiler* r;
@@ -450,7 +593,10 @@ int main(int argc, char** argv) {
               "the Switch and max A64 targets");
         snx_recompiler_set_jobs(r, 2);
         run64(r, "llvm", mem, keep_ir);
+        progress64(r, mem);
+        schedule64(r);
         invalidate64(r, mem);
+        live64(r, mem);
 #ifndef _WIN32
         spin64(r, mem);
 #endif

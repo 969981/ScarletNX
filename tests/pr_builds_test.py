@@ -3,8 +3,8 @@
 # Copyright 2026 the ScarletNX contributors
 """scripts/pr-builds.sh --print against a fake gh that has a run's artifacts and jobs: the builds linked, the APK's
 halves and edenprobe's report left out, the jobs that did not succeed named by their id in build.yml, the checks as
-installed and the sanitizers' build never among them, and edenprobe's line, its notice linked to the run. Then the
-pull request found from the commit when none is given. Offline."""
+installed, the sanitizers' build, the A64 differential's QEMU reference and Nightly due never among them, and
+edenprobe's line, its notice linked to the run. Then the pull request found from the commit when none is given. Offline."""
 
 import json
 import os
@@ -22,6 +22,8 @@ ARTIFACTS = {
         {'id': 1, 'name': 'ScarletNX-android-arm64-v8a-abc1234-stage', 'size_in_bytes': 1 << 20, 'expired': False,
          'expires_at': '2026-11-01T00:00:00Z'},
         {'id': 3, 'name': 'edenprobe-abc1234-1', 'size_in_bytes': 1 << 20, 'expired': False,
+         'expires_at': '2026-11-01T00:00:00Z'},
+        {'id': 4, 'name': 'fail-fast-1', 'size_in_bytes': 1 << 10, 'expired': False,
          'expires_at': '2026-11-01T00:00:00Z'},
     ]
 }  # fmt: skip
@@ -57,6 +59,8 @@ WHOLE = [
     ('Linux AppImage (riscv64), as installed', 'skipped'),
     ('Windows zip, as installed', 'success'),
     ('edenprobe (Linux x86_64, lavapipe)', 'success'),
+    # the scheduled run's check, which every other event skips
+    ('Nightly due', 'skipped'),
 ]
 # a draft's: the cross AppImages skipped whole, under their name before the matrix filled it in, and macOS's
 DRAFT = [
@@ -115,10 +119,11 @@ with tempfile.TemporaryDirectory() as temporary:
     built = {'linux': {'result': 'success', 'outputs': {}}, 'windows': {'result': 'success', 'outputs': {}}}
     text = comment(built | {'edenprobe': {'result': 'success', 'outputs': {'result': TITLE}}})
     check(
-        "the builds linked, the halves of the APK and edenprobe's report left out",
+        "the builds linked, the halves of the APK, edenprobe's report and a failed job's mark left out",
         f'- [ScarletNX-windows-x86_64-abc1234]({RUN}/artifacts/2), 3 MiB' in text
         and '-stage' not in text
-        and 'edenprobe-abc1234' not in text,
+        and 'edenprobe-abc1234' not in text
+        and 'fail-fast' not in text,
         text,
     )
     check('kept until the first to expire', 'Builds of abc1234, kept until 2026-11-01:' in text, text)
@@ -155,6 +160,14 @@ with tempfile.TemporaryDirectory() as temporary:
             f'\n\n[{TITLE}]({RUN}): failed, see its summary\n\nNot built: appimage-cross (skipped), windows (failure), '
             'apple (skipped)\n'
         ),
+        text,
+    )
+    text = comment(
+        run_jobs=jobs(('Recompiler changes', 'success'), ("A64 differential's QEMU reference", 'skipped'), *WHOLE[1:2])
+    )
+    check(
+        'a pull request that skips the A64 differential: its QEMU reference and the job that skips it never named',
+        'Not built' not in text,
         text,
     )
     text = comment(run_jobs=jobs(*WHOLE[:2], ('Lint the shaders', 'failure')))

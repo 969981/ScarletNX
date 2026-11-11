@@ -68,7 +68,7 @@ if step.get('lines') is not None:
             time.sleep(step.get('slow', 0))
 if step.get('hang'):
     (scenario.parent / 'hung.pid').write_text(str(os.getpid()))
-    time.sleep(60)
+    time.sleep(3600)
 if step.get('signal'):
     os.kill(os.getpid(), step['signal'])
 sys.exit(step.get('exit', 0))
@@ -97,6 +97,10 @@ CASES = [
 WHOLE = START + CASES + [summary(2, 1, 1)]
 BASELINE = '# build: abc1234\n# mode: quick notime cpu\ncpu: adds\n'
 MISSING = 'missing'
+# the quiet seconds of a launch that is not meant to be killed: what it proves ends by itself, so no verdict may turn
+# on how long a loaded runner takes to start the fake or to end a crashed one (its core dump); ctest's timeout bounds a
+# hang. The two cases about the clock itself pass their own --timeout
+QUIET = '300'
 
 
 with tempfile.TemporaryDirectory() as temporary:
@@ -119,13 +123,13 @@ with tempfile.TemporaryDirectory() as temporary:
         steps = [step if isinstance(step, dict) else {'lines': step} for step in launches]
         (test / 'scenario.json').write_text(json.dumps({'launches': steps, **plan}))
         command = [sys.executable, str(SCRIPT), 'run', '--runtime', str(runtime), '--nro', str(nro), '--mode', mode]
-        command += ['--out', str(test / 'out'), '--summary', str(test / 'summary.md'), '--timeout', '10', *extra]
+        command += ['--out', str(test / 'out'), '--summary', str(test / 'summary.md'), '--timeout', QUIET, *extra]
         if baseline is not None:
             if baseline != MISSING:
                 (test / 'baseline.txt').write_text(baseline)
             command += ['--baseline', str(test / 'baseline.txt')]
         env = dict(os.environ, FAKE_SCENARIO=str(test / 'scenario.json'))
-        done = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60, check=False)
+        done = subprocess.run(command, env=env, capture_output=True, text=True, check=False)
         log = test / 'scenario.json.log'
         calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
         return done.returncode, done.stdout + done.stderr, test / 'out', calls
@@ -385,6 +389,17 @@ with tempfile.TemporaryDirectory() as temporary:
 
     status, text, out, calls = run([{'lines': WHOLE, 'signal': 11}])
     check('a crash after the summary fails', status == 1 and 'ended with exit -11 after its summary' in text, text)
+
+    # the fake writes its summary as it starts, then blocks: 30 quiet seconds, which no runner takes to start it, so
+    # the kill can only come after the summary
+    status, text, out, calls = run([{'lines': WHOLE, 'hang': True}], extra=['--timeout', '30'])
+    check(
+        'a launch killed after its summary fails, as that and after one launch',
+        status == 1
+        and 'launch 1 wrote its summary and did not end: killed after 30 s with no new line (--timeout 30)' in text
+        and len(calls) == 2,
+        text,
+    )
 
     ignored = [note('mode: quick, from the mode file; 1 unknown word ignored: grpahics')]
     status, text, out, calls = run([START[:2] + ignored + CASES + [summary(2, 1, 1)]])

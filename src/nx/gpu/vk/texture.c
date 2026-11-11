@@ -1649,17 +1649,17 @@ static Surf* rt_copy(Surf* rt, u32 w, u32 h, const VkFmt* as, int guest, int pix
     return c;
 }
 static Surf* rt_crop(Surf* rt, u32 w, u32 h, const VkFmt* as) { return rt_copy(rt, w, h, as, 0, 1); }
-/* A scaled color target for a program whose texels are the guest's (a compute program: its fetches, its size queries
-   and the images it stores into count them): its top-left w x h at the guest's size, in as when not NULL. NULL for a
-   multisampled or depth target, a format that can't be blitted or a copy that found no memory, said once: the caller
-   takes the scaled image */
+/* A scaled color target for a program whose texels are the guest's (a compute program, whose fetches, size queries
+   and stored images count them, or a stage before the fragment's): its top-left w x h at the guest's size, in as when
+   not NULL. NULL for a multisampled or depth target, a format that can't be blitted or a copy that found no memory,
+   said once: the caller takes the scaled image */
 static Surf* rt_guest(Surf* rt, u32 w, u32 h, const VkFmt* as) {
     Surf* c = rt->msaa || rt->f.depth || !can_blit(rt->f.vk) ? NULL : rt_copy(rt, w, h, as, 1, 1);
     if (!c)
         LOG_LIMIT(1,
-                  "vulkan: a compute program reads the %ux%u render target at %llx (format %d, depth %d, %u samples) "
-                  "and no copy of the guest's size could be made of it: the program is given its %ux%u image, "
-                  "whose pixels its fetches count\n",
+                  "vulkan: a compute, vertex, tessellation, geometry or mesh program reads the %ux%u render target at "
+                  "%llx (format %d, depth %d, %u samples) and no copy of the guest's size could be made of it: the "
+                  "program is given its %ux%u image, whose pixels its fetches count\n",
                   rt->w, rt->h, (unsigned long long)rt->gva, (int)rt->f.vk, rt->f.depth, ds_msaa_samples(rt->msaa),
                   rt->sw, rt->sh);
     return c;
@@ -2416,12 +2416,21 @@ static Surf* tex_from_tic(const u32* tic, int raw, int use) {
         /* a header of another texel size covers other memory than the target's pixels (depth is read through its
            own aspect, whatever the host format's size) */
         if (f.bpp == rt->f.bpp || f.depth || rt->f.depth) {
-            /* A smaller header is a corner of the target only where its pixels lie at the same bytes (dynamic
-               resolution). One laid out otherwise is another texture in memory the target once had, which it doesn't
-               read, and which neither keeps the target alive nor loads it again. One game's 256x1 ramp, at the address
-               of a 2048x4096 depth target gone by, took that target's corner, and its sky stayed white until it was
-               started again */
-            if (!rt->msaa && (rt->w != w || rt->h != h) && !vk_rt_same_layout(rt, w, h, bl, bh, pitch)) {
+            /* A smaller header is a corner of the target where its pixels lie at the same bytes (dynamic resolution).
+               One laid out otherwise is another texture in memory the target once had, which it doesn't read, and
+               which neither keeps the target alive nor loads it again. One game's 256x1 ramp, at the address of a
+               2048x4096 depth target gone by, took that target's corner, and its sky stayed white until it was started
+               again.
+               A color header of the target's texel size over a block linear target that memory hasn't replaced since
+               its last draw is the corner too, whatever its rows. One game makes a texture of each size of its dynamic
+               resolution over the storage of its 1920x1080 frame targets, draws the full-size one and samples the
+               frame through the one of the frame's size (1611x906 to 1919x1079). Its NVN driver gives that one rows of
+               fewer GOBs (101 for 1611 texels, the target's being 120), and no wider tile width, yet the console shows
+               the frame: the target's bytes read through those rows were a mosaic of it in a run. Loaded from memory,
+               the texture showed older frames, as the target's pixels weren't there: a black screen or a mosaic
+               after each door */
+            if (!rt->msaa && (rt->w != w || rt->h != h) && !vk_rt_same_layout(rt, w, h, bl, bh, pitch) &&
+                !(!storage && bl && rt->bl && !f.depth && !rt->f.depth && f.bpp == rt->f.bpp && vk_rt_drawn_fresh(rt))) {
                 LOG_LIMIT(
                     30,
                     "vulkan: a %ux%u texture (%u bytes a texel, depth %d) at the address of the %ux%u render target "

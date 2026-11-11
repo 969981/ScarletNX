@@ -10,7 +10,8 @@
 # PR may be empty: then it is the open pull request whose head is SHA, and with none there is nothing to link. A job of
 # the run that did not succeed gets a line, by its id in build.yml, but edenprobe, which builds nothing: its line is its
 # result, the notice its job leaves, linked to the run's summary (docs/dev/edenprobe.md). The checks of a package as
-# installed and the sanitizers' build make no package, so they get none. NEEDS, when set, stands for the run's jobs, in
+# installed, the sanitizers' build, the A64 differential's QEMU reference, the job that says whether a pull request
+# needs it and the scheduled run's Nightly due make no package, so they get none. NEEDS, when set, stands for the run's jobs, in
 # the shape of toJSON(needs). --print writes the comment to stdout and posts nothing. gh needs a token that may read
 # the run's artifacts, jobs and checks, and write on pull requests.
 set -euo pipefail
@@ -34,11 +35,11 @@ if [ -z "$print" ] && [ "$(gh api "repos/$repo/pulls/$pr" --jq .head.sha)" != "$
     echo "$sha is no longer the head of #$pr: its comment stays"
     exit 0
 fi
-# every artifact but the APK's halves (-stage), which only the job that packs the APK takes, and edenprobe's reports,
-# which its line below links through the run
+# every artifact but the APK's halves (-stage), which only the job that packs the APK takes, edenprobe's reports,
+# which its line below links through the run, and a failed job's mark (scripts/fail-fast.py)
 artifacts=$(gh api "repos/$repo/actions/runs/$run/artifacts?per_page=100")
 links=$(jq -r --arg url "https://github.com/$repo/actions/runs/$run/artifacts" '
-    .artifacts | map(select((.expired | not) and (.name | endswith("-stage") or startswith("edenprobe-") | not))) |
+    .artifacts | map(select((.expired | not) and (.name | endswith("-stage") or startswith("edenprobe-") or startswith("fail-fast-") | not))) |
     sort_by(.name)[] |
     "- [\(.name)](\($url)/\(.id)), \(.size_in_bytes / 1048576 | floor) MiB"' <<<"$artifacts")
 until=$(jq -r '[.artifacts[].expires_at] | min // empty | .[:10]' <<<"$artifacts")
@@ -55,6 +56,7 @@ if [ -z "${NEEDS:-}" ]; then
             elif startswith("Windows (") then "windows"
             elif startswith("edenprobe") then "edenprobe"
             elif endswith(", as installed") then empty
+            elif . == "Recompiler changes" or startswith("A64 differential") or . == "Nightly due" then empty
             elif test("^Linux AppImage \\((x86_64|aarch64)\\)$") then "appimage"
             elif startswith("Linux AppImage (") then "appimage-cross"
             elif test("^Linux \\([^,]*\\)$") then "linux"
