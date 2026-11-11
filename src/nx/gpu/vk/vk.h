@@ -116,6 +116,8 @@ typedef struct {
     VkPhysicalDeviceFeatures feat;
     int has_divisor;    /* VK_EXT_vertex_attribute_divisor: instance divisors above 1 */
     int astc_bc7_could; /* the GPU samples BCn but not ASTC: astc_mode=2 holds its ASTC textures as BC7 */
+    /* the block formats the device samples, whether turned on or not (vk_blocks_want): VK_BLOCKS_* bits */
+    u32 blocks_have;
     /* astc_mode's Auto holds the ASTC textures it decodes as BC7: the device started with a budget under
        SNX_ASTC_EXACT_MB (gpu/texture/astc_bc.h). vk_astc_bc7 says what the mode in effect holds them as */
     int astc_auto_bc7;
@@ -134,8 +136,8 @@ typedef struct {
     int has_portability;        /* a portability driver (MoltenVK): the device lists VK_KHR_portability_subset */
     int has_xfb;                /* VK_EXT_transform_feedback (without it, g_shader_xfb_stores) */
     int has_mixed_samples;      /* VK_NV_framebuffer_mixed_samples: coverage at more samples than color storage */
-    /* VK_NV_device_diagnostic_checkpoints, enabled where the device has it: the draw or dispatch a GPU fault hangs on
-       (record.c's vk_checkpoint_dump). has_checkpoints below is checkpoints.c's, with vk_checkpoints=1 */
+    /* VK_NV_device_diagnostic_checkpoints, enabled with vk_checkpoints=1 where the device has it: the draw or dispatch a
+       GPU fault hangs on (record.c's vk_checkpoint_dump). has_checkpoints below is checkpoints.c's markers, on it too */
     int has_nv_checkpoints;
     int has_fault; /* VK_EXT_device_fault: the GPU's own report of a fault, at a lost device */
     int has_coverage_to_color, has_post_depth_coverage;
@@ -206,6 +208,9 @@ typedef struct {
        VK_KHR_get_surface_capabilities2): a present can be held until a time, on a surface that says so (sc_hold) */
     int has_present_timing;
     int has_calibrated_mono; /* CLOCK_MONOTONIC among the calibrateable time domains */
+    /* QueryPerformanceCounter among them (Windows), VK_EXT_calibrated_timestamps on for it: plat_ns's clock, which the
+       GPU profile's idle times are put on there (gpuprof.c) */
+    int has_calibrated_qpc;
     int has_surface_caps2;   /* the instance's VK_KHR_get_surface_capabilities2, which present timing is asked by */
     u32 gfx_timestamp_bits;  /* the graphics queue family's timestampValidBits: 0 where it writes no timestamps */
     /* VK_EXT_memory_budget: the driver tells each heap's use and budget (VMA reads them, and guesses without it) */
@@ -474,7 +479,11 @@ void vk_ck_report(void); /* logs them, once: before the fatal error of a lost de
 /* the next submission waits for a timeline semaphore of someone else's (FFmpeg's picture's) at one value and signals
    it at another: whichever submit comes next takes them, so commands recorded from now on never run before the wait */
 void vk_submit_after(VkSemaphore sem, u64 wait, u64 signal);
-void vk_finish(void); /* submits and waits until the GPU has done everything, and lands every result */
+/* submits and waits until the GPU has done everything, and lands every result. The caller's file and line count the
+   finishes it made, which the stats every 600 presents name (vk_finishes_log), by their number and their wait */
+void vk_finish_at(const char* file, int line);
+#define vk_finish() vk_finish_at(__FILE__, __LINE__)
+void vk_finishes_log(void);
 /* a save state's load (Renderer.reset): every surface, buffer and sample counter kept of the old guest memory goes */
 void vk_surf_forget_all(void);
 void vk_buf_forget_all(void);
@@ -780,6 +789,15 @@ enum {
 VkFmt vk_rt_format(u32 fmt);
 VkFmt vk_zt_format(u32 fmt);
 VkFmt vk_tic_format(u32 w0, int srgb); /* bpp 0: not supported */
+/* g_vk.blocks_have's bits */
+enum { VK_BLOCKS_ASTC = 1, VK_BLOCKS_ETC2 = 2, VK_BLOCKS_BC = 4 };
+/* the block formats' features to turn on of those the device has (have): BCn wherever it has them, ASTC LDR and ETC2
+   where native_astc and native_etc2 ask as well */
+void vk_blocks_want(const VkPhysicalDeviceFeatures* have, VkPhysicalDeviceFeatures* want);
+/* the log's line for each family of block textures (ASTC, ETC2 and EAC, BCn): sampled as the games' blocks, encoded
+   again on the GPU, or decoded, and into what; a warning where a setting asks for what the GPU lacks. Once the device
+   is made and astc_mode chosen */
+void vk_blocks_say(void);
 /* the ASTC textures the GPU decodes are held as BC7: astc_mode's BC7, or its Auto on a device that started with little
    memory (gpu/texture/astc_bc.h) */
 int vk_astc_bc7(void);
@@ -837,6 +855,10 @@ typedef struct Surf {
     VmaAllocation mem;
     VkImageView att;        /* level 0: the attachment */
     VkImageView att_linear; /* same storage without sRGB conversion */
+    VkImageView present;    /* level 0's layer 0 as its bytes (its sRGB twin's UNORM), sampled: the window's present
+                               (present_quad.c), made at its first */
+    u32 present_serial;     /* that view's number among all made, which a set holding it is known by: unlike its
+                               handle, never another view's */
     VkImageLayout layout;   /* the whole image is kept in one layout */
     VkPipelineStageFlags2 stage;
     VkAccessFlags2 access;
@@ -1712,7 +1734,7 @@ void vk_release_retire(u32 id);
 void vk_release_drain(void);
 /* query.c: the samples-passed counter with occlusion queries (renderer.h samples_*), under vk_lock. vk_query_draw before
    a game's draw in a rendering pass, vk_query_pass_end before the pass ends or a draw of the renderer's own in it
-   (render.c), vk_query_flush outside a pass before a submit (cmd.c) */
+   (render.c), vk_query_flush outside a pass before a submit (cmd.c), where the reports' copies are recorded */
 void vk_query_draw(VkCommandBuffer cb, u32 owner); /* counted as the targets' samples, the guest's */
 void vk_query_pass_end(VkCommandBuffer cb);
 void vk_query_flush(VkCommandBuffer cb);
@@ -1782,10 +1804,16 @@ u32 vk_ww_epoch(void);
 /* the calling thread runs a job of a stream (1: its checks see the CPU's writes from before the newest epoch now, and
    from before the waits it ends) or stops (0: they see every epoch's) */
 void vk_ww_stream(int on);
+void vk_ww_seen(void);                 /* renderer.h mem_seen: the running job's checks take in the newest epoch */
 void vk_mem_changed(u64 cpu, u64 len); /* gpu.c's g_gpu_mem_changed: the range counts as written */
 /* own.c's landed hook: host pages [cpu, cpu + size) a landing wrote, with their bytes then, whose next report as
    written counts only if those changed */
 void vk_ww_landed(u64 cpu, u64 size, const u8* bytes);
+void vk_ww_stats(u32 presents); /* the stats: the write tracking's epochs and scans since the last, a line */
+/* tests: the landed pages' list sorted as a scan's take sorts it, its length, or ~0u when it isn't one entry a page in
+   the pages' order; and the hash kept for the host page at cpu (0 for none) */
+u32 vk_ww_landed_check(void);
+u64 vk_ww_landed_hash(u64 cpu);
 
 /* pipeline.c */
 /* the constant buffer words a translation read (the translator resolves BRX jump tables through them): what it made
@@ -2057,6 +2085,11 @@ void vk_pass_ends_log(void);
 /* the on-screen controls and the game's menu over a swapchain image in TRANSFER_DST_OPTIMAL, which it stays in;
    safe is the picture's part clear of the system's bars (gpu/vk/ui.c) */
 void vk_ui_draw(VkCommandBuffer cb, VkImage sc, const int safe[4]);
+/* The window's one pass over sc, which the acquire waits for at the colour output: cleared to black, src's crop drawn
+   at to (transform's flips, then its quarter turn), and the on-screen layer over it; sc ends ready to present. src is
+   sampled through its bytes' view into a UNORM swapchain, so nothing converts sRGB; NULL for black alone */
+void vk_ui_present(VkCommandBuffer cb, VkImage sc, Surf* src, VkRect2D crop, VkRect2D to, u32 transform,
+                   const int safe[4]);
 void vk_ui_swapchain_gone(void); /* its images' views go before the swapchain does */
 void vk_render_clear(const DsState* ds, const DrawClear* c, const DrawOwner* o);
 /* viewport index of a draw's state with the resolution scale, and the draw's facing */

@@ -234,24 +234,8 @@ static VkPipelineLayout g_mg_layout;
 static VkPipeline g_mg_pipe;
 static void merge_init(void) {
     if (g_mg_pipe) return;
-    VkDescriptorSetLayoutBinding b[3];
-    for (u32 i = 0; i < 3; i++)
-        b[i] = (VkDescriptorSetLayoutBinding){.binding = i,
-                                              .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                              .descriptorCount = 1,
-                                              .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
-    VkDescriptorSetLayoutCreateInfo di = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 3, .pBindings = b};
-    if (!VK_OK(vkCreateDescriptorSetLayout(g_vk.dev, &di, NULL, &g_mg_ds)))
-        fatal("vulkan: cannot create the write-back merge's descriptor layout");
-    VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MergeParams)};
-    VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-                                     .setLayoutCount = 1,
-                                     .pSetLayouts = &g_mg_ds,
-                                     .pushConstantRangeCount = 1,
-                                     .pPushConstantRanges = &push};
-    if (!VK_OK(vkCreatePipelineLayout(g_vk.dev, &li, NULL, &g_mg_layout)))
-        fatal("vulkan: cannot create the write-back merge's pipeline layout");
+    if (!VK_OK(snx_vk_compute_layouts(g_vk.dev, 3, 0, sizeof(MergeParams), &g_mg_ds, &g_mg_layout)))
+        fatal("vulkan: cannot create the write-back merge's descriptor and pipeline layouts");
     if (!VK_OK(snx_vk_compute_pipeline(g_vk.dev, vk_pipeline_cache(), g_mg_layout, wlog_merge_spv, wlog_merge_spv_size,
                                        &g_mg_pipe)))
         fatal("vulkan: cannot create the write-back merge's pipeline");
@@ -269,15 +253,7 @@ int vk_wlog_merge(VkWriteLog* l, u32 part, u32 from, u32 to, VkBuffer src, u64 s
     VkDescriptorBufferInfo info[3] = {{src, sb, src_off + to - sb},
                                       {dst, db, dst_off + (to - from) - db},
                                       {l->buf, (u64)part * SH_WLOG_PART * 4, (u64)SH_WLOG_PART * 4}};
-    VkWriteDescriptorSet w[3];
-    for (u32 k = 0; k < 3; k++)
-        w[k] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                      .dstSet = set,
-                                      .dstBinding = k,
-                                      .descriptorCount = 1,
-                                      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                      .pBufferInfo = &info[k]};
-    vkUpdateDescriptorSets(g_vk.dev, 3, w, 0, NULL);
+    snx_vk_storage_buffers(g_vk.dev, set, info, 3);
     MergeParams p = {from / 4096, from, to, (u32)((src_off + from - sb) / 4), (u32)((dst_off - db) / 4)};
     VkCommandBuffer cb = vk_cmd();
     rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_mg_pipe);

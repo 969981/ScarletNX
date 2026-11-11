@@ -32,21 +32,8 @@ static struct {
 
 static void bl_init(void) {
     if (g_blocklinear.pipe) return;
-    VkDescriptorSetLayoutBinding bindings[2] = {
-        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
-    VkDescriptorSetLayoutCreateInfo di = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = bindings};
-    if (!VK_OK(vkCreateDescriptorSetLayout(g_vk.dev, &di, NULL, &g_blocklinear.ds)))
-        fatal("vulkan: cannot create the block linear descriptor layout");
-    VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BlParams)};
-    VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-                                     .setLayoutCount = 1,
-                                     .pSetLayouts = &g_blocklinear.ds,
-                                     .pushConstantRangeCount = 1,
-                                     .pPushConstantRanges = &push};
-    if (!VK_OK(vkCreatePipelineLayout(g_vk.dev, &li, NULL, &g_blocklinear.layout)))
-        fatal("vulkan: cannot create the block linear pipeline layout");
+    if (!VK_OK(snx_vk_compute_layouts(g_vk.dev, 2, 0, sizeof(BlParams), &g_blocklinear.ds, &g_blocklinear.layout)))
+        fatal("vulkan: cannot create the block linear descriptor and pipeline layouts");
     VkShaderModule module;
     if (!VK_OK(snx_vk_shader_module(g_vk.dev, blocklinear_spv, blocklinear_spv_size, &module)))
         fatal("vulkan: cannot load the block linear shader");
@@ -149,16 +136,9 @@ int vk_bl_move(VkCommandBuffer cb, const VkBlMove* m, int to_bl, VkBuffer bl, u6
     bl_init();
     VkDescriptorSet set = vk_desc_alloc(g_blocklinear.ds);
     if (!set) return 0;
-    VkDescriptorBufferInfo sides[2] = {{bl, bl_off, bl_size}, {lin, lin_off, lin_size}};
-    VkWriteDescriptorSet writes[2];
-    for (u32 i = 0; i < 2; i++)
-        writes[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                           .dstSet = set,
-                                           .dstBinding = to_bl ? 1 - i : i, /* binding 0 is read, 1 written */
-                                           .descriptorCount = 1,
-                                           .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                           .pBufferInfo = &sides[i]};
-    vkUpdateDescriptorSets(g_vk.dev, 2, writes, 0, NULL);
+    const VkDescriptorBufferInfo bl_side = {bl, bl_off, bl_size}, lin_side = {lin, lin_off, lin_size};
+    VkDescriptorBufferInfo sides[2] = {to_bl ? lin_side : bl_side, to_bl ? bl_side : lin_side}; /* read, written */
+    snx_vk_storage_buffers(g_vk.dev, set, sides, 2);
     BlParams p = {.runs = runs,
                   .rows = m->rows,
                   .lin_runs = m->lin_pitch >> 4,

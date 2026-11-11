@@ -33,6 +33,11 @@ takes a value takes it as `--option VALUE` or as `--option=VALUE`. A common opti
 run with the same message in each driver, `scarletnx-agb does not take --update`. An older name of an option still
 works for now, and the run says once what it is called now ([Deprecations](deprecations.md#now)).
 
+Each driver that recompiles (`scarletnx`, `scarletnx-3ds`, `scarletnx-vita`, `scarletnx-agb`) also takes
+`--aot_threads=N`, the setting [`aot_threads`](settings.md): the threads compiling the game's code, 0 (the default)
+the computer's cores with a quarter left free. A GBA ROM's code is one module and compiles on one thread whatever N,
+which its recompile says. A value that is not a whole number from 0 to 1024 stops the run.
+
 | Option | Meaning | Switch | 3DS | Vita | AGB | Android | GNU ABI |
 |---|---|---|---|---|---|---|---|
 | `-x`, `--extract` | Extract the game, without playing it | yes | yes | yes | | | |
@@ -832,14 +837,11 @@ screenshot). Fingers press them, the mouse's left button too; a finger that land
 touch screen. They are on by default on Android and off elsewhere.
 
 The game's menu (Back on Android, Home on a gamepad, F2) has their page: show them, *Edit layout* (drag a control;
-tap one and size it with the bar on top; *Done* or Back ends it), snap to a grid, scale and opacity, the buttons
+tap one and size it with the bar on top; *Done* or Back ends it), snap to a grid, scale, the buttons
 shown, a stick's middle where the finger lands, a D-pad a finger slides on, a buzz on each press (Android), the touch
-screen, and *Reset layout*. *Skin* goes round their looks: ScarletNX's own, line (white lines, after libretro's flat
-retropad; the default) and yorha (the launcher's yorha theme on the controls), and the built-in one (rEden's). Any
-[RetroArch overlay](../../dist/controls/skins/README.md) is a skin too:
-`controls_skin=` the path of its `.cfg` (the launcher's Settings take it as text), and the controls take its places,
-sizes, images and pressed looks; what it lacks keeps the built-in look, and the log says each part it leaves out. The
-game's `.ini` keeps them: `controls`, `controls_scale`, `controls_alpha`, `controls_skin`,
+screen, and *Reset layout*. Each control is a white shape drawn hard over the game, its edge and its label; a pressed
+one is filled, its label cut out. The
+game's `.ini` keeps them: `controls`, `controls_scale`,
 `controls_snap`, `controls_rel_center`, `controls_dpad_slide`, `controls_haptics`, a control's place once it
 was moved (`controls_a=0.930 0.470 100`: its middle across the screen and its size in percent), and whether it is
 shown once that changed (`controls_a_shown=0`). The launcher's Settings have the same, but the layout.

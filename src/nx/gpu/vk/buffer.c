@@ -1802,11 +1802,17 @@ static void ww_publish(WwStage* st) {
     pm_unlock(&g_wres_lk);
     st->n = 0;
 }
+/* the scans since the last stats (vk_ww_stats), the scanner's [0] and the checks' [1]: leaves, and their time */
+static u64 g_wscan_leaves[2], g_wscan_ns[2]; /* atomic */
+static u64 g_wscan_skipped; /* the leaves a check claimed that the scanner had scanned in their epoch already */
 /* scans leaves [lo, hi], claimed by the caller, in the epoch seen - 1, and ends the claims: 0, or -1 when tracking
    failed */
 static int ww_scan_leaves(u64 lo, u64 hi, u32 seen, WwStage* st) {
     t_buffer.wstage = st;
+    u64 t0 = plat_ns();
     int r = ww_scan_free(lo << WW_LEAF_SHIFT, (hi + 1) << WW_LEAF_SHIFT);
+    __atomic_add_fetch(&g_wscan_leaves[st != &g_wstage_scanner], hi - lo + 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_wscan_ns[st != &g_wstage_scanner], plat_ns() - t0, __ATOMIC_RELAXED);
     ww_publish(st);
     if (r < 0) __atomic_store_n(&g_wscan_failed, 1, __ATOMIC_RELEASE);
     for (u64 l = lo; l <= hi; l++) {
@@ -1832,7 +1838,12 @@ typedef struct {
 #define WW_LANDED_MAX (1u << 18) /* pages (1 GB): past it the reports count as they are */
 static WwLanded* g_wland;
 static u32 g_wland_n, g_wland_cap, g_wland_seq;
-static int g_wland_sorted = 1;
+/* g_wland is sorted (landed_order) up to g_wland_sorted, the entries after it added since, in their order. Sorting
+   all of them again for each landing's few, with the qsort of the C library through a function pointer, was a
+   fourteenth of one game's GPU thread: the new ones are sorted alone and merged in (landed_sort) */
+static u32 g_wland_sorted;
+static WwLanded* g_wland_tmp; /* the merge's copy of the new entries */
+static u32 g_wland_tmp_cap;
 static PMutex g_wland_lk = PMUTEX_INIT; /* after g_wres_lk */
 void vk_ww_landed(u64 cpu, u64 size, const u8* bytes) {
     if (!bytes || cpu >= AS_SIZE || size > AS_SIZE - cpu) return;
@@ -1846,7 +1857,6 @@ void vk_ww_landed(u64 cpu, u64 size, const u8* bytes) {
             g_wland_cap = cap;
         }
         g_wland[g_wland_n++] = (WwLanded){(cpu + o) >> 12, vk_hash(bytes + o, 4096), bytes + o, g_wland_seq++};
-        g_wland_sorted = 0;
     }
     pm_unlock(&g_wland_lk);
 }
@@ -1855,17 +1865,60 @@ static int landed_order(const void* a, const void* b) {
     if (x->page != y->page) return x->page < y->page ? -1 : 1;
     return x->seq < y->seq ? -1 : x->seq > y->seq;
 }
-/* g_wland by page, a page's newest entry alone */
+/* g_wland by page, a page's newest entry alone: the entries added since the last sort sorted (by page, then by their
+   order, which is newer than every sorted entry's) and merged into the sorted ones from the end, then a page's older
+   entries dropped from where the merge began */
 static void landed_sort(void) {
-    u32 n = 0;
-    if (g_wland_sorted) return;
-    qsort(g_wland, g_wland_n, sizeof *g_wland, landed_order);
-    for (u32 i = 0; i < g_wland_n; i++) {
+    u32 s = g_wland_sorted, k = g_wland_n - s, n, from;
+    if (!k) return;
+    qsort(g_wland + s, k, sizeof *g_wland, landed_order);
+    from = s;
+    if (s && g_wland[s - 1].page >= g_wland[s].page) {
+        if (g_wland_tmp_cap < k) {
+            WwLanded* t = (WwLanded*)realloc(g_wland_tmp, (size_t)k * sizeof *t);
+            if (!t) { /* all of them sorted again, as before */
+                qsort(g_wland, g_wland_n, sizeof *g_wland, landed_order);
+                from = 0;
+                goto dedup;
+            }
+            g_wland_tmp = t;
+            g_wland_tmp_cap = k;
+        }
+        memcpy(g_wland_tmp, g_wland + s, (size_t)k * sizeof *g_wland);
+        i64 i = (i64)s - 1, j = (i64)k - 1, w = (i64)g_wland_n - 1;
+        while (j >= 0) /* a new entry of a page goes after its sorted ones: its seq is newer */
+            if (i >= 0 && g_wland[i].page > g_wland_tmp[j].page)
+                g_wland[w--] = g_wland[i--];
+            else
+                g_wland[w--] = g_wland_tmp[j--];
+        from = (u32)(i + 1); /* below it nothing moved */
+    }
+dedup:
+    n = from ? from - 1 : 0; /* the entry before where the merge began may have the same page as the first after it */
+    for (u32 i = n; i < g_wland_n; i++) {
         if (n && g_wland[n - 1].page == g_wland[i].page) n--;
         g_wland[n++] = g_wland[i];
     }
     g_wland_n = n;
-    g_wland_sorted = 1;
+    g_wland_sorted = n;
+}
+u32 vk_ww_landed_check(void) {
+    pm_lock(&g_wland_lk);
+    landed_sort();
+    u32 n = g_wland_n;
+    for (u32 i = 1; i < g_wland_n; i++)
+        if (g_wland[i - 1].page >= g_wland[i].page) n = ~0u;
+    pm_unlock(&g_wland_lk);
+    return n;
+}
+u64 vk_ww_landed_hash(u64 cpu) {
+    u64 h = 0;
+    pm_lock(&g_wland_lk);
+    landed_sort();
+    for (u32 i = 0; i < g_wland_n; i++)
+        if (g_wland[i].page == cpu >> 12) h = g_wland[i].hash;
+    pm_unlock(&g_wland_lk);
+    return h;
 }
 /* whether a landed page still holds the landing's bytes. Where traps land in place (no mirror: Windows) they are the
    page's own, read without faulting: an owner may hold it again, or mem.c have given it back, and its report counts */
@@ -1879,7 +1932,8 @@ static int landed_unchanged(const WwLanded* l) {
     return vk_hash(bytes, 4096) == l->hash;
 }
 /* what a scan found written, [o, e), marked but for the landed pages on it that still hold the landing's bytes. Every
-   entry on it goes (no bytes until ww_take_scanned drops them) */
+   entry on it goes (no bytes until ww_take_scanned drops them, from the first, g_wland_gone) */
+static u32 g_wland_gone;
 static void ww_mark_scanned(u64 o, u64 e) {
     u32 lo = 0, hi = g_wland_n;
     u64 at = o;
@@ -1898,6 +1952,7 @@ static void ww_mark_scanned(u64 o, u64 e) {
             at = a + 4096;
         }
         g_wland[i].bytes = NULL;
+        if (i < g_wland_gone) g_wland_gone = i;
     }
     if (at < e) ww_mark_range(at, e);
 }
@@ -1909,12 +1964,13 @@ static void ww_take_scanned(void) {
     if (g_wres_n) g_wclock++;
     pm_lock(&g_wland_lk);
     if (g_wland_n) {
-        u32 n = 0;
         landed_sort();
+        g_wland_gone = g_wland_n;
         for (int i = 0; i < g_wres_n; i++) ww_mark_scanned(g_wres[i].a, g_wres[i].e);
-        for (u32 i = 0; i < g_wland_n; i++)
+        u32 n = g_wland_gone; /* the entries before the first that went stay where they are */
+        for (u32 i = n; i < g_wland_n; i++)
             if (g_wland[i].bytes) g_wland[n++] = g_wland[i];
-        g_wland_n = n;
+        g_wland_n = g_wland_sorted = n;
     } else
         for (int i = 0; i < g_wres_n; i++) ww_mark_range(g_wres[i].a, g_wres[i].e);
     pm_unlock(&g_wland_lk);
@@ -1985,6 +2041,9 @@ void vk_ww_new_epoch(void) {
         pm_unlock(&g_wscan_wlk);
     }
 }
+void vk_ww_seen(void) {
+    if (t_buffer.ww_streaming) t_buffer.ww_stream = __atomic_load_n(&g_ww_epoch, __ATOMIC_ACQUIRE);
+}
 u32 vk_ww_epoch(void) {
     return t_buffer.ww_streaming ? t_buffer.ww_stream : __atomic_load_n(&g_ww_epoch, __ATOMIC_ACQUIRE);
 }
@@ -2026,11 +2085,22 @@ static int ww_take_leaves(u64 lo, u64 hi, u32 seen) {
         /* the scanner may be scanning some of them: wait for those, which it may have scanned in this epoch */
         for (a = first; a <= last; a++)
             while (!ww_claim(a)) plat_yield();
-        for (; first <= last && (i32)(__atomic_load_n(&g_wleaf_done[first], __ATOMIC_RELAXED) - seen) >= 0; first++)
-            __atomic_store_n(&g_wleaf_busy[first], 0, __ATOMIC_RELEASE);
-        for (; last > first && (i32)(__atomic_load_n(&g_wleaf_done[last], __ATOMIC_RELAXED) - seen) >= 0; last--)
-            __atomic_store_n(&g_wleaf_busy[last], 0, __ATOMIC_RELEASE);
-        if (first <= last && ww_scan_leaves(first, last, seen, &g_wstage_check) < 0) return -1;
+        /* the runs of them not scanned in this epoch, each scanned once: one the scanner did between two the check
+           needs is let go, as one at either end is */
+        for (a = first; a <= last;) {
+            if ((i32)(__atomic_load_n(&g_wleaf_done[a], __ATOMIC_RELAXED) - seen) >= 0) {
+                __atomic_store_n(&g_wleaf_busy[a], 0, __ATOMIC_RELEASE);
+                g_wscan_skipped++;
+                a++;
+                continue;
+            }
+            u64 run = a;
+            while (a <= last && (i32)(__atomic_load_n(&g_wleaf_done[a], __ATOMIC_RELAXED) - seen) < 0) a++;
+            if (ww_scan_leaves(run, a - 1, seen, &g_wstage_check) < 0) {
+                for (; a <= last; a++) __atomic_store_n(&g_wleaf_busy[a], 0, __ATOMIC_RELEASE);
+                return -1;
+            }
+        }
     }
     ww_take_scanned();
     for (a = l; a <= hi; a++)
@@ -2122,6 +2192,22 @@ int vk_written_since(const u8* host, u64 len, u32 since) {
     return 0;
 }
 u32 vk_ww_now(void) { return g_wclock; }
+void vk_ww_stats(u32 presents) {
+    static u32 epoch0;
+    u32 e = __atomic_load_n(&g_ww_epoch, __ATOMIC_RELAXED);
+    u64 l[2], ns[2];
+    for (int i = 0; i < 2; i++) {
+        l[i] = __atomic_exchange_n(&g_wscan_leaves[i], 0, __ATOMIC_RELAXED);
+        ns[i] = __atomic_exchange_n(&g_wscan_ns[i], 0, __ATOMIC_RELAXED);
+    }
+    if (g_ww > 0 && presents)
+        LOG("vulkan: write scans over %u presents: %.1f epochs a present; the scanner %.1f leaves of 4 MiB a present "
+            "(%.2f ms), the checks %.1f (%.2f ms, and %.1f the scanner had)\n",
+            presents, (double)(e - epoch0) / presents, (double)l[0] / presents, (double)ns[0] / 1e6 / presents,
+            (double)l[1] / presents, (double)ns[1] / 1e6 / presents, (double)g_wscan_skipped / presents);
+    epoch0 = e;
+    g_wscan_skipped = 0;
+}
 /* the hot pages of guest memory [a, e) protected again and reported (plat_ww_cool), its leaves claimed as a check's
    scan claims them: 1 when it had any, which the next ww_take_scanned marks */
 static int ww_cool_range(u64 a, u64 e) {
@@ -2591,7 +2677,9 @@ static int copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered)
     out_map(o, gva);
     u64 align = vk_stage_align();
     if (align < g_vk.props.limits.nonCoherentAtomSize) align = g_vk.props.limits.nonCoherentAtomSize;
-    o->ptr = vk_stage_output(len, align, buf, off, &o->mem);
+    /* a write-only logged binding's staging is filled with zeros on the GPU (below), in whole words */
+    int zeros = !(owned && !(back && g_bind_no_read)) && pending != 2 && logged && g_bind_no_read;
+    o->ptr = vk_stage_output(zeros ? (len + 3) & ~3ull : len, align, buf, off, &o->mem);
     if (!o->ptr) {
         free(o);
         return 0;
@@ -2621,8 +2709,11 @@ static int copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered)
         } else {
             /* write-only: the program only writes it, its bytes (if any) land from the log. But its stores are
                partial, and the GPU's read-modify-write of the surrounding cache line reads the staging it would
-               have written over: give it zeros, not uninitialized ring memory, which can hang the GPU */
-            memset(o->ptr, 0, len);
+               have written over: give it zeros, not uninitialized ring memory, which can hang the GPU. The GPU
+               writes them, in the upload command buffer that runs first in the submission: nothing before them
+               there uses this new staging, and nothing on the CPU writes it after. The CPU's memset of up to
+               16 MiB a binding was a twentieth of one game's GPU thread */
+            rec_CmdFillBuffer(vk_cmd_upload(0), *buf, *off, (len + 3) & ~3ull, 0);
             o->no_input = 1;
         }
     } else {
@@ -3746,7 +3837,7 @@ void vk_buf_frame(void) {
 void vk_buf_forget_all(void) {
     u32 i;
     vk_uma_forget_all();
-    for (i = 0; i < g_nvb; i++)
+    for (i = 1; i < g_nvb; i++) /* entry 0 is none: vb_new never writes it, and its bytes are what malloc gave */
         if (g_vb[i].len) {
             drop_own(i);
             vb_free(i);

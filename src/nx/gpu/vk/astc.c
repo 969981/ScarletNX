@@ -157,21 +157,8 @@ static u32 tile_shift(u32 nx, u32 n) {
 
 static void astc_init(void) {
     if (g_astc.module) return;
-    VkDescriptorSetLayoutBinding bindings[2] = {
-        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
-    VkDescriptorSetLayoutCreateInfo di = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = bindings};
-    if (!VK_OK(vkCreateDescriptorSetLayout(g_vk.dev, &di, NULL, &g_astc.ds)))
-        fatal("vulkan: cannot create the ASTC descriptor layout");
-    VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(AstcParams)};
-    VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-                                     .setLayoutCount = 1,
-                                     .pSetLayouts = &g_astc.ds,
-                                     .pushConstantRangeCount = 1,
-                                     .pPushConstantRanges = &push};
-    if (!VK_OK(vkCreatePipelineLayout(g_vk.dev, &li, NULL, &g_astc.layout)))
-        fatal("vulkan: cannot create the ASTC pipeline layout");
+    if (!VK_OK(snx_vk_compute_layouts(g_vk.dev, 2, 0, sizeof(AstcParams), &g_astc.ds, &g_astc.layout)))
+        fatal("vulkan: cannot create the ASTC descriptor and pipeline layouts");
     if (!VK_OK(snx_vk_shader_module(g_vk.dev, astc_spv, astc_spv_size, &g_astc.module)))
         fatal("vulkan: cannot load the ASTC shader");
     g_astc.cap = 16ull << 20; /* a 2048x2048 slice a strip: fewer barriers between decoding and copying */
@@ -468,15 +455,7 @@ static VkDescriptorSet two_buffers(VkBuffer in, u64 in_off, u64 in_size, VkBuffe
     VkDescriptorSet set = vk_desc_alloc(g_astc.ds);
     if (!set) return VK_NULL_HANDLE;
     VkDescriptorBufferInfo buffers[2] = {{in, in_off, in_size}, {out, 0, out_size}};
-    VkWriteDescriptorSet writes[2];
-    for (u32 i = 0; i < 2; i++)
-        writes[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                           .dstSet = set,
-                                           .dstBinding = i,
-                                           .descriptorCount = 1,
-                                           .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                           .pBufferInfo = &buffers[i]};
-    vkUpdateDescriptorSets(g_vk.dev, 2, writes, 0, NULL);
+    snx_vk_storage_buffers(g_vk.dev, set, buffers, 2);
     return set;
 }
 

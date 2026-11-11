@@ -847,13 +847,20 @@ static int page_aligned(u64 a) { return !(a & GMMU_PAGE_MASK); }
 static NvMapH* nvmap_live(u32 h) {
     return h && h < NVMAP_HANDLES && g_hle.nvdrv.nvh[h].alive ? &g_hle.nvdrv.nvh[h] : NULL;
 }
-/* CREATE: a new handle of the size, its number its id, with one reference. A freed number goes out again first */
+/* CREATE: a new handle of the size, its number its id, with one reference. A freed number goes out last, after the
+   numbers never used and the ones freed before it (Eden's nvmap never hands one out twice): the game's NvRm library
+   drops its own record of a number after FREE returns, and until then takes a new handle under that number for the
+   one it freed, with FROM_ID and FREE calls that no longer pair */
 static u32 nvmap_ioc_create(u8* d) {
-    u32 h;
+    u32 h = 0;
     pm_lock(&g_host.nvdrv.lock);
-    h = g_hle.nvdrv.nvh_nfree                    ? g_hle.nvdrv.nvh_free[--g_hle.nvdrv.nvh_nfree]
-        : g_hle.nvdrv.nvh_next < NVMAP_HANDLES ? g_hle.nvdrv.nvh_next++
-                                               : 0;
+    if (g_hle.nvdrv.nvh_next < NVMAP_HANDLES)
+        h = g_hle.nvdrv.nvh_next++;
+    else if (g_hle.nvdrv.nvh_nfree) {
+        h = g_hle.nvdrv.nvh_free[0];
+        memmove(g_hle.nvdrv.nvh_free, g_hle.nvdrv.nvh_free + 1,
+                --g_hle.nvdrv.nvh_nfree * sizeof g_hle.nvdrv.nvh_free[0]);
+    }
     if (h) {
         NvMapH* m = &g_hle.nvdrv.nvh[h];
         memset(m, 0, sizeof *m);
@@ -1332,7 +1339,10 @@ static u32 ioctl_ctrl(u32 fd, u32 cmd, u8* d, u32 n) {
     }
     switch (c) {
         case NVHOST_CTRL_SYNCPT_READ: snx_st_le32(d + CTRL_SYNCPT_VALUE, syncpt_read(id)); return NV_RESULT_SUCCESS;
-        case NVHOST_CTRL_SYNCPT_INCR: syncpt_incr(id); return NV_RESULT_SUCCESS;
+        case NVHOST_CTRL_SYNCPT_INCR: /* a GPU stream's wait on it takes in what the CPU wrote before */
+            gpu_cpu_signal();
+            syncpt_incr(id);
+            return NV_RESULT_SUCCESS;
         case NVHOST_CTRL_SYNCPT_WAIT:
         case NVHOST_CTRL_SYNCPT_WAITEX: { /* WAITEX has the value back at its end */
             int ok = syncpt_wait(id, snx_ld_le32(d + CTRL_SYNCPT_THRESH),

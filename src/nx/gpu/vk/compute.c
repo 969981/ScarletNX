@@ -556,6 +556,61 @@ static void cs_land(void) {
     cs_any_update();
 }
 
+/* Window w of the windows a dispatch binds for a pointer table in constant buffer bank (SH_GBUF_TABLE): the bank's
+   64-bit words that map are its pointers, and each run of memory mapped from the lowest pointer not in an earlier run
+   (at most 16 MiB, as vk_gbuf_desc binds a bare address) holds those below its end. With more runs than windows, the
+   two runs closest together are bound as one, the memory between them too, until they fit: copy_runs reads what
+   isn't mapped as zero. *base 0 for a window the table has no run for, with the 16 bytes an unbound buffer gets. One
+   game's culling programs keep 20 pointers in cbuf 4, in 11 runs over two stretches of about 2 MiB, and one of them
+   has 9 buffer slots left for them */
+static int u64_order(const void* a, const void* b) {
+    u64 x = *(const u64*)a, y = *(const u64*)b;
+    return x < y ? -1 : x > y;
+}
+static void table_window(u32 bank, u32 w, u32 windows, u64* base, u32* len) {
+    u64 v[512], from[64], to[64];
+    u32 n = 0, runs = 0, unused;
+    *base = 0;
+    *len = 16;
+    if (bank >= QMD_NUM_CONST_BUFFERS) return;
+    /* a bank a pending write in place covers isn't in g_cb yet (g_cb_later): the windows are made of its words, so it
+       is read now, after the write, or they would be the table an earlier dispatch left there */
+    cs_cb_read(bank, 0, &unused);
+    for (u32 o = 0; o + 8 <= g_cbn[bank] && n < 512; o += 8) {
+        u64 x = snx_ld_le32(g_cb[bank] + o) | (u64)snx_ld_le32(g_cb[bank] + o + 4) << 32;
+        if (x && !(x & 3) && !(x >> 40)) v[n++] = x; /* the GPU's addresses have 40 bits */
+    }
+    qsort(v, n, sizeof *v, u64_order);
+    for (u32 i = 0; i < n && runs < 64;) {
+        u64 cpu = 0, run = gmmu_run(v[i], 16u << 20, &cpu) & ~3ull;
+        if (!run) { /* no memory there: a word that is no pointer */
+            i++;
+            continue;
+        }
+        from[runs] = v[i];
+        to[runs++] = v[i] + run;
+        while (i < n && v[i] < to[runs - 1]) i++;
+    }
+    while (runs > windows) { /* the two runs closest together, as one window of at most 16 MiB */
+        u32 best = runs;
+        for (u32 k = 0; k + 1 < runs; k++)
+            if (to[k + 1] - from[k] <= (16u << 20) && (best == runs || from[k + 1] - to[k] < from[best + 1] - to[best]))
+                best = k;
+        if (best == runs) break;
+        to[best] = to[best + 1] > to[best] ? to[best + 1] : to[best];
+        for (u32 k = best + 1; k + 1 < runs; k++) from[k] = from[k + 1], to[k] = to[k + 1];
+        runs--;
+    }
+    if (runs > windows && !w)
+        LOG_LIMIT(1,
+                  "vulkan: a compute program's pointer table in constant buffer %u has %u runs of mapped memory "
+                  "that its %u windows can't hold: the pointers in the others read 0\n",
+                  bank, runs, windows);
+    if (w < runs) {
+        *base = from[w];
+        *len = (u32)(to[w] - from[w]);
+    }
+}
 /* A descriptor can fail after its inputs were copied into the arena. No command references those inputs yet. */
 static void cs_abandon_binding(u8* originals[8]) {
     vk_buf_writable_abort(); /* a deferred dispatch's outputs, not recorded */
@@ -718,6 +773,7 @@ static u64 cs_key(const u8* code, u32 flow_base, u32 lx, u32 ly, u32 lz, u32 shm
 }
 static CsPipe* cs_make(const u8* code, u32 blen, u64 key, u32 flow_base, u32 lx, u32 ly, u32 lz, u32 shm, CsKey k,
                        VkCbReader read);
+static int cs_replay_read(u32 idx, u32 off, u32* out);
 /* Whether a translation reads other lanes: a GroupNonUniform capability (61 to 68), or CooperativeMatrixKHR (6022:
    sm86_translate.c's hmma_coop, whose 16x16 matrices take a subgroup of 32 lanes), among those the module starts
    with. Its lanes are a warp's 32, which the translation finds as its own 32 of a subgroup of 32 or 64; in a
@@ -730,6 +786,18 @@ static int cs_reads_lanes(const u32* spv, size_t words) {
         u32 width = spv[at] >> 16;
         if (!width || at + width > words || (spv[at] & 0xffffu) != 17) break; /* past the OpCapability ones */
         if (width == 2 && ((spv[at + 1] >= 61 && spv[at + 1] <= 68) || spv[at + 1] == 6022)) return 1;
+        at += width;
+    }
+    return 0;
+}
+/* whether a translation has shared memory: an OpVariable (59) of the Workgroup storage class (4), which the
+   translation declares when the program addresses shared memory (sm86_translate.c's shared_var) */
+static int cs_uses_shared(const u32* spv, size_t words) {
+    for (size_t at = 5; at < words;) {
+        u32 width = spv[at] >> 16;
+        if (!width || at + width > words) break;
+        if ((spv[at] & 0xffffu) == 59 && width >= 4 && spv[at + 3] == 4) return 1;
+        if ((spv[at] & 0xffffu) == 54) break; /* OpFunction: the variables of the module come before */
         at += width;
     }
     return 0;
@@ -767,6 +835,14 @@ static CsPipe* cs_make(const u8* code, u32 blen, u64 key, u32 flow_base, u32 lx,
     p->si.cs_local[0] = lx;
     p->si.cs_local[1] = ly;
     p->si.cs_local[2] = lz;
+    /* An Ounce program's shared memory is the size its control section declares (nvn_section.h's 0x64), as the
+       console's driver puts it in the QMD, rounded up to the 256 bytes the console allocates in: an access past the
+       declared size would still land in the block's own allocation there. The translation clamps an access past the
+       array to its last word (sm86_translate.c's mem_ptr). One game's video upscaler declares 0x5460 bytes and
+       addresses exactly that; with the 16 KiB a program without a size got before, its tiles folded onto that last
+       word and raced there, and its frames came out as strips of other tiles' bytes. A program that declares 0 and
+       still addresses shared memory gets the translation's 16 KiB, and a log line below says so */
+    if (shm && g_shader_sm86) shm = (shm + 255u) & ~255u;
     p->si.shared_size = (int)shm;
     /* A block may ask for more shared memory than the device gives (48 KiB on the console, 32 KiB on Adreno 6xx to
        8xx). The program then gets the device's size when no access of it can reach past that, and is skipped
@@ -807,6 +883,12 @@ static CsPipe* cs_make(const u8* code, u32 blen, u64 key, u32 flow_base, u32 lx,
             p->si.first_unsupported[0] ? p->si.first_unsupported : "unsupported feature or shader");
         return p;
     }
+    /* not for a pipeline of an earlier run (vk_cs_pipe_load): one saved before the size was read has 0 in its key */
+    if (!shm && g_shader_sm86 && read != cs_replay_read && cs_uses_shared(spv, nw))
+        LOG_LIMIT(8,
+                  "vulkan: compute %016llx declares no shared memory and addresses it: it gets the translation's 16 "
+                  "KiB\n",
+                  (unsigned long long)key);
     u32 image_slots = g_vk.props.limits.maxPerStageDescriptorStorageImages;
     if (image_slots > g_vk.props.limits.maxDescriptorSetStorageImages)
         image_slots = g_vk.props.limits.maxDescriptorSetStorageImages;
@@ -1301,7 +1383,19 @@ void vk_dispatch(const DispatchState* d) {
     u32 ss[16];
     int ng = p->si.ngbuf > 16 ? 16 : p->si.ngbuf;
     u64 need = 0;
+    int tables = 0;
     for (int i = 0; i < ng; i++) {
+        if (SH_GBUF_TABLE(p->si.gbuf_cbuf_off[i])) { /* a pointer table's window, whose base the program reads */
+            u32 windows = 0;
+            for (int j = 0; j < ng; j++)
+                windows += SH_GBUF_TABLE(p->si.gbuf_cbuf_off[j]) &&
+                           SH_GBUF_BANK(p->si.gbuf_cbuf_off[j]) == SH_GBUF_BANK(p->si.gbuf_cbuf_off[i]);
+            table_window(SH_GBUF_BANK(p->si.gbuf_cbuf_off[i]), SH_GBUF_TABLE_WINDOW(p->si.gbuf_cbuf_off[i]), windows,
+                         &sa[i], &ss[i]);
+            need += ss[i] + vk_stage_align();
+            tables = 1;
+            continue;
+        }
         u32 v[3] = {0, 0, 0}, bank = SH_GBUF_BANK(p->si.gbuf_cbuf_off[i]), off = SH_GBUF_OFFSET(p->si.gbuf_cbuf_off[i]);
         /* the address's words: an indirect buffer's are its parent's, which vk_gbuf_desc follows to the pointer */
         for (u32 w = 0; w < (bank ? 2u : 3u); w++) cs_cb_read(bank, off + 4 * w, &v[w]);
@@ -1332,6 +1426,7 @@ void vk_dispatch(const DispatchState* d) {
         need += bimg[i].bytes + vk_stage_align();
     }
     need += sizeof(i32) * 320 + vk_stage_align(); /* optional format data */
+    if (tables) need += 16 * 16 + vk_stage_align(); /* the windows' bases (SNX_VKB_MBASE) */
     /* dispatches that read textures run on the graphics queue, after what was recorded before them. Inputs that
        pending compute results overlap land those first, before anything is put in the arena. With unified memory every
        dispatch does: its storage buffers are read and written in place (uma.c), in order with the draws on one queue,
@@ -1619,6 +1714,41 @@ rebind:
                                        .dstBinding = SNX_VKB_WPAGES,
                                        .descriptorCount = 1,
                                        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                       .pBufferInfo = &bi[nw]};
+        nw++;
+    }
+    if (tables) {
+        /* each pointer table window's base and length, at its buffer's slot: 16 vec4 of words (SNX_VKB_MBASE) */
+        u32 mb[64] = {0};
+        for (int i = 0; i < ng; i++)
+            if (SH_GBUF_TABLE(p->si.gbuf_cbuf_off[i])) {
+                mb[4 * i] = (u32)sa[i];
+                mb[4 * i + 1] = (u32)(sa[i] >> 32);
+                mb[4 * i + 2] = ss[i];
+            }
+        VkBuffer mbase = g_ar;
+        u64 o = 0;
+        u8* dst;
+        if (deferred)
+            dst = vk_stage(sizeof mb, vk_stage_align(), &mbase, &o);
+        else {
+            o = arena_alloc(sizeof mb);
+            dst = g_ar_ptr + o;
+        }
+        if (!dst) {
+            res_unref_all(made, ng);
+            g_cs_skips[CS_SKIP_RESOURCES]++;
+            cs_abandon_binding(originals);
+            return;
+        }
+        memcpy(dst, mb, sizeof mb);
+        snx_le32_array(dst, sizeof mb / 4); /* the shader reads the words little-endian */
+        bi[nw] = (VkDescriptorBufferInfo){mbase, o, sizeof mb};
+        w[nw] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                       .dstSet = set,
+                                       .dstBinding = SNX_VKB_MBASE,
+                                       .descriptorCount = 1,
+                                       .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                                        .pBufferInfo = &bi[nw]};
         nw++;
     }

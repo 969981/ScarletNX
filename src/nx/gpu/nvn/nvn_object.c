@@ -804,8 +804,9 @@ void nvn_TexturePoolRegisterImage(CPU* c, u64 tp, i32 id, u64 t, u64 v) {
 /* A sampler descriptor written over another that the submitted work may still read. The game reuses a pool entry as
    soon as the console's GPU is past the work that read it, which the replay can still have ahead of it: its draws would
    read the new sampler (one game's bloom reuses an entry per mip level each frame, read other levels and went white).
-   So the write waits for the work submitted before it, and is recorded for the renderer's kept descriptors. The
-   descriptor the slot already holds changes nothing for that work: no wait */
+   So the write waits for the work submitted before it, as far as that goes without the game (a queue stopped at an
+   event the game signals after this call reads the new sampler behind that wait on the console too), and is recorded
+   for the renderer's kept descriptors. The descriptor the slot already holds changes nothing for that work: no wait */
 static void sampler_write(u64 slot, const u32 tsc[8]) {
     if (!memcmp(GP(slot), tsc, NVN_DESCRIPTOR_SIZE)) return;
     nvn_wait_begin();
@@ -1794,13 +1795,14 @@ static int stage_of(NvnProgram* o, u64 data, u64 control) {
         st->cb = (u16)(gr32(control + 0x40) >> 8);
         st->cb_size = (u16)((gr32(control + 0x3c) + 0xff) >> 8);
         /* a compute program's workgroup size, at 0x58-0x60 of its section (0 in the graphics ones), and its shared
-           memory bytes at 0x64: 0 in most of one game's programs, 0x800 to 0xc000 in the others. Without it the
-           translator gave each 16 KiB, and those of 48 KiB reached past their shared array */
+           memory's bytes at 0x64 (nvn_section.h): 0 in most of one game's programs, 0x800 to 0xc000 in the
+           others. Without it the translator gave each 16 KiB, and those of 48 KiB reached past their shared
+           array */
         if (st == &o->st[NVN_SHADER_STAGE_COMPUTE]) {
             o->block[0] = (u16)gr32(control + 0x58);
             o->block[1] = (u16)gr32(control + 0x5c);
             o->block[2] = (u16)gr32(control + 0x60);
-            o->off_a = gr32(control + 0x64);
+            o->off_a = nvn_section_shared(GP(control));
         }
         return 1;
     }
@@ -2454,6 +2456,7 @@ u32 nvn_EventGetValue(CPU* c, u64 e) {
 void nvn_EventSignal(CPU* c, u64 e, i32 mode, u32 value) {
     u64 a = NVN_OBJ(NvnEvent, e)->value;
     (void)c;
+    gpu_cpu_signal(); /* a stream's wait on the event takes in what the CPU wrote before (nvn_replay.c) */
     __atomic_thread_fence(__ATOMIC_RELEASE);
     gw32(a, mode == NVN_EVENT_SIGNAL_MODE_ADD ? gr32(a) + value : value);
     gpu_kick();

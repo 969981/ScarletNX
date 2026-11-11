@@ -1540,6 +1540,53 @@ static int check_clear_load_op(void) {
     return 0;
 }
 
+/* Two GPU addresses showing the same guest memory, as one game's virtual pools over one physical pool do: a target
+   drawn through the second after one drawn through the first holds the newer pixels, and the older one's write-back
+   (which lands under it, as a compute result published over the bytes lands every older image first) leaves it as it
+   is. The write-back stamped the second address written, and the newer target's next use loaded the older pixels
+   over its own: a cutscene's whole frame showed pieces of old frames */
+static int check_alias_newer_target(void) {
+    GpuChannel* ch = calloc(1, sizeof *ch);
+    CHECK(ch);
+    u32* r = ch->r3d;
+    const u64 cpu = HEAP_BASE + 0xA80000, older = 0x9800000ull, newer = 0x9900000ull;
+    CHECK(mem_map(cpu, 0x10000, MS_NORMAL, PERM_RW) == 0);
+    memset(GP(cpu), 0, 0x10000);
+    gmmu_map(older, cpu, 0x10000);
+    gmmu_map(newer, cpu, 0x10000);
+    r[0x487] = 1;
+    r[0x202] = 64; /* 16 RGBA pixels, pitch linear */
+    r[0x203] = 16;
+    r[0x204] = 0xD5; /* A8B8G8R8 */
+    r[0x205] = 0x1000;
+    r[0x206] = 1;
+    const float red[4] = {1, 0, 0, 1}, green[4] = {0, 1, 0, 1};
+    r[0x201] = (u32)older;
+    memcpy(&r[0x360], red, sizeof red);
+    engine_clear(ch, 15 << 2);
+    r[0x201] = (u32)newer;
+    memcpy(&r[0x360], green, sizeof green);
+    engine_clear(ch, 15 << 2);
+    vk_render_end();
+    Surf *a = vk_rt_find(older), *b = vk_rt_find(newer);
+    CHECK(a && b && a != b && b->wseq > a->wseq);
+    vk_rt_flush(older); /* the older pixels land in memory, under the newer target */
+    u8 mem[4], px[4];
+    CHECK(!gmem_read(newer, mem, 4));
+    CHECK(mem[0] == 255 && mem[1] == 0);
+    vk_rt_note_read(b); /* its next use */
+    CHECK(vk_rt_find(newer) == b);
+    CHECK(!read_pixel0(b, px));
+    if (px[0] != 0 || px[1] != 255) {
+        fprintf(stderr, "the newer target over an older one's bytes at another address: %u %u %u %u, not green\n",
+                px[0], px[1], px[2], px[3]);
+        return 1;
+    }
+    CHECK(mem_unmap(cpu, 0x10000) == 0);
+    free(ch);
+    return 0;
+}
+
 /* Images in pieces (sparse binding: vkQueueBindSparse on the graphics queue) made on this thread while the recording
    thread submits frames to the same queue: Vulkan requires the two calls to be externally synchronized, which the
    validation layer's threading checks report when they overlap */
@@ -5278,6 +5325,7 @@ static int check_uma_page_changes(void) {
 #include "vulkan_shared_clamp.inc"
 #include "vulkan_index_draws.inc"
 #include "vulkan_pass_breaks.inc"
+#include "vulkan_ui.inc"
 #include "vulkan_storage_formats.inc"
 #include "vulkan_scaled_compute.inc"
 #include "vulkan_storage_atomics.inc"
@@ -5352,6 +5400,7 @@ static int check_uma_page_changes(void) {
 #include "vulkan_fragment_barrier.inc"
 #include "vulkan_capture_cap.inc"
 #include "vulkan_trim.inc"
+#include "vulkan_owned_page_reads.inc"
 
 /* key's row among the settings the runtime applies itself (options.c's), or NULL */
 static const IniOpt* setting_row(const char* key) {
@@ -5385,6 +5434,78 @@ static int check_map_lands_covered(void) {
     g_gpu_mapping_end();
     CHECK(!vk_buf_pending(gva, 0x1000));
     puts("A change of guest memory lands the buffer results over its pages, and only those");
+    return 0;
+}
+
+/* A change of backing tells the kernel that it waits for the renderer (g_gpu_mapping_waits) before the wait starts, and
+   at no other time: the thread in a memory SVC lets go of its core there (kernel/thread.c's core_leave_waiting), and
+   holds it through an SVC that waits for nothing, as on the console. Nothing waits where the renderer holds nothing
+   over the pages and its lock is free; a lock another thread holds is a wait, told while that thread still holds it,
+   and so is a result pending on the pages, which lands */
+static u32 g_map_waits, g_map_holder, g_map_told; /* the holder: 1 holds vk_lock, 2 let go of it */
+static void map_waits(void) {
+    __atomic_add_fetch(&g_map_waits, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&g_map_holder, __ATOMIC_SEQ_CST) != 1) return;
+    __atomic_store_n(&g_map_told, 1, __ATOMIC_SEQ_CST); /* the holder lets go now, and the change gets the lock */
+    plat_wake_word(&g_map_told);
+}
+static void map_holder(void* arg) {
+    u64 until = plat_ns() + 5000000000ull; /* a change that never tells gets the lock then, and fails its counts */
+    (void)arg;
+    vk_lock();
+    __atomic_store_n(&g_map_holder, 1, __ATOMIC_SEQ_CST);
+    plat_wake_word(&g_map_holder);
+    while (!__atomic_load_n(&g_map_told, __ATOMIC_SEQ_CST) && plat_ns() < until)
+        plat_wait_word(&g_map_told, 0, 10000000);
+    vk_unlock();
+    __atomic_store_n(&g_map_holder, 2, __ATOMIC_SEQ_CST);
+    plat_wake_word(&g_map_holder);
+}
+static int check_map_waits(void) {
+    const u64 gva = 0xac00000, cpu = HEAP_BASE + 0x5e00000;
+    void (*const kernel)(void) = g_gpu_mapping_waits;
+    VkBuffer out;
+    u64 at;
+    u32 told;
+    g_gpu_mapping_waits = map_waits;
+    /* fresh memory, as svcMapPhysicalMemory maps, where no check here maps the GPU's address space: the change takes
+       no lock of the renderer's */
+    g_gpu_mapping_begin(STACK_BASE + 0x3000000, 0x10000, GPU_MAPPING_GUEST_ONLY);
+    g_gpu_mapping_end();
+    CHECK(!g_map_waits);
+    /* a change of the GPU's address space lands nothing and waits only for the lock: not while this thread holds it,
+       which keeps out the renderer's own threads, whose hold of a moment is a wait and told as one */
+    vk_lock();
+    g_gpu_mapping_begin(gva + 0x100000, 0x1000, GPU_MAPPING_GMMU);
+    g_gpu_mapping_end();
+    vk_unlock();
+    CHECK(!g_map_waits);
+    CHECK(plat_thread(map_holder, NULL, 0) == 0);
+    while (!__atomic_load_n(&g_map_holder, __ATOMIC_SEQ_CST)) plat_wait_word(&g_map_holder, 0, -1);
+    g_gpu_mapping_begin(gva + 0x100000, 0x1000, GPU_MAPPING_GMMU); /* the same change, another thread's hold */
+    g_gpu_mapping_end();
+    CHECK(g_map_waits == 1 && g_map_told);
+    while (__atomic_load_n(&g_map_holder, __ATOMIC_SEQ_CST) != 2) plat_wait_word(&g_map_holder, 1, -1);
+    if (!vk_uma()) { /* a result pending on the page, as check_map_lands_covered's */
+        CHECK(mem_map(cpu, 0x1000, MS_NORMAL, PERM_RW) == 0);
+        gmmu_map(gva, cpu, 0x1000);
+        vk_lock();
+        CHECK(vk_buf_copy_writable(gva, 0x1000, &out, &at, 1));
+        vk_buf_writable_commit();
+        vk_unlock();
+        CHECK(vk_buf_pending(gva, 0x1000));
+        /* from here: the changes above are told too where an earlier check left the renderer something over the
+           pages. This thread's hold again, so that the landing alone is the wait */
+        told = g_map_waits;
+        vk_lock();
+        g_gpu_mapping_begin(cpu, 0x1000, GPU_MAPPING_GUEST_ONLY);
+        g_gpu_mapping_end();
+        vk_unlock();
+        CHECK(g_map_waits == told + 1);
+        CHECK(!vk_buf_pending(gva, 0x1000));
+    }
+    g_gpu_mapping_waits = kernel;
+    puts("A change of backing tells the kernel of a wait for the renderer's lock or a landing, and of no other");
     return 0;
 }
 
@@ -5772,6 +5893,8 @@ static int run_headless(int argc, char** argv) {
             result = check_cross_stage_image_alias();
         else if (!strcmp(name, "lone_lane"))
             result = check_lone_lane();
+        else if (!strcmp(name, "owned_page_reads"))
+            result = check_owned_page_reads();
         else if (!strcmp(name, "cross_stage_blend"))
             result = check_cross_stage_blend_snapshots();
         else if (!strcmp(name, "txd_uniform"))
@@ -5854,6 +5977,12 @@ static int run_headless(int argc, char** argv) {
         printf("PASS headless Vulkan resolution scale only: %u validation messages\n", g_vk_validation_messages);
         return 0;
     }
+    if (getenv("SNX_TEST_UI_ONLY")) { /* vulkan_ui.inc's check alone: the on-screen layer's pass */
+        CHECK(!check_ui());
+        vk_pipeline_quiesce();
+        printf("PASS headless Vulkan on-screen layer only: %u validation messages\n", g_vk_validation_messages);
+        return 0;
+    }
     if (getenv("SNX_TEST_PASS_BREAKS_ONLY")) { /* vulkan_pass_breaks.inc's checks alone */
         CHECK(!check_pass_breaks());
         vk_pipeline_quiesce();
@@ -5895,6 +6024,7 @@ static int run_headless(int argc, char** argv) {
         if (!strcmp(name, "dispatch") && ++ran) CHECK(!check_uma_dispatch());
         if (!strcmp(name, "texture_pending") && ++ran) CHECK(!check_uma_texture_pending());
         if (!strcmp(name, "dispatch_constants") && ++ran) CHECK(!check_uma_dispatch_constants());
+        if (!strcmp(name, "dispatch_table") && ++ran) CHECK(!check_uma_dispatch_table());
         if (!strcmp(name, "header_words") && ++ran) CHECK(!check_uma_header_words());
         if (!strcmp(name, "placed") && ++ran) CHECK(!check_uma_placed());
         if (!strcmp(name, "placed_view") && ++ran) CHECK(!check_uma_placed_view());
@@ -5903,7 +6033,7 @@ static int run_headless(int argc, char** argv) {
             fprintf(stderr,
                     "SNX_TEST_UMA_ONLY=%s names no check: 1, runtime_write, constants, migrate, way, region_writes, "
                     "region_merge, writes, feedback, publish, dispatch, texture_pending, dispatch_constants, "
-                    "header_words, placed, placed_view or logged_back\n",
+                    "dispatch_table, header_words, placed, placed_view or logged_back\n",
                     name);
             return 2;
         }
@@ -5923,6 +6053,7 @@ static int run_headless(int argc, char** argv) {
         CHECK(!check_uma_dispatch());
         CHECK(!check_uma_texture_pending());
         CHECK(!check_uma_dispatch_constants());
+        CHECK(!check_uma_dispatch_table());
         CHECK(!check_uma_header_words());
         CHECK(!check_uma_placed());
         CHECK(!check_uma_placed_view());
@@ -6036,6 +6167,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_pass_breaks());
     CHECK(!check_mesh_inputs());
     CHECK(!check_lone_lane());
+    CHECK(!check_owned_page_reads());
     CHECK(!check_frag_coord_origin());
     CHECK(!check_varying_passes());
     CHECK(!check_rt_other_layout());
@@ -6053,6 +6185,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_srgb_write());
     CHECK(!check_srgb_blit());
     CHECK(!check_clear_load_op());
+    CHECK(!check_alias_newer_target());
     CHECK(!check_sparse_while_submitting());
     CHECK(!check_multisample_shader_gate());
     CHECK(!check_msaa());
@@ -6089,6 +6222,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_dma_untracked_source());
     CHECK(!check_dma_tiles());
     CHECK(!check_map_lands_covered());
+    CHECK(!check_map_waits());
     CHECK(!check_blit());
     CHECK(!check_blit_bands());
     CHECK(!check_take_after_writes());
@@ -6104,6 +6238,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_uma_dispatch());
     CHECK(!check_uma_texture_pending());
     CHECK(!check_uma_dispatch_constants());
+    CHECK(!check_uma_dispatch_table());
     CHECK(!check_uma_header_words());
     CHECK(!check_uma_placed());
     CHECK(!check_uma_placed_view());

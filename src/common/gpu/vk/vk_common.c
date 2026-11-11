@@ -328,3 +328,53 @@ VkResult snx_vk_compute_pipeline(VkDevice dev, VkPipelineCache cache, VkPipeline
                                  size_t size, VkPipeline* out) {
     return snx_vk_compute_pipeline_subgroups(dev, cache, layout, words, size, 0, false, out);
 }
+VkResult snx_vk_compute_layouts(VkDevice dev, uint32_t buffers, uint32_t images, uint32_t push,
+                                VkDescriptorSetLayout* set, VkPipelineLayout* layout) {
+    VkDescriptorSetLayoutBinding bindings[SNX_VK_COMPUTE_BINDINGS];
+    *set = VK_NULL_HANDLE;
+    *layout = VK_NULL_HANDLE;
+    if (buffers > SNX_VK_COMPUTE_BINDINGS || images > SNX_VK_COMPUTE_BINDINGS - buffers)
+        return VK_ERROR_TOO_MANY_OBJECTS;
+    for (uint32_t i = 0; i < buffers + images; ++i)
+        bindings[i] = (VkDescriptorSetLayoutBinding){.binding = i,
+                                                     .descriptorType = i < buffers ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                                                                   : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     .descriptorCount = 1,
+                                                     .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
+    VkDescriptorSetLayoutCreateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                          .bindingCount = buffers + images,
+                                          .pBindings = bindings};
+    VkResult r = vkCreateDescriptorSetLayout(dev, &si, NULL, set);
+    if (r != VK_SUCCESS) {
+        *set = VK_NULL_HANDLE;
+        return r;
+    }
+    VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, push};
+    VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                     .setLayoutCount = 1,
+                                     .pSetLayouts = set,
+                                     .pushConstantRangeCount = push ? 1 : 0,
+                                     .pPushConstantRanges = push ? &range : NULL};
+    r = vkCreatePipelineLayout(dev, &li, NULL, layout);
+    if (r != VK_SUCCESS) {
+        vkDestroyDescriptorSetLayout(dev, *set, NULL);
+        *set = VK_NULL_HANDLE;
+        *layout = VK_NULL_HANDLE;
+    }
+    return r;
+}
+void snx_vk_storage_buffers(VkDevice dev, VkDescriptorSet set, const VkDescriptorBufferInfo* infos, uint32_t count) {
+    VkWriteDescriptorSet writes[16];
+    for (uint32_t first = 0; first < count;) { /* sixteen at a time: no program here binds more, and none is refused */
+        uint32_t n = count - first < 16 ? count - first : 16;
+        for (uint32_t i = 0; i < n; ++i)
+            writes[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                               .dstSet = set,
+                                               .dstBinding = first + i,
+                                               .descriptorCount = 1,
+                                               .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                               .pBufferInfo = &infos[first + i]};
+        vkUpdateDescriptorSets(dev, n, writes, 0, NULL);
+        first += n;
+    }
+}

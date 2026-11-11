@@ -397,6 +397,9 @@ void gpu_park(GpuChannel* ch, u32 kind, u64 addr, u32 val, int geq);
 /* something a parked channel may wait for changed (a syncpoint increment, on the GPU thread or off it): look again.
    Any thread */
 void gpu_kick(void);
+/* the CPU signals what a GPU stream may wait for (an NVN event, a syncpoint increment through nvhost-ctrl): what it
+   wrote before is for the work after the wait to see (renderer.h mem_may_have_changed). Before the signal, any thread */
+void gpu_cpu_signal(void);
 /* a game pause, with no guest thread left to submit: the GPU thread runs what is queued up to now (channels waiting on
    the CPU stay parked), the renderer finishes (Renderer.idle), and the thread waits until gpu_release. 0, or -1 when it
    didn't get there within timeout_ms (and won't stop when it does) */
@@ -428,6 +431,10 @@ enum {
    manager's own lock */
 extern void (*g_gpu_mapping_begin)(u64 gva, u64 size, int kind);
 extern void (*g_gpu_mapping_end)(void);
+/* begin is about to wait for the renderer, which the console's change of memory never does: for its lock, which another
+   thread holds, or for results of the GPU to land in the pages changed. The kernel's side (core_leave_waiting), set
+   when it starts: a thread in a memory SVC holds its core until this is called */
+extern void (*g_gpu_mapping_waits)(void);
 
 /* ---- engines.c: the 3D engine's methods and the report semaphores */
 u64 gpu_ticks(void); /* the GPU's timestamp: 614.4 MHz ticks of the guest clock */
