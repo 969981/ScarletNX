@@ -30,9 +30,9 @@ static const char* lex(GlslcStage stage, const char* source, size_t size) {
     } else {
         g_lex_test.text[0] = 0;
         for (uint32_t i = 0; i + 1 < g->ntoks && w + 1 < sizeof g_lex_test.text; i++) {
-            const GlslcToken* t = &g->toks[i];
+            const GlslcPlace* t = &g->toks[i];
             int k = snprintf(g_lex_test.text + w, sizeof g_lex_test.text - w, "%.*s ", (int)t->text.len,
-                             glslc_token_text(g, t));
+                             glslc_place_text(g, t));
             if (k < 0) break;
             w += (size_t)k;
         }
@@ -113,7 +113,7 @@ static void keywords(void) {
     GlslcResult* r = &g_lex_test.result;
     static const struct {
         const char* source;
-        uint8_t kind;
+        uint32_t kind; /* TK_IDENT: a name (GLSLC_TK_NAME) */
     } cases[] = {
         {"uint", TK_IDENT},
         {"#version 300 es\nuint", TK_TYPE + GT_UINT - 1},
@@ -136,8 +136,9 @@ static void keywords(void) {
         Glslc* g = glslc_open(g_lex_test.workspace, g_lex_test.workspace_size, SNX_GLSLC_FRAGMENT, cases[i].source,
                               strlen(cases[i].source), r);
         assert(g && glslc_run(g, GLSLC_PASS_LEX, NULL, 0) == 0);
-        if (g->toks[0].kind != cases[i].kind) {
-            fprintf(stderr, "%s: kind %u, want %u\n", cases[i].source, g->toks[0].kind, cases[i].kind);
+        uint32_t got = g->kinds[0];
+        if (cases[i].kind == TK_IDENT ? !GLSLC_IS_NAME(got) : got != cases[i].kind) {
+            fprintf(stderr, "%s: kind %u, want %u\n", cases[i].source, got, cases[i].kind);
             exit(1);
         }
     }
@@ -234,11 +235,13 @@ static void bounds(void) {
     n = (size_t)snprintf(big, sizeof g_lex_test.big, "#version 300 es\n");
     for (uint32_t i = 0; i < 257; i++) n += (size_t)snprintf(big + n, sizeof g_lex_test.big - n, "#line %u\n", i + 10);
     expect_error(SNX_GLSLC_FRAGMENT, big, n, 265, 1, "more than the 256 #line directives"); /* numbered by the last */
-    /* macro definitions */
+    /* macro definitions: the predefined macros count once the shader reads them, GL_ES here */
     n = (size_t)snprintf(big, sizeof g_lex_test.big, "#version 300 es\n");
     for (uint32_t i = 0; i < 520; i++) n += (size_t)snprintf(big + n, sizeof g_lex_test.big - n, "#define M%u\n", i);
-    expect_error(SNX_GLSLC_FRAGMENT, big, n, 2 + SNX_GLSLC_MAX_MACROS - 1 - 5 - glslc_extension_count, 9,
-                 "more than the 511 macros");
+    expect_error(SNX_GLSLC_FRAGMENT, big, n, 2 + SNX_GLSLC_MAX_MACROS - 1, 9, "more than the 511 macros");
+    n = (size_t)snprintf(big, sizeof g_lex_test.big, "#version 300 es\n#ifdef GL_ES\n#endif\n");
+    for (uint32_t i = 0; i < 520; i++) n += (size_t)snprintf(big + n, sizeof g_lex_test.big - n, "#define M%u\n", i);
+    expect_error(SNX_GLSLC_FRAGMENT, big, n, 4 + SNX_GLSLC_MAX_MACROS - 2, 9, "more than the 511 macros");
 }
 
 int main(void) {

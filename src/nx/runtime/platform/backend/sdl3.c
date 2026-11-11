@@ -27,6 +27,7 @@
 #include "nx/runtime/platform/help.h"
 #include "nx/runtime/platform/hotkeys.h"
 #include "common/utilities/pad_sdl.h"
+#include "common/utilities/quit_key.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -609,6 +610,7 @@ const char* const* backend_vk_extensions(u32* n) {
     return e;
 }
 void backend_vk_check(void) { gpu_driver_check(); }
+int backend_vk_no_device(char* out, size_t size) { return gpu_driver_no_device(out, size); }
 int backend_vk_surface(VkInstance instance, VkSurfaceKHR* surface) {
 #ifdef SDL_PLATFORM_ANDROID
     /* a package's instance: SDL would ask the system's loader for its surface */
@@ -1046,6 +1048,12 @@ static int key_action(const SDL_KeyboardEvent* k) {
                    hotkey_row(also)->key, hotkey_row(a)->key);
     return a;
 }
+/* a line over the game for a few seconds, from the frontend's thread: the renderer draws it under ui_lock */
+static void toast(const char* text) {
+    ui_lock();
+    overlay_toast(text, plat_ns());
+    ui_unlock();
+}
 /* a runtime key's action, which the game's menu's F1 page lists (overlay.c's keys_row) with the game's buttons of
    keymap: a binding changed here changes there. The menu's is menu_event's */
 static void mouse_let_go(void);
@@ -1118,7 +1126,22 @@ static void hotkey(int action) {
             break;
         case HOTKEY_CAPTURE: g_renderer->capture(1); break;
         case HOTKEY_MOUSE: mouse_let_go(); break;
-        case HOTKEY_QUIT: g_quit = 1; break;
+        case HOTKEY_QUIT: /* asked twice: a first press only warns */
+            if (hotkey_quit_press(plat_ns()))
+                g_quit = 1;
+            else {
+                char text[96];
+                snx_quit_warning(text, sizeof text, hotkey_text(HOTKEY_QUIT));
+                toast(text);
+                LOG("%s\n", text);
+            }
+            break;
+        case HOTKEY_TV_MODE: {
+            char text[64];
+            options_tv_mode_step(1, text, sizeof text);
+            toast(text);
+            break;
+        }
         default: break;
     }
 }
@@ -1220,8 +1243,8 @@ static int menu_event(const SDL_Event* e, int action) {
         switch (e->key.key) {
             case SDLK_UP: overlay_move(-1); break;
             case SDLK_DOWN: overlay_move(1); break;
-            case SDLK_LEFT: overlay_do(overlay_side(-1)); break;
-            case SDLK_RIGHT: overlay_do(overlay_side(1)); break;
+            case SDLK_LEFT: overlay_do(e->key.repeat ? overlay_side_held(-1) : overlay_side(-1)); break;
+            case SDLK_RIGHT: overlay_do(e->key.repeat ? overlay_side_held(1) : overlay_side(1)); break;
             case SDLK_RETURN:
             case SDLK_SPACE:
                 if (!e->key.repeat) overlay_do(overlay_select());

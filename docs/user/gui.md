@@ -186,9 +186,15 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   opens, with the GPU and the driver Eden recommends for it; a repository that failed says why, and Enter fetches the
   lists again. A release's box lists its downloads with their sizes, a GPU maker's own drivers (every GameHub one, and
   one named Qualcomm) marked *proprietary, no license*; the one picked is downloaded, its progress in the note, and
-  added as Add Driver adds a zip. They load on Android 9 or newer, arm64, with an Adreno GPU (`/dev/kgsl-3d0`): the page's first line says
-  what this device is and, anywhere else, why games there use the system driver, and Use is refused there with that
-  line. A game whose package does not load stops, saying why. Under them, **edenprobe Mode** (Quick, the default:
+  added as Add Driver adds a zip. They load on Android 9 or newer, arm64, with an Adreno GPU (`/dev/kgsl-3d0`) or an
+  Xclipse GPU (a render node of the `amdgpu` kernel driver in `/dev/dri`, for [RADV's port to
+  it](https://github.com/JimVulkan/radv-xclipse), whose package asks Android 14): the page's first line says what this
+  device is and, anywhere else, why games there use the system driver. There the packages, Download Driver and Add
+  Driver are greyed, each row saying what the device lacks (*Android only*, *Unsupported GPU*...) and Enter
+  the whole line; a package's box still opens for its Remove, its Use refused with that line. On an Xclipse GPU
+  Download Driver alone is greyed, as those repositories hold Adreno's drivers: its package is added from its zip. A
+  game whose package does not load stops, saying why, and so does one whose package lists no Vulkan device, a driver
+  for another GPU. Under them, **edenprobe Mode** (Quick, the default:
   `quick notime cpu graphics`; Full adds `fs video audio kernel display`) and **Run edenprobe**, which plays
   [edenprobe](../dev/edenprobe.md)'s probes as a game with the GPU driver picked here, from `probe/edenprobe.nro` of the
   Logs folder, in a data folder of its own there (`probe/.scarletnx`: none of your settings, saves or users) with the
@@ -546,8 +552,10 @@ cannot be read is named and the others still listed.
   none; on a phone the way to them, with a tap on *Save states* at the foot), **Clean Cache** deletes its shader
   and code caches, asked first ([Usage](usage.md#mods)), and **GPU Driver** and **Freedreno Settings** open
   Settings > App's pages for that game alone: GPU Driver's first row, **Global**, follows the launcher's pick, the
-  game's own kept as `gpu_driver=` in its `.ini` (nothing: the system's driver); Freedreno Settings with none of its
-  own takes the launcher's. A collection's game ([Usage](usage.md#collections)) has a **Play Program N** row for
+  game's own kept as `gpu_driver=` in its `.ini` (nothing: the system's driver); where no package loads the row is
+  greyed, saying what the device lacks, unless the game is set to a package, to take that pick back. Freedreno
+  Settings with none of its own takes the launcher's. A collection's game ([Usage](usage.md#collections)) has a
+  **Play Program N** row for
   each other program it has made, which plays that program directly as Play plays the game's own (its menu, program
   0), the box's picks kept. On
   another row, a dump, a package or another console's game, it says what it opens. The side panel of a recompiled
@@ -729,7 +737,7 @@ to 4.5:1 for text: a colour changes there, not in the files.
 The runtime draws a loading screen of its own in the same look while it prepares the shaders before a game starts
 (`prepare_shaders = 2`, the default). It shows steps with their progress, the lines of the work scrolling under
 them, and a progress bar in every theme. A key that types, an arrow or the keypad, a gamepad button other than Home,
-or a tap starts the game at once, and the rest is prepared while it runs. Esc quits, or on Android back opens the
+or a tap starts the game at once, and the rest is prepared while it runs. Esc twice quits, or on Android back opens the
 menu, whose Exit quits. The screen appears only when the work takes longer than a quarter second, and its words are
 in English whatever language the launcher uses. It reads the theme the launcher picked from the launcher's
 `app.ini`, from the built-ins, the `themes/` of the data folder (the one Folders picked, when it did) and

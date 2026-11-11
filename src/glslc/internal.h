@@ -9,6 +9,7 @@
 #define SNX_GLSLC_INTERNAL_H
 #include "glslc/glslc.h"
 #include <setjmp.h>
+#include <string.h>
 
 /* versions, as an index (vi) and as a mask of indices */
 enum { GLSLC_V100 = 0, GLSLC_V300 = 1, GLSLC_V310 = 2, GLSLC_V320 = 3 };
@@ -25,62 +26,75 @@ enum { GLSLC_V100 = 0, GLSLC_V300 = 1, GLSLC_V310 = 2, GLSLC_V320 = 3 };
 #define GLSLC_SC   4u
 #define GLSLC_SALL 7u
 
+/* Token kinds, 32 bits. A punctuator is its own characters: one is its ASCII code ('('), two or three are packed from
+   the first in the low byte (GLSLC_TK2('+', '='), GLSLC_TK3('<', '<', '=')), made from the bytes one at a time, so a
+   kind is the same number on a big-endian host. The kinds no character spells are below ' '; keywords from 0x80, the
+   built-in types' from TK_TYPE (0x100), which no two characters reach (their second byte is past ' '). A name the
+   preprocessor let through is GLSLC_TK_NAME | its index in g->names: two tokens name the same thing when their kinds
+   are equal. Inside the lexer an identifier is TK_IDENT until its name is needed */
+#define GLSLC_TK2(a, b)    ((uint32_t)(unsigned char)(a) | (uint32_t)(unsigned char)(b) << 8)
+#define GLSLC_TK3(a, b, c) (GLSLC_TK2(a, b) | (uint32_t)(unsigned char)(c) << 16)
+#define GLSLC_TK_NAME      0x80000000u
+#define GLSLC_IS_NAME(k)   (((k)&GLSLC_TK_NAME) != 0)
+#define GLSLC_NAME_OF(k)   ((k) & ~GLSLC_TK_NAME)
+#define GLSLC_IS_TYPE(k)   ((k) >= TK_TYPE && (k) < TK_TYPE + 0x100u)
 enum {
     TK_EOF = 0,
-    TK_IDENT,
+    TK_IDENT,      /* an identifier the lexer has not named yet */
     TK_INTCONST,
     TK_UINTCONST,
     TK_FLOATCONST,
-    TK_JUNK, /* a character no token starts with, only seen in a section #if leaves out */
-    TK_LPAREN,
-    TK_RPAREN,
-    TK_LBRACKET,
-    TK_RBRACKET,
-    TK_LBRACE,
-    TK_RBRACE,
-    TK_DOT,
-    TK_COMMA,
-    TK_COLON,
-    TK_SEMICOLON,
-    TK_QUESTION,
-    TK_PLUS,
-    TK_MINUS,
-    TK_STAR,
-    TK_SLASH,
-    TK_PERCENT,
-    TK_LT,
-    TK_GT,
-    TK_LE,
-    TK_GE,
-    TK_EQ,
-    TK_NE,
-    TK_ANDAND,
-    TK_OROR,
-    TK_XORXOR,
-    TK_BANG,
-    TK_TILDE,
-    TK_AMP,
-    TK_BAR,
-    TK_CARET,
-    TK_SHL,
-    TK_SHR,
-    TK_INC,
-    TK_DEC,
-    TK_ASSIGN,
-    TK_ADD_ASSIGN,
-    TK_SUB_ASSIGN,
-    TK_MUL_ASSIGN,
-    TK_DIV_ASSIGN,
-    TK_MOD_ASSIGN,
-    TK_SHL_ASSIGN,
-    TK_SHR_ASSIGN,
-    TK_AND_ASSIGN,
-    TK_XOR_ASSIGN,
-    TK_OR_ASSIGN,
-    TK_HASH,
-    TK_HASHHASH,
+    TK_JUNK,     /* a character no token starts with, only seen in a section #if leaves out */
+    TK_RESERVED, /* a word the version reserves: an error wherever it is used */
+    TK_LPAREN = '(',
+    TK_RPAREN = ')',
+    TK_LBRACKET = '[',
+    TK_RBRACKET = ']',
+    TK_LBRACE = '{',
+    TK_RBRACE = '}',
+    TK_DOT = '.',
+    TK_COMMA = ',',
+    TK_COLON = ':',
+    TK_SEMICOLON = ';',
+    TK_QUESTION = '?',
+    TK_PLUS = '+',
+    TK_MINUS = '-',
+    TK_STAR = '*',
+    TK_SLASH = '/',
+    TK_PERCENT = '%',
+    TK_LT = '<',
+    TK_GT = '>',
+    TK_BANG = '!',
+    TK_TILDE = '~',
+    TK_AMP = '&',
+    TK_BAR = '|',
+    TK_CARET = '^',
+    TK_ASSIGN = '=',
+    TK_HASH = '#',
+    TK_LE = GLSLC_TK2('<', '='),
+    TK_GE = GLSLC_TK2('>', '='),
+    TK_EQ = GLSLC_TK2('=', '='),
+    TK_NE = GLSLC_TK2('!', '='),
+    TK_ANDAND = GLSLC_TK2('&', '&'),
+    TK_OROR = GLSLC_TK2('|', '|'),
+    TK_XORXOR = GLSLC_TK2('^', '^'),
+    TK_SHL = GLSLC_TK2('<', '<'),
+    TK_SHR = GLSLC_TK2('>', '>'),
+    TK_INC = GLSLC_TK2('+', '+'),
+    TK_DEC = GLSLC_TK2('-', '-'),
+    TK_ADD_ASSIGN = GLSLC_TK2('+', '='),
+    TK_SUB_ASSIGN = GLSLC_TK2('-', '='),
+    TK_MUL_ASSIGN = GLSLC_TK2('*', '='),
+    TK_DIV_ASSIGN = GLSLC_TK2('/', '='),
+    TK_MOD_ASSIGN = GLSLC_TK2('%', '='),
+    TK_AND_ASSIGN = GLSLC_TK2('&', '='),
+    TK_XOR_ASSIGN = GLSLC_TK2('^', '='),
+    TK_OR_ASSIGN = GLSLC_TK2('|', '='),
+    TK_HASHHASH = GLSLC_TK2('#', '#'),
+    TK_SHL_ASSIGN = GLSLC_TK3('<', '<', '='),
+    TK_SHR_ASSIGN = GLSLC_TK3('>', '>', '='),
     /* keywords, classified as the tokens leave the preprocessor: which words are keywords depends on the version */
-    TK_ATTRIBUTE,
+    TK_ATTRIBUTE = 0x80,
     TK_VARYING,
     TK_CONST,
     TK_UNIFORM,
@@ -121,8 +135,7 @@ enum {
     TK_RETURN,
     TK_TRUE,
     TK_FALSE,
-    TK_RESERVED, /* a word the version reserves: an error wherever it is used */
-    TK_TYPE      /* TK_TYPE + i is the keyword of built-in type i + 1 (GT_VOID is TK_TYPE) */
+    TK_TYPE = 0x100 /* TK_TYPE + i is the keyword of built-in type i + 1 (GT_VOID is TK_TYPE) */
 };
 
 /* token flags */
@@ -131,22 +144,52 @@ enum {
 
 typedef struct {
     GlslcView text; /* the token's text in the source, or in the synthesized text with GLSLC_TF_SYNTH */
+    uint32_t kind;  /* TK_*, or GLSLC_TK_NAME | the name */
     uint16_t site;  /* where an error about it points: its own place, or the macro use it came out of */
-    uint8_t kind;
     uint8_t flags;
+    uint8_t pad;
 } GlslcToken;
 
-#define GLSLC_MF_FUNCTION 1u  /* takes arguments */
-#define GLSLC_MF_SYNTH    2u  /* name is in the synthesized text: a predefined macro */
-#define GLSLC_MF_LINE     4u  /* __LINE__: the line it is used on */
-#define GLSLC_MF_DEAD     8u  /* #undef'd */
-#define GLSLC_MF_VERSION  16u /* __VERSION__: the version #version set */
+/* A token as the passes after the lexer read it: its kind is g->kinds' (a dense array, for the parser's look at
+   the kinds ahead), its text, site and flags here (GLSLC_TF_SYNTH; GLSLC_TF_BOL is the lexer's only) */
+typedef struct {
+    GlslcView text;
+    uint16_t site;
+    uint8_t flags;
+    uint8_t pad;
+} GlslcPlace;
+#define GLSLC_KIND_PAD 16u /* TK_EOF kinds after the last token's, so a look past the end reads within the array */
+
+/* A name the preprocessor read: every identifier with the same text has the same one, so what the lexer learns of a
+   name (the macro it names, whether it is a keyword) it learns once */
+#define GLSLC_NAME_SYNTH 1u     /* text is in the synthesized text: a predefined macro's name */
+#define GLSLC_NAME_PLAIN 0xffffu /* keyword: the name is no keyword in any version */
+typedef struct {
+    GlslcView text;   /* its first place */
+    uint16_t next;    /* the next name in its hash bucket */
+    uint16_t macro;   /* the macro it names now, 0 for none */
+    uint16_t keyword; /* glslc_keywords' row plus one, or GLSLC_NAME_PLAIN */
+    /* the parser's: the innermost symbol of the name in scope (0 for none), and the first rows of
+       glslc_builtin_fns and glslc_builtin_vars with its text, plus one (the table's count plus one for none, 0
+       until looked up) */
+    uint16_t sym;
+    uint16_t builtin_fn;
+    uint8_t builtin_var;
+    uint8_t flags; /* GLSLC_NAME_* */
+} GlslcName;
+#define GLSLC_NAME_BUCKETS 2048u
+
+#define GLSLC_MF_FUNCTION   1u  /* takes arguments */
+#define GLSLC_MF_PREDEFINED 2u  /* a predefined macro, which #define and #undef refuse */
+#define GLSLC_MF_LINE       4u  /* __LINE__: the line it is used on */
+#define GLSLC_MF_DEAD       8u  /* #undef'd */
+#define GLSLC_MF_VERSION    16u /* __VERSION__: the version #version set */
 
 typedef struct {
     GlslcView name;
     uint16_t first; /* its parameters, then its body, in mtoks */
     uint16_t count; /* parameters and body tokens */
-    uint16_t next;  /* the next macro in its hash bucket */
+    uint16_t pad;
     uint8_t params; /* how many of the tokens at first are the parameters */
     uint8_t flags;  /* GLSLC_MF_* */
 } GlslcMacro;
@@ -235,7 +278,7 @@ typedef struct {
     uint8_t prec;
     uint8_t mflags;   /* GLSLC_MEM_* */
     int16_t location; /* in and out blocks' members: the one given, -1 without one */
-    uint16_t pad;
+    uint16_t key;     /* the name's index in g->names */
 } GlslcMember;
 
 /* symbols */
@@ -283,9 +326,9 @@ typedef struct {
     uint16_t node; /* variables: their declaration; functions: their definition (0 while only declared) */
     uint16_t aux;  /* functions: first parameter; block members: the block's symbol; built-ins: the table row */
     uint16_t aux2; /* functions: parameters; block members: the member */
-    uint16_t next; /* the next symbol in its hash bucket */
+    uint16_t next; /* the symbol of its name it hides, in scope again after it */
     int16_t location, binding, set; /* -1 without one */
-    uint16_t pad;
+    uint16_t key;                   /* the name's index in g->names, 0 for a symbol no name finds */
 } GlslcSymbol;
 
 typedef struct {
@@ -295,6 +338,8 @@ typedef struct {
     uint8_t prec;
     uint16_t qual;
     uint16_t sym; /* the parameter's symbol in the function's definition */
+    uint16_t key; /* the name's index in g->names, 0 for no name */
+    uint16_t pad;
 } GlslcParam;
 
 typedef struct {
@@ -429,6 +474,7 @@ enum {
 };
 typedef struct {
     const char* name;
+    uint8_t len; /* the name's, builtins.c's ROW */
     uint8_t feature; /* GLSLC_EXT_* */
     uint8_t vmask;   /* the versions it is for */
 } GlslcExtension;
@@ -437,6 +483,7 @@ enum { GLSLC_BEHAVIOR_DISABLE = 0, GLSLC_BEHAVIOR_ENABLE, GLSLC_BEHAVIOR_REQUIRE
 /* built-in tables (builtins.c) */
 typedef struct {
     const char* name;
+    uint8_t len; /* the name's, builtins.c's ROW */
     uint8_t kind, base, rows, cols, dim, tflags;
     uint8_t vmask; /* versions it is a type in */
     uint8_t ext;   /* the extension that adds it to 1.00 */
@@ -444,10 +491,11 @@ typedef struct {
 
 typedef struct {
     const char* name;
-    uint8_t kind; /* the token kind */
-    uint8_t kw;   /* versions it is a keyword in */
-    uint8_t res;  /* versions it is reserved in */
-    uint8_t ext;  /* the extension that makes it a keyword where it is not one */
+    uint8_t len;   /* the name's, builtins.c's ROW */
+    uint16_t kind; /* the token kind */
+    uint8_t kw;    /* versions it is a keyword in */
+    uint8_t res;   /* versions it is reserved in */
+    uint8_t ext;   /* the extension that makes it a keyword where it is not one */
 } GlslcKeyword;
 
 /* how a built-in function is written in SPIR-V */
@@ -504,6 +552,7 @@ enum {
 
 typedef struct {
     const char* name;
+    uint8_t len; /* the name's, builtins.c's ROW */
     const char* sig; /* return, '=', arguments: one letter each (builtins.c says what each means) */
     uint8_t bk;      /* GLSLC_BK_* */
     uint8_t vmask;   /* versions it is in */
@@ -515,6 +564,7 @@ typedef struct {
 
 typedef struct {
     const char* name;
+    uint8_t len; /* the name's, builtins.c's ROW */
     uint16_t type;   /* GT_* */
     uint8_t storage; /* GLSLC_ST_IN, OUT, CONST */
     uint8_t stages;
@@ -563,7 +613,12 @@ typedef struct {
     uint32_t* sym_types;   /* variables: their SPIR-V storage class plus one; functions: their OpTypeFunction */
     uint32_t* sampler_ids; /* a uniform or parameter of a struct that holds samplers: its first sampler's variable or
                               parameter, the next sampler's at the next id */
-    GlslcHashEntry* hash;  /* pointer, image and sampler array types, constants: open addressing on GLSLC_HASH_SIZE */
+    /* pointer, image and sampler array types, constants: open addressing on GLSLC_HASH_SIZE. A sparse set says which
+       slots are taken (Briggs and Torczon's): slot i is when hash_back[i] < nhash and hash_used[hash_back[i]] is i,
+       which nothing left in the workspace can make true, so the hash is empty without being cleared */
+    GlslcHashEntry* hash;
+    uint16_t *hash_used, *hash_back;
+    uint32_t nhash;
     GlslcWords caps, imports, entry, modes, names, annotations, globals, functions, locals, body;
     uint32_t next_id;
     uint32_t glsl_ext;  /* the GLSL.std.450 import */
@@ -595,8 +650,11 @@ typedef struct {
 #define GLSLC_HASH_SIZE   8192u
 enum { GLSLC_LAYOUT_NONE = 0, GLSLC_LAYOUT_STD140 = 1, GLSLC_LAYOUT_STD430 = 2 };
 
+#define GLSLC_SOURCE_PAD 8u
+#define GLSLC_TYPE_NAMES 4u /* the most types one message names, and one more */
 typedef struct {
-    /* the input */
+    /* the input: a copy of the source in the workspace, GLSLC_SOURCE_PAD zero bytes after its end, so the lexer reads
+       a byte or three ahead without asking whether the source has them (a view's place is the same in both) */
     const char* src;
     uint32_t src_len;
     GlslcStage stage;
@@ -615,12 +673,15 @@ typedef struct {
     /* the preprocessor */
     char* synth;
     uint32_t nsynth;
-    GlslcToken* toks;
+    GlslcPlace* toks;  /* the tokens the preprocessor let through, the last TK_EOF */
+    uint32_t* kinds;   /* their kinds, then GLSLC_KIND_PAD more TK_EOF */
     uint32_t ntoks;
     uint32_t overflow_site; /* the first token past SNX_GLSLC_MAX_TOKENS */
     GlslcMacro* macros;
     uint32_t nmacros;
-    uint16_t macro_hash[256];
+    GlslcName* names;
+    uint32_t nnames;
+    uint16_t name_hash[GLSLC_NAME_BUCKETS];
     GlslcToken* mtoks;
     uint32_t nmtoks;
     GlslcToken* exp;
@@ -645,9 +706,8 @@ typedef struct {
     uint32_t ntypes;
     GlslcMember* members;
     uint32_t nmembers;
-    GlslcSymbol* syms;
+    GlslcSymbol* syms; /* each name's innermost one is its g->names entry's sym */
     uint32_t nsyms;
-    uint16_t* sym_hash; /* GLSLC_SYM_BUCKETS heads */
     GlslcParam* params;
     uint32_t nparams;
     GlslcCall* calls;
@@ -673,10 +733,12 @@ typedef struct {
     uint8_t buffer_packing;
     uint8_t uniform_row_major;
     uint8_t buffer_row_major;
+    /* the types an error's message names, made only when it is (parser.c's type_text) */
+    char type_names[GLSLC_TYPE_NAMES][64];
+    uint32_t type_name_next;
     /* the back end */
     GlslcEmitter e;
 } Glslc;
-#define GLSLC_SYM_BUCKETS 1024u
 
 /* glslc.c: a compilation in a workspace's memory, and its passes up to last (the tests stop after a pass to read its
    arrays). glslc_open refuses a workspace, stage, size or source glslc cannot take (NULL, and result->error) */
@@ -687,16 +749,56 @@ int glslc_run(Glslc* g, int last, uint32_t* words, size_t capacity);
 void glslc_fail(Glslc* g, uint32_t site, const char* fmt, ...);
 void glslc_warn(Glslc* g, uint32_t site, const char* fmt, ...);
 void glslc_locate(const Glslc* g, uint32_t site, uint32_t* line, uint32_t* column);
-uint32_t glslc_hash(const char* text, uint32_t len);
+/* the 8 bytes at p as a number, the first in the low byte: the same number on any host, and one load on a
+   little-endian one */
+static inline uint64_t glslc_bytes8(const char* p) {
+    const unsigned char* b = (const unsigned char*)p;
+    return (uint64_t)b[0] | (uint64_t)b[1] << 8 | (uint64_t)b[2] << 16 | (uint64_t)b[3] << 24 | (uint64_t)b[4] << 32 |
+           (uint64_t)b[5] << 40 | (uint64_t)b[6] << 48 | (uint64_t)b[7] << 56;
+}
+/* text's hash, 8 bytes a step, each made from its bytes (the same on any host), then mixed (MurmurHash3's finalizer).
+   It reads up to 7 bytes past text's end, which the source's copy (GLSLC_SOURCE_PAD) and the synthesized text (the
+   workspace's next array) have. Inline: tools/glslc_kwgen hashes the keywords with it too */
+static inline uint32_t glslc_hash(const char* text, uint32_t len) {
+    uint64_t h = (uint64_t)len * 0x9e3779b97f4a7c15ull, w = 0;
+    uint32_t i = 0;
+    for (; i + 8 <= len; i += 8) h = (h ^ glslc_bytes8(text + i)) * 0xff51afd7ed558ccdull;
+    if (i < len) w = glslc_bytes8(text + i) & (~0ull >> (64u - 8u * (len - i))); /* the last bytes, the ones past cut */
+    h = (h ^ w) * 0xc4ceb9fe1a85ec53ull;
+    h ^= h >> 33;
+    return (uint32_t)h;
+}
+/* The keywords' perfect hash, which tools/glslc_kwgen finds for glslc_keywords at build time (glslc_keywords.inc,
+   keywords.c reads it): a keyword's bucket is the low bits of its hash, and its slot its hash mixed with the bucket's
+   displacement, the one that gives each of the bucket's keywords a slot no other keyword has */
+static inline uint32_t glslc_keyword_slot(uint32_t h, uint32_t displacement, uint32_t mask) {
+    uint32_t x = (h ^ displacement * 0x85ebca6bu) * 0x9e3779b1u;
+    x ^= x >> 15;
+    x *= 0x2c1b3c6du;
+    x ^= x >> 12;
+    return x & mask;
+}
 const char* glslc_view_text(const Glslc* g, GlslcView v);
 const char* glslc_token_text(const Glslc* g, const GlslcToken* t);
-int glslc_view_is(const Glslc* g, GlslcView v, const char* word);
-int glslc_views_equal(const Glslc* g, GlslcView a, GlslcView b);
+const char* glslc_place_text(const Glslc* g, const GlslcPlace* p);
+/* whether v is the n bytes at word: the lengths first, so most names differ without a byte read */
+static inline int glslc_view_is_n(const Glslc* g, GlslcView v, const char* word, uint32_t n) {
+    return v.len == n && !memcmp(g->src + v.pos, word, n);
+}
+/* whether v is word: inline, so a literal's strlen is the compiler's */
+static inline int glslc_view_is(const Glslc* g, GlslcView v, const char* word) {
+    return glslc_view_is_n(g, v, word, (uint32_t)strlen(word));
+}
+/* whether v is a table row's name (builtins.c's ROW gives its length) */
+#define GLSLC_VIEW_IS_ROW(g, v, row) glslc_view_is_n((g), (v), (row)->name, (row)->len)
 /* lexer.c: fills toks, ending with TK_EOF */
 void glslc_lex(Glslc* g);
 int glslc_parse_int(const char* text, uint32_t len, uint32_t* value); /* 0 when it does not fit in 32 bits */
 /* builtins.c */
+/* keywords.c: the keyword of text, NULL for none, in one slot of the perfect hash; with its glslc_hash, h, as the
+   lexer has it, which reads past text (see glslc_hash), or without, which does not */
 const GlslcKeyword* glslc_find_keyword(const char* text, uint32_t len);
+const GlslcKeyword* glslc_find_keyword_hashed(const char* text, uint32_t len, uint32_t h);
 /* parser.c: fills the nodes, types and symbols */
 void glslc_parse(Glslc* g);
 uint32_t glslc_type_components(const Glslc* g, uint32_t type);

@@ -5298,6 +5298,7 @@ static int check_uma_page_changes(void) {
 #include "vulkan_txd_uniform.inc"
 #include "vulkan_vertex_input.inc"
 #include "vulkan_frag_coord.inc"
+#include "vulkan_varying.inc"
 #include "vulkan_vertex_restride.inc"
 #include "vulkan_msaa.inc"
 #include "vulkan_cross_stage_alias.inc"
@@ -5616,7 +5617,8 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_recorder_self_sync());
     viw_install();
     /* every check with each draw binding the pipeline linked from its parts and never the one made whole
-       (SNX_TEST_GPL=linked), or with each pipeline made whole as on a device without pipeline libraries (whole) */
+       (SNX_TEST_GPL=linked), or with each pipeline made whole, with the dynamic state the libraries gave (whole) */
+    g_mx_fixed_libraries = g_vk.has_gpl;
     if (getenv("SNX_TEST_GPL")) {
         const char* gpl = getenv("SNX_TEST_GPL");
         if (!strcmp(gpl, "linked")) {
@@ -6035,6 +6037,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_mesh_inputs());
     CHECK(!check_lone_lane());
     CHECK(!check_frag_coord_origin());
+    CHECK(!check_varying_passes());
     CHECK(!check_rt_other_layout());
     CHECK(!check_vertex_restride());
     CHECK(!check_vertex_input_layouts());

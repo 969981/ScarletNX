@@ -27,6 +27,7 @@ FILES = [
     'ScarletNX-linux-ppc64le.AppImage',
     'ScarletNX-linux-ppc64.AppImage',
     'ScarletNX-linux-riscv64.AppImage',
+    'ScarletNX-linux-loongarch64.AppImage',
     'ScarletNX-windows-x86_64.zip',
     'ScarletNX-android-universal.apk',
     'ScarletNX-macos-arm64.zip',
@@ -38,6 +39,7 @@ ZSYNC = [
     'ScarletNX-linux-ppc64le.AppImage.zsync',
     'ScarletNX-linux-ppc64.AppImage.zsync',
     'ScarletNX-linux-riscv64.AppImage.zsync',
+    'ScarletNX-linux-loongarch64.AppImage.zsync',
 ]
 failures = []
 
@@ -125,6 +127,10 @@ with tempfile.TemporaryDirectory() as temporary:
                 'ScarletNX-linux-riscv64.AppImage': 'elf riscv',
                 'ScarletNX-linux-riscv64.AppImage.zsync': 'zsync riscv',
             },
+            f'ScarletNX-linux-loongarch64-{short}.AppImage': {
+                'ScarletNX-linux-loongarch64.AppImage': 'elf loong',
+                'ScarletNX-linux-loongarch64.AppImage.zsync': 'zsync loong',
+            },
             f'ScarletNX-windows-x86_64-{short}': {'bin/scarletnx.exe': 'MZ', 'share/licenses/LICENSE': 'GPL'},
             f'ScarletNX-android-universal-{short}.apk': {f'ScarletNX-android-universal-{short}.apk': 'PK apk'},
             # skip-decompress: the macOS zip lands at the artifact's own path, the IPA inside its folder
@@ -173,11 +179,11 @@ with tempfile.TemporaryDirectory() as temporary:
         planned = dict(line.split('=', 1) for line in output.read_text().splitlines())
         return done, planned
 
-    def push_run(commit, conclusion='success', branch='main', number=1):
+    def push_run(commit, conclusion='success', branch='main', number=1, event='push'):
         return {
             'workflow_run': {
                 'id': number,
-                'event': 'push',
+                'event': event,
                 'head_branch': branch,
                 'head_sha': commit,
                 'conclusion': conclusion,
@@ -238,7 +244,21 @@ with tempfile.TemporaryDirectory() as temporary:
         planned == {'kind': 'nightly', 'run': '41', 'sha': sha, 'short': sha[:7], 'pr': '', 'tag': ''},
         planned,
     )
+    done, planned = run('plan', event=push_run(sha, number=44, event='schedule'))
+    check(
+        'a green scheduled run of main is planned as a nightly',
+        planned == {'kind': 'nightly', 'run': '44', 'sha': sha, 'short': sha[:7], 'pr': '', 'tag': ''},
+        planned,
+    )
+    done, planned = run('plan', event=push_run(sha, number=45, event='workflow_dispatch'))
+    check(
+        'a green run of main by hand is planned as a nightly',
+        planned == {'kind': 'nightly', 'run': '45', 'sha': sha, 'short': sha[:7], 'pr': '', 'tag': ''},
+        planned,
+    )
     for event, why in (
+        (push_run(sha, 'failure', event='schedule'), 'a failed scheduled run'),
+        (push_run(sha, branch='dev', event='workflow_dispatch'), 'a run by hand of another branch'),
         (push_run(sha, 'failure'), 'a failed run'),
         (push_run(sha, branch='dev'), 'another branch'),
         (push_run(sha, branch='v9.9.9'), 'a branch named like a version, no tag'),
@@ -260,11 +280,6 @@ with tempfile.TemporaryDirectory() as temporary:
         "its files, and the AppImages' .zsync",
         made and sorted(a['name'] for a in made['assets']) == sorted(FILES + ZSYNC),
         made and made['assets'],
-    )
-    check(
-        'no row for LoongArch, which CI builds no package of',
-        made and 'LoongArch' not in made['body'],
-        made and made['body'],
     )
     check(
         'its notes: the files linked from this release, the changes, the source',
@@ -473,6 +488,7 @@ with tempfile.TemporaryDirectory() as temporary:
             'Linux AppImage (ppc64le)',
             'Linux AppImage (ppc64)',
             'Linux AppImage (riscv64)',
+            'Linux AppImage (loongarch64)',
             'Windows (Clang + LLVM)',
             'Android APK',
         ]

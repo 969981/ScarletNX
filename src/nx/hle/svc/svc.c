@@ -150,23 +150,29 @@ static u32 create_thread(u64 entry, u64 arg, u64 stack_top, i32 prio, i32 core, 
     if (core == -2) core = g_hle.thread.default_core;
     R_UNLESS(core >= 0 && core < NCORES && ((g_hle.svcmem.core_mask >> core) & 1), SNX_RC_SVC_INVALID_CORE_ID);
     R_UNLESS(valid_prio(prio), SNX_RC_SVC_INVALID_PRIORITY);
-    u32 rc;
-    t = kthread_create(entry, arg, stack_top, prio, core);
+    u32 rc = kthread_create(entry, arg, stack_top, prio, core, &t);
+    if (rc == SNX_RC_SVC_LIMIT_REACHED)
+        WARN_LIMIT(4,
+                   "svcCreateThread: the process has %d threads that have not exited, the most a console application "
+                   "may, the game gets LimitReached (%#x)\n",
+                   THREAD_MAX, rc);
+    else if (rc)
+        WARN_LIMIT(4,
+                   "svcCreateThread: all %d thread slots are in use (exited threads keep theirs while a handle to "
+                   "them is open), the game gets OutOfResource (%#x)\n",
+                   KTHREAD_MAX, rc);
+    R_TRY(rc);
     rc = give_handle(&t->o, out);
     if (!rc) kthread_set_own_handle(t, *out);
     return rc;
 }
 static u32 start_thread(u32 h) {
     KThread* t = thread_of(h);
-    int st;
+    u32 rc;
     R_UNLESS(t, SNX_RC_SVC_INVALID_HANDLE);
-    pm_lock(&g_host.kernel.klock);
-    st = t->state;
-    klock_unlock();
-    if (st == 0) kthread_start(t);
+    rc = kthread_start(t);
     thread_put(t);
-    R_UNLESS(st == 0, SNX_RC_SVC_INVALID_STATE);
-    R_SUCCEED();
+    return rc;
 }
 /* svcSleepThread: a sleep off the core, or one of the three yields (0 on its core, -1 and -2 to any core) */
 static void sleep_thread(KThread* t, i64 ns) {
@@ -368,12 +374,20 @@ static u32 cancel_sync(u32 h) {
 
 /* ============================================================ events */
 static u32 create_event(u32* wh, u32* rh) {
-    KEvent* r = kevent_new("event");
-    KWEvent* w;
-    pm_lock(&g_host.kernel.pool_lk);
-    w = (KWEvent*)POOL_TAKE(g_hle.svc.wevents, g_hle.svc.wevent_next, "writable events");
-    w->o.type = KO_WEVENT;
-    pm_unlock(&g_host.kernel.pool_lk);
+    KEvent* r = kevent_try_new("event");
+    KWEvent* w = NULL;
+    if (r) {
+        pm_lock(&g_host.kernel.pool_lk);
+        w = (KWEvent*)POOL_TRY(g_hle.svc.wevents, g_hle.svc.wevent_next);
+        if (w) w->o.type = KO_WEVENT;
+        pm_unlock(&g_host.kernel.pool_lk);
+    }
+    if (!w) {
+        WARN_LIMIT(4, "svcCreateEvent: all %d %s are in use, the game gets OutOfResource (%#x)\n",
+                   r ? KHANDLED_MAX : KEVENT_MAX, r ? "writable events" : "events", SNX_RC_SVC_OUT_OF_RESOURCE);
+        if (r) kobj_destroy(&r->o); /* no reference yet */
+        R_THROW(SNX_RC_SVC_OUT_OF_RESOURCE);
+    }
     kobj_set_name(&w->o, "writable event");
     w->r = kobj_id(&r->o);
     kobj_ref(&r->o);
@@ -519,9 +533,11 @@ static u32 get_info(u32 id0, u32 h, u64 id1, u64* out) {
         R_SUCCEED();
     }
     if (id0 != 9) return svc_get_info(id0, h, id1, out);
-    R_UNLESS(!h, SNX_RC_SVC_INVALID_HANDLE); /* ResourceLimit: always succeeds after its checks */
+    R_UNLESS(!h, SNX_RC_SVC_INVALID_HANDLE); /* ResourceLimit */
     R_UNLESS(!id1, SNX_RC_SVC_INVALID_COMBINATION);
-    *out = h_new(&g_hle.svc.reslimit);
+    u32 rh = h_new(&g_hle.svc.reslimit);
+    R_UNLESS(rh, SNX_RC_SVC_OUT_OF_HANDLES);
+    *out = rh;
     R_SUCCEED();
 }
 

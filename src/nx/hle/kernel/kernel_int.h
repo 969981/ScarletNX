@@ -73,11 +73,13 @@ int sleep_nl(KThread* t, i64 timeout);
 
 /* ---- thread.c: threads and the guest cores */
 int kthread_live_count(void);
-/* a thread with no reference: the first handle takes one, as its host thread does from its start to its exit */
-KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core);
+/* a thread with no reference: the first handle takes one, as its host thread does from its start to its exit. 0, or
+   the result svcCreateThread answers, with *out NULL */
+u32 kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core, KThread** out);
 /* h, the thread's own handle, where an Ounce program's thread finds it in its TLS (thread.c) */
 void kthread_set_own_handle(KThread* t, u32 h);
-void kthread_start(KThread* t);
+/* 0, or InvalidState for a thread that has started already: only one call starts it */
+u32 kthread_start(KThread* t);
 void svc_exit_thread(KThread* t);
 void process_exit(int code);
 /* gives the core to a waiting thread of higher priority, then waits for it again */
@@ -320,6 +322,7 @@ typedef struct {
     KCodeView views[KCODEVIEW_MAX]; /* under g_host.svcmem.views_lk: a free one has size 0 */
     KMapView maps[KMAPVIEW_MAX]; /* under g_host.svcmem.map_lk: a free one has size 0 */
     u64 fit; /* memory_fit_mode's: the most the game is told, measured as it starts (mem_fit); 0 for the console's */
+    u64 fit_available, fit_footprint; /* what mem_fit measured for it, 0 with fit: a crash's hint says them */
 } HleSvcMem;
 /* svc_mem's host side: the views' lock, which a save state never holds (hle.h's g_host) */
 typedef struct {

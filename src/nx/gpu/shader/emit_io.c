@@ -21,9 +21,17 @@ u32 shader_ipa_interpolation(const u32* sph, u32 input) {
     return 2;
 }
 
+/* Whether a plain IPA of the attribute word at addr reads one of the position pass's inputs (pos_in, a mask of
+   generics) where the pass has its value: a perspective one's x, y or w */
+int shader_ipa_position(u32 pos_in, const u32* sph, u32 addr) {
+    u32 input = (addr - 0x80) >> 4;
+    return addr >= 0x80 && addr < 0x280 && (pos_in >> input & 1) && (addr >> 2 & 3) != 2 &&
+           shader_ipa_interpolation(sph, input) == 2;
+}
+
 void shader_alpha_test(DirectCtx* c, u32 push, u32 push_pointer, u32 alpha) {
     u32 index[3];
-    for (u32 i = 0; i < 3; i++) index[i] = spv_emit_constant_u32(&c->emit, c->u32_type, i);
+    for (u32 i = 0; i < 3; i++) index[i] = shader_u32(c, i);
     u32 enabled = spv_emit_push_component_f32(&c->emit, push_pointer, push, index[0], index[0], c->f32_type);
     u32 function = spv_emit_push_component_f32(&c->emit, push_pointer, push, index[0], index[1], c->f32_type);
     u32 reference = spv_emit_push_component_f32(&c->emit, push_pointer, push, index[0], index[2], c->f32_type);
@@ -38,7 +46,7 @@ void shader_alpha_test(DirectCtx* c, u32 push, u32 push_pointer, u32 alpha) {
         u32 result = spv_emit_bool_binary(&c->emit, c->bool_type, 0, selected, comparison);
         pass = spv_emit_bool_binary(&c->emit, c->bool_type, 1, pass, result);
     }
-    u32 fail = spv_emit_bool_not(&c->emit, c->bool_type, pass);
+    u32 fail = spv_emit_unary(&c->emit, SPV_OP_LOGICAL_NOT, c->bool_type, pass);
     fail = spv_emit_bool_binary(&c->emit, c->bool_type, 0, active, fail);
     if (c->discarded) { /* in the flow loop: discarded after it */
         spv_emit_store(
@@ -55,17 +63,16 @@ void shader_alpha_test(DirectCtx* c, u32 push, u32 push_pointer, u32 alpha) {
 }
 
 u32 shader_frag_y_origin(DirectCtx* c, u32 push, u32 y) {
-    u32 one = spv_emit_constant_u32(&c->emit, c->u32_type, 1);
+    u32 one = shader_u32(c, 1);
     u32 pointer = spv_emit_type_pointer(&c->emit, 9, c->u32_type); /* PushConstant */
-    u32 lower_left = spv_emit_push_component_f32(&c->emit, pointer, push, one,
-                                                 spv_emit_constant_u32(&c->emit, c->u32_type, 2), c->u32_type);
-    u32 height = spv_emit_push_component_f32(&c->emit, pointer, push, one,
-                                             spv_emit_constant_u32(&c->emit, c->u32_type, 3), c->u32_type);
-    u32 up = spv_emit_fadd(&c->emit, c->f32_type, spv_emit_convert_u_to_f(&c->emit, c->f32_type, height),
-                           spv_emit_fnegate(&c->emit, c->f32_type, y));
+    u32 lower_left = spv_emit_push_component_f32(&c->emit, pointer, push, one, shader_u32(c, 2), c->u32_type);
+    u32 height = spv_emit_push_component_f32(&c->emit, pointer, push, one, shader_u32(c, 3), c->u32_type);
+    u32 up = spv_emit_binary(&c->emit, SPV_OP_F_ADD, c->f32_type,
+                             spv_emit_unary(&c->emit, SPV_OP_CONVERT_U_TO_F, c->f32_type, height),
+                             spv_emit_unary(&c->emit, SPV_OP_F_NEGATE, c->f32_type, y));
     spv_emit_no_contraction(&c->emit, up);
-    return spv_emit_select(&c->emit, c->f32_type, spv_emit_i_not_equal(&c->emit, c->bool_type, lower_left, c->zero), up,
-                           y);
+    return spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->f32_type,
+                            spv_emit_binary(&c->emit, SPV_OP_I_NOT_EQUAL, c->bool_type, lower_left, c->zero), up, y);
 }
 
 /* The last stage's position as the rasterizer takes it. A viewport coordinate swizzle in the key (SNX_SH_SWIZZLE)
@@ -75,39 +82,37 @@ u32 shader_frag_y_origin(DirectCtx* c, u32 push, u32 y) {
    and height in bits 0-15 and 16-31 of the push constant's w, as Eden's position_pass.cpp does with its render area.
    Then z goes from -w..w to 0..w where the push constant's y says the depth mode is -1 to 1 */
 void shader_vertex_position_fix(DirectCtx* c, u32 position, u32 push, u32 push_pointer, u32 vec4_type) {
-    u32 member = spv_emit_constant_u32(&c->emit, c->u32_type, 0);
+    u32 member = shader_u32(c, 0);
     if (c->swizzle & SNX_SH_SWIZZLE) {
         u32 value = spv_emit_load(&c->emit, vec4_type, position), swizzled = value;
         for (u32 k = 0; k < 4; k++) {
             u32 code = (c->swizzle >> (SNX_SH_SWIZZLE_SHIFT + 4 * k)) & 7;
             u32 part = spv_emit_vec4_extract(&c->emit, c->f32_type, value, code >> 1);
-            if (code & 1) part = spv_emit_fnegate(&c->emit, c->f32_type, part);
+            if (code & 1) part = spv_emit_unary(&c->emit, SPV_OP_F_NEGATE, c->f32_type, part);
             swizzled = spv_emit_vec4_insert(&c->emit, vec4_type, swizzled, part, k);
         }
         spv_emit_store(&c->emit, position, swizzled);
     }
     if (c->window_xy) {
-        u32 size =
-            spv_emit_bitcast(&c->emit, c->u32_type,
-                             spv_emit_push_component_f32(&c->emit, push_pointer, push, member,
-                                                         spv_emit_constant_u32(&c->emit, c->u32_type, 3), c->f32_type));
-        u32 extent[2] = {
-            spv_emit_bitwise_and_u32(&c->emit, c->u32_type, size, spv_emit_constant_u32(&c->emit, c->u32_type, 0xFFFF)),
-            spv_emit_shift_right_u32(&c->emit, c->u32_type, size, spv_emit_constant_u32(&c->emit, c->u32_type, 16))};
+        u32 size = spv_emit_unary(
+            &c->emit, SPV_OP_BITCAST, c->u32_type,
+            spv_emit_push_component_f32(&c->emit, push_pointer, push, member, shader_u32(c, 3), c->f32_type));
+        u32 extent[2] = {spv_emit_binary(&c->emit, SPV_OP_BITWISE_AND, c->u32_type, size, shader_u32(c, 0xFFFF)),
+                         spv_emit_binary(&c->emit, SPV_OP_SHIFT_RIGHT_LOGICAL, c->u32_type, size, shader_u32(c, 16))};
         u32 two = spv_emit_constant_f32(&c->emit, c->f32_type, 2.0f);
         u32 minus_one = spv_emit_constant_f32(&c->emit, c->f32_type, -1.0f);
         u32 value = spv_emit_load(&c->emit, vec4_type, position);
         for (u32 k = 0; k < 2; k++) {
-            u32 scale =
-                spv_emit_fdiv(&c->emit, c->f32_type, two, spv_emit_convert_u_to_f(&c->emit, c->f32_type, extent[k]));
+            u32 scale = spv_emit_binary(&c->emit, SPV_OP_F_DIV, c->f32_type, two,
+                                        spv_emit_unary(&c->emit, SPV_OP_CONVERT_U_TO_F, c->f32_type, extent[k]));
             u32 pixels = spv_emit_vec4_extract(&c->emit, c->f32_type, value, k);
-            u32 clip =
-                spv_emit_fadd(&c->emit, c->f32_type, spv_emit_fmul(&c->emit, c->f32_type, pixels, scale), minus_one);
+            u32 clip = spv_emit_binary(&c->emit, SPV_OP_F_ADD, c->f32_type,
+                                       spv_emit_binary(&c->emit, SPV_OP_F_MUL, c->f32_type, pixels, scale), minus_one);
             value = spv_emit_vec4_insert(&c->emit, vec4_type, value, clip, k);
         }
         spv_emit_store(&c->emit, position, value);
     }
-    u32 component = spv_emit_constant_u32(&c->emit, c->u32_type, 1);
+    u32 component = shader_u32(c, 1);
     u32 enabled = spv_emit_push_component_f32(&c->emit, push_pointer, push, member, component, c->f32_type);
     u32 zero = spv_emit_constant_f32(&c->emit, c->f32_type, 0.0f);
     u32 test = spv_emit_fcompare(&c->emit, c->bool_type, 5, enabled, zero);
@@ -118,15 +123,80 @@ void shader_vertex_position_fix(DirectCtx* c, u32 position, u32 push, u32 push_p
     u32 value = spv_emit_load(&c->emit, vec4_type, position);
     u32 z = spv_emit_vec4_extract(&c->emit, c->f32_type, value, 2);
     u32 w = spv_emit_vec4_extract(&c->emit, c->f32_type, value, 3);
-    u32 sum = spv_emit_fadd(&c->emit, c->f32_type, z, w);
+    u32 sum = spv_emit_binary(&c->emit, SPV_OP_F_ADD, c->f32_type, z, w);
     spv_emit_no_contraction(&c->emit, sum);
     u32 half = spv_emit_constant_f32(&c->emit, c->f32_type, 0.5f);
-    u32 depth = spv_emit_fmul(&c->emit, c->f32_type, sum, half);
+    u32 depth = spv_emit_binary(&c->emit, SPV_OP_F_MUL, c->f32_type, sum, half);
     spv_emit_no_contraction(&c->emit, depth);
     value = spv_emit_vec4_insert(&c->emit, vec4_type, value, depth, 2);
     spv_emit_store(&c->emit, position, value);
     spv_emit_branch(&c->emit, merge);
     spv_emit_label(&c->emit, merge);
+    if (c->position_copy) spv_emit_store(&c->emit, c->position_copy, spv_emit_load(&c->emit, vec4_type, position));
+}
+
+/* The fragment's own x and y in clip space over its w, from gl_FragCoord and the draw's viewport 0 (x, y, width and
+   height as the draw sets them, the push constant's third vector: vk/render.c): what a perspective input holding the
+   position reads as over w, with the precision of the rasterizer's position rather than of the host's interpolation
+   of a clipped primitive's inputs (shader.h, SH_VARYING_) */
+void shader_frag_ndc(DirectCtx* c, u32 fragcoord, u32 vec4_type, u32 push, u32 push_pointer, u32 ndc[2]) {
+    u32 coord = spv_emit_load(&c->emit, vec4_type, fragcoord);
+    u32 member = spv_emit_constant_u32(&c->emit, c->u32_type, 2);
+    u32 two = spv_emit_constant_f32(&c->emit, c->f32_type, 2.0f);
+    u32 minus_one = spv_emit_constant_f32(&c->emit, c->f32_type, -1.0f);
+    for (u32 k = 0; k < 2; k++) {
+        u32 origin = spv_emit_push_component_f32(&c->emit, push_pointer, push, member,
+                                                 spv_emit_constant_u32(&c->emit, c->u32_type, k), c->f32_type);
+        u32 extent = spv_emit_push_component_f32(&c->emit, push_pointer, push, member,
+                                                 spv_emit_constant_u32(&c->emit, c->u32_type, k + 2), c->f32_type);
+        u32 from =
+            spv_emit_binary(&c->emit, SPV_OP_F_ADD, c->f32_type, spv_emit_vec4_extract(&c->emit, c->f32_type, coord, k),
+                            spv_emit_unary(&c->emit, SPV_OP_F_NEGATE, c->f32_type, origin));
+        u32 across = spv_emit_binary(&c->emit, SPV_OP_F_MUL, c->f32_type,
+                                     spv_emit_binary(&c->emit, SPV_OP_F_DIV, c->f32_type, from, extent), two);
+        spv_emit_no_contraction(&c->emit, across);
+        ndc[k] = spv_emit_binary(&c->emit, SPV_OP_F_ADD, c->f32_type, across, minus_one);
+        spv_emit_no_contraction(&c->emit, ndc[k]);
+    }
+}
+
+/* A per-vertex input's component at one of the triangle's vertices: at[vertex] is the input's array of the three
+   (PerVertexKHR), or with flat the flat input that holds that vertex's value (SH_VARYING_GEOMETRY) */
+u32 shader_vertex_value(DirectCtx* c, u32 vec4_type, const u32 at[3], int flat, u32 vertex, u32 component) {
+    SpvEmitter* e = &c->emit;
+    if (flat) return spv_emit_vec4_extract(e, c->f32_type, spv_emit_load(e, vec4_type, at[vertex]), component);
+    return spv_emit_load(e, c->f32_type,
+                         spv_emit_interface_scalar_pointer(e, 1, c->f32_type, at[vertex],
+                                                           spv_emit_constant_u32(e, c->u32_type, vertex),
+                                                           spv_emit_constant_u32(e, c->u32_type, component)));
+}
+
+/* The fragment's weights of its triangle's second and third vertices (the first's is what is left of 1), from the
+   three vertices' clip space positions (position, the per-vertex input that holds them) and the fragment's own place
+   (ndc, shader_frag_ndc): with q = (ndc.x, ndc.y, 1) and v the vertices' (x, y, w), vertex i's is q . (vj x vk) over
+   the sum of the three, as Eden's BarycentricVaryingPass has them. They are the weights the console interpolates
+   with, of the primitive as the program gave it and not of what the host's clipping left of it */
+void shader_frag_weights(DirectCtx* c, u32 vec4_type, const u32 position[3], int flat, const u32 ndc[2],
+                         u32 weight[2]) {
+    SpvEmitter* e = &c->emit;
+    u32 f = c->f32_type, v[3][3], edge[3];
+    for (u32 k = 0; k < 3; k++)
+        for (u32 i = 0; i < 3; i++) v[k][i] = shader_vertex_value(c, vec4_type, position, flat, k, i == 2 ? 3 : i);
+    for (u32 k = 0; k < 3; k++) {
+        const u32 *a = v[(k + 1) % 3], *b = v[(k + 2) % 3];
+        u32 cross[3];
+        for (u32 i = 0; i < 3; i++) {
+            u32 j = (i + 1) % 3, l = (i + 2) % 3;
+            cross[i] =
+                spv_emit_binary(e, SPV_OP_F_ADD, f, spv_emit_binary(e, SPV_OP_F_MUL, f, a[j], b[l]),
+                                spv_emit_unary(e, SPV_OP_F_NEGATE, f, spv_emit_binary(e, SPV_OP_F_MUL, f, a[l], b[j])));
+        }
+        edge[k] = spv_emit_binary(
+            e, SPV_OP_F_ADD, f, spv_emit_binary(e, SPV_OP_F_MUL, f, cross[0], ndc[0]),
+            spv_emit_binary(e, SPV_OP_F_ADD, f, spv_emit_binary(e, SPV_OP_F_MUL, f, cross[1], ndc[1]), cross[2]));
+    }
+    u32 sum = spv_emit_binary(e, SPV_OP_F_ADD, f, edge[0], spv_emit_binary(e, SPV_OP_F_ADD, f, edge[1], edge[2]));
+    for (u32 k = 0; k < 2; k++) weight[k] = spv_emit_binary(e, SPV_OP_F_DIV, f, edge[k + 1], sum);
 }
 
 /* a captured word's bits (ShXfb.layout), 0 for one with no output (left as it is, as the extension does) */
@@ -139,7 +209,7 @@ static u32 xfb_word(DirectCtx* c, const XfbOut* x, u32 word) {
         var = x->output_attrs[(word - 32) >> 2];
     if (!var) return 0;
     u32 value = spv_emit_vec4_extract(&c->emit, c->f32_type, spv_emit_load(&c->emit, x->vec4, var), component);
-    return spv_emit_bitcast(&c->emit, c->u32_type, value);
+    return spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->u32_type, value);
 }
 
 /* Transform feedback by stores: a vertex's place is VertexIndex - first + (InstanceIndex - first instance) * the
@@ -150,11 +220,12 @@ static void xfb_write(DirectCtx* c, const XfbOut* x) {
     for (u32 i = 0; i < 5; i++)
         p[i] = spv_emit_load(
             e, u, spv_emit_storage_access_u32(e, x->pointer, x->params, c->zero, spv_emit_constant_u32(e, u, i)));
-    u32 vertex = spv_emit_isub_u32(e, u, spv_emit_load(e, u, x->vertex_index), p[0]);
-    u32 instance = spv_emit_isub_u32(e, u, spv_emit_load(e, u, x->instance_index), p[1]);
-    u32 place = spv_emit_iadd_u32(e, u, vertex, spv_emit_imul_u32(e, u, instance, p[2]));
-    u32 in = spv_emit_bool_binary(e, c->bool_type, 0, spv_emit_u_less(e, c->bool_type, vertex, p[2]), /* and */
-                                  spv_emit_u_less(e, c->bool_type, place, p[3]));
+    u32 vertex = spv_emit_binary(e, SPV_OP_I_SUB, u, spv_emit_load(e, u, x->vertex_index), p[0]);
+    u32 instance = spv_emit_binary(e, SPV_OP_I_SUB, u, spv_emit_load(e, u, x->instance_index), p[1]);
+    u32 place = spv_emit_iadd_u32(e, u, vertex, spv_emit_binary(e, SPV_OP_I_MUL, u, instance, p[2]));
+    u32 in = spv_emit_bool_binary(e, c->bool_type, 0,
+                                  spv_emit_binary(e, SPV_OP_U_LESS_THAN, c->bool_type, vertex, p[2]), /* and */
+                                  spv_emit_binary(e, SPV_OP_U_LESS_THAN, c->bool_type, place, p[3]));
     u32 yes = spv_emit_id(e), done = spv_emit_id(e);
     spv_emit_selection_merge(e, done);
     spv_emit_branch_conditional(e, in, yes, done);
@@ -162,12 +233,13 @@ static void xfb_write(DirectCtx* c, const XfbOut* x) {
     for (u32 b = 0; b < 4; b++) {
         if (!x->buffer[b]) continue;
         /* a buffer that the guest left off has a 16-byte placeholder binding: no store goes there (p[4], the mask) */
-        u32 bit = spv_emit_bitwise_and_u32(e, u, p[4], spv_emit_constant_u32(e, u, 1u << b));
-        u32 on = spv_emit_i_not_equal(e, c->bool_type, bit, c->zero), store = spv_emit_id(e), next = spv_emit_id(e);
+        u32 bit = spv_emit_binary(e, SPV_OP_BITWISE_AND, u, p[4], spv_emit_constant_u32(e, u, 1u << b));
+        u32 on = spv_emit_binary(e, SPV_OP_I_NOT_EQUAL, c->bool_type, bit, c->zero), store = spv_emit_id(e),
+            next = spv_emit_id(e);
         spv_emit_selection_merge(e, next); /* the merge must come just before its branch */
         spv_emit_branch_conditional(e, on, store, next);
         spv_emit_label(e, store);
-        u32 base = spv_emit_imul_u32(e, u, place, spv_emit_constant_u32(e, u, x->key->stride[b] / 4u));
+        u32 base = spv_emit_binary(e, SPV_OP_I_MUL, u, place, spv_emit_constant_u32(e, u, x->key->stride[b] / 4u));
         for (u32 w = 0; w < x->key->count[b] && w < 128; w++) {
             u32 value = xfb_word(c, x, x->key->layout[b][w]);
             if (!value) continue;
@@ -216,12 +288,11 @@ void shader_geometry_passthrough(DirectCtx* c, const ShaderInfo* si, u32 vertice
     u32 saved_layer = layer ? spv_emit_load(&c->emit, layer_type, layer) : 0;
     for (u32 k = 0; k < clip_count; k++)
         saved_clip[k] = spv_emit_load(&c->emit, c->f32_type,
-                                      spv_emit_output_element_pointer(&c->emit, c->f32_type, clip,
-                                                                      spv_emit_constant_u32(&c->emit, c->u32_type, k)));
+                                      spv_emit_output_element_pointer(&c->emit, c->f32_type, clip, shader_u32(c, k)));
     u32 id = spv_emit_load(&c->emit, c->u32_type, primitive_id);
     u32 count = vertices == 4 ? 2 : vertices == 6 ? 3 : vertices;
     for (u32 v = 0; v < count; v++) {
-        u32 index = spv_emit_constant_u32(&c->emit, c->u32_type, vertices == 4 ? v + 1 : vertices == 6 ? v * 2 : v);
+        u32 index = shader_u32(c, vertices == 4 ? v + 1 : vertices == 6 ? v * 2 : v);
         for (u32 a = 0; a < 33; a++) {
             u32 out = a ? outputs[a - 1] : position;
             if (!out) continue;
@@ -231,8 +302,7 @@ void shader_geometry_passthrough(DirectCtx* c, const ShaderInfo* si, u32 vertice
             u32 value = saved[a];
             for (u32 k = 0; k < 4; k++) {
                 if (!(mask & (1u << k))) continue;
-                u32 ptr = spv_emit_interface_scalar_pointer(&c->emit, 1, c->f32_type, in, index,
-                                                            spv_emit_constant_u32(&c->emit, c->u32_type, k));
+                u32 ptr = spv_emit_interface_scalar_pointer(&c->emit, 1, c->f32_type, in, index, shader_u32(c, k));
                 value = spv_emit_vec4_insert(&c->emit, vec4, value, spv_emit_load(&c->emit, c->f32_type, ptr), k);
             }
             spv_emit_store(&c->emit, out, value);
@@ -240,9 +310,7 @@ void shader_geometry_passthrough(DirectCtx* c, const ShaderInfo* si, u32 vertice
         if (point_size) spv_emit_store(&c->emit, point_size, size);
         if (layer) spv_emit_store(&c->emit, layer, saved_layer);
         for (u32 k = 0; k < clip_count; k++)
-            spv_emit_store(&c->emit,
-                           spv_emit_output_element_pointer(&c->emit, c->f32_type, clip,
-                                                           spv_emit_constant_u32(&c->emit, c->u32_type, k)),
+            spv_emit_store(&c->emit, spv_emit_output_element_pointer(&c->emit, c->f32_type, clip, shader_u32(c, k)),
                            saved_clip[k]);
         spv_emit_store(&c->emit, primitive_id_out, id);
         if (position_fix) shader_vertex_position_fix(c, position, push, push_pointer, vec4);
@@ -309,18 +377,15 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
            vertex stage) and the component by its word. An address of no declared input reads 0, as in Eden */
         u32 width = B(w, 47, 2) + 1;
         u32 vertex = between ? shader_shared_index(c, reg_read(c, B(w, 39, 8)), in_vertices) : 0;
-        u32 base = spv_emit_iadd_u32(&c->emit, c->u32_type, reg_read(c, a),
-                                     spv_emit_constant_u32(&c->emit, c->u32_type, B(w, 20, 10)));
-        u32 two = spv_emit_constant_u32(&c->emit, c->u32_type, 2),
-            three = spv_emit_constant_u32(&c->emit, c->u32_type, 3);
-        u32 four = spv_emit_constant_u32(&c->emit, c->u32_type, 4);
+        u32 base = spv_emit_iadd_u32(&c->emit, c->u32_type, reg_read(c, a), shader_u32(c, B(w, 20, 10)));
+        u32 two = shader_u32(c, 2), three = shader_u32(c, 3);
+        u32 four = shader_u32(c, 4);
         for (u32 k = 0; k < width; k++) {
-            u32 offset =
-                k ? spv_emit_iadd_u32(&c->emit, c->u32_type, base, spv_emit_constant_u32(&c->emit, c->u32_type, k * 4))
-                  : base;
-            u32 vector = spv_emit_shift_right_u32(&c->emit, c->u32_type, offset, four);
-            u32 component = spv_emit_bitwise_and_u32(
-                &c->emit, c->u32_type, spv_emit_shift_right_u32(&c->emit, c->u32_type, offset, two), three);
+            u32 offset = k ? spv_emit_iadd_u32(&c->emit, c->u32_type, base, shader_u32(c, k * 4)) : base;
+            u32 vector = spv_emit_binary(&c->emit, SPV_OP_SHIFT_RIGHT_LOGICAL, c->u32_type, offset, four);
+            u32 component =
+                spv_emit_binary(&c->emit, SPV_OP_BITWISE_AND, c->u32_type,
+                                spv_emit_binary(&c->emit, SPV_OP_SHIFT_RIGHT_LOGICAL, c->u32_type, offset, two), three);
             u32 value = c->zero;
             for (u32 v = 0; v <= 32; v++) {
                 u32 variable = v < 32 ? inputs[v] : between ? position_in : 0;
@@ -328,10 +393,11 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
                 u32 type = v < 32 ? input_component_type[v] : c->f32_type;
                 u32 bits = spv_emit_load(
                     &c->emit, type, spv_emit_interface_scalar_pointer(&c->emit, 1, type, variable, vertex, component));
-                if (type != c->u32_type) bits = spv_emit_bitcast(&c->emit, c->u32_type, bits);
-                u32 at = spv_emit_constant_u32(&c->emit, c->u32_type, v < 32 ? 8 + v : 7);
-                value = spv_emit_select(&c->emit, c->u32_type, spv_emit_i_equal(&c->emit, c->bool_type, vector, at),
-                                        bits, value);
+                if (type != c->u32_type) bits = spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->u32_type, bits);
+                u32 at = shader_u32(c, v < 32 ? 8 + v : 7);
+                value =
+                    spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->u32_type,
+                                     spv_emit_binary(&c->emit, SPV_OP_I_EQUAL, c->bool_type, vector, at), bits, value);
             }
             reg_write(c, d + k, value);
         }
@@ -342,20 +408,19 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
         if (!patch) vertex = shader_shared_index(c, reg_read(c, B(w, 39, 8)), output ? out_vertices : in_vertices);
         for (k = 0; k < width; k++) {
             u32 location = addr + k * 4, value = c->zero, pointer = 0, storage;
-            u32 component = spv_emit_constant_u32(&c->emit, c->u32_type, (location >> 2) & 3);
+            u32 component = shader_u32(c, (location >> 2) & 3);
             if (patch) { /* the control program reads back what it wrote */
                 storage = stage == ST_TCS ? 3 : 1;
                 if (location >= 0x20)
                     pointer = spv_emit_interface_scalar_pointer(&c->emit, storage, c->f32_type,
                                                                 patch_vars[(location - 0x20) >> 4], 0, component);
                 else if (location < 0x18)
-                    pointer = spv_emit_interface_scalar_pointer(
-                        &c->emit, storage, c->f32_type, location < 0x10 ? tess_outer : tess_inner, 0,
-                        spv_emit_constant_u32(&c->emit, c->u32_type, (location & 0xf) / 4));
+                    pointer = spv_emit_interface_scalar_pointer(&c->emit, storage, c->f32_type,
+                                                                location < 0x10 ? tess_outer : tess_inner, 0,
+                                                                shader_u32(c, (location & 0xf) / 4));
             } else if (location == 0x2f0 || location == 0x2f4)
-                pointer = spv_emit_interface_scalar_pointer(
-                    &c->emit, 1, c->f32_type, tess_coord, 0,
-                    spv_emit_constant_u32(&c->emit, c->u32_type, (location - 0x2f0) / 4));
+                pointer = spv_emit_interface_scalar_pointer(&c->emit, 1, c->f32_type, tess_coord, 0,
+                                                            shader_u32(c, (location - 0x2f0) / 4));
             else if (location == 0x60)
                 value = primitive_read(c, primitive_id);
             else if (location == 0x6c) {
@@ -367,8 +432,8 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
             } else if (location >= 0x2c0 && location < 0x2e0) {
                 u32 variable = output ? clip_output : t->clip_input;
                 if (variable)
-                    pointer = spv_emit_interface_scalar_pointer(&c->emit, output ? 3 : 1, c->f32_type, variable,
-                         vertex, spv_emit_constant_u32(&c->emit, c->u32_type, (location - 0x2c0) / 4));
+                    pointer = spv_emit_interface_scalar_pointer(&c->emit, output ? 3 : 1, c->f32_type, variable, vertex,
+                                                                shader_u32(c, (location - 0x2c0) / 4));
             }
             else if (output)
                 pointer = spv_emit_interface_scalar_pointer(
@@ -378,7 +443,9 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
                 pointer = spv_emit_interface_scalar_pointer(
                     &c->emit, 1, c->f32_type, location < 0x80 ? position_in : inputs[(location - 0x80) >> 4], vertex,
                     component);
-            if (pointer) value = spv_emit_bitcast(&c->emit, c->u32_type, spv_emit_load(&c->emit, c->f32_type, pointer));
+            if (pointer)
+                value = spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->u32_type,
+                                       spv_emit_load(&c->emit, c->f32_type, pointer));
             reg_write(c, d + k, value);
         }
     } else if (op == O_ALD) {
@@ -391,13 +458,13 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
                     instance = spv_emit_load(&c->emit, c->u32_type, instance_index);
                     u32 base_bits =
                         spv_emit_push_component_f32(&c->emit, push_pointer, push, c->zero, c->zero, c->f32_type);
-                    u32 base = spv_emit_bitcast(&c->emit, c->u32_type, base_bits);
+                    u32 base = spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->u32_type, base_bits);
                     /* with draw parameters the push holds what the draw's first instance adds to the base
                        instance (render.c), which BaseInstance gives */
                     if (base_instance)
-                        base = spv_emit_isub_u32(&c->emit, c->u32_type,
-                                                 spv_emit_load(&c->emit, c->u32_type, base_instance), base);
-                    instance = spv_emit_isub_u32(&c->emit, c->u32_type, instance, base);
+                        base = spv_emit_binary(&c->emit, SPV_OP_I_SUB, c->u32_type,
+                                               spv_emit_load(&c->emit, c->u32_type, base_instance), base);
+                    instance = spv_emit_binary(&c->emit, SPV_OP_I_SUB, c->u32_type, instance, base);
                 } else
                     instance = spv_emit_load(&c->emit, c->u32_type, vertex_index);
                 reg_write(c, d + k, instance);
@@ -405,8 +472,9 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
                 u32 vector = spv_emit_load(&c->emit, input_vec_type[index], inputs[index]);
                 u32 value = spv_emit_vec4_extract(&c->emit, input_component_type[index], vector, (location >> 2) & 3);
                 reg_write(c, d + k,
-                          input_component_type[index] == c->u32_type ? value
-                                                                     : spv_emit_bitcast(&c->emit, c->u32_type, value));
+                          input_component_type[index] == c->u32_type
+                              ? value
+                              : spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->u32_type, value));
             }
         }
     } else if (op == O_AST && (stage == ST_TCS || B(w, 31, 1))) {
@@ -417,14 +485,14 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
             u32 location = addr + k * 4, pointer = 0;
             /* A later evaluation stage makes the control program's layer and viewport outputs inert. */
             if (!B(w, 31, 1) && (location == 0x64 || location == 0x68)) continue;
-            u32 component = spv_emit_constant_u32(&c->emit, c->u32_type, (location >> 2) & 3);
+            u32 component = shader_u32(c, (location >> 2) & 3);
             if (!B(w, 31, 1) && location == 0x6c && point_size) {
                 u32 type = spv_emit_type_pointer(&c->emit, 3, c->f32_type);
                 pointer = SPV(&c->emit, SPV_OP_ACCESS_CHAIN, type, point_size, vertex);
             } else if (!B(w, 31, 1) && location >= 0x2c0 && location < 0x2e0) {
                 if (clip_output && (clip_used & (1u << ((location - 0x2c0) / 4))))
                     pointer = spv_emit_interface_scalar_pointer(&c->emit, 3, c->f32_type, clip_output, vertex,
-                        spv_emit_constant_u32(&c->emit, c->u32_type, (location - 0x2c0) / 4));
+                                                                shader_u32(c, (location - 0x2c0) / 4));
             } else if (!B(w, 31, 1))
                 pointer = spv_emit_interface_scalar_pointer(
                     &c->emit, location >= 0x80 && attr_private[(location - 0x80) >> 4] ? 6 : 3, c->f32_type,
@@ -433,9 +501,9 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
                 pointer = spv_emit_interface_scalar_pointer(&c->emit, 3, c->f32_type,
                                                             patch_vars[(location - 0x20) >> 4], 0, component);
             else if (location < 0x18)
-                pointer = spv_emit_interface_scalar_pointer(
-                    &c->emit, 3, c->f32_type, location < 0x10 ? tess_outer : tess_inner, 0,
-                    spv_emit_constant_u32(&c->emit, c->u32_type, (location & 0xf) / 4));
+                pointer = spv_emit_interface_scalar_pointer(&c->emit, 3, c->f32_type,
+                                                            location < 0x10 ? tess_outer : tess_inner, 0,
+                                                            shader_u32(c, (location & 0xf) / 4));
             if (pointer) spv_emit_store(&c->emit, pointer, reg_read_as(c, d + k, c->f32_type));
         }
     } else if (op == O_AST) {
@@ -461,8 +529,7 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
             if (location >= 0x2c0) {
                 u32 index = (location - 0x2c0) / 4;
                 if (clip_used & (1u << index)) {
-                    u32 ptr = spv_emit_output_element_pointer(&c->emit, c->f32_type, clip_output,
-                                                              spv_emit_constant_u32(&c->emit, c->u32_type, index));
+                    u32 ptr = spv_emit_output_element_pointer(&c->emit, c->f32_type, clip_output, shader_u32(c, index));
                     spv_emit_store(&c->emit, ptr, reg_read_as(c, d + k, c->f32_type));
                 }
                 continue;
@@ -474,16 +541,15 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
             spv_emit_store(&c->emit, variable, vector);
         }
     } else if (op == O_OUT_R || op == O_OUT_C || op == O_OUT_I) {
-        u32 stream = op == O_OUT_I ? spv_emit_constant_u32(&c->emit, c->u32_type, B(w, 20, 2))
+        u32 stream = op == O_OUT_I   ? shader_u32(c, B(w, 20, 2))
                      : op == O_OUT_C ? shader_cbuf_word(c, w)
-                                        : reg_read(c, b);
-        stream = spv_emit_bitwise_and_u32(&c->emit, c->u32_type, stream,
-                                           spv_emit_constant_u32(&c->emit, c->u32_type, 3));
+                                     : reg_read(c, b);
+        stream = spv_emit_binary(&c->emit, SPV_OP_BITWISE_AND, c->u32_type, stream, shader_u32(c, 3));
         for (u32 target = 0; target < 4; target++) {
             if (target && !(t->stream_mask & (1u << target))) continue;
-            u32 literal = spv_emit_constant_u32(&c->emit, c->u32_type, target);
+            u32 literal = shader_u32(c, target);
             u32 emit_label = spv_emit_id(&c->emit), merge = spv_emit_id(&c->emit);
-            u32 selected = spv_emit_i_equal(&c->emit, c->bool_type, stream, literal);
+            u32 selected = spv_emit_binary(&c->emit, SPV_OP_I_EQUAL, c->bool_type, stream, literal);
             spv_emit_selection_merge(&c->emit, merge);
             spv_emit_branch_conditional(&c->emit, selected, emit_label, merge);
             spv_emit_label(&c->emit, emit_label);
@@ -511,11 +577,11 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
                             else if (attr == 27 && point_size)
                                 value = spv_emit_load(&c->emit, c->f32_type, point_size);
                             else if (attr == 25 && layer_output)
-                                value = spv_emit_bitcast(&c->emit, c->f32_type,
-                                                          spv_emit_load(&c->emit, i32_type, layer_output));
+                                value = spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->f32_type,
+                                                       spv_emit_load(&c->emit, i32_type, layer_output));
                             else if (attr == 26 && viewport_output)
-                                value = spv_emit_bitcast(&c->emit, c->f32_type,
-                                                          spv_emit_load(&c->emit, i32_type, viewport_output));
+                                value = spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->f32_type,
+                                                       spv_emit_load(&c->emit, i32_type, viewport_output));
                             spv_emit_store(&c->emit, variable, value);
                         }
                     }
@@ -533,7 +599,7 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
         }
         reg_write(c, d, c->zero);
     } else if (op == O_AL2P) {
-        u32 offset = spv_emit_constant_u32(&c->emit, c->u32_type, B(w, 20, 11));
+        u32 offset = shader_u32(c, B(w, 20, 11));
         reg_write(c, d, spv_emit_iadd_u32(&c->emit, c->u32_type, reg_read(c, a), offset));
     } else if (op == O_ISBERD) {
         reg_write(c, d, reg_read(c, a));
@@ -542,13 +608,12 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
            mode by its vector (one nothing feeds reads 0, 0, 0, 1) and interpolated in its own mode, then the
            instruction's mode and saturation, as below */
         u32 offset = reg_read(c, a);
-        u32 vector =
-            spv_emit_shift_right_u32(&c->emit, c->u32_type, offset, spv_emit_constant_u32(&c->emit, c->u32_type, 4));
-        u32 component = spv_emit_bitwise_and_u32(
-            &c->emit, c->u32_type,
-            spv_emit_shift_right_u32(&c->emit, c->u32_type, offset, spv_emit_constant_u32(&c->emit, c->u32_type, 2)),
-            spv_emit_constant_u32(&c->emit, c->u32_type, 3));
-        u32 last = spv_emit_i_equal(&c->emit, c->bool_type, component, spv_emit_constant_u32(&c->emit, c->u32_type, 3));
+        u32 vector = spv_emit_binary(&c->emit, SPV_OP_SHIFT_RIGHT_LOGICAL, c->u32_type, offset, shader_u32(c, 4));
+        u32 component = spv_emit_binary(
+            &c->emit, SPV_OP_BITWISE_AND, c->u32_type,
+            spv_emit_binary(&c->emit, SPV_OP_SHIFT_RIGHT_LOGICAL, c->u32_type, offset, shader_u32(c, 2)),
+            shader_u32(c, 3));
+        u32 last = spv_emit_binary(&c->emit, SPV_OP_I_EQUAL, c->bool_type, component, shader_u32(c, 3));
         u32 wcoord =
             fragcoord ? spv_emit_vec4_extract(&c->emit, c->f32_type, spv_emit_load(&c->emit, vec4, fragcoord), 3) : 0;
         u32 value = zero_f;
@@ -560,19 +625,18 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
                     spv_emit_load(&c->emit, c->f32_type,
                                   spv_emit_interface_scalar_pointer(&c->emit, 1, c->f32_type, inputs[v], 0, component));
                 if (shader_ipa_interpolation(sph, v) == 2 && wcoord) {
-                    bits = spv_emit_fmul(&c->emit, c->f32_type, bits, wcoord);
+                    bits = spv_emit_binary(&c->emit, SPV_OP_F_MUL, c->f32_type, bits, wcoord);
                     spv_emit_no_contraction(&c->emit, bits);
                 }
             } else /* no output feeds it (in_unfed_mask) */
-                bits = spv_emit_select(&c->emit, c->f32_type, last, spv_emit_constant_f32(&c->emit, c->f32_type, 1.0f),
-                                       zero_f);
-            value = spv_emit_select(
-                &c->emit, c->f32_type,
-                spv_emit_i_equal(&c->emit, c->bool_type, vector, spv_emit_constant_u32(&c->emit, c->u32_type, 8 + v)),
-                bits, value);
+                bits = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->f32_type, last,
+                                        spv_emit_constant_f32(&c->emit, c->f32_type, 1.0f), zero_f);
+            value = spv_emit_ternary(
+                &c->emit, SPV_OP_SELECT, c->f32_type,
+                spv_emit_binary(&c->emit, SPV_OP_I_EQUAL, c->bool_type, vector, shader_u32(c, 8 + v)), bits, value);
         }
         if (B(w, 54, 2) == 1) {
-            value = spv_emit_fmul(&c->emit, c->f32_type, value, reg_read_as(c, b, c->f32_type));
+            value = spv_emit_binary(&c->emit, SPV_OP_F_MUL, c->f32_type, value, reg_read_as(c, b, c->f32_type));
             spv_emit_no_contraction(&c->emit, value);
         }
         value = shader_float_saturate(c, value, B(w, 51, 1));
@@ -583,36 +647,56 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
         u32 value;
         u32 interpolation = 0;
         if (addr == 0x64) {
-            value = layer_input ? spv_emit_bitcast(&c->emit, c->f32_type,
-                                                   spv_emit_bitcast(&c->emit, c->u32_type,
-                                                                    spv_emit_load(&c->emit, i32_type, layer_input)))
-                                : spv_emit_bitcast(&c->emit, c->f32_type, c->zero); /* no capability: layer 0 */
+            value = layer_input
+                        ? spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->f32_type,
+                                         spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->u32_type,
+                                                        spv_emit_load(&c->emit, i32_type, layer_input)))
+                        : spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->f32_type, c->zero); /* no capability: layer 0 */
         } else if (addr == 0x3fc) {
             u32 facing = spv_emit_load(&c->emit, c->bool_type, frontface);
-            u32 bits = spv_emit_select(&c->emit, c->u32_type, facing,
-                                       spv_emit_constant_u32(&c->emit, c->u32_type, 0xffffffffu), c->zero);
-            value = spv_emit_bitcast(&c->emit, c->f32_type, bits);
+            u32 bits =
+                spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->u32_type, facing, shader_u32(c, 0xffffffffu), c->zero);
+            value = spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->f32_type, bits);
         } else if (addr == 0x60) {
-            value = spv_emit_bitcast(&c->emit, c->f32_type,
-                                     primitive_read(c, primitive_id));
+            value = spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->f32_type, primitive_read(c, primitive_id));
         } else if (addr == 0x2e0 || addr == 0x2e4) {
             value = spv_emit_vec4_extract(&c->emit, c->f32_type, spv_emit_load(&c->emit, vec2, point_coord), component);
             if (addr == 0x2e4) { /* T flips with the sprite's origin, a push constant (see vk/render.c) */
-                u32 flip = spv_emit_push_component_f32(&c->emit, push_pointer, push, c->zero,
-                                                       spv_emit_constant_u32(&c->emit, c->u32_type, 3), c->f32_type);
-                u32 flipped = spv_emit_fadd(&c->emit, c->f32_type, spv_emit_constant_f32(&c->emit, c->f32_type, 1.0f),
-                                            spv_emit_fnegate(&c->emit, c->f32_type, value));
-                value = spv_emit_select(&c->emit, c->f32_type,
-                                        spv_emit_fcompare(&c->emit, c->bool_type, 5, flip, zero_f), flipped, value);
+                u32 flip =
+                    spv_emit_push_component_f32(&c->emit, push_pointer, push, c->zero, shader_u32(c, 3), c->f32_type);
+                u32 flipped = spv_emit_binary(&c->emit, SPV_OP_F_ADD, c->f32_type,
+                                              spv_emit_constant_f32(&c->emit, c->f32_type, 1.0f),
+                                              spv_emit_unary(&c->emit, SPV_OP_F_NEGATE, c->f32_type, value));
+                value = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->f32_type,
+                                         spv_emit_fcompare(&c->emit, c->bool_type, 5, flip, zero_f), flipped, value);
             }
         } else if (addr >= 0x80) {
             u32 input = (addr - 0x80) >> 4;
-            if (inputs[input]) {
+            interpolation = shader_ipa_interpolation(sph, input);
+            if (shader_ipa_position(t->pos_in, sph, addr)) {
+                /* the position over its w (SH_VARYING_): the fragment's own x and y, and 1 */
+                value = component == 3 ? spv_emit_constant_f32(&c->emit, c->f32_type, 1.0f) : t->frag_ndc[component];
+                interpolation = 0;
+            } else if (input < 32 && (t->pv_mask >> input & 1)) {
+                /* its three vertices' values: the first's, and the others' differences from it by their weights, so
+                   that a value the three share comes out as it is (Eden: one game truncates such an input) */
+                const u32 from[3] = {inputs[input], t->pv_flat ? t->pv_copy[input][0] : inputs[input],
+                                     t->pv_flat ? t->pv_copy[input][1] : inputs[input]};
+                u32 at[3];
+                for (u32 k = 0; k < 3; k++) at[k] = shader_vertex_value(c, vec4, from, t->pv_flat, k, component);
+                value = at[0];
+                for (u32 k = 1; k < 3; k++) {
+                    u32 past = spv_emit_binary(&c->emit, SPV_OP_F_ADD, c->f32_type, at[k],
+                                               spv_emit_unary(&c->emit, SPV_OP_F_NEGATE, c->f32_type, at[0]));
+                    value = spv_emit_binary(
+                        &c->emit, SPV_OP_F_ADD, c->f32_type, value,
+                        spv_emit_binary(&c->emit, SPV_OP_F_MUL, c->f32_type, t->pv_weight[k - 1], past));
+                }
+            } else if (inputs[input]) {
                 value = spv_emit_load(&c->emit, vec4, inputs[input]);
                 value = spv_emit_vec4_extract(&c->emit, c->f32_type, value, component);
             } else /* no output feeds it (in_unfed_mask) */
                 value = spv_emit_constant_f32(&c->emit, c->f32_type, component == 3 ? 1.0f : 0.0f);
-            interpolation = shader_ipa_interpolation(sph, input);
         }
         if (addr >= 0x70 && addr < 0x80) {
             u32 coord = spv_emit_load(&c->emit, vec4, fragcoord);
@@ -620,10 +704,10 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
             /* a[0x7c] is the interpolated 1/w, FragCoord.w as it is: shaders take its reciprocal for
                IPA.MUL */
             if (addr != 0x7c && needs_scale && component < 2) {
-                u32 zero_index = spv_emit_constant_u32(&c->emit, c->u32_type, 0);
+                u32 zero_index = shader_u32(c, 0);
                 u32 scale = spv_emit_uniform_component(&c->emit, c->scale_pointer, c->scale_buffer, zero_index,
                                                        zero_index, zero_index, c->f32_type);
-                value = spv_emit_fmul(&c->emit, c->f32_type, value, scale);
+                value = spv_emit_binary(&c->emit, SPV_OP_F_MUL, c->f32_type, value, scale);
                 spv_emit_no_contraction(&c->emit, value);
             }
             if (addr == 0x74) value = shader_frag_y_origin(c, push, value);
@@ -633,12 +717,12 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
                interpolated 1/w, FragCoord.w, it is what the hardware gives. */
             u32 coord = spv_emit_load(&c->emit, vec4, fragcoord);
             u32 wcoord = spv_emit_vec4_extract(&c->emit, c->f32_type, coord, 3);
-            value = spv_emit_fmul(&c->emit, c->f32_type, value, wcoord);
+            value = spv_emit_binary(&c->emit, SPV_OP_F_MUL, c->f32_type, value, wcoord);
             spv_emit_no_contraction(&c->emit, value);
         }
         if (B(w, 54, 2) == 1) {
             u32 rhs = reg_read_as(c, b, c->f32_type);
-            value = spv_emit_fmul(&c->emit, c->f32_type, value, rhs);
+            value = spv_emit_binary(&c->emit, SPV_OP_F_MUL, c->f32_type, value, rhs);
             spv_emit_no_contraction(&c->emit, value);
         }
         value = shader_float_saturate(c, value, B(w, 51, 1));

@@ -68,14 +68,22 @@ extern int g_opt_fps;                              /* atomic: the game's threads
 void fps_limit_text(int fps, char* out, size_t n); /* g_opt_fps as fps_limit's value: "game", "0", "30"... */
 
 /* The TV mode in effect now: 0 handheld, 1 TV (docked). docked's Auto asks the host's power state, and
-   options_tv_mode_update keeps g_settings.tv_mode at the mode it picks */
-static inline int snx_tv_mode(void) { return g_settings.tv_mode; }
+   options_tv_mode_update keeps g_settings.tv_mode at the mode it picks from the frontend's thread, while the game's
+   threads read it */
+static inline int snx_tv_mode(void) { return __atomic_load_n(&g_settings.tv_mode, __ATOMIC_RELAXED); }
 /* docked's set function: 0 Off, 1 On, 2 Auto, which picks the mode in effect now */
 void options_tv_mode_set(const IniOpt* o, const char* v);
 /* starts the host's power watcher and logs the mode Auto picks, once the window backend is up */
 void options_tv_mode_start(void);
-/* the watcher's change, each frame: the new mode, its events, and the log line when it changed */
+/* the frontend's tick: a step's new mode told to the services; Auto's watcher's change, its events and its log line */
 void options_tv_mode_update(void);
+/* the choice in effect: docked's (0 Off, 1 On, 2 Auto) until a step changes it */
+int options_tv_mode_choice(void);
+/* hotkey_tv_mode's and the game's menu's TV mode row's, on the frontend's thread: the next choice round On, Off and
+   Auto (step < 0 the other way), in effect at once and for this run only, the .ini's docked as it was. Its line in the
+   log, the same words in text (size bytes, 0 for none), and the choice. The services hear of a new mode on the next
+   options_tv_mode_update: the menu's pads step it under the input's lock, which hid's change takes */
+int options_tv_mode_step(int step, char* text, size_t size);
 /* ldn, read: local wireless over the LAN (ldn_mitm's protocol), through an Eden room, or off
    (hle/services/network/ldn.c) */
 enum { SNX_OPT_LDN_LAN, SNX_OPT_LDN_ROOM, SNX_OPT_LDN_OFF };

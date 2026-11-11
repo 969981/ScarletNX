@@ -515,13 +515,30 @@ void kthread_destroy(KObj* o) {
 }
 
 /* a thread that hasn't started, entering at entry with arg in x0 (r0) and sp at stack_top, its return address 0, from
-   g_hle.thread.threads (KTHREAD_MAX). It stays valid while a reference to it is held */
-KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core) {
-    KThread* t;
+   g_hle.thread.threads (KTHREAD_MAX). It stays valid while a reference to it is held. A process that has THREAD_MAX
+   threads that haven't exited gets LimitReached, counted and taken under g_klock so that two creations can't both
+   take the last one; with every slot in use (exited threads keep theirs while a handle to them is open) it gets
+   OutOfResource. The console counts an exited thread until its last handle closes, and has a creation wait 100 ms
+   for that: here it stops counting as it exits, so no creation the console lets through is refused. An Ounce
+   program's limit isn't known, and none is refused for it */
+u32 kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core, KThread** out) {
+    KThread* t = NULL;
+    int i, live = 0;
+    *out = NULL;
+    pm_lock(&g_host.kernel.klock);
     pm_lock(&g_host.kernel.pool_lk);
-    t = (KThread*)POOL_TAKE(g_hle.thread.threads, g_hle.thread.thread_next, "threads");
-    t->o.type = KO_THREAD;
+    for (i = 0; i < KTHREAD_MAX; i++)
+        if (g_hle.thread.threads[i].o.type == KO_THREAD && g_hle.thread.threads[i].state != 2) live++;
+    if (live < THREAD_MAX || g_ounce) t = (KThread*)POOL_TRY(g_hle.thread.threads, g_hle.thread.thread_next);
+    if (t) t->o.type = KO_THREAD;
     pm_unlock(&g_host.kernel.pool_lk);
+    klock_unlock();
+    if (!t) return live < THREAD_MAX || g_ounce ? SNX_RC_SVC_OUT_OF_RESOURCE : SNX_RC_SVC_LIMIT_REACHED;
+    if (live >= THREAD_MAX)
+        WARN_LIMIT(1,
+                   "kernel: thread %d of an Ounce program, past the %d a console application may have: its own "
+                   "limit isn't known here, so it is made\n",
+                   live + 1, THREAD_MAX);
     /* a slot's earlier thread may have ended inside an SVC, as a save state's load ends them where they stopped */
     __atomic_store_n(&g_host.thread.handed[kt_ix(t) - 1], 0, __ATOMIC_RELAXED);
     kobj_set_name(&t->o, "thread");
@@ -537,8 +554,6 @@ KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core) {
     t->id = g_hle.kernel.next_tid++;
     t->tls = tls_alloc_nl();
     klock_unlock();
-    if (kthread_live_count() > THREAD_MAX)
-        WARN_LIMIT(1, "kernel: more than %d threads, the console's limit\n", THREAD_MAX);
 
     t->cpu.mem = g_mem;
     t->cpu.disp = g_disp;
@@ -561,7 +576,8 @@ KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core) {
         a->tpidruro = (u32)t->tls;
         a->rt = &g_arm_rt;
     }
-    return t;
+    *out = t;
+    R_SUCCEED();
 }
 
 /* An Ounce program's thread finds its own handle at 0x110 of its TLS, where the Ounce's kernel puts it: no code of the
@@ -601,12 +617,16 @@ static void thread_main(void* p) {
     __atomic_add_fetch(&g_host.thread.nhost, 1, __ATOMIC_ACQ_REL);
     thread_run(t, t->entry);
 }
-/* the host thread holds a reference from here until svc_exit_thread */
-void kthread_start(KThread* t) {
-    kobj_ref(&t->o);
+/* the host thread holds a reference from here until svc_exit_thread. The state is read and set in one hold of the
+   lock: of two StartThread calls on one handle, the second finds the thread started and gets InvalidState */
+u32 kthread_start(KThread* t) {
+    int state;
     pm_lock(&g_host.kernel.klock);
-    t->state = 1;
+    state = t->state;
+    if (state == 0) t->state = 1;
     klock_unlock();
+    R_UNLESS(state == 0, SNX_RC_SVC_INVALID_STATE);
+    kobj_ref(&t->o);
     LOGV("StartThread %llu entry=%llx prio=%d core=%d\n", (unsigned long long)t->id, (unsigned long long)t->entry,
          t->prio, t->core);
     {
@@ -623,6 +643,7 @@ void kthread_start(KThread* t) {
                   strerror(reason));
         }
     }
+    R_SUCCEED();
 }
 /* svcExitThread: the thread's waiters (joins) are woken, and its core goes to the next thread. Then its host thread
    lets go of it: its last use of the KThread, which may be freed with that reference */
@@ -867,7 +888,8 @@ void kernel_run_main(u64 entry, u64 stack_size, int prio, int core) {
         fatal("No room for the main thread's stack (%llu KiB)", (unsigned long long)(stack_size >> 10));
     g_main_stack_size = stack_size;
     g_hle.thread.default_core = core;
-    t = kthread_create(entry, 0, stack + stack_size, prio, core);
+    if (kthread_create(entry, 0, stack + stack_size, prio, core, &t))
+        fatal("No thread slot for the main thread: all %d are in use", KTHREAD_MAX);
     memcpy(t->name, "main", 5);
     g_hle.thread.main_tid = t->id;
     h = h_new(&t->o);
@@ -876,7 +898,7 @@ void kernel_run_main(u64 entry, u64 stack_size, int prio, int core) {
     t->arm.r[1] = h;
     LOG("main thread: entry %llx, stack %llx (%llu KiB), priority %d, core %d\n", (unsigned long long)entry,
         (unsigned long long)stack, (unsigned long long)(stack_size >> 10), prio, core);
-    kthread_start(t);
+    (void)kthread_start(t); /* made above: it has not started */
 }
 
 /* svcExitProcess, and the game's end however it comes: what the runtime keeps across runs is saved first, as the

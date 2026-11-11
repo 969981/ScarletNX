@@ -88,12 +88,13 @@ static int user_writable(u64 a, u64 size) {
    boards; 12, and an Ounce game, an experimental 10 GiB budget, more than the older console's pool), see
    docs/platforms/nx/memory-accounting.md */
 static int large(void) { return g_settings.memory_gb >= 12 || g_ounce; }
-static u64 pool(void) {
-    if (large()) return 10ull << 30;
-    if (g_settings.memory_gb >= 8) return 6964 * MIB;
-    if (g_settings.memory_gb >= 6) return 4916 * MIB;
+static u64 pool_of(int memory_gb) {
+    if (memory_gb >= 12 || g_ounce) return 10ull << 30;
+    if (memory_gb >= 8) return 6964 * MIB;
+    if (memory_gb >= 6) return 4916 * MIB;
     return 3285 * MIB;
 }
+static u64 pool(void) { return pool_of(g_settings.memory_gb); }
 u64 mem_total(void) {
     u64 total = pool();
     return g_hle.svcmem.fit && g_hle.svcmem.fit < total ? g_hle.svcmem.fit : total;
@@ -101,22 +102,23 @@ u64 mem_total(void) {
 /* the most memory a process may have: Mesosphere's m_max_process_memory, the heap region's size. A 32-bit process
    gets 2 GiB without an alias region and 1 GiB with one, however large the application pool is; a game that asks
    GetInfo for the total and sets its heap to nearly all of it would otherwise ask for more than its heap region */
-static u64 process_memory_total(void) {
-    u64 total = mem_total();
-    return total < HEAP_SIZE ? total : HEAP_SIZE;
-}
+static u64 reach(u64 total) { return total < HEAP_SIZE ? total : HEAP_SIZE; }
+static u64 process_memory_total(void) { return reach(mem_total()); }
 /* what the game may have of what the process can reach: the rest takes the runtime as it is now and the graphics'
    first allocations, never less than a phone's run measured, and the game keeps a GiB however little is left */
 #define FIT_GRAPHICS    (256 * MIB)
 #define FIT_OTHER_LEAST (700 * MIB)
 #define FIT_LEAST       (1024 * MIB)
+static u64 fit_other(u64 footprint) {
+    u64 other = footprint + FIT_GRAPHICS;
+    return other < FIT_OTHER_LEAST ? FIT_OTHER_LEAST : other;
+}
 u64 mem_fit_budget(u64 available, u64 footprint) {
-    u64 limit = available + footprint, other = footprint + FIT_GRAPHICS;
-    if (other < FIT_OTHER_LEAST) other = FIT_OTHER_LEAST;
+    u64 limit = available + footprint, other = fit_other(footprint);
     return limit > other + FIT_LEAST ? limit - other : FIT_LEAST;
 }
 void mem_fit(int measured, u64 available, u64 footprint) {
-    g_hle.svcmem.fit = 0;
+    g_hle.svcmem.fit = g_hle.svcmem.fit_available = g_hle.svcmem.fit_footprint = 0;
     if (!measured) {
         LOG("memory: memory_fit_mode=0 (Auto), but this system tells neither what it can still give nor what the process holds: "
             "the game is told the console's %llu MiB\n",
@@ -124,11 +126,49 @@ void mem_fit(int measured, u64 available, u64 footprint) {
         return;
     }
     g_hle.svcmem.fit = mem_fit_budget(available, footprint);
+    g_hle.svcmem.fit_available = available;
+    g_hle.svcmem.fit_footprint = footprint;
     LOG("memory: memory_fit_mode=0 (Auto): the game is told %llu MiB, the console's being %llu (the system can still give %llu MiB, "
         "the process holds %llu)\n",
-        (unsigned long long)(process_memory_total() >> 20),
-        (unsigned long long)((pool() < HEAP_SIZE ? pool() : HEAP_SIZE) >> 20), (unsigned long long)(available >> 20),
-        (unsigned long long)(footprint >> 20));
+        (unsigned long long)(process_memory_total() >> 20), (unsigned long long)(reach(pool()) >> 20),
+        (unsigned long long)(available >> 20), (unsigned long long)(footprint >> 20));
+}
+void mem_gb_said(void) {
+    if (g_ounce && g_settings.memory_gb)
+        LOG("memory: memory_gb=%d does not change an Ounce game's memory: it is told %llu MiB\n", g_settings.memory_gb,
+            (unsigned long long)(process_memory_total() >> 20));
+}
+int mem_short_hint(char* out, size_t size) {
+    u64 told = process_memory_total(), console = reach(pool()), fit = g_hle.svcmem.fit;
+    u64 available = g_hle.svcmem.fit_available;
+    out[0] = 0;
+    if (fit && fit < console) {
+        /* the least the system has to give for mem_fit_budget to reach the console's amount, rounded up */
+        u64 enough = console + fit_other(g_hle.svcmem.fit_footprint) - g_hle.svcmem.fit_footprint + MIB - 1;
+        snprintf(out, size,
+                 "It was told %llu MiB of the console's %llu: memory_fit_mode=0 (Auto) measured %llu MiB the system "
+                 "could still give as the game started. memory_fit_mode=1 (Off) in its .ini tells it %llu MiB whatever "
+                 "the system can give, and Auto does once the system can still give %llu MiB",
+                 (unsigned long long)(told >> 20), (unsigned long long)(console >> 20),
+                 (unsigned long long)(available >> 20), (unsigned long long)(console >> 20),
+                 (unsigned long long)(enough >> 20));
+        return 1;
+    }
+    if (g_settings.memory_gb < 6) {
+        u64 six = reach(pool_of(6)), with_six = fit && fit < six ? fit : six;
+        if (with_six <= told) return 0; /* an Ounce game's pool, or a 32-bit process's heap region, is the same at 6 */
+        if (with_six < six)
+            snprintf(out, size,
+                     "It was told %llu MiB (memory_gb=%d): memory_gb=6 in its .ini tells it %llu MiB of its %llu, as "
+                     "memory_fit_mode=0 (Auto) measured %llu MiB the system could still give as the game started",
+                     (unsigned long long)(told >> 20), g_settings.memory_gb, (unsigned long long)(with_six >> 20),
+                     (unsigned long long)(six >> 20), (unsigned long long)(available >> 20));
+        else
+            snprintf(out, size, "It was told %llu MiB (memory_gb=%d): memory_gb=6 in its .ini tells it %llu MiB",
+                     (unsigned long long)(told >> 20), g_settings.memory_gb, (unsigned long long)(six >> 20));
+        return 1;
+    }
+    return 0;
 }
 /* the loaded images, the main thread's stack, the heap, physical memory and the system resource, charged once */
 u64 used_memory(void) {
@@ -709,9 +749,15 @@ static u32 svc_tmem_new_impl(u64 addr, u64 size, u32 perm, KTmem** out) {
     if (!in_region(addr, size, 0, AS_END) || !range_ok(addr, size, 0, MSF_CAN_TRANSFER, PERM_RW, ~0u, 0))
         R_THROW(SNX_RC_SVC_INVALID_CURRENT_MEMORY);
     pm_lock(&g_host.kernel.pool_lk);
-    m = (KTmem*)POOL_TAKE(g_hle.svcmem.tmems, g_hle.svcmem.tmem_next, "transfer memories");
-    m->o.type = KO_TMEM;
+    m = (KTmem*)POOL_TRY(g_hle.svcmem.tmems, g_hle.svcmem.tmem_next);
+    if (m) m->o.type = KO_TMEM;
     pm_unlock(&g_host.kernel.pool_lk);
+    if (!m) {
+        WARN_LIMIT(4,
+                   "svcCreateTransferMemory: all %d transfer memories are in use, the game gets OutOfResource (%#x)\n",
+                   KHANDLED_MAX, SNX_RC_SVC_OUT_OF_RESOURCE);
+        R_THROW(SNX_RC_SVC_OUT_OF_RESOURCE);
+    }
     kobj_set_name(&m->o, "transfer memory");
     m->addr = addr;
     m->size = size;
@@ -757,9 +803,15 @@ static u32 svc_codemem_new_impl(u64 addr, u64 size, KObj** out) {
         R_THROW(SNX_RC_SVC_INVALID_CURRENT_MEMORY);
     R_TRY(mem_result(mem_alias_begin(addr, size)));
     pm_lock(&g_host.kernel.pool_lk);
-    c = (KCodeMem*)POOL_TAKE(g_hle.svcmem.codemems, g_hle.svcmem.codemem_next, "code memories");
-    c->o.type = KO_CODEMEM;
+    c = (KCodeMem*)POOL_TRY(g_hle.svcmem.codemems, g_hle.svcmem.codemem_next);
+    if (c) c->o.type = KO_CODEMEM;
     pm_unlock(&g_host.kernel.pool_lk);
+    if (!c) {
+        WARN_LIMIT(4, "svcCreateCodeMemory: all %d code memories are in use, the game gets OutOfResource (%#x)\n",
+                   KHANDLED_MAX, SNX_RC_SVC_OUT_OF_RESOURCE);
+        mem_alias_end(addr, size);
+        R_THROW(SNX_RC_SVC_OUT_OF_RESOURCE);
+    }
     kobj_set_name(&c->o, "code memory");
     c->addr = addr;
     c->size = size;

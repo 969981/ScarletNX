@@ -896,7 +896,7 @@ static void prepare_wait(const char* title) {
                          "Any button or tap: start now. The rest is prepared while you play. Back: menu.");
 #else
             prepare_draw(look, title, st, n, &p,
-                         "Any key, button or tap: start now. The rest is prepared while you play. Esc: quit.");
+                         "Any key, button or tap: start now. The rest is prepared while you play. Esc twice: quit.");
 #endif
             shown = 1;
         }
@@ -1225,6 +1225,7 @@ int snx_main(int argc, char** argv) {
         SnxU64 available = 0, footprint = snx_footprint();
         mem_fit(snx_memory_available(&available) && footprint, available, footprint);
     }
+    mem_gb_said();
     kernel_init();
     plat_trap_waiting(kthread_fault_lend);
     dispatch_init();

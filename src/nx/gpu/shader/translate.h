@@ -49,6 +49,8 @@ typedef struct {
     /* the last stage before rasterization takes its position's x and y from pixels (SNX_SH_WINDOW_XY), and gives
        it a viewport swizzle (the key's SNX_SH_SWIZZLE and its fields, else 0), in shader_vertex_position_fix */
     int window_xy;
+    /* a vertex program's output that takes the position after its fix (ShaderInfo.position_copy), 0 for none */
+    u32 position_copy;
     u32 swizzle;
     /* constant buffer words read in the block being written, by bank and offset (a cache: a word that collides is
        read again), and their bitcast to a float, 0 until made. A draw's constant buffers don't change under it */
@@ -80,7 +82,17 @@ typedef struct {
     u32 primitive_base; /* capture slices preserve the original fragment PrimitiveId through push constants */
     u32 branch_cond;   /* with structured flow, the condition of the branch that ends the block, 0 for always */
     u32 branch_target; /* and the word a BRX that ends it goes to */
+    /* the u32 constants under SH_SMALL_U32 made so far, 0 for one not made: shader_u32 asks the emitter once each */
+    u32 small_u32[64];
 } DirectCtx;
+#define SH_SMALL_U32 64u
+
+/* the u32 constant of value: a small one from c->small_u32, after the emitter makes it the first time */
+static inline u32 shader_u32(DirectCtx* c, u32 value) {
+    if (value >= SH_SMALL_U32) return spv_emit_constant_u32(&c->emit, c->u32_type, value);
+    if (!c->small_u32[value]) c->small_u32[value] = spv_emit_constant_u32(&c->emit, c->u32_type, value);
+    return c->small_u32[value];
+}
 
 /* Fragment fetches from a scaled render target (resolution=): texel p is at (p + 0.5) * scale, and TXQ answers the
    size over the scale. The texture's bit is in the push constants' uvec4, x for slots 0-31, y for 32-63 */
@@ -91,6 +103,30 @@ static const SpvGlsl450Op conversion_rounds[] = {SPV_GLSL_ROUND_EVEN, SPV_GLSL_F
 /* the words of a program that direct_can_reach's reachability bitset holds: 0x20000 bytes of the window vk_shader_get
    reads it from (SH_CODE), and the checks give up on a program longer than that */
 #define DIRECT_WORDS_MAX 16384u
+
+/* A program's words with what dataflow.c's searches ask of them again and again, made once (shader_flow_init): each
+   word's decode, the flow instructions and where control goes from each, and where each instruction's basic block
+   starts. The searches then go over the flow instructions, not every word, and decode nothing */
+typedef struct {
+    const u64* insn;
+    u32 n;
+    const Op** op; /* by word: decode()'s answer */
+    u32 bad;       /* the first instruction (IDX_OK) decode doesn't know, n when there is none */
+    /* each word's targets, besides the next instruction (direct_flow_decode): target and elsewhere from edge_at[k] to
+       edge_at[k + 1]. unknown[k] when they can't be known (a JMP, a jump table that isn't found) */
+    u32 *edge_at, *target;
+    u8 *elsewhere, *unknown;
+    u32* flow; /* the words with targets or unknown ones, in order, nflow of them */
+    u32 nflow;
+    /* by instruction: the last place before it or at it that control arrives at from a flow instruction, 11 for
+       none. It holds for an instruction at or before known_to: past a jump table that isn't found, or anywhere
+       in a program with a JMP, there is no telling (direct_reaching_def) */
+    u32* block_start;
+    u32 known_to;
+} ShFlow;
+/* f for the n words at insn, which stay its own until shader_flow_free: 0 when memory runs out */
+int shader_flow_init(ShFlow* f, const u64* insn, u32 n);
+void shader_flow_free(ShFlow* f);
 
 /* gb_at's mark for an access whose buffer is found when it runs (shader_global_dynamic) */
 #define GB_DYNAMIC 254
@@ -153,22 +189,23 @@ u32 shader_texs_dref(u32 encoding, u32 b);
 int shader_half_arithmetic(int op);
 u32 shader_sparse_predicate(u64 w, int op);
 /* dataflow.c */
-int shader_direct_own_pixel_fetch(const u64* insn, u32 n, u32 index);
-int shader_direct_screen_uv(const u64* insn, u32 n, u32 index, u32 x, u32 y);
-u32 shader_direct_screen_out(const u64* insn, u32 n, u32* yneg);
-int shader_direct_track_const(const u64* insn, u32 n, u32 index, u32 reg, u32* value, int depth);
+int shader_direct_own_pixel_fetch(const ShFlow* f, u32 index);
+int shader_direct_screen_uv(const ShFlow* f, u32 index, u32 x, u32 y);
+u32 shader_direct_screen_out(const ShFlow* f, u32* yneg);
+u32 shader_direct_position_out(const ShFlow* f);
+int shader_direct_track_const(const ShFlow* f, u32 index, u32 reg, u32* value, int depth);
 /* Proven register bits at index: (runtime & *known)==*value, with *value masked by *known. Unknown is0/0.
    No specialization reads of mutable buffers; predicated or ambiguous definitions are left unknown. */
-int shader_direct_track_known_bits(const u64* insn, u32 n, u32 index, u32 reg, u32* known, u32* value, int depth);
-int shader_direct_track_cbuf_word(const u64* insn, u32 n, u32 index, u32 reg, u32* bank, u32* off, int depth);
-int shader_direct_track_image_handle(const u64* insn, u32 n, u32 index, u32 reg, u32* bank, u32* off, int depth);
-int shader_direct_track_image_handle_pair(const u64* insn, u32 n, u32 index, u32 reg, u32* bank, u32* off, u32* bank2,
+int shader_direct_track_known_bits(const ShFlow* f, u32 index, u32 reg, u32* known, u32* value, int depth);
+int shader_direct_track_cbuf_word(const ShFlow* f, u32 index, u32 reg, u32* bank, u32* off, int depth);
+int shader_direct_track_image_handle(const ShFlow* f, u32 index, u32 reg, u32* bank, u32* off, int depth);
+int shader_direct_track_image_handle_pair(const ShFlow* f, u32 index, u32 reg, u32* bank, u32* off, u32* bank2,
                                           u32* off2, int depth);
-int shader_al2p_predicate_unseen(const u64* insn, u32 n, u32 at);
-u32 shader_direct_indexed_handle(const u64* insn, u32 n, u32 index, u32 reg, int stage, u32* ldc);
+int shader_al2p_predicate_unseen(const ShFlow* f, u32 at);
+u32 shader_direct_indexed_handle(const ShFlow* f, u32 index, u32 reg, int stage, u32* ldc);
 int shader_direct_bindless_matches(const ShTex* t, u32 bank, int handle_count, u32 bank2, u32 off2, u32 indexed,
                                    u32 ldc);
-int shader_direct_query_type(const u64* insn, u32 n, int bindless, u32 bank, u32 off, u32* type, u32* array);
+int shader_direct_query_type(const ShFlow* f, int bindless, u32 bank, u32 off, u32* type, u32* array);
 u32* shader_untracked_handle(ShaderInfo* si, const char* kind, const u64* insn, u32 i, u32 reg);
 u32* shader_untracked_reject(ShaderInfo* si, const u64* insn, u32 i, u32 reg, u8* gb_at, u32* pop_targets);
 int shader_legacy_varyings(const u64* insn, u32 n, u32 words, const u32* sph, int stage, ShaderInfo* si, u64** moved,
@@ -243,6 +280,10 @@ u32 shader_ipa_interpolation(const u32* sph, u32 input);
 void shader_alpha_test(DirectCtx* c, u32 push, u32 push_pointer, u32 alpha);
 u32 shader_frag_y_origin(DirectCtx* c, u32 push, u32 y);
 void shader_vertex_position_fix(DirectCtx* c, u32 position, u32 push, u32 push_pointer, u32 vec4_type);
+int shader_ipa_position(u32 pos_in, const u32* sph, u32 addr);
+u32 shader_vertex_value(DirectCtx* c, u32 vec4_type, const u32 at[3], int flat, u32 vertex, u32 component);
+void shader_frag_weights(DirectCtx* c, u32 vec4_type, const u32 position[3], int flat, const u32 ndc[2], u32 weight[2]);
+void shader_frag_ndc(DirectCtx* c, u32 fragcoord, u32 vec4_type, u32 push, u32 push_pointer, u32 ndc[2]);
 /* What a program's transform feedback writes at each exit or emitted vertex (shader_xfb_store) */
 typedef struct {
     int stores; /* by storage buffer stores (g_shader_xfb_stores), else by the extension's decorations */
@@ -297,7 +338,7 @@ static inline void var_write(DirectCtx* c, u32 v, u32 value) {
 static inline u32 reg_read(DirectCtx* c, u32 r) {
     if (r >= 255) return c->zero;
     if (c->var_block[r] == c->emit.block && (c->var_val[r] || c->reg_alt_type[r])) {
-        if (!c->var_val[r]) c->var_val[r] = spv_emit_bitcast(&c->emit, c->u32_type, c->reg_alt[r]);
+        if (!c->var_val[r]) c->var_val[r] = spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->u32_type, c->reg_alt[r]);
         return c->var_val[r];
     }
     c->var_val[r] = spv_emit_load(&c->emit, c->u32_type, c->reg[r]);
@@ -309,7 +350,7 @@ static inline u32 reg_read(DirectCtx* c, u32 r) {
 
 static inline void reg_write(DirectCtx* c, u32 r, u32 value) {
     if (r >= 255) return;
-    if (c->guard) value = spv_emit_select(&c->emit, c->u32_type, c->guard, value, reg_read(c, r));
+    if (c->guard) value = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->u32_type, c->guard, value, reg_read(c, r));
     var_write(c, r, value);
     c->reg_alt_type[r] = 0;
 }
@@ -319,7 +360,7 @@ static inline void reg_write(DirectCtx* c, u32 r, u32 value) {
 static inline void reg_write_as(DirectCtx* c, u32 r, u32 value, u32 type) {
     if (r >= 255) return;
     if (c->guard) { /* a guarded write's bits are a select of value's, not value's */
-        reg_write(c, r, spv_emit_bitcast(&c->emit, c->u32_type, value));
+        reg_write(c, r, spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->u32_type, value));
         return;
     }
     var_write(c, r, 0);
@@ -327,10 +368,10 @@ static inline void reg_write_as(DirectCtx* c, u32 r, u32 value, u32 type) {
     c->reg_alt_type[r] = type;
 }
 static inline u32 reg_read_as(DirectCtx* c, u32 r, u32 type) {
-    if (r >= 255) return spv_emit_bitcast(&c->emit, type, c->zero);
+    if (r >= 255) return spv_emit_unary(&c->emit, SPV_OP_BITCAST, type, c->zero);
     if (c->var_block[r] == c->emit.block && c->reg_alt_type[r] == type) return c->reg_alt[r];
     u32 bits = reg_read(c, r);
-    c->reg_alt[r] = spv_emit_bitcast(&c->emit, type, bits);
+    c->reg_alt[r] = spv_emit_unary(&c->emit, SPV_OP_BITCAST, type, bits);
     c->reg_alt_type[r] = type;
     if (type == c->f32_type && c->taint_known && !c->tainted[r]) shader_ftz_mark(c, c->reg_alt[r]);
     return c->reg_alt[r];
@@ -338,12 +379,12 @@ static inline u32 reg_read_as(DirectCtx* c, u32 r, u32 type) {
 
 static inline u32 pred_read(DirectCtx* c, u32 p, int negative) {
     u32 value = p == 7 ? c->true_value : var_read(c, VAR_PRED + p);
-    return negative ? spv_emit_bool_not(&c->emit, c->bool_type, value) : value;
+    return negative ? spv_emit_unary(&c->emit, SPV_OP_LOGICAL_NOT, c->bool_type, value) : value;
 }
 
 static inline void pred_write(DirectCtx* c, u32 p, u32 value) {
     if (p >= 7) return;
-    if (c->guard) value = spv_emit_select(&c->emit, c->bool_type, c->guard, value, pred_read(c, p, 0));
+    if (c->guard) value = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->bool_type, c->guard, value, pred_read(c, p, 0));
     var_write(c, VAR_PRED + p, value);
 }
 
@@ -351,14 +392,14 @@ static inline void pred_write(DirectCtx* c, u32 p, u32 value) {
    instruction's guard is false */
 static inline u32 flag_read(DirectCtx* c, u32 flag) { return var_read(c, flag_var(c, flag)); }
 static inline void cc_store(DirectCtx* c, u32 flag, u32 value) {
-    if (c->guard) value = spv_emit_select(&c->emit, c->bool_type, c->guard, value, flag_read(c, flag));
+    if (c->guard) value = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->bool_type, c->guard, value, flag_read(c, flag));
     var_write(c, flag_var(c, flag), value);
 }
 
 static inline u32 bool_combine(DirectCtx* c, u32 op, u32 left, u32 right) {
     return op < 3 ? spv_emit_bool_binary(&c->emit, c->bool_type, op, left, right) : left;
 }
-static inline u32 cc_not(DirectCtx* c, u32 x) { return spv_emit_bool_not(&c->emit, c->bool_type, x); }
+static inline u32 cc_not(DirectCtx* c, u32 x) { return spv_emit_unary(&c->emit, SPV_OP_LOGICAL_NOT, c->bool_type, x); }
 static inline u32 cc_and(DirectCtx* c, u32 x, u32 y) { return spv_emit_bool_binary(&c->emit, c->bool_type, 0, x, y); }
 static inline u32 cc_or(DirectCtx* c, u32 x, u32 y) { return spv_emit_bool_binary(&c->emit, c->bool_type, 1, x, y); }
 static inline u32 cc_xor(DirectCtx* c, u32 x, u32 y) { return spv_emit_bool_binary(&c->emit, c->bool_type, 2, x, y); }
@@ -382,6 +423,7 @@ typedef struct {
     int stage;
     const u64* insn;
     u32 n;
+    const ShFlow* flow; /* insn's, for the searches of dataflow.c */
     u32* sph;
     u32 target;
     int passthrough;
@@ -449,6 +491,15 @@ typedef struct {
     u32 invocation_id;
     u32 patch_vertices;
     int position_fix;
+    /* a fragment program's inputs the position pass takes (ShaderInfo.varying), and the fragment's own x and y in clip
+       space over w that they read as (shader_frag_ndc) */
+    u32 pos_in, frag_ndc[2];
+    /* the inputs the per-vertex pass takes and the fragment's weights of the second and third vertex
+       (shader_frag_weights). An input is an array of its three vertices' values, or with pv_flat (a geometry program
+       wrote them) the first vertex's, the others' in pv_copy */
+    u32 pv_mask, pv_weight[2];
+    const u32 (*pv_copy)[2];
+    int pv_flat;
     u32 sample_mask_output;
     int guest_sample_mask;
     u32 sample_id;

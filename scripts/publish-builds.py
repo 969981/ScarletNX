@@ -67,6 +67,7 @@ ARTIFACTS = {
     'ScarletNX-linux-ppc64le-{short}.AppImage': 'ScarletNX-linux-ppc64le.AppImage',
     'ScarletNX-linux-ppc64-{short}.AppImage': 'ScarletNX-linux-ppc64.AppImage',
     'ScarletNX-linux-riscv64-{short}.AppImage': 'ScarletNX-linux-riscv64.AppImage',
+    'ScarletNX-linux-loongarch64-{short}.AppImage': 'ScarletNX-linux-loongarch64.AppImage',
     'ScarletNX-windows-x86_64-{short}': 'ScarletNX-windows-x86_64.zip',
     'ScarletNX-android-universal-{short}.apk': 'ScarletNX-android-universal.apk',
     'ScarletNX-macos-arm64-{short}.zip': 'ScarletNX-macos-arm64.zip',
@@ -78,6 +79,7 @@ OPTIONAL = {
     'ScarletNX-linux-ppc64le.AppImage',
     'ScarletNX-linux-ppc64.AppImage',
     'ScarletNX-linux-riscv64.AppImage',
+    'ScarletNX-linux-loongarch64.AppImage',
     'ScarletNX-macos-arm64.zip',
     'ScarletNX-ios-arm64.ipa',
 }
@@ -574,7 +576,8 @@ class Publisher(Hub):
             return False
 
     def on_run(self, run):
-        if run['event'] == 'push':
+        # a scheduled run builds the default branch, as a push to it; a run by hand builds the branch it was asked for
+        if run['event'] in ('push', 'schedule', 'workflow_dispatch'):
             name = run['head_branch']
             if run['head_repository']['full_name'] != self.repo:
                 print(f'a push to {run["head_repository"]["full_name"]}: nothing to publish')

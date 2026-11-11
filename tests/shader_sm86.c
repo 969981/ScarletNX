@@ -185,30 +185,32 @@ static void test_flow(void) {
 }
 
 static void test_table(void) {
-    /* each row decodes to itself, in every form it takes, and no 12-bit code is also an ALU form */
-    for (int op = 1; op < SM86__COUNT; op++) {
-        const Sm86OpInfo* info = &sm86_ops[op];
-        for (u32 form = 0; form < 8; form++) {
-            if (info->kind == SM86_K_FIX && form) break;
-            if (info->kind != SM86_K_FIX && !(info->forms & (1u << form))) continue;
-            Word x = info->kind == SM86_K_FIX ? fix(info->code) : alu(info->code, form, 1, 2);
-            if (info->kind == SM86_K_UALU) set(&x, 91, 1, 1);
-            Sm86Insn in = dec(x);
-            if (in.op != op) fprintf(stderr, "%s form %u decodes as %s\n", info->name, form, sm86_ops[in.op].name);
-            CHECK(in.op == op);
-        }
-    }
+    /* sm86.decode's patterns agree with SM86_OPS: every opcode has a code, an ALU opcode's codes (its forms) share
+       their low 9 bits, any other opcode has a single 12-bit code, and the predicate bits change nothing */
+    u32 codes[SM86__COUNT] = {0}, low9[SM86__COUNT] = {0};
     for (u32 code = 0; code < 4096; code++) {
-        int fixed = 0, as_alu = 0;
-        for (int op = 1; op < SM86__COUNT; op++) {
-            const Sm86OpInfo* info = &sm86_ops[op];
-            if (info->kind == SM86_K_FIX && info->code == code) fixed++;
-            if (info->kind != SM86_K_FIX && info->code == (code & 0x1ff) && (info->forms & (1u << (code >> 9))))
-                as_alu++;
+        Sm86Insn in = dec(fix(code));
+        for (u32 pred = 0; pred < 16; pred++) {
+            Word x = fix(code);
+            set(&x, 12, 4, pred);
+            CHECK(dec(x).op == in.op);
         }
-        if (fixed + as_alu > 1) fprintf(stderr, "code 0x%03x matches %d rows\n", code, fixed + as_alu);
-        CHECK(fixed + as_alu <= 1);
+        if (in.op == SM86_NONE) continue;
+        if (codes[in.op]++ && sm86_ops[in.op].kind != SM86_K_FIX && low9[in.op] != (code & 0x1ff)) {
+            fprintf(stderr, "%s has codes of two ALU opcodes\n", sm86_ops[in.op].name);
+            CHECK(0);
+        }
+        low9[in.op] = code & 0x1ff;
     }
+    for (int op = 1; op < SM86__COUNT; op++) {
+        int ok = sm86_ops[op].kind == SM86_K_FIX ? codes[op] == 1 : codes[op] >= 1 && codes[op] <= 7;
+        if (!ok) fprintf(stderr, "%s has %u codes\n", sm86_ops[op].name, codes[op]);
+        CHECK(ok);
+    }
+    /* a few rows of sm86.decode: FADD in form 1 and 7, FMUL not in form 2, UIADD3 in form 4, FSWZADD */
+    CHECK(dec(alu(0x021, 1, 1, 2)).op == SM86_FADD && dec(alu(0x021, 7, 1, 2)).op == SM86_FADD);
+    CHECK(dec(alu(0x020, 2, 1, 2)).op == SM86_NONE && dec(alu(0x090, 4, 1, 2)).op == SM86_UIADD3);
+    CHECK(dec(fix(0x822)).op == SM86_FSWZADD && dec(fix(0x022)).op == SM86_NONE);
     Sm86Insn in;
     CHECK(!sm86_decode(0x7fff, 0, &in) && in.op == SM86_NONE); /* 0xfff is no opcode */
 }
@@ -1252,6 +1254,85 @@ static void test_lane_masks(const char* dir) {
     size_t count = 0;
     CHECK(!sm86_to_spirv(code, 3 * 16, ST_FS, fsph, &si, &count));
     (void)dir;
+}
+
+/* SHFL with its lane operand and c each an immediate or a register (II 0xf89, RI 0x589, IR 0x989, RR 0x389), run at
+   every lane of a warp: the lane it reads and whether that lane is in range are PTX's shfl.sync, the same in the
+   four forms. c 0x1c03 is a segment of 4 lanes, 0x1807 of 8, 0x1c1f a segment of 4 whose clamp says 32, 0x1f the
+   warp. A compute network's upscaler has c in a register */
+static Word predicated(Word x, u32 pred);
+static void test_shfl_operands(const char* dir) {
+    static const u32 forms[4] = {0xf89, 0x589, 0x989, 0x389}, cs[4] = {0x1c03, 0x1807, 0x1c1f, 0x1f};
+    static const u32 bs[4] = {0, 1, 3, 30};
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    int bad = 0;
+    for (u32 f = 0; f < 4; f++)
+        for (u32 mode = 0; mode < 4; mode++)
+            for (u32 ci = 0; ci < 4; ci++)
+                for (u32 bi = 0; bi < 4; bi++) {
+                    int lane_reg = forms[f] == 0x589 || forms[f] == 0x389,
+                        c_reg = forms[f] == 0x989 || forms[f] == 0x389;
+                    u32 b = bs[bi], cc = cs[ci];
+                    u8 code[16 * 8] = {0};
+                    put(code, 0, mov_imm(2, 0x1234));
+                    put(code, 1, mov_imm(4, cc | 0xffff0000u)); /* the bits above c's 13 are not its */
+                    put(code, 2, mov_imm(5, b));
+                    put(code, 3, mov_imm(0, 0));
+                    Word x = fix(forms[f]); /* SHFL P0, R6, R2, b, c */
+                    set(&x, 16, 8, 6);
+                    set(&x, 24, 8, 2);
+                    if (lane_reg)
+                        set(&x, 32, 8, 5);
+                    else
+                        set(&x, 53, 5, b);
+                    if (c_reg)
+                        set(&x, 64, 8, 4);
+                    else
+                        set(&x, 40, 13, cc);
+                    set(&x, 58, 2, mode);
+                    set(&x, 81, 3, 0);
+                    put(code, 4, x);
+                    put(code, 5, predicated(mov_imm(0, 1), 0));
+                    put(code, 6, exit_insn());
+                    put(code, 7, bra(7, 7, 7, 0));
+                    ShaderInfo si = {0};
+                    size_t count = 0;
+                    u32* spv = sm86_to_spirv(code, 8 * 16, ST_FS, fsph, &si, &count);
+                    if (!spv) {
+                        if (!bad++) fprintf(stderr, "shfl 0x%x mode %u: %s\n", forms[f], mode, si.first_unsupported);
+                        continue;
+                    }
+                    if (mode == 0 && ci == 0 && bi == 0) {
+                        char name[32];
+                        snprintf(name, sizeof name, "fs_shfl_%x", forms[f]);
+                        CHECK(keep_module(dir, name, spv, count));
+                    }
+                    for (u32 lane = 0; lane < 32; lane++) {
+                        u32 seg = (cc >> 8) & 31, min_lane = lane & seg, max_lane = min_lane | (cc & ~seg & 31);
+                        u32 j = mode == 0   ? (min_lane | (b & ~seg & 31))
+                                : mode == 1 ? lane - b
+                                : mode == 2 ? lane + b
+                                            : lane ^ b;
+                        u32 ok = mode == 1 ? (i32)j >= (i32)min_lane : j <= max_lane;
+                        SpvEvalEnv env = {0};
+                        env.builtin[41][0] = lane;
+                        env.shuffle_id = ~0u;
+                        const char* why = spv_eval(spv, count, &env);
+                        if (why || !env.out_written[0] || env.out[0][0] != ok || env.shuffle_id != (j & 31)) {
+                            if (!bad++)
+                                fprintf(stderr,
+                                        "shfl 0x%x mode %u c 0x%x b %u lane %u: reads lane %u in range %u, wants %u "
+                                        "and %u%s%s\n",
+                                        forms[f], mode, cc, b, lane, env.shuffle_id, env.out[0][0], j & 31, ok,
+                                        why ? ", the evaluator stops at " : "", why ? why : "");
+                        }
+                    }
+                    free(spv);
+                }
+    CHECK(bad == 0);
+    if (bad) fprintf(stderr, "shfl: %d cases differ\n", bad);
 }
 
 /* LDC c[bank][R + offset] of NAK's MemType U8 (0), I8 (1), U16 (2) and I16 (3): the byte or halfword at the
@@ -3159,7 +3240,7 @@ static void test_mesh_output_bytes(void) {
         for (u32 k = 0; k < nd; k++) {
             const u32* d = spv + decorations[k];
             if (d[1] != id) continue;
-            per_primitive |= d[2] == 5271; /* PerPrimitiveEXT */
+            per_primitive |= d[2] == 5271;                       /* PerPrimitiveEXT */
             indices |= d[2] == 11 /* BuiltIn */ && d[3] == 5296; /* PrimitiveTriangleIndicesEXT */
         }
         if (!indices) *(per_primitive ? &primitive : &vertex) += 1;
@@ -3572,6 +3653,7 @@ int main(int argc, char** argv) {
     test_global_flow(dir);
     test_fswzadd(dir);
     test_lane_masks(dir);
+    test_shfl_operands(dir);
     test_ldc_small(dir);
     test_break(dir);
     test_local_memory(dir);
