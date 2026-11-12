@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 #include "3ds/runtime/internal.h"
+#include "3ds/aot/ctr_hook.h"
 #include "3ds/board/clock.h"
 #include "common/utilities/endian.h"
 #include "3ds/gpu/pica.h"
@@ -95,6 +96,7 @@ void snx_ctr_shared_page_time(SnxCtrProcess* p) {
 }
 void snx_ctr_process_free(SnxCtrProcess* p) {
     if (!p) return;
+    snx_ctr_hooks_free(p->hooks);
     snx_ctr_uds_close(p);
     if (p->gsp.pica) snx_ctr_pica_free(p->gsp.pica);
     free(p->gsp.pica);
@@ -146,6 +148,7 @@ SnxCtrProcess* snx_ctr_process_new(const SnxCtrImage* image, SnxCtrModel model) 
     p->physical_end = p->physical_next + p->app_limit;
     p->objects[1] = (CtrObject){.type = CTR_OBJ_PROCESS, .refs = 1};
     p->objects[2] = (CtrObject){.type = CTR_OBJ_THREAD, .refs = 1};
+    p->objects_changed = 1; /* the scheduler's lists are made at its first pass */
     p->current_thread = 2;
     /* the ExHeader's ARM11 local capabilities give the main thread's priority (Azahar Process::Run) */
     p->objects[2].data.thread.priority = image->main_priority;

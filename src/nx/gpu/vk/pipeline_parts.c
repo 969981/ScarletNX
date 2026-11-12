@@ -108,6 +108,7 @@ void vk_pipe_part_src(u32 part, const void* key, PipeKey* out) {
         const PipeFsKey* f = key;
         out->fs = f->fs;
         out->arrays = f->arrays;
+        out->fs_spec = f->spec;
         out->feedback = f->feedback;
         out->sample_shading = f->sample_shading;
         out->samples = f->samples;
@@ -204,6 +205,18 @@ u32 vk_pipe_dynamic(u32 parts, const PipeDynIn* in, VkDynamicState* out) {
     return n;
 }
 
+u32 vk_pipe_fs_spec(u32 declared, int alpha_test, u32 alpha_func, int lower_left, int sprite_origin) {
+    u32 spec = 0;
+    if ((declared >> SH_SPEC_ALPHA & 1) && alpha_test) spec |= SH_SPEC_ALPHA_ALWAYS ^ (alpha_func & PIPE_SPEC_ALPHA);
+    if ((declared >> SH_SPEC_LOWER_LEFT & 1) && lower_left) spec |= PIPE_SPEC_LOWER_LEFT;
+    if ((declared >> SH_SPEC_SPRITE_FLIP & 1) && !sprite_origin == !lower_left) spec |= PIPE_SPEC_SPRITE_FLIP;
+    return spec;
+}
+void vk_pipe_fs_spec_values(u32 fs_spec, u32 values[SH_SPEC_COUNT]) {
+    values[SH_SPEC_ALPHA] = SH_SPEC_ALPHA_ALWAYS ^ (fs_spec & PIPE_SPEC_ALPHA);
+    values[SH_SPEC_LOWER_LEFT] = (fs_spec & PIPE_SPEC_LOWER_LEFT) != 0;
+    values[SH_SPEC_SPRITE_FLIP] = (fs_spec & PIPE_SPEC_SPRITE_FLIP) != 0;
+}
 
 void vk_pipe_split(const PipeKey* k, VkShaderModule fs, const PipeSplitDevice* d, PipeViKey* vi, PipePrKey* pr,
                    PipeFsKey* f, PipeFoKey* fo) {
@@ -226,6 +239,7 @@ void vk_pipe_split(const PipeKey* k, VkShaderModule fs, const PipeSplitDevice* d
     *f = (PipeFsKey){0};
     f->fs = fs;
     f->arrays = k->arrays & VK_ARRAYS_FS;
+    f->spec = k->fs_spec;
     if (!d->feedback_dynamic) f->feedback = k->feedback;
     if (k->sample_shading) {
         f->sample_shading = k->sample_shading;

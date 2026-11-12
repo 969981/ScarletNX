@@ -4,6 +4,7 @@
 #include "3ds/aot/ctr_compile.h"
 #include "3ds/aot/ctr_jit.h"
 #include "3ds/aot/ctr_discover.h"
+#include "3ds/aot/ctr_hook.h"
 #include "3ds/memory/host.h"
 #include "common/utilities/common.h"
 #include "common/utilities/game_ini.h"
@@ -120,6 +121,11 @@ static void report_threads(SnxCtrProcess* p) {
         printf(" 0x%02x x%" PRIu64, best, p->svc_counts[best]);
     }
     putchar('\n');
+    if (p->hooks) {
+        char line[256];
+        snx_ctr_hooks_report(p->hooks, line, sizeof line);
+        printf("  %s\n", line);
+    }
     snx_ctr_present_report();
 }
 /* The game folder's copy of the runtime, named after it, which plays the game as a Switch game's copy does
@@ -185,6 +191,11 @@ int snx_ctr_aot_run(const char* directory, const SnxCtrSource* game, SnxCtrModel
         goto done;
     }
     process->ipc_stubs = ipc_stubs;
+    if (g_settings.ctr_hooks) {
+        char found[256];
+        process->hooks = snx_ctr_hooks_find(process, found, sizeof found);
+        if (found[0]) printf("%s\n", found);
+    }
     char why[256];
     if (!(jit = snx_ctr_jit_new(process, why, sizeof why)))
         printf("No run-time compiler (%s): only the static blocks run\n", why);
@@ -205,7 +216,8 @@ int snx_ctr_aot_run(const char* directory, const SnxCtrSource* game, SnxCtrModel
     char id[17];
     snprintf(id, sizeof id, "%016llX", (unsigned long long)process->title_id);
     char run[SNX_RUN_LOG_LINE];
-    printf("Game: %s (%s) - %s\n", process->title[0] ? process->title : id, id, snx_build_log_line());
+    printf("ScarletNX - %s (3DS)\nbuild: %s\ntitle ID: %s\n", process->title[0] ? process->title : id,
+           snx_build_log_line(), id);
     snx_run_log_line(run, (long long)time(NULL));
     printf("%s\n", run);
     if (!snx_ctr_present_init(process->memory, frames))

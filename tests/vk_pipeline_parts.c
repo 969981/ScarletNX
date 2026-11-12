@@ -218,12 +218,12 @@ static void check_states(void) {
    state and no other, so a new state of known shaders reuses the parts that compile shaders */
 enum { F_VS, F_TCS, F_TES, F_GS, F_PATCH, F_POLYGON, F_CLAMP, F_PROVOKING, F_CONSERVATIVE, F_TOPO, F_VI, F_NCOLOR,
        F_COLOR, F_DEPTH, F_STENCIL, F_BLEND, F_MASK, F_LOGIC, F_SAMPLES, F_SAMPLE_OFF, F_A2C, F_A2O, F_COVERAGE,
-       F_ADVANCED, F_SHADING, F_FEEDBACK, F_ARRAYS_VS, F_ARRAYS_FS, F_ARRAYS_GS, F_FS, F_COUNT };
+       F_ADVANCED, F_SHADING, F_FEEDBACK, F_ARRAYS_VS, F_ARRAYS_FS, F_ARRAYS_GS, F_FS_SPEC, F_FS, F_COUNT };
 static const char* const g_fields[F_COUNT] = {
     "vs", "tcs", "tes", "gs", "patch", "polygon", "depth_clamp", "provoking_last", "conservative", "topo_class", "vi",
     "ncolor", "color", "depth", "stencil", "blend", "blend mask", "logic_op", "samples", "sample_off",
     "alpha_to_coverage", "alpha_to_one", "coverage", "advanced blend", "sample_shading", "feedback", "arrays (vertex)",
-    "arrays (fragment)", "arrays (geometry)", "fs"};
+    "arrays (fragment)", "arrays (geometry)", "fs_spec", "fs"};
 static void mutate(PipeKey* k, int f) {
     switch (f) {
     case F_VS: k->vs = (VkShaderModule)(uintptr_t)0x1010; break;
@@ -255,6 +255,7 @@ static void mutate(PipeKey* k, int f) {
     case F_ARRAYS_VS: k->arrays |= 1u; break;
     case F_ARRAYS_FS: k->arrays |= 2u; break;
     case F_ARRAYS_GS: k->arrays |= 16u; break;
+    case F_FS_SPEC: k->fs_spec = 3; break;
     default: k->fs = (VkShaderModule)(uintptr_t)0x2020; break;
     }
 }
@@ -299,7 +300,7 @@ static void check_split(void) {
                     break;
                 case F_SHADING: want = VK_PART_FS | VK_PART_FO; break;
                 case F_FEEDBACK: want = dynamic ? 0 : VK_PART_FS | VK_PART_FO; break;
-                case F_ARRAYS_FS: case F_FS: want = VK_PART_FS; break;
+                case F_ARRAYS_FS: case F_FS_SPEC: case F_FS: want = VK_PART_FS; break;
                 default: want = VK_PART_FO; break;
                 }
                 char what[160];
@@ -336,6 +337,30 @@ static void check_split(void) {
             b.blend[0].mask = 1;
             CHECK(parts_differ(&a, &b, &d) == 0, "a write mask without a fragment program is no new part");
         }
+}
+
+/* ---- the fragment module's specialization constants in the key (vk_pipe_fs_spec): every state of the constants a
+   module declares gives the pipeline those values back, and a constant it does not declare stays out of the key */
+static void check_fs_spec(void) {
+    for (u32 declared = 0; declared < 1u << SH_SPEC_COUNT; declared++)
+        for (u32 state = 0; state < 64; state++) {
+            int alpha_test = state & 1, lower_left = state >> 1 & 1, sprite_origin = state >> 2 & 1;
+            u32 alpha_func = state >> 3, values[SH_SPEC_COUNT];
+            u32 spec = vk_pipe_fs_spec(declared, alpha_test, alpha_func, lower_left, sprite_origin);
+            vk_pipe_fs_spec_values(spec, values);
+            u32 want[SH_SPEC_COUNT] = {SH_SPEC_ALPHA_ALWAYS, 0, 0};
+            if (declared >> SH_SPEC_ALPHA & 1) want[SH_SPEC_ALPHA] = alpha_test ? alpha_func : SH_SPEC_ALPHA_ALWAYS;
+            if (declared >> SH_SPEC_LOWER_LEFT & 1) want[SH_SPEC_LOWER_LEFT] = (u32)lower_left;
+            if (declared >> SH_SPEC_SPRITE_FLIP & 1) want[SH_SPEC_SPRITE_FLIP] = sprite_origin == lower_left;
+            if (memcmp(values, want, sizeof want))
+                fprintf(stderr, "constants %x, state %u: the pipeline gives %u %u %u, not %u %u %u\n", declared, state,
+                        values[0], values[1], values[2], want[0], want[1], want[2]);
+            CHECK(!memcmp(values, want, sizeof want), "a pipeline gives the declared constants the draw's state");
+            CHECK(declared || !spec, "a module with no constant takes no pipeline of its own for the state");
+        }
+    CHECK(!vk_pipe_fs_spec(1u << SH_SPEC_ALPHA, 1, SH_SPEC_ALPHA_ALWAYS, 1, 0) &&
+              !vk_pipe_fs_spec(1u << SH_SPEC_ALPHA, 0, 3, 0, 1),
+          "the test off and the function always are one pipeline, whatever the origin, for a module with no other");
 }
 
 static void say(const char* line, int warn) {
@@ -399,6 +424,7 @@ int main(void) {
     check_bans();
     check_states();
     check_split();
+    check_fs_spec();
     printf("%s: %u checks, %u failed\n", g_test.failures ? "FAIL" : "PASS", g_test.checks, g_test.failures);
     return g_test.failures != 0;
 }

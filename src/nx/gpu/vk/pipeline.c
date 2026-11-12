@@ -1209,7 +1209,7 @@ VkShaderModule vk_module_spv_location(const u32* source, size_t nw, u32 location
 /* an empty fragment shader for depth-only passes */
 static VkShaderModule null_fs(void) {
     if (!g_pipeline.null_fs)
-        g_pipeline.null_fs = vk_module_spv(snx_null_fs_spv, sizeof snx_null_fs_spv / sizeof *snx_null_fs_spv);
+        g_pipeline.null_fs = vk_module_spv(snx_null_fs_spv, snx_null_fs_spv_size / sizeof *snx_null_fs_spv);
     return g_pipeline.null_fs;
 }
 
@@ -1239,6 +1239,10 @@ float vk_conservative_extra(u32 conservative) {
 typedef struct {
     VkPipelineShaderStageCreateInfo st[5];
     u32 nst, npr; /* the stages, the first npr of them before rasterization and then the fragment one */
+    /* the fragment module's specialization constants (k->fs_spec), by SpecId */
+    u32 spec_values[SH_SPEC_COUNT];
+    VkSpecializationMapEntry spec_entries[SH_SPEC_COUNT];
+    VkSpecializationInfo spec;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo warp; /* a mesh pipeline's mesh and task stages' */
     /* with descriptor heaps (k->heaps), each stage's mapping of its set's bindings */
     VkShaderDescriptorSetAndBindingMappingInfoEXT mappings[5];
@@ -1308,6 +1312,14 @@ static void pipe_info(const PipeKey* k, VkShaderModule fs, PipeInfo* o) {
                                                              o->binding_maps[o->nst], SNX_VKB_END),
                 .pMappings = o->binding_maps[o->nst]};
             o->st[o->nst].pNext = &o->mappings[o->nst];
+        }
+        if (s == 4 && k->fs_spec) {
+            /* a constant the module does not declare changes nothing in it, so each is given whatever the module */
+            vk_pipe_fs_spec_values(k->fs_spec, o->spec_values);
+            for (u32 id = 0; id < SH_SPEC_COUNT; id++)
+                o->spec_entries[id] = (VkSpecializationMapEntry){id, id * (u32)sizeof(u32), sizeof(u32)};
+            o->spec = (VkSpecializationInfo){SH_SPEC_COUNT, o->spec_entries, sizeof o->spec_values, o->spec_values};
+            o->st[o->nst].pSpecializationInfo = &o->spec;
         }
         o->nst++;
         if (s < 4) o->npr = o->nst;
@@ -2507,8 +2519,10 @@ static void pf_load_pipe(void* ctx, const u64 m[5], const void* key, u32 keylen)
 
 /* PF_GUEST_VERSION: what a PF_SOURCE or PF_PIPE record means, beyond the sizes the key holds. Raised when a PipeKey
    field or a key word (vk_shader_get's mask) comes to mean something else, so that the records of an earlier build
-   are dropped rather than made into pipelines and shaders of the wrong state */
-#define PF_GUEST_VERSION 6
+   are dropped rather than made into pipelines and shaders of the wrong state. 7: a PipeKey holds the fragment
+   module's specialization constants (fs_spec), which a record of 6 has nowhere: it would be made as a pipeline of the
+   default constants, whatever alpha function and origin its program was drawn with */
+#define PF_GUEST_VERSION 7
 /* The file's key: whatever changes the SPIR-V translation makes or what a PipeKey means. First its guest part, which
    the PF_SOURCE and PF_PIPE records depend on (pf_open): the device; the features and limits the translator,
    vk_shader_get and pipe_create consult; the sizes of what those records hold whole. Then the rest, which only the

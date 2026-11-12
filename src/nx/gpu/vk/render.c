@@ -636,13 +636,11 @@ static int clear_masked(u32 slot, u32 mask, const float* cc, VkRect2D rect, u32 
     rp_record();
     const VkFmt* f = &g_rp.rt[slot]->f;
     int num = f->is_int ? (f->sint ? 2 : 1) : 0;
-    if (!g_clear.vs) g_clear.vs = vk_module_spv(snx_clear_vs_spv, sizeof snx_clear_vs_spv / sizeof *snx_clear_vs_spv);
+    if (!g_clear.vs) g_clear.vs = vk_module_spv(snx_clear_vs_spv, snx_clear_vs_spv_size / sizeof *snx_clear_vs_spv);
     if (!g_clear.fs[slot][num]) {
         static const u32* words[3] = {snx_clear_fs_float_spv, snx_clear_fs_uint_spv, snx_clear_fs_sint_spv};
-        static const size_t count[3] = {sizeof snx_clear_fs_float_spv / sizeof *snx_clear_fs_float_spv,
-                                        sizeof snx_clear_fs_uint_spv / sizeof *snx_clear_fs_uint_spv,
-                                        sizeof snx_clear_fs_sint_spv / sizeof *snx_clear_fs_sint_spv};
-        g_clear.fs[slot][num] = vk_module_spv_location(words[num], count[num], slot);
+        const u64 bytes[3] = {snx_clear_fs_float_spv_size, snx_clear_fs_uint_spv_size, snx_clear_fs_sint_spv_size};
+        g_clear.fs[slot][num] = vk_module_spv_location(words[num], bytes[num] / sizeof(u32), slot);
     }
     if (!g_clear.vs || !g_clear.fs[slot][num]) return 0;
     PipeKey k;
@@ -682,7 +680,7 @@ static int clear_masked(u32 slot, u32 mask, const float* cc, VkRect2D rect, u32 
    output, color writes or depth writes. It covers only the requested rectangle and layer, under the GPU predicate. */
 static int clear_stencil_masked(u32 mask, u32 value, VkRect2D rect, u32 layer, u32 pred) {
     rp_record();
-    if (!g_clear.vs) g_clear.vs = vk_module_spv(snx_clear_vs_spv, sizeof snx_clear_vs_spv / sizeof *snx_clear_vs_spv);
+    if (!g_clear.vs) g_clear.vs = vk_module_spv(snx_clear_vs_spv, snx_clear_vs_spv_size / sizeof *snx_clear_vs_spv);
     if (!g_clear.vs) return 0;
     PipeKey k;
     memset(&k, 0, sizeof k); /* pipeline keys compare every byte */
@@ -4209,6 +4207,10 @@ retry:
     if (kept && (memcmp(&sample_locations, &g_draw.k.sample_locations, sizeof sample_locations) ||
                  to_color != g_draw.k.coverage_to_color)) kept = 0;
     if (kept && memcmp(&native_blend, &g_draw.k.advanced, sizeof native_blend)) kept = 0;
+    u32 fs_spec = fs ? vk_pipe_fs_spec(fs->si.spec, ds->dyn.alpha_test, ds->dyn.alpha_func,
+                                       (ds->dyn.window_origin & DS_ORIGIN_LOWER_LEFT) != 0, ds->dyn.sprite_origin)
+                     : 0;
+    if (kept && fs_spec != g_draw.k.fs_spec) kept = 0;
     PipeKey made_k;
     VertexPlan made_pl;
     const PipeKey* k = &g_draw.k;
@@ -4223,6 +4225,7 @@ retry:
             return;
         }
         made_k.coverage = coverage;
+        made_k.fs_spec = fs_spec;
         made_k.advanced = native_blend;
         made_k.sample_locations = sample_locations;
         made_k.coverage_to_color = to_color;
@@ -4900,11 +4903,10 @@ retry:
               rec_CmdSetStencilWriteMask(cb, VK_STENCIL_FACE_BACK_BIT, sb[6])));
     }
     /* push constants: the depth mode (snx_vp.y) for the vertex stage, 0 too where the device makes the range of -1 to
-       1 (VK_DYN_PR_DEPTH_RANGE), the alpha test (on, function, reference) and
-       the point sprite's T flip for the fragment stage. PointCoord's T is 0 at row 0, which is a lower-left window's
-       bottom: it flips when the sprite's origin (1 the top) is the other side. Then the fragment stage's scaled
-       textures (stage_set), and whether the window is lower left and its surface clip's height, which the fragment's
-       y counts up from there (shader/emit_io.c's shader_frag_y_origin) */
+       1 (VK_DYN_PR_DEPTH_RANGE), and the alpha test's reference for the fragment stage. Then the fragment stage's
+       scaled textures (stage_set) and the surface clip's height, which the fragment's y counts up from in a lower-left
+       window (shader/emit_io.c's shader_frag_y_origin). The test's function, the window's origin and the point
+       sprite's T flip are the pipeline's (vk_pipe_fs_spec) */
     float pc[32] = {0, ds->dyn.depth_mode || (g_vk.dyn_pr & VK_DYN_PR_DEPTH_RANGE) ? 0.0f : 1.0f, 0, 0};
     /* with the viewport transform off, the viewport's width and height (window_size), which the last stage before
        rasterization takes the position's pixels to clip space by (SNX_SH_WINDOW_XY) */
@@ -4925,18 +4927,14 @@ retry:
        indirect mesh draw's first group, which the task or mesh program takes from SNX_VKB_RS */
     u32 params = mesh && dc->indirect ? SH_PUSH_GPU_MESH_FIRST : dc->indirect ? dc->params : 0;
     memcpy(&pc[2], &params, sizeof(u32));
-    pc[4] = ds->dyn.alpha_test ? 1.0f : 0.0f;
-    pc[5] = (float)ds->dyn.alpha_func;
-    memcpy(&pc[6], &ds->dyn.alpha_ref, 4);
-    pc[7] = ds->dyn.sprite_origin == ((ds->dyn.window_origin & DS_ORIGIN_LOWER_LEFT) != 0) ? 1.0f : 0.0f;
+    memcpy(&pc[6], &ds->dyn.alpha_ref, 4); /* the test's function is the pipeline's (vk_pipe_fs_spec) */
     u32 scaled_words[2] = {(u32)scaled[0], (u32)(scaled[0] >> 32)};
     memcpy(&pc[8], scaled_words, sizeof scaled_words);
     /* and of those the ones whose target has the draw's size, in the uvec4 at byte 96: the one at byte 80 holds a
        texture draw's rectangle and a varying pass's viewport */
     u32 own_words[2] = {(u32)scaled[1], (u32)(scaled[1] >> 32)};
     memcpy(&pc[24], own_words, sizeof own_words);
-    u32 origin_words[2] = {(ds->dyn.window_origin & DS_ORIGIN_LOWER_LEFT) != 0, ds->dyn.clip_height};
-    memcpy(&pc[10], origin_words, sizeof origin_words);
+    memcpy(&pc[11], &ds->dyn.clip_height, sizeof(u32));
     float point_size = (dc->state_flags & DS_DRAW_POINT_SIZE) ? dc->point_size : 1.0f;
     if (!g_vk.feat.largePoints || !(point_size > 0)) point_size = 1.0f;
     if (point_size < g_vk.props.limits.pointSizeRange[0]) point_size = g_vk.props.limits.pointSizeRange[0];

@@ -235,6 +235,11 @@ if(TARGET snx_ctr_board)
     snx_test_target(snx-test-3ds-ipc 11)
     target_link_libraries(snx-test-3ds-ipc PRIVATE snx_ctr_process)
     add_test(NAME 3ds_ipc COMMAND snx-test-3ds-ipc)
+    # the SDK's IPC stubs run without the SVC (aot/hook.c)
+    add_executable(snx-test-3ds-hook 3ds_hook.c support/3ds_guest.c)
+    snx_test_target(snx-test-3ds-hook 11)
+    target_link_libraries(snx-test-3ds-hook PRIVATE snx_ctr_process)
+    add_test(NAME 3ds_hook COMMAND snx-test-3ds-hook)
     add_executable(snx-test-3ds-hid 3ds_hid.c support/3ds_guest.c)
     snx_test_target(snx-test-3ds-hid 11)
     target_link_libraries(snx-test-3ds-hid PRIVATE snx_ctr_process)
@@ -1969,6 +1974,11 @@ add_executable(snx-test-loader loader_test.c "${PROJECT_SOURCE_DIR}/src/nx/loade
 snx_test_target(snx-test-loader 99)
 target_link_libraries(snx-test-loader PRIVATE snx_test_common snx_lz4 OpenSSL::Crypto snx_nx_module) # the route list
 add_test(NAME loader_native COMMAND snx-test-loader)
+# the linker (src/nx/loader/relocate.c): three modules relocated into copies and in place, and the two compared
+add_executable(snx-test-relocate relocate_test.c "${PROJECT_SOURCE_DIR}/src/nx/loader/relocate.c")
+snx_test_target(snx-test-relocate 99)
+target_link_libraries(snx-test-relocate PRIVATE scarletnx-common)
+add_test(NAME loader_relocate COMMAND snx-test-relocate)
 # the read-only function matcher: names for a stripped module's functions from the sdk module's exports
 add_executable(snx-test-function-match function_match.c "${PROJECT_SOURCE_DIR}/src/nx/loader/match.c")
 snx_test_target(snx-test-function-match 99)
@@ -2383,6 +2393,15 @@ endif()
 add_executable(snx-test-runtime-variants runtime_variants.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/guest_jit.c")
 snx_test_target(snx-test-runtime-variants 11)
 target_link_libraries(snx-test-runtime-variants PRIVATE scarletnx-common scarletnx-filesystem snx_settings)
+# the runtime's linker beside the game's own (runtime/linker.c): nn::init::Start's slot taken until its first call,
+# when the game's memory is compared with the copy the runtime linked
+add_executable(snx-test-runtime-linker runtime_linker.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/linker.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/loader/relocate.c")
+snx_test_target(snx-test-runtime-linker 11)
+target_link_libraries(snx-test-runtime-linker PRIVATE scarletnx-common scarletnx-filesystem snx_settings)
+add_test(NAME runtime_linker COMMAND snx-test-runtime-linker)
+add_test(NAME runtime_linker_differ COMMAND snx-test-runtime-linker differ)
+add_test(NAME runtime_linker_switch COMMAND snx-test-runtime-linker switch)
 # an NRO's own AOT module (nro_module_fixture.c, a descriptor and two functions by hand), which guest_jit.c loads for
 # the NRO mapped at the address it was made for: runtime_variants copies it under the names the NROs' hashes give
 add_library(snx-test-nro-module MODULE nro_module_fixture.c)
@@ -2750,13 +2769,13 @@ else()
     add_test(NAME a64_ported_cases COMMAND snx-test-a64-ported)
 endif()
 
-add_executable(snx-test-astc astc_decode.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/astc_cpu.c")
+add_executable(snx-test-astc astc_decode.c support/astc.c)
 snx_test_target(snx-test-astc 23)
 add_test(NAME astc_decode COMMAND snx-test-astc)
 # the generated MiiModel archive (hle/filesystem/mii_model.c, which the test includes): its tables against the
 # console's part list and layout, every part's zlib stream, its textures decoded by the CPU references against what
 # they were drawn from, its shapes' attributes and triangles, each file no bigger than the console's
-add_executable(snx-test-mii-model mii_model.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/astc_cpu.c" support/bcn.c
+add_executable(snx-test-mii-model mii_model.c support/astc.c support/bcn.c
                "${PROJECT_SOURCE_DIR}/src/common/utilities/mii_db.c"
                "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/blocklinear.c") # g_gob_native, which the layout reads
 snx_test_target(snx-test-mii-model 99)
@@ -2779,7 +2798,7 @@ if(NOT WIN32)
 endif()
 add_test(NAME mii_cfl COMMAND snx-test-mii-cfl)
 # the ASTC shader's GLSL run on the CPU (tests/glsl/glsl.hpp) against the same decoder: no GPU needed
-add_executable(snx-test-astc-glsl glsl/astc_glsl.cpp "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/astc_cpu.c")
+add_executable(snx-test-astc-glsl glsl/astc_glsl.cpp support/astc.c)
 snx_test_target(snx-test-astc-glsl 23)
 target_include_directories(snx-test-astc-glsl PRIVATE glsl)
 add_test(NAME astc_glsl COMMAND snx-test-astc-glsl)
@@ -2874,7 +2893,7 @@ target_include_directories(snx-test-texconv-glsl PRIVATE glsl)
 add_test(NAME texconv_glsl COMMAND snx-test-texconv-glsl)
 
 # single blocks from rEden's ASTC decoder tests, against edenprobe's and astcenc's texels (astc_blocks.c)
-add_executable(snx-test-astc-blocks astc_blocks.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/astc_cpu.c")
+add_executable(snx-test-astc-blocks astc_blocks.c support/astc.c)
 snx_test_target(snx-test-astc-blocks 23)
 add_test(NAME astc_blocks COMMAND snx-test-astc-blocks)
 

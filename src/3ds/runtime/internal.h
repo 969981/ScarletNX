@@ -338,6 +338,13 @@ struct SnxCtrProcess {
     uint32_t stub_logged[256], stub_logged_count;
     uint64_t time_update_ns; /* host monotonic deadline of the shared page's next hourly time entry */
     uint64_t sched_seq;      /* the last ready_seq/wait_seq handed out */
+    /* The thread and the timer objects, in index order, for the scheduler's passes (kernel/thread.c): an object is 752
+       bytes, and a pass over all of them for their types touched 192 KiB. Made again after an object was made or freed
+       (objects_changed counts them; sched_listed is the count they were made at). Their types are checked as they are
+       read: one freed since is passed over */
+    uint32_t objects_changed, sched_listed;
+    uint16_t sched_threads[CTR_OBJECTS], sched_timers[CTR_OBJECTS];
+    uint32_t sched_thread_count, sched_timer_count;
     /* the block at pc the static module lacks, compiled while the game runs (aot/jit.c) when the driver sets it: NULL
        when it cannot be. stale drops the one compiled before, whose code changed */
     SnxArmBlock (*compile)(void* compiler, uint32_t pc, bool thumb, bool stale);
@@ -347,6 +354,8 @@ struct SnxCtrProcess {
     void (*flush)(void* compiler);
     /* set by flush, and run by the dispatcher before its next block */
     void (*reclaim)(void* compiler);
+    /* the functions of the static text the runtime runs in C (aot/ctr_hook.h), NULL for none */
+    struct SnxCtrHooks* hooks;
     unsigned char physical_owner[];
 };
 CtrThread* snx_ctr_thread(SnxCtrProcess* p);
@@ -364,6 +373,8 @@ void snx_ctr_thread_ready(SnxCtrProcess* p, uint32_t thread);
 uint32_t snx_ctr_thread_priority(SnxCtrProcess* p, uint32_t thread);
 /* every object's effective priority at once (CTR_OBJECTS entries; 64 for what is not a thread) */
 void snx_ctr_thread_priorities(SnxCtrProcess* p, uint32_t* priority);
+/* the scheduler's lists of threads and timers, made again when objects were made or freed since */
+void snx_ctr_sched_lists(SnxCtrProcess* p);
 /* an object type a thread can wait on */
 bool snx_ctr_waitable(uint32_t type);
 /* host monotonic nanoseconds, the clock every deadline is on */
@@ -392,7 +403,14 @@ uint32_t snx_ctr_shared_pages(SnxCtrProcess* p, uint32_t size);
 /* The old linear heap address of the FCRAM page at `physical`; 0 below FCRAM, as for a block with no pages */
 uint32_t snx_ctr_linear_address(uint32_t physical);
 uint32_t snx_ctr_named_connect(SnxCtrProcess* p, uint32_t name_address, uint32_t* out);
+/* svcSendSyncRequest: the request in the current thread's TLS command buffer (TLS + 0x80), answered there */
 SnxCtrSvcResult snx_ctr_ipc_send(SnxCtrProcess* p, uint32_t handle, uint32_t* transport_result);
+/* The request in words, the command buffer's 64 words held by the caller, sent on the session or file handle and
+   answered in place, as snx_ctr_ipc_send's are; words is left as it was when the kernel refuses the request or a
+   service blocks the thread, as the TLS buffer is (aot/hook.c sends a hooked IPC stub's request with it) */
+SnxCtrSvcResult snx_ctr_ipc_exchange(SnxCtrProcess* p, uint32_t handle, uint32_t words[64], uint32_t* transport_result);
+/* the SNX_CTR_SERVICE_* the session or file handle reaches: SNX_CTR_SERVICE_NONE for any other handle */
+uint32_t snx_ctr_ipc_service(const SnxCtrProcess* p, uint32_t handle);
 /* SVC helpers use only RAM transactions, never MMIO or a flat pointer. */
 uint32_t snx_ctr_kernel_memory(SnxCtrProcess* p, uint32_t operation, uint32_t va, uint32_t source, uint32_t size,
                                uint32_t permissions, uint32_t* output);

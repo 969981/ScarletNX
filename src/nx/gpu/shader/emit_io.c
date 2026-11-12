@@ -30,24 +30,18 @@ int shader_ipa_position(u32 pos_in, const u32* sph, u32 addr) {
 }
 
 void shader_alpha_test(DirectCtx* c, u32 push, u32 push_pointer, u32 alpha) {
-    u32 index[3];
-    for (u32 i = 0; i < 3; i++) index[i] = shader_u32(c, i);
-    u32 enabled = spv_emit_push_component_f32(&c->emit, push_pointer, push, index[0], index[0], c->f32_type);
-    u32 function = spv_emit_push_component_f32(&c->emit, push_pointer, push, index[0], index[1], c->f32_type);
-    u32 reference = spv_emit_push_component_f32(&c->emit, push_pointer, push, index[0], index[2], c->f32_type);
-    u32 zero = spv_emit_constant_f32(&c->emit, c->f32_type, 0.0f);
-    u32 active = spv_emit_fcompare(&c->emit, c->bool_type, 5, enabled, zero);
-    u32 pass =
-        spv_emit_fcompare(&c->emit, c->bool_type, 2, function, spv_emit_constant_f32(&c->emit, c->f32_type, 7.0f));
+    /* the function is the pipeline's (SH_SPEC_ALPHA: always, with the test off), so the driver keeps the one
+       comparison of the draw, or none; the reference stays a push constant, as any value of a draw's */
+    u32 function = shader_spec(c, SH_SPEC_ALPHA, SH_SPEC_ALPHA_ALWAYS);
+    u32 reference = spv_emit_push_component_f32(&c->emit, push_pointer, push, c->zero, shader_u32(c, 2), c->f32_type);
+    u32 pass = spv_emit_binary(&c->emit, SPV_OP_I_EQUAL, c->bool_type, function, shader_u32(c, SH_SPEC_ALPHA_ALWAYS));
     for (u32 mode = 1; mode <= 6; mode++) {
-        u32 tag = spv_emit_constant_f32(&c->emit, c->f32_type, (float)mode);
-        u32 selected = spv_emit_fcompare(&c->emit, c->bool_type, 2, function, tag);
+        u32 selected = spv_emit_binary(&c->emit, SPV_OP_I_EQUAL, c->bool_type, function, shader_u32(c, mode));
         u32 comparison = spv_emit_fcompare(&c->emit, c->bool_type, mode, alpha, reference);
         u32 result = spv_emit_bool_binary(&c->emit, c->bool_type, 0, selected, comparison);
         pass = spv_emit_bool_binary(&c->emit, c->bool_type, 1, pass, result);
     }
     u32 fail = spv_emit_unary(&c->emit, SPV_OP_LOGICAL_NOT, c->bool_type, pass);
-    fail = spv_emit_bool_binary(&c->emit, c->bool_type, 0, active, fail);
     if (c->discarded) { /* in the flow loop: discarded after it */
         spv_emit_store(
             &c->emit, c->discarded,
@@ -65,7 +59,7 @@ void shader_alpha_test(DirectCtx* c, u32 push, u32 push_pointer, u32 alpha) {
 u32 shader_frag_y_origin(DirectCtx* c, u32 push, u32 y) {
     u32 one = shader_u32(c, 1);
     u32 pointer = spv_emit_type_pointer(&c->emit, 9, c->u32_type); /* PushConstant */
-    u32 lower_left = spv_emit_push_component_f32(&c->emit, pointer, push, one, shader_u32(c, 2), c->u32_type);
+    u32 lower_left = shader_spec(c, SH_SPEC_LOWER_LEFT, 0);
     u32 height = spv_emit_push_component_f32(&c->emit, pointer, push, one, shader_u32(c, 3), c->u32_type);
     u32 up = spv_emit_binary(&c->emit, SPV_OP_F_ADD, c->f32_type,
                              spv_emit_unary(&c->emit, SPV_OP_CONVERT_U_TO_F, c->f32_type, height),
@@ -656,14 +650,14 @@ void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
             value = spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->f32_type, primitive_read(c, primitive_id));
         } else if (addr == 0x2e0 || addr == 0x2e4) {
             value = shader_input_component(c, vec2, point_coord, c->f32_type, component);
-            if (addr == 0x2e4) { /* T flips with the sprite's origin, a push constant (see vk/render.c) */
-                u32 flip =
-                    spv_emit_push_component_f32(&c->emit, push_pointer, push, c->zero, shader_u32(c, 3), c->f32_type);
+            if (addr == 0x2e4) { /* T flips with the sprite's origin, the pipeline's (SH_SPEC_SPRITE_FLIP) */
+                u32 flip = shader_spec(c, SH_SPEC_SPRITE_FLIP, 0);
                 u32 flipped = spv_emit_binary(&c->emit, SPV_OP_F_ADD, c->f32_type,
                                               spv_emit_constant_f32(&c->emit, c->f32_type, 1.0f),
                                               spv_emit_unary(&c->emit, SPV_OP_F_NEGATE, c->f32_type, value));
                 value = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->f32_type,
-                                         spv_emit_fcompare(&c->emit, c->bool_type, 5, flip, zero_f), flipped, value);
+                                         spv_emit_binary(&c->emit, SPV_OP_I_NOT_EQUAL, c->bool_type, flip, c->zero),
+                                         flipped, value);
             }
         } else if (addr >= 0x80) {
             u32 input = (addr - 0x80) >> 4;

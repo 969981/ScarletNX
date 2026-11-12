@@ -187,6 +187,7 @@ checks: any number of DLCs and one update at most. Give their dumps with the gam
 ```sh
 ./build/scarletnx Game.xci --update Update.nsp --update Dlc.nsp   # the game made first if it isn't yet
 ./build/scarletnx Dlc.nsp                                          # a game made already: its DLC checked too
+./build/scarletnx -r recompiled/<id>/<id> --update Dlc.nsp         # a game made already, its dump not needed
 ```
 
 Each dump given is checked along with what the list checks already: a DLC is added, and an update, older or newer,
@@ -198,6 +199,13 @@ playing, Play keeps it and plays the game, and Back leaves the list as it was. A
 kept the same way by `scarletnx-3ds` (`scarletnx-3ds DLC.cia`, or `--update` with the game); an update there has no
 program of its own, as the game's reads its code, and is listed by its TMD's version (`Update v1040`): see
 [3DS](../platforms/3ds/README.md).
+
+Games groups a game's update and DLC dumps found in the dumps folders as one item, under **Updates and DLCs**
+(`A game: update 1.0.1 + 99 DLCs`), by what each dump is (its content meta, which `-x --icon` reads into the icons'
+cache as `title.ini`), whatever its file is called: the newest update and each DLC once. Opening the item puts them in
+the game made already (`-r` on its program, `--update` each), else recompiles the game's dump with them, else says
+which game is missing. Making a game's dump with such dumps of it around asks *Found the update 1.0.1 and 99 DLCs of
+this game. Recompile together?*, **Yes** in focus; **No** makes the game alone.
 
 - **Programs:** an update is recompiled from its own ExeFS into a program beside the game,
   `recompiled/<id>/<id>_<its title ID>v<its version>`, which runs whenever it is checked. Every version of a game's update
