@@ -748,6 +748,12 @@ if(NOT SNX_BUILD_NX AND NOT SNX_BUILD_GNUABI)
     return()
 endif()
 
+# the shared SPIR-V optimizer's passes on modules the test writes word by word
+add_executable(snx-test-spirv-opt spirv_opt.c "${PROJECT_SOURCE_DIR}/src/common/utilities/spirv_opt.c")
+snx_test_target(snx-test-spirv-opt 99)
+target_include_directories(snx-test-spirv-opt PRIVATE "${PROJECT_SOURCE_DIR}/src")
+add_test(NAME spirv_opt COMMAND snx-test-spirv-opt)
+
 # Validate the direct writer against SPIRV-Tools when the system tools are installed.
 if(SNX_BUILD_NX)
     find_program(SNX_SPIRV_VAL spirv-val)
@@ -1505,6 +1511,10 @@ if(TARGET SDL3::SDL3) # F1's and the Shortcuts pages name the runtime's keys as 
         "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ui.c"
         "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/stats.c"
         "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/hotkeys.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c")
+    if(SNX_TRACY)
+        # the keys page has the capture's row in a build with the client, which the test expects of either
+        target_compile_definitions(snx-test-overlay PRIVATE SNX_TRACY=1)
+    endif()
     snx_test_target(snx-test-overlay 11)
     target_link_libraries(snx-test-overlay PRIVATE scarletnx-common snx_splash m SDL3::SDL3)
     target_include_directories(snx-test-overlay PRIVATE "${PROJECT_BINARY_DIR}/generated")
@@ -2602,6 +2612,12 @@ add_executable(snx-test-nro-modules nro_modules.c)
 snx_test_target(snx-test-nro-modules 11)
 target_link_libraries(snx-test-nro-modules PRIVATE snx_llvm snx_driver OpenSSL::Crypto ${CMAKE_DL_LIBS})
 add_test(NAME nro_modules COMMAND snx-test-nro-modules $<TARGET_FILE:scarletnx> "${CMAKE_CURRENT_BINARY_DIR}/nro-modules-data")
+# a game module's calls through its PLT stubs: direct once the game's linker has bound the slot to the one function
+# that defines the stub's symbol, through the dispatch table otherwise
+add_executable(snx-test-plt-calls plt_calls.c)
+snx_test_target(snx-test-plt-calls 11)
+target_link_libraries(snx-test-plt-calls PRIVATE snx_llvm snx_driver ${CMAKE_DL_LIBS})
+add_test(NAME plt_calls COMMAND snx-test-plt-calls $<TARGET_FILE:scarletnx> "${CMAKE_CURRENT_BINARY_DIR}/plt-calls-data")
 add_test(NAME llvm_module COMMAND snx-test-llvm-module $<TARGET_FILE:scarletnx> "${PROJECT_SOURCE_DIR}")
 add_test(NAME llvm_module_stats COMMAND snx-test-llvm-module $<TARGET_FILE:scarletnx> "${PROJECT_SOURCE_DIR}" --stats)
 # the recompiler as a library (snx_recompiler.h): A64 on every backend built, A32, from code in memory
@@ -3499,7 +3515,7 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
 endif()
 # these recompile with --repo of the checkout, which keeps the code units (nx/loader/unit_cache.c) in the user's cache
 # folder: a folder of the build tree's instead, where XDG names it
-foreach(snx_test native_recompiler llvm_module nro_modules nx_runtime_homebrew nx_runtime_homebrew_64k_pages)
+foreach(snx_test native_recompiler llvm_module nro_modules plt_calls nx_runtime_homebrew nx_runtime_homebrew_64k_pages)
     if(TEST ${snx_test})
         set_property(TEST ${snx_test} APPEND PROPERTY ENVIRONMENT "XDG_CACHE_HOME=${CMAKE_CURRENT_BINARY_DIR}/xdg-cache")
     endif()

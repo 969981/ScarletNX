@@ -264,6 +264,12 @@ typedef struct {
     VkShaderModule module;
 } Variant;
 
+/* the stages of a graphics pipeline */
+enum { ST_VS, ST_GS, ST_FS, ST_COUNT };
+static const VkShaderStageFlagBits k_stage_bit[ST_COUNT] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_GEOMETRY_BIT,
+                                                            VK_SHADER_STAGE_FRAGMENT_BIT};
+static const char* const k_stage_opt[ST_COUNT] = {"--vs", "--gs", "--fs"};
+
 typedef struct {
     SpBench* b;
     VkInstance inst;
@@ -282,13 +288,17 @@ typedef struct {
     uint32_t ts_mask_bits;
     /* the measured stage's pipeline kind */
     VkShaderStageFlagBits stage;
-    /* the companion stage (--vs, --fs): one for every shader, or one for each (--vs given once a shader) */
-    SrModule other[SP_MAX_SHADERS];
-    uint32_t* other_words[SP_MAX_SHADERS];
-    size_t other_size[SP_MAX_SHADERS];
-    VkShaderModule other_module[SP_MAX_SHADERS];
-    size_t other_count;
-    bool have_other, builtin_vs;
+    /* the companion stages of a graphics pipeline (--vs, --gs, --fs, ST_*): each one for every shader, or one for
+       each (given once a shader) */
+    SrModule comp[ST_COUNT][SP_MAX_SHADERS];
+    uint32_t* comp_words[ST_COUNT][SP_MAX_SHADERS];
+    size_t comp_size[ST_COUNT][SP_MAX_SHADERS];
+    VkShaderModule comp_module[ST_COUNT][SP_MAX_SHADERS];
+    size_t comp_count[ST_COUNT];
+    /* the built-in vertex shader feeds the pipeline (no --vs); fullscreen: it draws one full-screen triangle, for a
+       fragment shader */
+    bool builtin_vs, fullscreen;
+    VkShaderModule builtin_module;
     Res* res;
     size_t res_count;
     Target rts[SP_MAX_RTS];
@@ -614,6 +624,9 @@ static bool make_device(Gpu* g, const SpConfig* cfg) {
                         VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT |
                         VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT |
                         VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT;
+        if (f2.features.geometryShader)
+            g->stat_flags |= VK_QUERY_PIPELINE_STATISTIC_GEOMETRY_SHADER_INVOCATIONS_BIT |
+                             VK_QUERY_PIPELINE_STATISTIC_GEOMETRY_SHADER_PRIMITIVES_BIT;
         if (g->family == UINT32_MAX)
             g->stat_flags = 0;
     } else if (cfg->pipeline_stats) {
@@ -1534,22 +1547,44 @@ static uint32_t* load_spirv(const char* path, size_t* size) {
     return words;
 }
 
-/* the companion stage of shader v */
-static size_t oi(const Gpu* g, size_t v) { return g->other_count > 1 ? v : 0; }
+/* the companion of stage s that goes with shader v */
+static size_t ci(const Gpu* g, int s, size_t v) { return g->comp_count[s] > 1 ? v : 0; }
 
-static bool load_other(Gpu* g, const char* spec) {
+/* the module of stage s in shader v's pipeline: the measured shader, a companion, or NULL for none (or the built-in
+   vertex shader) */
+static const SrModule* stage_mod(const Gpu* g, int s, size_t v) {
+    if (g->stage == k_stage_bit[s])
+        return &g->b->shaders[v].mod;
+    return g->comp_count[s] ? &g->comp[s][ci(g, s, v)] : NULL;
+}
+
+/* the modules of shader v's pipeline, the measured one first: their count */
+static size_t pipe_mods(const Gpu* g, size_t v, const SrModule* out[ST_COUNT]) {
+    size_t n = 0;
+    out[n++] = &g->b->shaders[v].mod;
+    for (int s = 0; s < ST_COUNT; s++)
+        if (g->stage != k_stage_bit[s] && g->comp_count[s])
+            out[n++] = &g->comp[s][ci(g, s, v)];
+    return n;
+}
+
+static bool load_comp(Gpu* g, int s, const char* spec) {
     char path[1024], err[256];
     const char* entry;
     split_entry(spec, path, sizeof path, &entry);
-    size_t k = g->other_count++;
-    g->other_words[k] = load_spirv(path, &g->other_size[k]);
-    if (!g->other_words[k])
+    size_t k = g->comp_count[s]++;
+    g->comp_words[s][k] = load_spirv(path, &g->comp_size[s][k]);
+    if (!g->comp_words[s][k])
         return false;
-    if (!sr_reflect(g->other_words[k], g->other_size[k], entry, &g->other[k], err, sizeof err)) {
+    if (!sr_reflect(g->comp_words[s][k], g->comp_size[s][k], entry, &g->comp[s][k], err, sizeof err)) {
         fprintf(stderr, "snx-shaderperf: %s: %s\n", path, err);
         return false;
     }
-    g->have_other = true;
+    if (g->comp[s][k].entry.stage != k_stage_bit[s]) {
+        fprintf(stderr, "snx-shaderperf: %s %s is a %s shader\n", k_stage_opt[s], path,
+                sr_stage_name(g->comp[s][k].entry.stage));
+        return false;
+    }
     return true;
 }
 
@@ -1651,18 +1686,6 @@ static void target_free(Gpu* g, Target* t) {
     memset(t, 0, sizeof *t);
 }
 
-/* the fragment shader of the pipeline: the measured one or --fs, NULL for none */
-static const SrModule* frag_module(Gpu* g) {
-    if (g->stage == VK_SHADER_STAGE_FRAGMENT_BIT)
-        return &g->b->shaders[0].mod;
-    return g->have_other ? &g->other[0] : NULL;
-}
-
-static const SrModule* vert_module(Gpu* g) {
-    if (g->stage == VK_SHADER_STAGE_VERTEX_BIT)
-        return &g->b->shaders[0].mod;
-    return g->have_other ? &g->other[0] : NULL;
-}
 
 static bool parse_topology(const char* s, VkPrimitiveTopology* out) {
     static const struct {
@@ -1670,7 +1693,9 @@ static bool parse_topology(const char* s, VkPrimitiveTopology* out) {
         VkPrimitiveTopology t;
     } k[] = {{"points", VK_PRIMITIVE_TOPOLOGY_POINT_LIST},       {"lines", VK_PRIMITIVE_TOPOLOGY_LINE_LIST},
              {"linestrip", VK_PRIMITIVE_TOPOLOGY_LINE_STRIP},    {"triangles", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST},
-             {"strip", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP},     {"fan", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN}};
+             {"strip", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP},     {"fan", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN},
+             {"lines_adj", VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY},
+             {"triangles_adj", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY}};
     for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
         if (ieq(s, k[i].name)) {
             *out = k[i].t;
@@ -1679,33 +1704,82 @@ static bool parse_topology(const char* s, VkPrimitiveTopology* out) {
     return false;
 }
 
+/* vertices of one primitive in a list of the topology, 1 for the strips and fans past their first */
+static uint32_t prim_vertices(VkPrimitiveTopology t) {
+    switch (t) {
+    case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return 1;
+    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: return 2;
+    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY: return 4;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY: return 6;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: return 3;
+    default: return 1;
+    }
+}
+
+/* the primitives a draw of n vertices makes */
+static uint64_t primitives(VkPrimitiveTopology t, uint32_t n) {
+    switch (t) {
+    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: return n >= 2 ? n - 1 : 0;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN: return n >= 3 ? n - 2 : 0;
+    default: return n / prim_vertices(t);
+    }
+}
+
 /* render targets, vertex buffers and the index buffer of a graphics pipeline */
 static bool make_graphics(Gpu* g) {
     SpConfig* cfg = &g->b->cfg;
-    const SrModule* fs = frag_module(g);
-    const SrModule* vs = vert_module(g);
-    if (g->stage == VK_SHADER_STAGE_FRAGMENT_BIT && !g->have_other) {
+    const SrModule* fs = stage_mod(g, ST_FS, 0);
+    const SrModule* vs = stage_mod(g, ST_VS, 0);
+    if (!vs) {
+        /* the built-in vertex shader feeds the next stage */
+        const SrModule* next = stage_mod(g, ST_GS, 0) ? stage_mod(g, ST_GS, 0) : fs;
         g->builtin_vs = true;
-        for (size_t i = 0; i < fs->input_count; i++) {
-            const SrVarying* v = &fs->inputs[i];
+        g->fullscreen = g->stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+        for (size_t i = 0; i < next->input_count; i++) {
+            const SrVarying* v = &next->inputs[i];
             if (v->builtin)
                 continue;
             if (v->scalar != SR_FLOAT || v->width != 32 || v->location + v->locations > 8 || v->vec > 4) {
                 fprintf(stderr,
-                        "snx-shaderperf: the fragment shader's input %s at location %u is %s%u x%u; the built-in "
+                        "snx-shaderperf: the %s shader's input %s at location %u is %s%u x%u; the built-in "
                         "vertex shader gives float vec4 at locations 0 to 7 only: give one with --vs (--print-vs "
                         "writes a matching GLSL one)\n",
-                        v->name[0] ? v->name : "?", v->location, sr_scalar_name(v->scalar), v->width, v->vec);
+                        sr_stage_name(next->entry.stage), v->name[0] ? v->name : "?", v->location,
+                        sr_scalar_name(v->scalar), v->width, v->vec);
                 return false;
             }
         }
     }
+    /* a geometry shader's input primitive picks the topology unless --topology does */
+    const SrModule* gs = stage_mod(g, ST_GS, 0);
+    if (!cfg->topology) {
+        static const char* const by_input[7] = {"triangles", "points", "lines", "triangles", "lines_adj", "triangles",
+                                                "triangles_adj"};
+        cfg->topology = gs && gs->gs_input_vertices <= 6 ? by_input[gs->gs_input_vertices] : "triangles";
+    }
     if (!parse_topology(cfg->topology, &g->topology)) {
-        fprintf(stderr, "snx-shaderperf: --topology %s: points lines linestrip triangles strip fan\n", cfg->topology);
+        fprintf(stderr, "snx-shaderperf: --topology %s: points lines linestrip triangles strip fan lines_adj "
+                        "triangles_adj\n", cfg->topology);
         return false;
     }
+    for (size_t v = 0; v < g->b->shader_count; v++) {
+        /* every geometry shader of the run reads the primitive the topology makes */
+        const SrModule* m = stage_mod(g, ST_GS, v);
+        uint32_t want = g->topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP       ? 2
+                        : g->topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ? 3
+                        : g->topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN   ? 3
+                                                                               : prim_vertices(g->topology);
+        if (m && m->gs_input_vertices && m->gs_input_vertices != want) {
+            fprintf(stderr,
+                    "snx-shaderperf: %s: the geometry shader reads primitives of %u vertices and --topology %s makes "
+                    "them of %u: run geometry shaders of one input primitive together\n",
+                    g->b->shaders[v].label, m->gs_input_vertices, cfg->topology, want);
+            return false;
+        }
+    }
     if (!cfg->vertices)
-        cfg->vertices = g->stage == VK_SHADER_STAGE_VERTEX_BIT ? 3u * 65536u : 3u;
+        cfg->vertices = g->stage == VK_SHADER_STAGE_FRAGMENT_BIT ? 3u : prim_vertices(g->topology) * 65536u;
     if (fs) {
         for (size_t i = 0; i < fs->output_count; i++) {
             const SrVarying* v = &fs->outputs[i];
@@ -1763,6 +1837,27 @@ static bool make_graphics(Gpu* g) {
                     return false;
                 }
                 VkFormat vk = attr_format(v);
+                uint32_t loc = v->location + k;
+                if (loc < 32 && cfg->attr_formats[loc]) {
+                    /* --attr: the format the buffer holds, which the input fetch converts (unorm, snorm, half...) */
+                    const SpFormat* af = sp_format_find(cfg->attr_formats[loc]);
+                    VkFormatProperties fp = {0};
+                    if (af)
+                        vkGetPhysicalDeviceFormatProperties(g->phys, af->vk, &fp);
+                    bool int_fmt = af && (af->numeric == SP_UINT || af->numeric == SP_SINT);
+                    if (af && int_fmt != (v->scalar != SR_FLOAT)) {
+                        fprintf(stderr, "snx-shaderperf: --attr %u=%s: the input %s is %s, the format %s\n", loc,
+                                cfg->attr_formats[loc], v->name, v->scalar == SR_FLOAT ? "float" : "an integer",
+                                int_fmt ? "an integer one" : "a float one (float, norm or scaled)");
+                        return false;
+                    }
+                    if (!af || !(fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)) {
+                        fprintf(stderr, "snx-shaderperf: --attr %u=%s: %s\n", loc, cfg->attr_formats[loc],
+                                af ? "the device has no vertex buffers of it" : "unknown format (--list-formats)");
+                        return false;
+                    }
+                    vk = af->vk;
+                }
                 const SpFormat* f = sp_format_vk(vk);
                 if (!f) {
                     fprintf(stderr, "snx-shaderperf: vertex input %s: no attribute format for %s%u x%u\n", v->name,
@@ -1822,9 +1917,12 @@ static bool make_graphics(Gpu* g) {
 /* ---- per-shader state ---- */
 
 static uint32_t push_size_of(Gpu* g, size_t v) {
-    uint32_t s = g->b->shaders[v].mod.push_size;
-    if (g->have_other && g->other[oi(g, v)].push_size > s)
-        s = g->other[oi(g, v)].push_size;
+    const SrModule* mods[ST_COUNT];
+    size_t n = pipe_mods(g, v, mods);
+    uint32_t s = 0;
+    for (size_t k = 0; k < n; k++)
+        if (mods[k]->push_size > s)
+            s = mods[k]->push_size;
     return (s + 3) & ~3u;
 }
 
@@ -1933,10 +2031,12 @@ static bool build_push(Gpu* g, size_t v) {
             for (size_t k = 0; k < m->push_count && !mem; k++)
                 if (strcmp(m->push[k].name, target) == 0)
                     mem = &m->push[k];
-            const SrModule* om = g->have_other ? &g->other[oi(g, v)] : NULL;
-            for (size_t k = 0; om && k < om->push_count && !mem; k++)
-                if (strcmp(om->push[k].name, target) == 0)
-                    mem = &om->push[k];
+            const SrModule* mods[ST_COUNT];
+            size_t nm = pipe_mods(g, v, mods);
+            for (size_t j = 1; j < nm; j++)
+                for (size_t k = 0; k < mods[j]->push_count && !mem; k++)
+                    if (strcmp(mods[j]->push[k].name, target) == 0)
+                        mem = &mods[j]->push[k];
             if (!mem) {
                 fprintf(stderr, "snx-shaderperf: --push %s: no such member (--reflect lists them)\n", target);
                 return false;
@@ -2009,11 +2109,12 @@ static bool build_spec(Gpu* g, size_t v) {
 /* set layouts, descriptor sets and the pipeline layout of a shader with the companion stage */
 static bool make_layout(Gpu* g, size_t v) {
     Variant* var = &g->var[v];
-    const SrModule* mods[2] = {&g->b->shaders[v].mod, g->have_other ? &g->other[oi(g, v)] : NULL};
+    const SrModule* mods[ST_COUNT];
+    size_t nm = pipe_mods(g, v, mods);
     uint32_t max_set = 0;
     bool any = false;
-    for (int k = 0; k < 2; k++)
-        for (size_t i = 0; mods[k] && i < mods[k]->binding_count; i++) {
+    for (size_t k = 0; k < nm; k++)
+        for (size_t i = 0; i < mods[k]->binding_count; i++) {
             any = true;
             if (mods[k]->bindings[i].set > max_set)
                 max_set = mods[k]->bindings[i].set;
@@ -2022,8 +2123,8 @@ static bool make_layout(Gpu* g, size_t v) {
     for (uint32_t s = 0; s < var->set_count; s++) {
         VkDescriptorSetLayoutBinding lb[64];
         uint32_t n = 0;
-        for (int k = 0; k < 2; k++)
-            for (size_t i = 0; mods[k] && i < mods[k]->binding_count; i++) {
+        for (size_t k = 0; k < nm; k++)
+            for (size_t i = 0; i < mods[k]->binding_count; i++) {
                 const SrBinding* sb = &mods[k]->bindings[i];
                 if (sb->set != s)
                     continue;
@@ -2084,9 +2185,10 @@ static bool make_pool(Gpu* g) {
     VkDescriptorPoolSize sizes[16];
     uint32_t n = 0, sets = 0;
     for (size_t v = 0; v < g->b->shader_count; v++) {
-        const SrModule* mods[2] = {&g->b->shaders[v].mod, g->have_other ? &g->other[oi(g, v)] : NULL};
-        for (int k = 0; k < 2; k++)
-            for (size_t i = 0; mods[k] && i < mods[k]->binding_count; i++) {
+        const SrModule* mods[ST_COUNT];
+        size_t nm = pipe_mods(g, v, mods);
+        for (size_t k = 0; k < nm; k++)
+            for (size_t i = 0; i < mods[k]->binding_count; i++) {
                 const SrBinding* sb = &mods[k]->bindings[i];
                 Res* r = find_res(g, sb->set, sb->binding);
                 uint32_t j = 0;
@@ -2121,7 +2223,7 @@ static bool create_pipeline(Gpu* g, size_t v, VkPipelineCreateFlags flags, VkPip
     SpShader* sh = &g->b->shaders[v];
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rss = {
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, NULL, cfg->subgroup_size};
-    VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    VkPipelineShaderStageCreateInfo stages[ST_COUNT] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     stages[0].stage = g->stage;
     stages[0].module = var->module;
     stages[0].pName = sh->mod.entry.name;
@@ -2139,22 +2241,33 @@ static bool create_pipeline(Gpu* g, size_t v, VkPipelineCreateFlags flags, VkPip
         return true;
     }
     uint32_t stage_count = 1;
-    if (g->builtin_vs || g->have_other) {
-        stages[1] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        stages[1].stage = g->stage == VK_SHADER_STAGE_FRAGMENT_BIT ? VK_SHADER_STAGE_VERTEX_BIT
-                                                                   : VK_SHADER_STAGE_FRAGMENT_BIT;
-        stages[1].module = g->other_module[oi(g, v)];
-        stages[1].pName = g->builtin_vs ? "main" : g->other[oi(g, v)].entry.name;
-        stage_count = 2;
+    for (int s = 0; s < ST_COUNT; s++) {
+        if (g->stage == k_stage_bit[s])
+            continue;
+        VkShaderModule m = VK_NULL_HANDLE;
+        const char* name = "main";
+        if (g->comp_count[s]) {
+            m = g->comp_module[s][ci(g, s, v)];
+            name = g->comp[s][ci(g, s, v)].entry.name;
+        } else if (s == ST_VS && g->builtin_vs) {
+            m = g->builtin_module;
+        }
+        if (!m)
+            continue;
+        stages[stage_count] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        stages[stage_count].stage = k_stage_bit[s];
+        stages[stage_count].module = m;
+        stages[stage_count].pName = name;
+        stage_count++;
     }
-    bool has_fs = frag_module(g) != NULL;
+    bool has_fs = stage_mod(g, ST_FS, v) != NULL;
     VkPipelineVertexInputStateCreateInfo vis = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vis.vertexBindingDescriptionCount = g->attr_count;
     vis.pVertexBindingDescriptions = g->vbinds;
     vis.vertexAttributeDescriptionCount = g->attr_count;
     vis.pVertexAttributeDescriptions = g->attrs;
     VkPipelineInputAssemblyStateCreateInfo ias = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    ias.topology = g->builtin_vs ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : g->topology;
+    ias.topology = g->fullscreen ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : g->topology;
     VkPipelineViewportStateCreateInfo vps = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vps.viewportCount = vps.scissorCount = 1;
     VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
@@ -2272,8 +2385,8 @@ static void record_body(Gpu* g, size_t v, VkCommandBuffer cb, uint32_t reps, boo
     ri.pColorAttachments = cols;
     ri.pDepthAttachment = g->have_depth ? &dep : NULL;
     ri.pStencilAttachment = g->have_depth && (g->depth.aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? &dep : NULL;
-    uint32_t instances = g->builtin_vs ? 1 : cfg->instances;
-    uint32_t verts = g->builtin_vs ? 3 : cfg->vertices;
+    uint32_t instances = g->fullscreen ? 1 : cfg->instances;
+    uint32_t verts = g->fullscreen ? 3 : cfg->vertices;
     bool one_pass = cfg->overlap;
     if (one_pass)
         vkCmdBeginRendering(cb, &ri);
@@ -3012,9 +3125,12 @@ static void gpu_free(Gpu* g) {
         if (var->module)
             vkDestroyShaderModule(g->dev, var->module, NULL);
     }
-    for (size_t k = 0; k < SP_MAX_SHADERS; k++)
-        if (g->other_module[k])
-            vkDestroyShaderModule(g->dev, g->other_module[k], NULL);
+    for (int s = 0; s < ST_COUNT; s++)
+        for (size_t k = 0; k < SP_MAX_SHADERS; k++)
+            if (g->comp_module[s][k])
+                vkDestroyShaderModule(g->dev, g->comp_module[s][k], NULL);
+    if (g->builtin_module)
+        vkDestroyShaderModule(g->dev, g->builtin_module, NULL);
     if (g->dpool)
         vkDestroyDescriptorPool(g->dev, g->dpool, NULL);
     for (size_t i = 0; i < g->res_count; i++)
@@ -3038,10 +3154,11 @@ static void gpu_free(Gpu* g) {
     if (g->messenger)
         vkDestroyDebugUtilsMessengerEXT(g->inst, g->messenger, NULL);
     vkDestroyInstance(g->inst, NULL);
-    for (size_t k = 0; k < g->other_count; k++) {
-        sr_free(&g->other[k]);
-        free(g->other_words[k]);
-    }
+    for (int s = 0; s < ST_COUNT; s++)
+        for (size_t k = 0; k < g->comp_count[s]; k++) {
+            sr_free(&g->comp[s][k]);
+            free(g->comp_words[s][k]);
+        }
 }
 
 /* a device without the benchmark: for the listings */
@@ -3211,25 +3328,36 @@ bool sp_gpu_run(SpBench* b) {
     bool ok = false;
     g->stage = b->shaders[0].mod.entry.stage;
     if (g->stage != VK_SHADER_STAGE_COMPUTE_BIT && g->stage != VK_SHADER_STAGE_FRAGMENT_BIT &&
-        g->stage != VK_SHADER_STAGE_VERTEX_BIT) {
-        fprintf(stderr, "snx-shaderperf: %s shaders are not supported: compute, fragment and vertex are\n",
+        g->stage != VK_SHADER_STAGE_VERTEX_BIT && g->stage != VK_SHADER_STAGE_GEOMETRY_BIT) {
+        fprintf(stderr, "snx-shaderperf: %s shaders are not supported: compute, vertex, geometry and fragment are\n",
                 sr_stage_name(g->stage));
         goto out;
     }
-    if (g->stage == VK_SHADER_STAGE_FRAGMENT_BIT && cfg->vs_count) {
-        if (cfg->vs_count != 1 && cfg->vs_count != b->shader_count) {
-            fprintf(stderr, "snx-shaderperf: %zu --vs for %zu shaders: give one for all, or one each\n",
-                    cfg->vs_count, b->shader_count);
-            goto out;
-        }
-        for (size_t k = 0; k < cfg->vs_count; k++)
-            if (!load_other(g, cfg->vs[k]))
+    {
+        /* the companion stages: each given once for all the shaders, or once for each */
+        const char* const* lists[ST_COUNT] = {cfg->vs, cfg->gs, cfg->fs};
+        size_t counts[ST_COUNT] = {cfg->vs_count, cfg->gs_count, cfg->fs_count};
+        for (int s = 0; s < ST_COUNT; s++) {
+            if (!counts[s])
+                continue;
+            if (g->stage == VK_SHADER_STAGE_COMPUTE_BIT) {
+                sp_warn(b, "%s is for graphics shaders: ignored", k_stage_opt[s]);
+                continue;
+            }
+            if (g->stage == k_stage_bit[s]) {
+                sp_warn(b, "%s: the measured shaders are that stage: ignored", k_stage_opt[s]);
+                continue;
+            }
+            if (counts[s] != 1 && counts[s] != b->shader_count) {
+                fprintf(stderr, "snx-shaderperf: %zu %s for %zu shaders: give one for all, or one each\n", counts[s],
+                        k_stage_opt[s], b->shader_count);
                 goto out;
+            }
+            for (size_t k = 0; k < counts[s]; k++)
+                if (!load_comp(g, s, lists[s][k]))
+                    goto out;
+        }
     }
-    if (g->stage == VK_SHADER_STAGE_VERTEX_BIT && cfg->fs && !load_other(g, cfg->fs))
-        goto out;
-    if (g->stage == VK_SHADER_STAGE_COMPUTE_BIT && (cfg->vs_count || cfg->fs))
-        sp_warn(b, "--vs and --fs are for graphics shaders: ignored");
     if (!make_instance(g, cfg) || !pick_device(g, cfg) || !make_device(g, cfg))
         goto out;
     fill_device_info(g);
@@ -3249,8 +3377,9 @@ bool sp_gpu_run(SpBench* b) {
     }
     {
         size_t total = 0;
-        for (size_t k = 0; k < g->other_count; k++)
-            total += g->other[k].binding_count;
+        for (int s = 0; s < ST_COUNT; s++)
+            for (size_t k = 0; k < g->comp_count[s]; k++)
+                total += g->comp[s][k].binding_count;
         for (size_t v = 0; v < b->shader_count; v++)
             total += b->shaders[v].mod.binding_count;
         g->res = xcalloc(total, sizeof *g->res);
@@ -3258,10 +3387,11 @@ bool sp_gpu_run(SpBench* b) {
             for (size_t i = 0; i < b->shaders[v].mod.binding_count; i++)
                 if (!add_res(g, &b->shaders[v].mod.bindings[i]))
                     goto out;
-        for (size_t k = 0; k < g->other_count; k++)
-            for (size_t i = 0; i < g->other[k].binding_count; i++)
-                if (!add_res(g, &g->other[k].bindings[i]))
-                    goto out;
+        for (int s = 0; s < ST_COUNT; s++)
+            for (size_t k = 0; k < g->comp_count[s]; k++)
+                for (size_t i = 0; i < g->comp[s][k].binding_count; i++)
+                    if (!add_res(g, &g->comp[s][k].bindings[i]))
+                        goto out;
         for (size_t i = 0; i < cfg->bind_count; i++) {
             bool used = false;
             for (size_t k = 0; k < g->res_count && !used; k++) {
@@ -3280,11 +3410,12 @@ bool sp_gpu_run(SpBench* b) {
         goto out;
     if (!make_pool(g))
         goto out;
-    if (g->builtin_vs && !(g->other_module[0] = make_module(g, k_fullscreen_vert, sizeof k_fullscreen_vert)))
+    if (g->builtin_vs && !(g->builtin_module = make_module(g, k_fullscreen_vert, sizeof k_fullscreen_vert)))
         goto out;
-    for (size_t k = 0; k < g->other_count; k++)
-        if (!(g->other_module[k] = make_module(g, g->other_words[k], g->other_size[k])))
-            goto out;
+    for (int s = 0; s < ST_COUNT; s++)
+        for (size_t k = 0; k < g->comp_count[s]; k++)
+            if (!(g->comp_module[s][k] = make_module(g, g->comp_words[s][k], g->comp_size[s][k])))
+                goto out;
     for (size_t v = 0; v < b->shader_count; v++) {
         SpShader* sh = &b->shaders[v];
         Variant* var = &g->var[v];
@@ -3324,7 +3455,10 @@ bool sp_gpu_run(SpBench* b) {
             sh->invocations = (uint64_t)sh->dispatch[0] * sh->dispatch[1] * sh->dispatch[2] * local[0] * local[1] *
                               local[2];
         } else if (g->stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
-            sh->invocations = (uint64_t)cfg->width * cfg->height * (g->builtin_vs ? 1 : cfg->instances);
+            sh->invocations = (uint64_t)cfg->width * cfg->height * (g->fullscreen ? 1 : cfg->instances);
+        } else if (g->stage == VK_SHADER_STAGE_GEOMETRY_BIT) {
+            /* an invocation a primitive, times the shader's invocations mode */
+            sh->invocations = primitives(g->topology, cfg->vertices) * cfg->instances * sh->mod.gs_invocations;
         } else {
             sh->invocations = (uint64_t)cfg->vertices * cfg->instances;
         }

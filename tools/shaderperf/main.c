@@ -22,12 +22,14 @@ static const char* const k_help[] = {
     "\n",
     "Shaders:\n"
     "  --entry NAME              entry point of every shader (or SHADER.spv#NAME)\n"
-    "  --vs FILE[#entry]         vertex shader for the fragment shaders, or one --vs for each shader in order\n"
-    "                            (default: a built-in full-screen triangle\n"
+    "  --vs FILE[#entry]         vertex shader for geometry or fragment shaders, or one --vs for each shader in\n"
+    "                            order (default: a built-in one, a full-screen triangle for a fragment shader,\n"
     "                            giving float vec4 varyings at locations 0-7: r,g = screen uv, b = loc/8, a = 1)\n"
-    "  --fs FILE[#entry]         fragment shader for a vertex shader (default: rasterizer discard)\n"
+    "  --gs FILE[#entry]         geometry shader between them, or one each (default: none)\n"
+    "  --fs FILE[#entry]         fragment shader for vertex or geometry shaders, or one each (default: rasterizer\n"
+    "                            discard)\n"
     "  --reflect                 print each shader's reflected interface as JSON and exit (no GPU)\n"
-    "  --print-vs                print a GLSL full-screen vertex shader that feeds the fragment shader's inputs\n"
+    "  --print-vs                print a GLSL vertex shader that feeds the fragment or geometry shader's inputs\n"
     "                            (integer ones too) and exit: glslc -fshader-stage=vert it, then --vs\n"
     "\n",
     "Device:\n"
@@ -44,12 +46,15 @@ static const char* const k_help[] = {
     "  --size WxH[xD]            compute grid in invocations, or framebuffer (default 1920x1080x1)\n"
     "  --dispatch X,Y,Z          workgroups, in place of --size for compute\n"
     "  --samples N               MSAA samples of the render targets (default 1)\n"
-    "  --rt LOC=FORMAT           render target format of an output location (default rgba8_unorm, r..rgba32 int)\n"
+    "  --rt LOC=FORMAT           render target format of an output location (default rgba8_unorm, r..rgba32 int)\n"    "  --attr LOC=FORMAT         vertex attribute format of an input location (default the input's type: float\n"
+    "                            vec4 is rgba32_sfloat; give rgba8_unorm, rgba16_sfloat... for packed vertices)\n"
     "  --depth FORMAT            a depth attachment; --depth-test, --depth-write turn its test and writes on\n"
     "  --clear                   clear the attachments on each pass (default: don't care)\n"
     "  --blend none|alpha|add    blending on every render target (default none)\n"
-    "  --vertices N --instances N  vertices and instances a draw (vertex shaders: 196608 x 1)\n"
-    "  --topology points|lines|linestrip|triangles|strip|fan (default triangles)\n"
+    "  --vertices N --instances N  vertices and instances a draw (vertex and geometry shaders: 65536 primitives\n"
+    "                            x 1)\n"
+    "  --topology points|lines|linestrip|triangles|strip|fan|lines_adj|triangles_adj (default triangles, or a\n"
+    "                            geometry shader's input primitive)\n"
     "  --index none|seq|random   an index buffer (vertex cache behavior)\n"
     "  --vertex-fill PATTERN     vertex attribute data: noise, gradient, zero, solid:R,G,B,A (default noise)\n"
     "\n",
@@ -200,7 +205,6 @@ static int parse_args(int argc, char** argv, SpConfig* c, Mode* mode) {
     c->height = 1080;
     c->depth = 1;
     c->samples = 1;
-    c->topology = "triangles";
     c->instances = 1;
     c->default_buffer = 16u << 20;
     c->runtime_count = 1;
@@ -244,8 +248,14 @@ static int parse_args(int argc, char** argv, SpConfig* c, Mode* mode) {
             if (c->vs_count >= SP_MAX_SHADERS)
                 return usage_error("too many --vs: %s", v);
             c->vs[c->vs_count++] = v;
+        } else if (VALUE("--gs")) {
+            if (c->gs_count >= SP_MAX_SHADERS)
+                return usage_error("too many --gs: %s", v);
+            c->gs[c->gs_count++] = v;
         } else if (VALUE("--fs")) {
-            c->fs = v;
+            if (c->fs_count >= SP_MAX_SHADERS)
+                return usage_error("too many --fs: %s", v);
+            c->fs[c->fs_count++] = v;
         } else if (VALUE("--device")) {
             c->device = v;
         } else if (VALUE("--loader")) {
@@ -285,6 +295,10 @@ static int parse_args(int argc, char** argv, SpConfig* c, Mode* mode) {
             if (!split_arg(v, &pa) || atoi(pa.target) < 0 || atoi(pa.target) >= SP_MAX_RTS)
                 return usage_error("--rt %s: LOC=FORMAT, LOC 0 to 7", v);
             c->rt_formats[atoi(pa.target)] = pa.value;
+        } else if (VALUE("--attr")) {
+            if (!split_arg(v, &pa) || atoi(pa.target) < 0 || atoi(pa.target) >= 32)
+                return usage_error("--attr %s: LOC=FORMAT, LOC 0 to 31", v);
+            c->attr_formats[atoi(pa.target)] = pa.value;
         } else if (VALUE("--depth")) {
             c->depth_format = v;
         } else if (FLAG("--depth-test")) {
@@ -503,8 +517,13 @@ static void js_module(FILE* f, const char* path, const SrModule* m) {
         js_str(f, m->entries[i].name);
         fprintf(f, ", \"stage\": \"%s\"}", sr_stage_name(m->entries[i].stage));
     }
-    fprintf(f, "],\n   \"local_size\": [%u, %u, %u], \"local_size_spec_ids\": [", m->local[0], m->local[1],
-            m->local[2]);
+    if (m->entry.stage == VK_SHADER_STAGE_GEOMETRY_BIT)
+        fprintf(f, "],\n   \"geometry\": {\"invocations\": %u, \"input_vertices\": %u, \"max_vertices\": %u, "
+                   "\"output\": \"%s\"}",
+                m->gs_invocations, m->gs_input_vertices, m->gs_max_vertices,
+                m->gs_output == 0 ? "points" : m->gs_output == 1 ? "line_strip" : "triangle_strip");
+    fprintf(f, "%s\n   \"local_size\": [%u, %u, %u], \"local_size_spec_ids\": [",
+            m->entry.stage == VK_SHADER_STAGE_GEOMETRY_BIT ? "," : "],", m->local[0], m->local[1], m->local[2]);
     for (int i = 0; i < 3; i++) {
         if (m->local_spec[i] == UINT32_MAX)
             fprintf(f, "%snull", i ? ", " : "");
@@ -627,13 +646,13 @@ static int print_vs(const SpConfig* c) {
     SrModule m;
     if (!reflect_file(c->shaders[0], c->entry, &m))
         return 1;
-    if (m.entry.stage != VK_SHADER_STAGE_FRAGMENT_BIT) {
-        fprintf(stderr, "snx-shaderperf: --print-vs wants a fragment shader, %s is a %s one\n", c->shaders[0],
-                sr_stage_name(m.entry.stage));
+    if (m.entry.stage != VK_SHADER_STAGE_FRAGMENT_BIT && m.entry.stage != VK_SHADER_STAGE_GEOMETRY_BIT) {
+        fprintf(stderr, "snx-shaderperf: --print-vs wants a fragment or geometry shader, %s is a %s one\n",
+                c->shaders[0], sr_stage_name(m.entry.stage));
         sr_free(&m);
         return 1;
     }
-    printf("#version 450\n// a full-screen triangle for %s (snx-shaderperf --print-vs); draw 3 vertices\n",
+    printf("#version 450\n// a full-screen triangle every 3 vertices for %s (snx-shaderperf --print-vs)\n",
            c->shaders[0]);
     int status = 0;
     for (size_t i = 0; i < m.input_count; i++) {
@@ -712,6 +731,8 @@ static const char* stage_unit(VkShaderStageFlagBits stage, bool plural) {
         return plural ? "invocations" : "invocation";
     if (stage == VK_SHADER_STAGE_FRAGMENT_BIT)
         return plural ? "pixels" : "pixel";
+    if (stage == VK_SHADER_STAGE_GEOMETRY_BIT)
+        return plural ? "primitive invocations" : "primitive invocation";
     return plural ? "vertices" : "vertex";
 }
 
@@ -729,12 +750,18 @@ static void text_report(FILE* f, const SpBench* b, const SpCompare* cmp) {
                 b->shaders[0].dispatch[1], b->shaders[0].dispatch[2], b->shaders[0].mod.local[0],
                 b->shaders[0].mod.local[1], b->shaders[0].mod.local[2]);
     else if (stage == VK_SHADER_STAGE_FRAGMENT_BIT)
-        fprintf(f, "workload: fragment, %u x %u framebuffer, %u sample%s, %s vertex shader\n", c->width, c->height,
+        fprintf(f, "workload: fragment, %u x %u framebuffer, %u sample%s, %s vertex shader%s\n", c->width, c->height,
                 c->samples, c->samples > 1 ? "s" : "",
-                c->vs_count > 1 ? "one --vs each" : c->vs_count ? c->vs[0] : "built-in full-screen");
-        else
-        fprintf(f, "workload: vertex, %u vertices x %u instances, %s\n", c->vertices, c->instances,
-                c->fs ? c->fs : "rasterizer discard");
+                c->vs_count > 1 ? "one --vs each" : c->vs_count ? c->vs[0] : "built-in full-screen",
+                c->gs_count > 1 ? ", one --gs each" : c->gs_count ? ", a --gs" : "");
+    else if (stage == VK_SHADER_STAGE_GEOMETRY_BIT)
+        fprintf(f, "workload: geometry, %u vertices x %u instances of %s, %s vertex shader, %s\n", c->vertices,
+                c->instances, c->topology, c->vs_count > 1 ? "one --vs each" : c->vs_count ? c->vs[0] : "built-in",
+                c->fs_count > 1 ? "one --fs each" : c->fs_count ? c->fs[0] : "rasterizer discard");
+    else
+        fprintf(f, "workload: vertex, %u vertices x %u instances, %s%s\n", c->vertices, c->instances,
+                c->fs_count > 1 ? "one --fs each" : c->fs_count ? c->fs[0] : "rasterizer discard",
+                c->gs_count > 1 ? ", one --gs each" : c->gs_count ? ", a --gs" : "");
     fprintf(f, "sampling: %u repetitions a sample%s, %s barriers between them, outliers %s, %.0f ms in all\n", b->reps,
             c->reps_auto ? " (auto)" : "", c->overlap ? "no" : "with",
             c->outliers == SP_OUTLIERS_IQR ? "iqr" : c->outliers == SP_OUTLIERS_MAD ? "mad" : "kept", b->elapsed_ms);

@@ -29,10 +29,13 @@ typedef struct {
     const char* shaders[SP_MAX_SHADERS];
     size_t shader_count;
     const char* entry;
-    /* the other stage of a graphics pipeline, "path#entry": a vertex shader for all fragment shaders or one each */
+    /* the other stages of a graphics pipeline, "path#entry": each one for all the shaders, or one each */
     const char* vs[SP_MAX_SHADERS];
     size_t vs_count;
-    const char* fs;
+    const char* gs[SP_MAX_SHADERS];
+    size_t gs_count;
+    const char* fs[SP_MAX_SHADERS];
+    size_t fs_count;
     /* device */
     const char* loader;
     const char* device; /* index or a part of the name */
@@ -53,6 +56,7 @@ typedef struct {
     uint32_t vertices, instances;
     const char* index; /* none, seq, random */
     const char* vertex_fill;
+    const char* attr_formats[32]; /* --attr: a vertex input location's format, NULL for the shader's type */
     /* resources */
     SpArg binds[SP_MAX_ARGS];
     size_t bind_count;
