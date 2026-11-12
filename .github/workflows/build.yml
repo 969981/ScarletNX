@@ -1329,7 +1329,7 @@ jobs:
           path: ios-llvm
           key: ios-llvm-${{ hashFiles('scripts/apple-llvm.sh') }}-${{ steps.xcode.outputs.version }}
       - name: Install tools
-        run: brew install ninja ccache
+        run: brew install ninja ccache spirv-tools
       - name: Build LLVM's libraries for macOS
         id: macos-llvm-build
         if: steps.macos-llvm.outputs.cache-hit != 'true'
