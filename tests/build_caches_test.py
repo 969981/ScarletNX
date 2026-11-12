@@ -189,9 +189,14 @@ def self_test(text):
         '          key: ccache-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}\n'
         '      - name: Test under the sanitizers\n'
     )
+    # Select the first Linux compiler cache by its unique adjacent comment.
+    # The former qemu-reference cache fixture no longer exists in build.yml.
     reference = (
-        '      - uses: actions/cache/restore@v5\n        with:\n          path: .cache/ccache\n'
-        '          key: ccache-linux-x86_64-${{ github.run_id }}-${{ github.run_attempt }}\n'
+        "      # ccache under every compile, FFmpeg's and OpenSSL's too, from the newest cache of this job on this branch, else\n"
+        "      # on main. Each cmake gets it as its launcher: from the environment CMake would run its configure checks through\n"
+        "      # it, and they only miss\n"
+        "      - uses: actions/cache/restore@v5\n        with:\n          path: .cache/ccache\n"
+        "          key: ccache-${{ github.job }}-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}\n"
     )
     cases = [
         (
@@ -270,7 +275,7 @@ def self_test(text):
         (
             'a compiler cache left to actions/cache',
             replace_once(text, reference, reference.replace('actions/cache/restore@v5', 'actions/cache@v5')),
-            'qemu-reference: actions/cache@v5 on .cache/ccache saves it when the job ends',
+            'linux: actions/cache@v5 on .cache/ccache saves it when the job ends',
         ),
         (
             "a compiler cache's save taken out",
