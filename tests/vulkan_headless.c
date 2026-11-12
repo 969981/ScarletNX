@@ -98,6 +98,66 @@ static int check_recorder_self_sync(void) {
     return 0;
 }
 
+/* An error or a crash on the recording thread stops it inside a packet for good, with what the packet took: a submit or
+   a present keeps the graphics queue's lock. The window's release for the error's screen, which the main thread makes
+   (sdl3.c's fatal_screen), waited for that ring to drain with no end: the window froze, no error showed and the process
+   stayed. The release has to return in its own while: the window let go when the packet holds nothing, and kept (the
+   system's box shows the error) when it holds the queue's lock */
+static u32 g_rec_stop; /* 0 not reached, 1 the packet stopped there, 2 let go */
+static void recorder_stops(const void* arg) {
+    int hold_queue = *(const int*)arg;
+    if (hold_queue) vk_queue_lock(g_vk.gfx);
+    __atomic_store_n(&g_rec_stop, 1, __ATOMIC_RELEASE);
+    plat_wake_word(&g_rec_stop);
+    while (__atomic_load_n(&g_rec_stop, __ATOMIC_ACQUIRE) != 2) plat_wait_word(&g_rec_stop, 1, -1);
+    if (hold_queue) vk_queue_unlock(g_vk.gfx);
+}
+static u32 g_release_done; /* 0 running, 1 returned */
+static int g_released;
+static void release_on_thread(void* arg) {
+    (void)arg;
+    g_released = vk_window_release();
+    __atomic_store_n(&g_release_done, 1, __ATOMIC_RELEASE);
+    plat_wake_word(&g_release_done);
+}
+static int check_release_stopped_recorder(void) {
+    if (!vk_rec_threaded()) {
+        puts("SKIP the window's release past a stopped recording thread: vk_record=0 has none");
+        return 0;
+    }
+    for (int hold_queue = 0; hold_queue < 2; hold_queue++) {
+        u64 until = plat_ns() + 8000000000ull; /* the release's two waits of 2 s, with room to spare */
+        int returned;
+        u32 stop;
+        __atomic_store_n(&g_rec_stop, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_release_done, 0, __ATOMIC_RELEASE);
+        vk_lock();
+        vk_rec_call(recorder_stops, &hold_queue, sizeof hold_queue); /* the release's own drain publishes it */
+        vk_unlock();
+        CHECK(plat_thread(release_on_thread, NULL, 0) == 0);
+        for (;;) {
+            u64 now = plat_ns();
+            if (__atomic_load_n(&g_release_done, __ATOMIC_ACQUIRE) || now >= until) break;
+            plat_wait_word(&g_release_done, 0, (i64)(until - now));
+        }
+        returned = (int)__atomic_load_n(&g_release_done, __ATOMIC_ACQUIRE);
+        stop = __atomic_load_n(&g_rec_stop, __ATOMIC_ACQUIRE);
+        /* the packet let go: a release still waiting returns, and the ring drains for the checks after this one */
+        __atomic_store_n(&g_rec_stop, 2, __ATOMIC_RELEASE);
+        plat_wake_word(&g_rec_stop);
+        while (!__atomic_load_n(&g_release_done, __ATOMIC_ACQUIRE)) plat_wait_word(&g_release_done, 0, -1);
+        vk_rec_sync();
+        if (!returned)
+            fprintf(stderr, "the window's release waited past 8 s for the recording thread stopped in a packet%s\n",
+                    hold_queue ? " with the graphics queue's lock" : "");
+        CHECK(stop == 1);
+        CHECK(returned);
+        CHECK(g_released == !hold_queue);
+    }
+    printf("The window's release returns while the recording thread is stopped in a packet\n");
+    return 0;
+}
+
 /* A frame's descriptor pool holds VK_POOL_ARRAY_SETS sets of the arrays layouts, not 1024: a driver may make a pool's
    memory for all it can hold as the pool is made (Qualcomm's: 470 MiB for 1024 sets that all could hold the arrays).
    Its 1024 sets are for the layouts without them; a pool made because a set with the arrays didn't fit holds
@@ -1791,6 +1851,41 @@ static int check_translation_dead_code(void) {
         fprintf(stderr, "dead code: the runtime's module has %zu words, the translator's %zu\n", words, direct_words);
     CHECK(spirv && direct && words < direct_words);
     CHECK(spv_opt_dead_code(spirv, words) == words);
+    VkShaderModuleCreateInfo smi = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = words * sizeof(u32), .pCode = spirv};
+    VkShaderModule module;
+    CHECK(vkCreateShaderModule(g_vk.dev, &smi, NULL, &module) == VK_SUCCESS);
+    vkDestroyShaderModule(g_vk.dev, module, NULL);
+    free(spirv);
+    free(direct);
+    return 0;
+}
+
+/* and through value numbering: a fragment program that writes one sum to two of its color's registers (R0 and R1, by
+   FADDs of R4 with itself) comes out smaller than the translator's module with only its dead code out, with nothing
+   left for either pass, and the device takes the module */
+static int check_translation_values(void) {
+    u64 guest[16] = {0};
+    guest[9] = 0xf;                    /* the header's output map: render target 0's RGBA, from R0-R3 */
+    guest[10] = 0x001f8000fc0007e0ull; /* scheduler */
+    guest[11] = 0x4c98078004470004ull; /* MOV R4, c[0][0x110] */
+    guest[12] = 0x5c58000000470400ull; /* FADD R0, R4, R4 */
+    guest[13] = 0x5c58000000470401ull; /* FADD R1, R4, R4 */
+    guest[14] = 0x001f8000fc0007e0ull; /* scheduler */
+    guest[15] = 0xe30000000007000full; /* EXIT */
+    ShaderInfo info = {0}, direct_info = {0};
+    size_t words = 0, direct_words = 0;
+    u32* spirv = vk_translate_spirv((const u8*)guest, sizeof guest, ST_FS, &info, &words, NULL, NULL);
+    u32* direct = shader_to_spirv((const u8*)guest, sizeof guest, ST_FS, &direct_info, &direct_words, g_vk_ftz,
+                                  g_vk_preserve_infnan, g_vk_preserve_infnan64,
+                                  (g_vk_subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) != 0);
+    if (!spirv || !direct) fprintf(stderr, "values: %s; %s\n", info.first_unsupported, direct_info.first_unsupported);
+    CHECK(spirv && direct);
+    size_t dead = spv_opt_dead_code(direct, direct_words);
+    if (words >= dead)
+        fprintf(stderr, "values: the runtime's module has %zu words, without the pass %zu\n", words, dead);
+    CHECK(words < dead);
+    CHECK(spv_opt_values(spirv, words) == words && spv_opt_dead_code(spirv, words) == words);
     VkShaderModuleCreateInfo smi = {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = words * sizeof(u32), .pCode = spirv};
     VkShaderModule module;
@@ -5320,6 +5415,134 @@ static int check_rt_watch(void) {
     free(ch);
     return 0;
 }
+/* Depth targets the 3D engine clears and the CPU then reads from memory, as edenprobe's zeta and msaa suites do after a
+   barrier and a wait for idle: a release watches them as it does color ones, and the CPU's first read publishes them
+   and lands them in their format's layout (S8's a byte a texel, its stencil). Each format a 80x40 block linear target
+   (2 rows of blocks of 4 GOBs), cleared to depth 0.25 and stencil 0x5A, then its scissor's rectangle to depth 0.75 and
+   stencil 0xC3, in memory of its own (one over memory
+   the CPU read lately is published at the release instead); its bytes are those of the CPU reference
+   (support/dma_ref.c) laying the same picture out over the same memory, padding included. A 4x ZF32 target cleared to
+   0.75 holds it at every sample. They stayed on the GPU: the CPU read the bytes from before the clear. Where the device
+   has no D24S8 (AMD) the Z24S8 one is a float packed into 24 bits (vk_depth_pack), and 0.75 is 0xBFFFFF there too */
+#define ZWATCH_A  (HEAP_BASE + 0xC400000)
+#define ZWATCH_GA 0x3B0000000ull
+static int check_zt_watch(void) {
+    static const struct {
+        u32 zeta, bpp, msaa;
+        u32 word[2]
+                [2]; /* a texel (or a sample) out of the rectangle and in it: its first word, and the next (8 bytes) */
+    } c[] = {
+        {0x13, 2, 0, {{0x4000, 0}, {0xBFFF, 0}}},                     /* Z16 */
+        {0x0A, 4, 0, {{0x3E800000u, 0}, {0x3F400000u, 0}}},           /* Z32F */
+        {0x14, 4, 0, {{0x4000005Au, 0}, {0xBFFFFFC3u, 0}}},           /* Z24S8, the stencil low */
+        {0x19, 8, 0, {{0x3E800000u, 0x5A}, {0x3F400000u, 0xC3}}},     /* Z32F_X24S8 */
+        {0x17, 1, 0, {{0x5A, 0}, {0xC3, 0}}},                         /* S8 */
+        {0x0A, 4, DS_MSAA_2X2, {{0x3F400000u, 0}, {0x3F400000u, 0}}}, /* Z32F, 4 samples a pixel */
+    };
+    const u32 w = 80, h = 40, rect[4] = {8, 4, 51, 23}; /* x0, y0, x1, y1 */
+    const float quarter = 0.25f, three = 0.75f;
+    if (!own_traps() || vk_uma()) {
+        puts("depth target watch: needs traps and no unified memory, skipped");
+        return 0;
+    }
+    GpuChannel* ch = calloc(1, sizeof *ch);
+    CHECK(ch);
+    u32* r = ch->r3d;
+    CHECK(mem_map(ZWATCH_A, 0x200000, MS_NORMAL, PERM_RW) == 0);
+    gmmu_map(ZWATCH_GA, ZWATCH_A, 0x200000);
+    memset(GP(ZWATCH_A), 0x11, 0x200000);
+    for (u32 k = 0; k < sizeof c / sizeof *c; k++) {
+        const u64 t = (u64)k * 0x20000, ref = 0x100000, src = 0x180000;
+        const u32 sw = w, row = sw * c[k].bpp, gobs = (row + 63) / 64; /* a 4x one's registers count samples */
+        const u64 span = (u64)gobs * 2 * 4 * 512;                      /* 2 rows of blocks 4 GOBs high */
+        memset(GP(ZWATCH_A + ref), 0x11, 0x100000);
+        g_renderer->mem_may_have_changed();
+        vk_lock();
+        vk_rt_publish_drawn(); /* the targets the checks before drew */
+        vk_unlock();
+        VkRtWatchStats w0 = g_vk_rt_watch;
+        u64 lands = own_landings();
+        r[0x487] = 0; /* no color target */
+        r[0x54E] = 1;
+        r[0x3F8] = (u32)((ZWATCH_GA + t) >> 32);
+        r[0x3F9] = (u32)(ZWATCH_GA + t);
+        r[0x3FA] = c[k].zeta;
+        r[0x3FB] = 2u << 4; /* block linear, blocks 4 GOBs high */
+        r[0x3FC] = 0;
+        r[0x48A] = sw;
+        r[0x48B] = h;
+        r[0x48C] = 1;
+        r[0x574] = c[k].msaa;
+        r[0x368] = 0x5A;
+        r[0x43E] &= ~0x100u;
+        r[0x380] = 0;
+        memcpy(&r[0x364], c[k].msaa ? &three : &quarter, 4);
+        engine_clear(ch, 3);
+        if (!c[k].msaa) { /* the scissor's rectangle to 0.75 */
+            r[0x43E] |= 0x100;
+            r[0x380] = 1;
+            r[0x381] = rect[0] | rect[2] << 16;
+            r[0x382] = rect[1] | rect[3] << 16;
+            memcpy(&r[0x364], &three, 4);
+            r[0x368] = 0xC3;
+            engine_clear(ch, 3);
+            r[0x43E] &= ~0x100u;
+            r[0x380] = 0;
+        }
+        vk_lock();
+        vk_render_end();
+        vk_rt_publish_drawn();
+        vk_unlock();
+        r[0x574] = 0;
+        r[0x54E] = 0;
+        if (g_vk_rt_watch.arms != w0.arms + 1 || !own_watched(ZWATCH_A + t, span)) {
+            fprintf(stderr, "depth target watch, zeta %#x%s: %llu arms at the release, not 1, and %s\n", c[k].zeta,
+                    c[k].msaa ? " 4x" : "", (unsigned long long)(g_vk_rt_watch.arms - w0.arms),
+                    own_watched(ZWATCH_A + t, span) ? "watched" : "not watched");
+            return 1;
+        }
+        /* the reference: the picture in pitch rows, laid out block linear over a copy of the same memory */
+        for (u32 y = 0; y < h; y++)
+            for (u32 x = 0; x < sw; x++) {
+                const int in = !c[k].msaa && x >= rect[0] && x < rect[2] && y >= rect[1] && y < rect[3];
+                u8* p = GP(ZWATCH_A + src) + (u64)y * row + (u64)x * c[k].bpp;
+                memcpy(p, &c[k].word[in][0], c[k].bpp < 4 ? c[k].bpp : 4);
+                if (c[k].bpp == 8) memcpy(p + 4, &c[k].word[in][1], 4);
+            }
+        GpuDmaOp o;
+        memset(&o, 0, sizeof o);
+        o.multi = 1;
+        o.width = o.line_in = o.line_out = row;
+        o.lines = h;
+        o.src = pitch_side(ZWATCH_GA + src, row);
+        o.dst = bl_side(ZWATCH_GA + ref, row, h, 2, 0, 0);
+        dma_copy_ref(&o);
+        u8* got = malloc(span);
+        CHECK(got);
+        memcpy(got, GP(ZWATCH_A + t), span); /* faults: published and landed */
+        u64 bad = span;
+        for (u64 i = 0; i < span && bad == span; i++)
+            if (got[i] != GP(ZWATCH_A + ref)[i]) bad = i;
+        if (bad < span || g_vk_rt_watch.hits < w0.hits + 1 || own_landings() == lands) {
+            fprintf(stderr,
+                    "depth target watch, zeta %#x%s: %llu hits, %llu landings; byte %llu of %llu is %02x, the "
+                    "reference's %02x\n",
+                    c[k].zeta, c[k].msaa ? " 4x" : "", (unsigned long long)(g_vk_rt_watch.hits - w0.hits),
+                    (unsigned long long)(own_landings() - lands), (unsigned long long)(bad < span ? bad : 0),
+                    (unsigned long long)span, got[bad < span ? bad : 0], GP(ZWATCH_A + ref)[bad < span ? bad : 0]);
+            free(got);
+            return 1;
+        }
+        free(got);
+    }
+    vk_lock();
+    vk_rt_before_write(ZWATCH_GA, 0x200000); /* the targets go back to memory before it does */
+    vk_unlock();
+    CHECK(mem_unmap(ZWATCH_A, 0x200000) == 0);
+    free(ch);
+    puts("Depth targets the CPU reads after a clear land in their formats' layouts");
+    return 0;
+}
 static int check_rt_overlap(void) {
     GpuChannel* ch = calloc(1, sizeof *ch);
     GpuDmaOp o;
@@ -6078,12 +6301,14 @@ static int run_headless(int argc, char** argv) {
     }
     if (getenv("SNX_TEST_RECORDER_ONLY")) { /* the recording thread's own sync alone, on the driver the loader picks */
         CHECK(!check_recorder_self_sync());
+        CHECK(!check_release_stopped_recorder());
         vk_finish();
         vk_pipeline_quiesce();
         printf("PASS headless Vulkan recorder only: %u validation messages\n", g_vk_validation_messages);
         return 0;
     }
     CHECK(!check_recorder_self_sync());
+    CHECK(!check_release_stopped_recorder());
     viw_install();
     /* every check with each draw binding the pipeline linked from its parts and never the one made whole
        (SNX_TEST_GPL=linked), or with each pipeline made whole, with the dynamic state the libraries gave (whole) */
@@ -6295,6 +6520,14 @@ static int run_headless(int argc, char** argv) {
         vk_pipeline_quiesce();
         printf("PASS headless Vulkan writable storage buffers only: %u validation messages\n",
                g_vk_validation_messages);
+        return 0;
+    }
+    if (getenv("SNX_TEST_RT_WATCH_ONLY")) { /* the watched targets' checks alone, for their mutants */
+        CHECK(!check_rt_watch());
+        CHECK(!check_zt_watch());
+        vk_finish();
+        vk_pipeline_quiesce();
+        printf("PASS headless Vulkan watched targets only: %u validation messages\n", g_vk_validation_messages);
         return 0;
     }
     if (getenv("SNX_TEST_MSAA_ONLY")) { /* the multisample checks alone */
@@ -6526,6 +6759,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_layered_surface_loads());
     CHECK(!check_rect_textures());
     CHECK(!check_compute_depth_texture());
+    CHECK(!check_compute_compares());
     CHECK(!check_viewport_orientation());
     CHECK(!check_index_draws());
     CHECK(!check_pass_breaks());
@@ -6540,6 +6774,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_vertex_input_layouts());
     CHECK(!check_vertex_input_file_key());
     CHECK(!check_targetless_stores());
+    CHECK(!check_deko_vertex_storage());
     CHECK(!check_storage_image_keep());
     CHECK(!check_storage_buffer_keep());
     CHECK(!check_packed_depth());
@@ -6554,6 +6789,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_sparse_while_submitting());
     CHECK(!check_multisample_shader_gate());
     CHECK(!check_translation_dead_code());
+    CHECK(!check_translation_values());
     CHECK(!check_msaa());
     CHECK(!check_msaa_nvn());
     CHECK(!check_direct_spirv());
@@ -6614,6 +6850,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_uma_page_changes());
     CHECK(!check_rt_overlap());
     CHECK(!check_rt_watch());
+    CHECK(!check_zt_watch());
     CHECK(!check_uma());
     CHECK(!check_uma_way());
     CHECK(!check_uma_migrate());

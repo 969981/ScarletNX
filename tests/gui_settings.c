@@ -103,8 +103,8 @@ int main(int argc, char** argv) {
     assert(!tracy || !strcmp(s.keys[at(&s, "tracy_capture")].section, "Debug")); /* with the profiler's other rows */
     assert(!gui_settings_extract(&s)); /* off: a dump read in place */
     /* the recompiler's: none passed at its default, then --key=value; the optimization level takes 0 to 3 and z, the
-       LLVM batch full or ipo, the AOT threads a number (0 the cores), the unit size a number of instructions, the unit
-       cache limit a number of GB (0 none), and LLVM Internals is a page of its own */
+       LLVM batch full or ipo, the AOT threads a number (0 Auto) and the most Auto opens (0 the cores'), the unit size a
+       number of instructions, the unit cache limit a number of GB (0 none), and LLVM Internals is a page of its own */
     assert(!strcmp(s.keys[opt].section, "Launch") && !strcmp(s.keys[opt].key, "Optimization level") &&
            !strcmp(s.values[opt].key, "opt") && words(&s.keys[opt]) == 6 && !gui_settings_recompile(&s, 0, options));
     assert(gui_settings_set(&s, "opt", "2") && !gui_settings_recompile(&s, 0, options)); /* the default: no pick */
@@ -120,18 +120,23 @@ int main(int argc, char** argv) {
            gui_settings_recompile(&s, 0, options) == 3 && !strcmp(options[1], "--llvm_batch=ipo") &&
            !strcmp(options[2], "--aot_threads=4") && !gui_settings_set(&s, "llvm_batch", ".ini") &&
            gui_settings_set(&s, "llvm_batch", "full") && gui_settings_recompile(&s, 0, options) == 2);
-    assert(!strcmp(s.keys[opt + 3].section, "Launch") && !strcmp(s.keys[opt + 3].key, "Unit size") &&
-           !strcmp(s.values[opt + 3].key, "unit_instructions") && !strcmp(s.values[opt + 3].def, "90000"));
+    assert(!strcmp(s.keys[opt + 3].section, "Launch") && !strcmp(s.keys[opt + 3].key, "AOT threads at most") &&
+           !strcmp(s.values[opt + 3].key, "aot_threads_most") &&
+           !strcmp(s.values[opt + 3].def, "0")); /* Auto, the default, which is not passed */
+    assert(gui_settings_set(&s, "aot_threads_most", "3") && gui_settings_recompile(&s, 0, options) == 3 &&
+           !strcmp(options[2], "--aot_threads_most=3") && gui_settings_set(&s, "aot_threads_most", ""));
+    assert(!strcmp(s.keys[opt + 4].section, "Launch") && !strcmp(s.keys[opt + 4].key, "Unit size") &&
+           !strcmp(s.values[opt + 4].key, "unit_instructions") && !strcmp(s.values[opt + 4].def, "90000"));
     assert(gui_settings_set(&s, "unit_instructions", "20000") && gui_settings_recompile(&s, 0, options) == 3 &&
            !strcmp(options[2], "--unit_instructions=20000") && gui_settings_set(&s, "unit_instructions", ""));
-    assert(!strcmp(s.keys[opt + 4].section, "Launch") && !strcmp(s.keys[opt + 4].key, "Unit cache limit") &&
-           !strcmp(s.values[opt + 4].key, "unit_cache_gb") && strstr(s.keys[opt + 4].about, "0 = no limit"));
-    assert(!strcmp(s.values[opt + 4].def, "0") &&
-           strstr(s.keys[opt + 4].about, "a tenth of its disk free, at most 10 GB")); /* no limit */
+    assert(!strcmp(s.keys[opt + 5].section, "Launch") && !strcmp(s.keys[opt + 5].key, "Unit cache limit") &&
+           !strcmp(s.values[opt + 5].key, "unit_cache_gb") && strstr(s.keys[opt + 5].about, "0 = no limit"));
+    assert(!strcmp(s.values[opt + 5].def, "0") &&
+           strstr(s.keys[opt + 5].about, "a tenth of its disk free, at most 10 GB")); /* no limit */
     assert(gui_settings_set(&s, "unit_cache_gb", "50") && gui_settings_recompile(&s, 0, options) == 3 &&
            !strcmp(options[2], "--unit_cache_gb=50") && gui_settings_set(&s, "unit_cache_gb", ""));
-    assert(!strcmp(s.keys[opt + 5].section, "Launch") && s.values[opt + 5].kind == GUI_SETTING_PAGE &&
-           !strcmp(s.keys[opt + 5].key, "LLVM Internals"));
+    assert(!strcmp(s.keys[opt + 6].section, "Launch") && s.values[opt + 6].kind == GUI_SETTING_PAGE &&
+           !strcmp(s.keys[opt + 6].key, "LLVM Internals"));
     assert(gui_settings_set(&s, "opt", "2") && gui_settings_set(&s, "aot_threads", "") &&
            !gui_settings_recompile(&s, 0, options));
     /* a game's setting alone, as a GBA run takes fullscreen: once picked, and never a launcher's own */
@@ -752,18 +757,18 @@ int main(int argc, char** argv) {
         assert(key(&s, "gamepad_p3_device")->type == GUI_KEY_TEXT &&
                !strcmp(key(&s, "gamepad_p3_device")->section, "Controllers/Player"));
         assert(!strcmp(s.keys[s.own].section, "Game") && !strcmp(s.keys[s.count - 1].section, "Debug"));
-        assert(words(key(&s, "fullscreen")) == 2 && words(key(&s, "touch")) == 3 && words(key(&s, "controls")) == 2);
+        assert(words(key(&s, "fullscreen")) == 2 && words(key(&s, "touch")) == 3 && words(key(&s, "controls")) == 3);
         assert(!strcmp(key(&s, "controls")->key, "Show controls") &&
                !strcmp(key(&s, "touch")->words[2], "Fingers and mouse"));
         assert(!strcmp(key(&s, "gamepad_rumble")->words[0], "Off") && !key(&s, "controls_a"));
         assert(gui_settings_set(&s, "fullscreen", "0") && gui_settings_set(&s, "touch", "1"));
         assert(gui_settings_set(&s, "controls", "0") && key(&s, "resolution")->type == GUI_KEY_TEXT);
-        /* as the launcher has them: Off or On, Off its [default] */
-        assert(gui_settings_always(&s, "fullscreen", "0") && gui_settings_always(&s, "controls", "0"));
+        /* as the launcher has them: fullscreen Off or On, Off its [default]; the controls Auto, their [default] */
+        assert(gui_settings_always(&s, "fullscreen", "0") && gui_settings_always(&s, "controls", "2"));
         gui_settings_mark(&s);
-        assert(words(key(&s, "fullscreen")) == 2 && words(key(&s, "controls")) == 2);
+        assert(words(key(&s, "fullscreen")) == 2 && words(key(&s, "controls")) == 3);
         assert(!strcmp(on_screen(&s, "fullscreen"), "Off [default]") &&
-               !strcmp(on_screen(&s, "controls"), "Off [default]"));
+               !strcmp(on_screen(&s, "controls"), "Auto [default]"));
         /* a range as settings.txt has it, a large one to the last digit, which a typed value's dialog says */
         assert(key(&s, "map_limit_mb")->numeric && key(&s, "map_limit_mb")->hi == 1048576.0);
         assert(key(&s, "resolution")->lo == 0.25 && key(&s, "resolution")->hi == 16.0);

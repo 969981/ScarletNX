@@ -170,6 +170,11 @@ if(TARGET snx_ctr_board)
     snx_test_target(snx-test-3ds-clock 11)
     target_link_libraries(snx-test-3ds-clock PRIVATE snx_ctr_board m)
     add_test(NAME 3ds_clock COMMAND snx-test-3ds-clock)
+    # the SMDH's short title and its 48x48 icon, which the launcher shows the game by
+    add_executable(snx-test-3ds-smdh 3ds_smdh.c)
+    snx_test_target(snx-test-3ds-smdh 11)
+    target_link_libraries(snx-test-3ds-smdh PRIVATE snx_ctr_loader)
+    add_test(NAME 3ds_smdh COMMAND snx-test-3ds-smdh)
     add_executable(snx-test-3ds-memory 3ds_memory.c)
     snx_test_target(snx-test-3ds-memory 11)
         target_link_libraries(snx-test-3ds-memory PRIVATE snx_ctr_memory)
@@ -585,6 +590,17 @@ add_executable(snx-test-gpu-driver-stage gpu_driver_stage.c)
 snx_test_target(snx-test-gpu-driver-stage 11)
 target_link_libraries(snx-test-gpu-driver-stage PRIVATE scarletnx-common)
 add_test(NAME gpu_driver_stage COMMAND snx-test-gpu-driver-stage)
+# the common utilities alone, for the tests every build runs (gui_probe) and the NX ones
+add_library(snx_test_common STATIC "${PROJECT_SOURCE_DIR}/src/common/utilities/common.c"
+    "${PROJECT_SOURCE_DIR}/src/common/utilities/ini_lines.c" "${PROJECT_SOURCE_DIR}/src/common/utilities/game_ini.c"
+    "${PROJECT_SOURCE_DIR}/src/common/utilities/script.c")
+snx_test_target(snx_test_common 99)
+target_link_libraries(snx_test_common PUBLIC snx_libdeflate) # a control.nacp's titles in deflate
+target_link_libraries(snx_test_common PUBLIC scarletnx-platform) # the clocks (snx_seconds)
+if(WIN32)
+    target_link_libraries(snx_test_common PUBLIC advapi32)
+endif()
+
 # Run edenprobe's card and report (gui/probe.c)
 add_executable(snx-test-gui-probe gui_probe.c "${PROJECT_SOURCE_DIR}/src/gui/probe.c")
 snx_test_target(snx-test-gui-probe 99)
@@ -758,6 +774,14 @@ add_executable(snx-test-spirv-opt spirv_opt.c "${PROJECT_SOURCE_DIR}/src/common/
 snx_test_target(snx-test-spirv-opt 99)
 target_include_directories(snx-test-spirv-opt PRIVATE "${PROJECT_SOURCE_DIR}/src")
 add_test(NAME spirv_opt COMMAND snx-test-spirv-opt)
+add_executable(snx-test-spirv-opt-values spirv_opt_values.c "${PROJECT_SOURCE_DIR}/src/common/utilities/spirv_opt.c")
+snx_test_target(snx-test-spirv-opt-values 99)
+target_include_directories(snx-test-spirv-opt-values PRIVATE "${PROJECT_SOURCE_DIR}/src")
+add_test(NAME spirv_opt_values COMMAND snx-test-spirv-opt-values)
+add_executable(snx-test-spirv-opt-fold spirv_opt_fold.c "${PROJECT_SOURCE_DIR}/src/common/utilities/spirv_opt.c")
+snx_test_target(snx-test-spirv-opt-fold 99)
+target_include_directories(snx-test-spirv-opt-fold PRIVATE "${PROJECT_SOURCE_DIR}/src")
+add_test(NAME spirv_opt_fold COMMAND snx-test-spirv-opt-fold)
 
 # Validate the direct writer against SPIRV-Tools when the system tools are installed.
 if(SNX_BUILD_NX)
@@ -794,6 +818,12 @@ add_executable(snx-test-arm-exec arm_exec_test.c)
 snx_test_target(snx-test-arm-exec 11)
 target_link_libraries(snx-test-arm-exec PRIVATE snx_llvm)
 add_test(NAME arm_exec_dry_svc COMMAND snx-test-arm-exec)
+# a 32-bit game's blocks compiled from an NRO go when its memory is unmapped, so another NRO mapped there runs its own
+# code (runtime/arm.c, with the block compiler and the rest of the runtime stubbed)
+add_executable(snx-test-arm-code-invalidate arm_code_invalidate.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/arm.c")
+snx_test_target(snx-test-arm-code-invalidate 11)
+target_link_libraries(snx-test-arm-code-invalidate PRIVATE snx_llvm scarletnx-common)
+add_test(NAME arm_code_invalidate COMMAND snx-test-arm-code-invalidate)
 # a checked block links into the AOT module for Windows x86-64, which has no compiler runtime
 add_executable(snx-test-arm-checked-link arm_checked_link.c)
 snx_test_target(snx-test-arm-checked-link 11)
@@ -1122,6 +1152,14 @@ snx_test_target(snx-test-diag-abort 11) # log.h has _Thread_local
 target_include_directories(snx-test-diag-abort PRIVATE "${PROJECT_SOURCE_DIR}/src")
 snx_hookgen(snx-test-diag-abort SPEC "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/hooks.hook")
 add_test(NAME diag_abort COMMAND snx-test-diag-abort)
+# the event a hooked SDK object attaches to the game's SystemEvent (src/nx/hle/hook/codec.c's hook_attach_event): its
+# references, with the kernel's objects stubbed to their counts
+add_executable(snx-test-hook-event-reference hook_event_reference.c)
+snx_test_target(snx-test-hook-event-reference 11)
+target_include_directories(snx-test-hook-event-reference PRIVATE "${PROJECT_SOURCE_DIR}/src")
+snx_service_swipc(snx-test-hook-event-reference)
+snx_hookgen(snx-test-hook-event-reference SPEC "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/hooks.hook")
+add_test(NAME hook_event_reference COMMAND snx-test-hook-event-reference)
 # the hooks' NVN key (tests/hook/nvn_versions.hook): the API version read from a driver's nvnDeviceGetInteger
 # (src/nx/gpu/nvn/nvn_driver.c), the entry hook_select picks for it, and the versions the log calls described
 add_executable(snx-test-nvn-versions nvn_versions.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/version.c"
@@ -1819,20 +1857,10 @@ if(SNX_TRACY)
     target_include_directories(snx-test-tracy-state SYSTEM PRIVATE
         $<TARGET_PROPERTY:Tracy::TracyClient,INTERFACE_INCLUDE_DIRECTORIES>
         $<TARGET_PROPERTY:SDL3::Headers,INTERFACE_INCLUDE_DIRECTORIES>)
-    target_compile_definitions(snx-test-tracy-state PRIVATE SNX_TRACY=1
+    target_compile_definitions(snx-test-tracy-state PRIVATE SNX_TRACY=1 SNX_TRACY_VERSION="${SNX_TRACY_VERSION}"
         $<TARGET_PROPERTY:Tracy::TracyClient,INTERFACE_COMPILE_DEFINITIONS>)
     target_link_libraries(snx-test-tracy-state PRIVATE scarletnx-common scarletnx-filesystem snx_build_info)
     add_test(NAME tracy_state COMMAND snx-test-tracy-state)
-endif()
-
-add_library(snx_test_common STATIC "${PROJECT_SOURCE_DIR}/src/common/utilities/common.c"
-    "${PROJECT_SOURCE_DIR}/src/common/utilities/ini_lines.c" "${PROJECT_SOURCE_DIR}/src/common/utilities/game_ini.c"
-    "${PROJECT_SOURCE_DIR}/src/common/utilities/script.c")
-snx_test_target(snx_test_common 99)
-target_link_libraries(snx_test_common PUBLIC snx_libdeflate) # a control.nacp's titles in deflate
-target_link_libraries(snx_test_common PUBLIC scarletnx-platform) # the clocks (snx_seconds)
-if(WIN32)
-    target_link_libraries(snx_test_common PUBLIC advapi32)
 endif()
 
 # a collection's programs (common.h's snx_program_index, game_ini.h's hand-over, mods.h's own mods of a program)
@@ -1859,6 +1887,13 @@ snx_test_target(snx-test-script 99)
 target_link_libraries(snx-test-script PRIVATE snx_test_common)
 add_test(NAME script COMMAND snx-test-script)
 
+# a recompile's threads left open (common.h's SnxAotGovernor, recompiler/auto_workers.h): one more a tick while the
+# memory measured from the units holds it, on readings of the test's own
+add_executable(snx-test-aot-governor aot_governor.c)
+snx_test_target(snx-test-aot-governor 99)
+target_link_libraries(snx-test-aot-governor PRIVATE snx_test_common)
+add_test(NAME aot_governor COMMAND snx-test-aot-governor)
+
 # the summary's build line: its commit's day, and the days from it to the run (common/utilities/logscan.c)
 add_executable(snx-test-logscan-age logscan_age.c "${PROJECT_SOURCE_DIR}/src/common/utilities/logscan.c")
 snx_test_target(snx-test-logscan-age 99)
@@ -1870,6 +1905,7 @@ add_executable(snx-test-driver driver_workflow.c
     "${PROJECT_SOURCE_DIR}/src/nx/loader/match.c" "${PROJECT_SOURCE_DIR}/src/common/utilities/process.c"
     "${PROJECT_SOURCE_DIR}/src/common/utilities/logscan.c")
 snx_test_target(snx-test-driver 99)
+target_compile_definitions(snx-test-driver PRIVATE SNX_TRACY_VERSION="${SNX_TRACY_VERSION}")
 target_link_libraries(snx-test-driver PRIVATE snx_test_common snx_setup snx_lz4 OpenSSL::Crypto snx_demangle snx_nx_module)
 set_target_properties(snx-test-driver PROPERTIES LINKER_LANGUAGE CXX)
 if(APPLE) # driver/setup.c's weak snx_menu_language, as snx_driver has it: ld64 wants it named
@@ -1886,7 +1922,7 @@ if(NOT WIN32)
         "${PROJECT_SOURCE_DIR}/src/nx/loader/match.c" "${PROJECT_SOURCE_DIR}/src/common/utilities/process.c"
         "${PROJECT_SOURCE_DIR}/src/common/utilities/logscan.c")
     snx_test_target(snx-test-driver-ready 99)
-    target_compile_definitions(snx-test-driver-ready PRIVATE SNX_DRIVER_READY=1)
+    target_compile_definitions(snx-test-driver-ready PRIVATE SNX_DRIVER_READY=1 SNX_TRACY_VERSION="${SNX_TRACY_VERSION}")
     target_link_libraries(snx-test-driver-ready PRIVATE snx_test_common snx_setup snx_lz4 OpenSSL::Crypto snx_demangle
                                                         snx_nx_module)
     set_target_properties(snx-test-driver-ready PROPERTIES LINKER_LANGUAGE CXX)
@@ -2807,6 +2843,20 @@ add_executable(snx-test-bc7-glsl glsl/bc7_glsl.cpp glsl/bc7_cpu.cpp support/bcn.
 snx_test_target(snx-test-bc7-glsl 23)
 target_include_directories(snx-test-bc7-glsl PRIVATE glsl)
 add_test(NAME bc7_glsl COMMAND snx-test-bc7-glsl)
+# astc_bc7.comp's GLSL, ASTC blocks straight into BC7 ones, run on the CPU (tests/glsl/glsl.hpp): its blocks are the
+# encoder's of the texels the CPU's ASTC decoder makes: no GPU needed
+add_executable(snx-test-astc-bc7-glsl glsl/astc_bc7_glsl.cpp glsl/astc_bc7_cpu.cpp glsl/bc7_cpu.cpp support/astc.c
+               support/bcn.c)
+snx_test_target(snx-test-astc-bc7-glsl 23)
+target_include_directories(snx-test-astc-bc7-glsl PRIVATE glsl)
+add_test(NAME astc_bc7_glsl COMMAND snx-test-astc-bc7-glsl)
+# the ASTC 4x4 encoder's GLSL (BCn encoded again as ASTC) run on the CPU (tests/glsl/glsl.hpp), its blocks decoded by
+# the CPU's ASTC decoder: no GPU needed
+add_executable(snx-test-astc-encode-glsl glsl/astc_encode_glsl.cpp glsl/astc_encode_cpu.cpp glsl/bcn_astc_cpu.cpp
+               glsl/bc7_cpu.cpp support/astc.c support/bcn.c)
+snx_test_target(snx-test-astc-encode-glsl 23)
+target_include_directories(snx-test-astc-encode-glsl PRIVATE glsl)
+add_test(NAME astc_encode_glsl COMMAND snx-test-astc-encode-glsl)
 # the BCn to ETC2 and EAC transcoder's GLSL (texconv.glsl's ETC2 build) run on the CPU (tests/glsl/glsl.hpp), its blocks
 # decoded by the CPU references, the BCn pictures it is held to made by its own encoders and the BC7 one: no GPU needed
 add_executable(snx-test-bcn-etc2-glsl glsl/bcn_etc2_glsl.cpp glsl/bcn_etc2_cpu.cpp glsl/bc7_cpu.cpp support/etc2.c
@@ -3071,6 +3121,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(snx-test-plat-cpus PRIVATE scarletnx-platform) # plat_thread, plat_cpus, the waits
     add_test(NAME plat_cpus COMMAND snx-test-plat-cpus)
 endif()
+
+# the profiler's view of a named lock (common/platform/thread.c): its release is reported while it is held
+add_executable(snx-test-pm-tracy pm_tracy.c)
+snx_test_target(snx-test-pm-tracy 11)
+target_link_libraries(snx-test-pm-tracy PRIVATE scarletnx-platform)
+add_test(NAME pm_tracy COMMAND snx-test-pm-tracy)
 
 # the process's memory as common.c reads it, which memory_fit takes (process_memory.c)
 add_executable(snx-test-process-memory process_memory.c)

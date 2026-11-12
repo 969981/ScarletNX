@@ -105,7 +105,8 @@ static void advance(AgbCpu* cpu, AgbSink* sink, uint32_t cycles) {
 
 /* ---- interrupts ---- */
 
-static int irq_pending(AgbBoard* board) { return (board->irq_ime & 1) && (board->irq_ie & board->irq_if & 0x3FF); }
+/* the 14 interrupt lines, IE's and IF's bits 0 to 13: the DMAs' (8 to 11), the keypad's and the cartridge's too */
+static int irq_pending(AgbBoard* board) { return (board->irq_ime & 1) && (board->irq_ie & board->irq_if & 0x3FFF); }
 
 /* The interrupt entry the BIOS stub performs: the live registers land on the IRQ stack, the handler at
    0x03007FFC runs, and its return reaches the epilogue the machine services. Returns 0 while no handler
@@ -423,7 +424,13 @@ static int interpret(AgbBoard* board, AgbCpu* cpu, uint32_t word, int thumb) {
         } else {
             uint32_t updated = (cpu->arm.cpsr & ~bits) | (value & bits);
             if ((updated & 0x1F) != (cpu->arm.cpsr & 0x1F)) switch_mode(cpu, updated & 0x1F);
-            cpu->arm.cpsr = (updated & ~(uint32_t)SNX_ARM_T) | (cpu->arm.cpsr & SNX_ARM_T);
+            cpu->arm.cpsr = updated;
+            if (updated & SNX_ARM_T) {
+                /* the T bit set this way switches to Thumb with the next word already fetched as ARM, which runs as a
+                   no-op: Thumb starts two words on, as mGBA's MSR has it (a packer's check of the machine) */
+                cpu->arm.r[15] += 8;
+                return 0;
+            }
         }
         cpu->arm.r[15] += 4;
         return 0;

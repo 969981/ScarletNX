@@ -233,7 +233,9 @@ typedef struct {
     SDL_Mutex* lock;
     SDL_Condition* wake;
     SDL_Thread* thread;
-    char* driver; /* the program asked, and the data folder its keys are found by */
+    char* driver;    /* the program asked, and the data folder its keys are found by */
+    char* driver3ds; /* the 3DS driver, for a 3DS dump's icon: NULL before one is asked, or with none in the build */
+    char* driver3ds_first; /* the 3DS driver's name, for a program that holds several (gui_driver_run) */
     char* repo;
     char* dumps[GUI_DUMP_ASKS]; /* each owned, with its folder in the cache beside it */
     char* dirs[GUI_DUMP_ASKS];
@@ -427,7 +429,7 @@ typedef struct App {
     bool job_low;      /* its priority lowered: Background recompile Gentle, Auto on battery, or a game playing */
     bool job_kept_low; /* the system refused to raise it again: low until it ends, job_said says why */
     char job_said[160];
-    int job_threads;        /* the threads it was started with: 0 for the driver's own count (the AOT threads') */
+    int job_threads;        /* the most threads it was started with: 0 for the driver's own (the AOT threads') */
     int queue_focus;        /* the Compile tab's row, a job of the queue */
     int background_mode; /* app.ini's background_recompile: GUI_BACKGROUND_AUTO (Gentle on battery), FULL or GENTLE */
     /* the host on its battery, as SDL said it at power_ms (asked again 5 s on, not each frame); power_test, a test's: 1
@@ -3856,6 +3858,21 @@ static SDL_Texture* mii_texture(App* app, int mii, int side, bool* failed) {
     free(rgba);
     return texture;
 }
+/* The 3DS driver's icon of a game (icon.rgba): its SMDH's 48x48 icon as RGBA, rows top down, scaled nearest to side
+   pixels square with B, G, R, A in memory as the renderer takes them. 0 when drawn, 1 when bytes are not that icon */
+static int rgba_icon(const unsigned char* bytes, size_t size, int side, void* pixels) {
+    const unsigned char* src = bytes;
+    unsigned char* out = (unsigned char*)pixels;
+    int x, y;
+    if (!bytes || size != 48 * 48 * 4) return 1;
+    for (y = 0; y < side; ++y)
+        for (x = 0; x < side; ++x) {
+            const unsigned char* s = src + 4 * ((size_t)(y * 48 / side) * 48 + (size_t)(x * 48 / side));
+            Uint32 argb = (Uint32)255 << 24 | (Uint32)s[0] << 16 | (Uint32)s[1] << 8 | s[2];
+            memcpy(out + 4 * ((size_t)y * side + x), &argb, sizeof argb);
+        }
+    return 0;
+}
 /* the icon of the game whose program is at path, as its row shows it: its icon.jpg drawn once, then kept; NULL for
    a game without one. One that does not draw is said, with its file, and shows none */
 /* the folder in the cache a dump's icon goes in: icons/ of the menu's cache, named by a hash of the dump's path, size
@@ -3929,7 +3946,27 @@ static void last_line(const char* text, char* out, size_t size) {
 /* a dump's ask started: the driver's process, its output read from then on; false when it could not start, kept as
    failed then */
 static bool icon_ask_start(GuiDumpIcons* d, GuiIconAsk* a, char* dump, char* dir) {
-    const char* args[] = {d->driver, "--data", d->repo, "-x", "--icon", "--out", dir, "--", dump, NULL};
+    /* a 3DS dump's icon is its SMDH, which only the 3DS driver reads */
+    bool ctr = gui_is_cia(snx_path_leaf(dump));
+    const char* driver = ctr ? d->driver3ds : d->driver;
+    const char* first = ctr ? d->driver3ds_first : NULL; /* the Switch driver is the program's default */
+    const char* args[12];
+    int n = 0;
+    if (!driver || !d->repo) {
+        icon_failed_keep(d, dump, dir, snx_tr("Cannot start the run: out of memory"), NULL);
+        return false;
+    }
+    args[n++] = driver;
+    if (first) args[n++] = first; /* the name, to a program that holds several drivers */
+    args[n++] = "--data";
+    args[n++] = d->repo;
+    args[n++] = "-x";
+    args[n++] = "--icon";
+    args[n++] = "--out";
+    args[n++] = dir;
+    args[n++] = "--";
+    args[n++] = dump;
+    args[n] = NULL;
     char why[256];
     *a = (GuiIconAsk){0};
     a->dump = dump;
@@ -3970,6 +4007,12 @@ static bool icon_ask_poll(GuiDumpIcons* d, GuiIconAsk* a) {
     if (!gui_process_finished(a->process, &status)) return false;
     {
         char* icon = snx_path_join(a->dir, "icon.jpg");
+        char* rgba = snx_path_join(a->dir, "icon.rgba"); /* the 3DS driver writes its SMDH's icon so */
+        if (!snx_is_file(icon) && rgba && snx_is_file(rgba)) {
+            free(icon);
+            icon = rgba;
+            rgba = NULL;
+        }
         if (late || status || (!snx_is_file(icon) && !dlc_dir(a->dir))) {
             last_line(a->said, line, sizeof line);
             if (late)
@@ -3984,6 +4027,7 @@ static bool icon_ask_poll(GuiDumpIcons* d, GuiIconAsk* a) {
             icon_failed_keep(d, a->dump, a->dir, why,
                              strcmp(why, line) || strstr(a->said, line) != a->said ? a->said : NULL);
         }
+        free(rgba);
         free(icon);
     }
     gui_process_destroy(a->process);
@@ -4032,6 +4076,7 @@ static int SDLCALL dump_icons_run(void* data) {
     return 0;
 }
 static char* find_driver(const App* app, int item);
+static bool driver_run(const App* app, int item, GuiDriverRun* run);
 static void driver_missing(const App* app, int item, char* out, size_t size);
 static unsigned loads_off(App* app);
 /* a dump's icon to ask the driver for, once: false when it cannot be asked (the queue full, or no driver, kept as why
@@ -4047,7 +4092,20 @@ static bool dump_icon_ask(App* app, const char* dump, const char* dir) {
         return false;
     }
     if (!d->wait_ms) d->wait_ms = GUI_ICON_WAIT;
-    if (!d->driver) {
+    if (!d->repo) d->repo = snx_strdup(app->data_dir);
+    bool ctr = gui_is_cia(snx_path_leaf(dump));
+    if (ctr && !d->driver3ds) { /* a 3DS dump's icon is its SMDH, which only the 3DS driver reads */
+        GuiDriverRun how;
+        d->driver3ds = find_driver(app, GUI_3DS);
+        if (driver_run(app, GUI_3DS, &how) && how.first) d->driver3ds_first = snx_strdup(how.first);
+    }
+    if (ctr && !d->driver3ds) {
+        char why[256];
+        driver_missing(app, GUI_3DS, why, sizeof why);
+        icon_failed_keep(d, dump, dir, why, NULL);
+        return false;
+    }
+    if (!ctr && !d->driver) {
         d->driver = find_driver(app, GUI_SWITCH);
 #ifdef SDL_PLATFORM_IOS /* the app's own, which gui_process_start runs on a thread: its name is only argv[0] */
         if (!d->driver) d->driver = snx_strdup("scarletnx");
@@ -4058,8 +4116,6 @@ static bool dump_icon_ask(App* app, const char* dump, const char* dir) {
             icon_failed_keep(d, dump, dir, why, NULL);
             return false;
         }
-        free(d->repo);
-        d->repo = snx_strdup(app->data_dir);
     }
     SDL_LockMutex(d->lock);
     for (i = 0; i < d->count && strcmp(d->dirs[i], dir); ++i) {}
@@ -4153,6 +4209,8 @@ static void dump_icons_stop(App* app) {
     }
     free(d->failed);
     free(d->driver);
+    free(d->driver3ds);
+    free(d->driver3ds_first);
     free(d->repo);
     if (d->wake) SDL_DestroyCondition(d->wake);
     if (d->lock) SDL_DestroyMutex(d->lock);
@@ -4174,9 +4232,13 @@ static char* icon_file(App* app, const char* path, bool* loading) {
             break;
         }
     for (leaf = path + strlen(path); leaf > path && leaf[-1] != '/' && leaf[-1] != '\\'; --leaf) continue;
-    if (!gui_is_dump(leaf)) return gui_game_icon(path);
+    if (!gui_is_dump(leaf) && !gui_is_cia(leaf)) return gui_game_icon(path); /* a 3DS game's icon is asked too */
     if (!(dir = dump_icon_dir(app, path))) return NULL;
     file = snx_path_join(dir, "icon.jpg");
+    if (!snx_is_file(file)) { /* the 3DS driver's icon is icon.rgba */
+        free(file);
+        file = snx_path_join(dir, "icon.rgba");
+    }
     if (!snx_is_file(file)) {
         if (!icon_failed(&app->dump_icons, dir, why, sizeof why) && !dlc_dir(dir) &&
             (*loading = dump_icon_ask(app, path, dir)) && app->dump_icons.live)
@@ -4312,7 +4374,9 @@ static SDL_Texture* game_icon(App* app, const char* path) {
     }
     jpeg = file ? snx_read_file(file, &size) : NULL;
     pixels = jpeg ? malloc((size_t)GUI_ICON_SIDE * GUI_ICON_SIDE * 4) : NULL;
-    if (pixels && snx_splash_picture(jpeg, size, GUI_ICON_SIDE, 0, pixels, GUI_ICON_SIDE * 4))
+    if (pixels && (file && strlen(file) >= 5 && !strcmp(file + strlen(file) - 5, ".rgba")
+                       ? rgba_icon(jpeg, size, GUI_ICON_SIDE, pixels)
+                       : snx_splash_picture(jpeg, size, GUI_ICON_SIDE, 0, pixels, GUI_ICON_SIDE * 4)))
         snprintf(app->message, sizeof app->message, snx_tr("%s could not be drawn: the game shows Wimsy in grey"),
                  file);
     else if (pixels) {
@@ -4331,7 +4395,7 @@ static SDL_Texture* game_icon(App* app, const char* path) {
 }
 /* why the dump at path shows no icon, the driver's answer in this session, into out: false when none was given */
 static bool dump_icon_why(const App* app, const char* path, char* out, size_t size) {
-    char* dir = gui_is_dump(path) ? dump_icon_dir(app, path) : NULL;
+    char* dir = gui_is_dump(path) || gui_is_cia(path) ? dump_icon_dir(app, path) : NULL;
     bool failed = dir && icon_failed(&app->dump_icons, dir, out, size);
     free(dir);
     return failed;
@@ -6937,7 +7001,7 @@ bool ui_games_rows_get_row_info(App* app, size_t row, int width, UiRowInfo* info
                                                                                              : "",
                  queued);
         info->label = label;
-        if (r) info->image = r->driver == GUI_SWITCH || r->driver == GUI_VITA ? game_icon(app, r->path) : NULL;
+        if (r) info->image = game_icon(app, r->path);
         if (!r) info->image = icon_more(app);                /* Show More's cover */
         if (r && !info->image) info->image = icon_none(app); /* a game with none of its own */
         return true;
@@ -7046,7 +7110,7 @@ static void game_kind(const App* app, const GuiGames* games, size_t i, char* kin
                                      /* Games' own rows by what list_games read, another list's from its folder */
                                      : ready_kind(games == &app->games ? app->games_drivers[i] : row_driver(games, i)));
     n = strlen(kind);
-    if (!games->addons[i] && gui_is_dump(name) && games->paths[i])
+    if (!games->addons[i] && (gui_is_dump(name) || gui_is_cia(name)) && games->paths[i])
         n += icon_why_said(app, games->paths[i], kind + n, size - n);
     if (game_was_old(app, games->paths[i]))
         snprintf(kind + n, size - n, "%s",
@@ -7723,14 +7787,13 @@ static GuiSettings* settings_of(App* app) {
     free(list);
     free(driver);
     /* the launcher's own choices win over the game's .ini, as its items did: Off or On to every run, a phone's on the
-       whole screen, its pad shown */
+       whole screen; the on-screen controls Auto everywhere, shown on a touch screen while no gamepad is connected */
 #if defined(SDL_PLATFORM_ANDROID) || defined(SDL_PLATFORM_IOS)
     gui_settings_always(&app->settings, "fullscreen", "1");
-    gui_settings_always(&app->settings, "controls", "1");
 #else
     gui_settings_always(&app->settings, "fullscreen", "0");
-    gui_settings_always(&app->settings, "controls", "0");
 #endif
+    gui_settings_always(&app->settings, "controls", "2");
     gui_settings_mark(&app->settings);
     /* what older versions wrote that the rows read otherwise (a .ini, a default picked): written without, said once */
     if (gui_settings_load(&app->settings, app->settings_file, old, sizeof old)) {
@@ -7912,7 +7975,8 @@ static const GuiThemeKey app_keys[] = {
     {"", SNX_TR_NOOP("Background recompile"), GUI_KEY_ACTION, offsetof(GuiAppForm, background),
      sizeof(((GuiAppForm*)0)->background), NULL, 0,
      SNX_TR_NOOP("The Compile tab's: R's, B's and a game's first. Auto: Gentle on battery, Full on the charger. Full: "
-                 "every core. Gentle: half of them, at a low priority. Each goes gently while a game plays"),
+                 "its threads as the recompile's settings give them. Gentle: as many as the memory holds, up to half "
+                 "of those, at a low priority. Each goes gently while a game plays"),
      0, 0, 0, 0, NULL},
     {"", SNX_TR_NOOP("Theme Editor"), GUI_KEY_ACTION, 0, 0, NULL, 0,
      SNX_TR_NOOP("This theme's keys with a preview, saved as themes/<name>/theme.ini"), 0, 0, 0, 0, NULL},
@@ -9115,10 +9179,20 @@ static void recent_as_games(App* app) {
             } else
                 ++j;
     for (i = 0; i < app->recent.count; ++i) {
-        char* shown = app->recent.game[i].driver == GUI_SWITCH && gui_game_folder(app->recent.game[i].path)
-                          ? gui_game_shown(app->recent.game[i].path)
-                          : NULL;
-        if (shown && gui_recent_rename(&app->recent, app->recent.game[i].path, shown)) changed = true;
+        /* a game made, whichever console's: its own name (its control.nacp's, its .ini's), as Games shows it. A Switch
+           game with none takes its folder's; another console's folder is named by a title ID, which says less than
+           the name the run gave the entry */
+        const GuiRecentGame* r = &app->recent.game[i];
+        char* shown = r->prepared && gui_game_program(r->path) ? gui_game_shown(r->path) : NULL;
+        if (shown && r->driver != GUI_SWITCH) {
+            char* folder = snx_dirname(r->path);
+            if (!folder || !strcmp(shown, snx_path_leaf(folder))) {
+                free(shown);
+                shown = NULL;
+            }
+            free(folder);
+        }
+        if (shown && gui_recent_rename(&app->recent, r->path, shown)) changed = true;
         free(shown);
     }
     if (changed) recent_changed(app);
@@ -15520,17 +15594,17 @@ static void job_speed(App* app, char* out, size_t size) {
     else
         snprintf(out, size, "%s", snx_tr("Gentle, a game plays"));
     n = strlen(out);
-    if (app->job_threads && n < size) snprintf(out + n, size - n, snx_tr(", %d threads"), app->job_threads);
+    if (app->job_threads && n < size) snprintf(out + n, size - n, snx_tr(", up to %d threads"), app->job_threads);
     n = strlen(out);
     if (app->job_said[0] && !app->job_kept_low && n < size) /* the priority it could not have */
         snprintf(out + n, size - n, " (%s)", app->job_said);
 }
-/* the threads a recompile of the queue takes at full speed: the AOT threads picked, else the runtime's own Auto,
-   so a Gentle recompile (its half) leaves the machine the same room the queue's Full one would */
+/* the threads a recompile of the queue takes at full speed: the AOT threads picked, else the most the runtime's Auto
+   opens, so a Gentle recompile (its half) leaves the machine the same room the queue's Full one would */
 static int job_cores(App* app) {
-    const char* picked = gui_settings_value(settings_of(app), "aot_threads");
-    int n = picked ? SDL_atoi(picked) : 0;
-    return n > 0 ? n : (int)snx_build_threads();
+    const char *picked = gui_settings_value(settings_of(app), "aot_threads"),
+               *most = gui_settings_value(settings_of(app), "aot_threads_most");
+    return (int)snx_aot_threads(picked ? SDL_atoi(picked) : 0, most ? SDL_atoi(most) : 0, NULL, 0);
 }
 /* the Compile tab, its focus on job i */
 static void queue_show(App* app, int i) {
@@ -15552,12 +15626,13 @@ static void job_start(App* app) {
     while ((i = gui_queue_next(&app->queue)) >= 0 && gui_queue_running(&app->queue) < 0) {
         job = &app->queue.job[i];
         free((void*)argv);
-        argv = (const char**)snx_alloc((size_t)(job->argc + 2) * sizeof *argv); /* and --aot_threads= */
+        argv = (const char**)snx_alloc((size_t)(job->argc + 3) * sizeof *argv); /* and Gentle's two */
         n = gui_queue_argv(&app->queue, i, argv);
         gentle = job_gentle(app);
         app->job_threads = gentle ? SDL_max(1, job_cores(app) / 2) : 0;
-        if (gentle) { /* after the settings' --aot_threads=, which the last one given replaces */
-            snprintf(threads, sizeof threads, "--aot_threads=%d", app->job_threads);
+        if (gentle) { /* after the settings', which the last one given replaces: Auto, as the memory holds, up to half */
+            snprintf(threads, sizeof threads, "--aot_threads_most=%d", app->job_threads);
+            argv[n++] = "--aot_threads=0";
             argv[n++] = threads;
             argv[n] = NULL;
         }
@@ -15901,11 +15976,28 @@ static void games_back(App* app, const char* path) {
     }
     free(game);
 }
-/* Games listed again where it is, its focus kept on the game it was on (games_back) */
+/* the row of Games' Rows (and the grid's tile) the focus is on, as games_boxes counts them: past the lead's */
+static size_t games_focus_row(const App* app) {
+    size_t selected = app->browser.selected, head = app->browser.head;
+    return selected < head ? selected + 1 : (size_t)games_lead(app) + selected - head;
+}
+/* Games listed again where it is, its focus kept on the game it was on (games_back), on whatever row that game is
+   now: the list and the grid stay where the player scrolled them (the wheel, a thumb, a finger), as a focus that did
+   not move leaves them, a thumb held through it. The listing lays the grid out before its focus is back, so the
+   grid's place is put back after */
 static void games_relist(App* app) {
     bool recent;
     const char* was = games_focused_path(app, &recent);
+    bool seen = app->games_seen == app->browser.selected,
+         held = app->bar_focus[GUI_LIST_GRID] == SIZE_MAX || app->bar_focus[GUI_LIST_GRID] == games_focus_row(app) + 1;
+    float grid_y = app->list_y[GUI_LIST_GRID], grid_v = app->list_v[GUI_LIST_GRID];
     games_back(app, recent ? NULL : was);
+    if (seen) app->games_seen = app->browser.selected;
+    if (held) {
+        app->bar_focus[GUI_LIST_GRID] = games_focus_row(app) + 1;
+        app->list_y[GUI_LIST_GRID] = grid_y;
+        app->list_v[GUI_LIST_GRID] = grid_v;
+    }
 }
 /* the game of the Compile tab's focus, as Games lists it: what Tab and ESC there go back to; NULL with none */
 static const char* queue_game(const App* app) {

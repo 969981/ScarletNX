@@ -103,6 +103,8 @@ if(BUILD_TESTING)
              -DAPPLE_HOST=$<BOOL:${APPLE}> -P "${PROJECT_SOURCE_DIR}/tests/settings_list.cmake")
     add_test(NAME runtime_unknown_option COMMAND "${CMAKE_COMMAND}" -DRUNTIME=$<TARGET_FILE:scarletnx>
              -P "${PROJECT_SOURCE_DIR}/tests/unknown_option.cmake")
+    add_test(NAME runtime_tracy_version COMMAND "${CMAKE_COMMAND}" -DRUNTIME=$<TARGET_FILE:scarletnx>
+             "-DTRACY_VERSION=${SNX_TRACY_VERSION}" -P "${PROJECT_SOURCE_DIR}/tests/tracy_version.cmake")
     add_test(NAME runtime_recompile_settings COMMAND "${CMAKE_COMMAND}" -DRUNTIME=$<TARGET_FILE:scarletnx>
              -P "${PROJECT_SOURCE_DIR}/tests/recompile_settings.cmake")
     if(NOT WIN32) # Windows' error box would wait for a click
@@ -148,6 +150,7 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
         "${PROJECT_SOURCE_DIR}/tests/support/vic_ref.c" "${PROJECT_SOURCE_DIR}/tests/support/dma_ref.c"
         "${PROJECT_SOURCE_DIR}/tests/support/fermi2d_ref.c" "${PROJECT_SOURCE_DIR}/tests/support/half.c"
         "${PROJECT_SOURCE_DIR}/tests/support/sm86_ref.c" "${PROJECT_SOURCE_DIR}/tests/glsl/bc7_cpu.cpp"
+        "${PROJECT_SOURCE_DIR}/tests/glsl/astc_bc7_cpu.cpp"
         "${PROJECT_SOURCE_DIR}/tests/support/ui_shape_ref.c")
     target_include_directories(snx-test-vulkan PRIVATE "${PROJECT_SOURCE_DIR}/tests")
     target_link_libraries(snx-test-vulkan PRIVATE snx_nx_flags ${components} snx_driver FFmpeg::avutil Threads::Threads
@@ -227,11 +230,12 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     set_tests_properties(vulkan_headless PROPERTIES TIMEOUT 120
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     # the recording thread's own vk_rec_sync must return: the fatal path of a lost device calls it from that thread, and
-    # a wait there waits for the thread that runs it (record.c). This one needs no shaders, so it runs on any driver,
-    # and a run that hangs fails at the timeout
+    # a wait there waits for the thread that runs it (record.c); and the window's release for the error's screen must
+    # return while that thread is stopped in a packet. These need no shaders, so they run on any driver, and a run
+    # that hangs fails at the timeout
     add_test(NAME vulkan_recorder COMMAND snx-test-vulkan -H)
-    set_tests_properties(vulkan_recorder PROPERTIES TIMEOUT 20 ENVIRONMENT "SNX_TEST_RECORDER_ONLY=1"
-        PASS_REGULAR_EXPRESSION "The recording thread's own vk_rec_sync returns")
+    set_tests_properties(vulkan_recorder PROPERTIES TIMEOUT 30 ENVIRONMENT "SNX_TEST_RECORDER_ONLY=1"
+        PASS_REGULAR_EXPRESSION "PASS headless Vulkan recorder only")
     # the writable storage buffers' check (tests/vulkan_storage_buffer_keep.inc) with guest buffers copied: the default
     # run takes unified memory on an integrated device and on lavapipe, which writes them in guest memory instead of
     # keeping them on the GPU. A run that hangs fails at the timeout
@@ -246,6 +250,11 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     set_tests_properties(vulkan_owned_page_reads vulkan_owned_page_reads_protection PROPERTIES TIMEOUT 60
         ENVIRONMENT "SNX_TEST_NVN_CASE=owned_page_reads" SKIP_REGULAR_EXPRESSION "SKIP owned page reads"
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
+    # the targets a release watches and the CPU's first read lands, color and depth (check_rt_watch, check_zt_watch),
+    # with guest memory copied as on a discrete GPU: on unified memory they are skipped, as lavapipe's default run takes it
+    add_test(NAME vulkan_rt_watch COMMAND snx-test-vulkan -H --vk_memory=1)
+    set_tests_properties(vulkan_rt_watch PROPERTIES TIMEOUT 60 ENVIRONMENT "SNX_TEST_RT_WATCH_ONLY=1"
+        FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR;watch: needs traps")
     # the budget's trim alone (tests/vulkan_trim.inc): a trim that wants more than everything held would take what the
     # other checks hold
     add_test(NAME vulkan_trim COMMAND snx-test-vulkan -H)
@@ -354,7 +363,7 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
         ENVIRONMENT "SNX_TEST_VIC_ONLY=1"
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     # the ASTC upload against the CPU decoder, block linear moves on the GPU against bl_offset's layout and texture
-    # conversions against the CPU's, with the
+    # conversions (the blits between pixel formats too) against the CPU's, with the
     # backend's own frames, staging and allocations and the SPIR-V
     # the build makes (the file snx_glsl_spirv generated for snx_vk above). Again under a 4 MiB allocation cap, so
     # images in pieces are tested too. `snx-test-astc-vulkan --large` decodes two 512 MiB textures (minutes on lavapipe)
@@ -372,10 +381,25 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
         gpu/vk/memory.c gpu/vk/resource_stats.c gpu/vk/record.c gpu/vk/checkpoints.c gpu/vk/vma.cpp ${snx_astc_plat} "${volk_SOURCE_DIR}/volk.c"
         "${PROJECT_BINARY_DIR}/generated/spirv/astc_spv.c" "${PROJECT_BINARY_DIR}/generated/spirv/blocklinear_spv.c"
         "${PROJECT_BINARY_DIR}/generated/spirv/texconv_spv.c" "${PROJECT_BINARY_DIR}/generated/spirv/texconv_etc2_spv.c"
-        "${PROJECT_BINARY_DIR}/generated/spirv/bc7_spv.c"
-        "${PROJECT_BINARY_DIR}/generated/spirv/bc7_fast_spv.c" "${PROJECT_BINARY_DIR}/generated/spirv/bc7_mode6_spv.c"
-        "${PROJECT_BINARY_DIR}/generated/spirv/bc7_quick_spv.c"
-        "${PROJECT_SOURCE_DIR}/tests/glsl/bc7_cpu.cpp" "${PROJECT_SOURCE_DIR}/tests/glsl/bcn_etc2_cpu.cpp")
+        "${PROJECT_BINARY_DIR}/generated/spirv/texconv_convert_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/texconv_astc_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/texconv_astc_b_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/texconv_astc_c_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc7_a_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc7_b_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc7_fast_a_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc7_fast_b_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc7_mode6_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc7_quick_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc7_a_dot_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc7_b_dot_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc7_fast_a_dot_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc7_fast_b_dot_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc7_mode6_dot_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc7_quick_dot_spv.c"
+        "${PROJECT_SOURCE_DIR}/tests/glsl/bc7_cpu.cpp" "${PROJECT_SOURCE_DIR}/tests/glsl/astc_bc7_cpu.cpp"
+        "${PROJECT_SOURCE_DIR}/tests/glsl/bcn_etc2_cpu.cpp" "${PROJECT_SOURCE_DIR}/tests/glsl/bcn_astc_cpu.cpp"
+        "${PROJECT_SOURCE_DIR}/tests/glsl/blit_convert_cpu.cpp")
     target_include_directories(snx-test-astc-vulkan PRIVATE "${PROJECT_SOURCE_DIR}/tests/glsl")
     target_link_libraries(snx-test-astc-vulkan PRIVATE snx_nx_flags scarletnx-filesystem snx_xxhash snx_vk_common
                                                       Threads::Threads SDL3::SDL3 ${CMAKE_DL_LIBS})

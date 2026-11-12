@@ -637,19 +637,20 @@ static bool has_arg(const char* argv, const char* arg, const char* after) {
     return false;
 }
 /* a console's game not made yet, opened: its first compile through driver, its own (no Switch flag), -r before file
-   and its data folder, run to its end with status (driver_will). One the queue started gently has half the threads
-   as --aot_threads=, which every console's driver takes; another has none */
+   and its data folder, run to its end with status (driver_will). One the queue started gently has Auto's threads up
+   to half, --aot_threads=0 and --aot_threads_most=, which every console's driver takes; another has neither */
 static void compiled_by(App* app, const char* driver, const char* file, int status) {
-    char threads[32];
+    char threads[48];
     bool gentle = !app->menu.running && app->job_low;
     char* argv;
-    snprintf(threads, sizeof threads, "--aot_threads=%d", SDL_max(1, job_cores(app) / 2));
+    snprintf(threads, sizeof threads, "--aot_threads_most=%d", SDL_max(1, job_cores(app) / 2));
     assert(!gentle || app->job_threads == SDL_max(1, job_cores(app) / 2));
     argv = ran(app, status);
     assert(strstr(argv, driver) && strstr(argv, driver) < strchr(argv, '\n') && has_arg(argv, "-r", file) &&
            has_arg(argv, "--data", app->data_dir) && !has_arg(argv, "-S", NULL) &&
            !has_arg(argv, "--fullscreen=1", NULL));
-    assert(gentle ? has_arg(argv, threads, NULL) : !strstr(argv, "--aot_threads="));
+    assert(gentle ? has_arg(argv, "--aot_threads=0", NULL) && has_arg(argv, threads, NULL)
+                  : !strstr(argv, "--aot_threads=") && !strstr(argv, "--aot_threads_most="));
     free(argv);
 }
 /* the event e (a game dropped) taken with Background recompile Gentle: its compile starts gently */
@@ -4041,11 +4042,11 @@ static void recompile_queue(App* app) {
             go_tab(app, GUI_TAB_GAMES);
             focus_game(app, names[0]);
         }
-        snprintf(line, sizeof line, "threads 4, priority %d", low);
+        snprintf(line, sizeof line, "threads 0 up to 4, priority %d", low);
         assert(noted(&app->job_steps, line) && app->job_low && app->job_threads == 4 &&
                priority_of(job_pid(app)) == low);
         job_speed(app, said, sizeof said);
-        assert(!strcmp(said, way ? "Gentle, on battery, 4 threads" : "Gentle, 4 threads"));
+        assert(!strcmp(said, way ? "Gentle, on battery, up to 4 threads" : "Gentle, up to 4 threads"));
         job_step(app, 50);
         job_step(app, 75);
         job_step(app, 100);
@@ -4412,6 +4413,152 @@ static void dump_addons(App* app, const char* dir) {
     free(cache);
     free(cache_was);
 }
+/* a folder of dumps whose titles the driver has not said yet, in the Dumps library: a game's 3 DLCs, a0.nsp to a2.nsp,
+   made one item once known; 3 games' dumps after them, g00.xci to g02.xci; then 60 3DS games, which make the list
+   scroll and ask the driver nothing. Its path, which the caller frees */
+static char* relist_dumps(App* app, const char* dir, const char* name) {
+    char* dumps = snx_path_join(dir, name);
+    assert(!snx_mkdirs(dumps));
+    for (int k = 0; k < 66; ++k) {
+        char file[32], *path, *text;
+        if (k < 3) {
+            snprintf(file, sizeof file, "a%d.nsp", k);
+            text = snx_format("title=0100ABCD7000100%d\ngame=0100ABCD70000000\nversion=0\n", k + 1);
+        } else if (k < 6) {
+            snprintf(file, sizeof file, "g%02d.xci", k - 3);
+            text = snx_format("title=0100ABCD6%03d0000\ngame=0100ABCD6%03d0000\nversion=\nname=Game %02d\n", k, k, k);
+        } else {
+            snprintf(file, sizeof file, "z%02d.cia", k - 6);
+            text = snx_strdup("fixture");
+        }
+        path = snx_path_join(dumps, file);
+        assert(!snx_write_file(path, text, strlen(text)));
+        free(path);
+        free(text);
+    }
+    folder_keep(app, dumps, GUI_LIBRARY_DUMPS, false);
+    return dumps;
+}
+/* the mouse's left button pressed at pixel x, y of the render, or let go there */
+static void left_button(App* app, int x, int y, bool down) {
+    SDL_Event e = {0};
+    float wx, wy;
+    assert(SDL_RenderCoordinatesToWindow(app->renderer, (float)x + 0.5f, (float)y + 0.5f, &wx, &wy));
+    e.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+    e.button.button = SDL_BUTTON_LEFT;
+    e.button.x = wx;
+    e.button.y = wy;
+    event(app, &e);
+}
+/* Games listed again as the driver says what its dumps are (titles_look) while the player scrolls, the game in focus
+   on another row then (the dumps before it one item at the end, the groups' headings put in): View List's rows stay
+   where the wheel took them, and where the thumb held at the track's foot takes them, through the drag and once let
+   go; View Grid's lines stay where its thumb took them, held and let go. The focus on the same game all along */
+static void relist_keeps_scroll(App* app, const char* dir) {
+    char* cache_was = getenv("XDG_CACHE_HOME") ? snx_strdup(getenv("XDG_CACHE_HOME")) : NULL;
+    char *cache = snx_path_join(dir, "relist cache"), *dumps;
+    int text_size = app->menu.text_size, row_h, total, view, k, focus;
+    GuiGamesBoxes g;
+    GuiRect track, thumb;
+    SDL_Event e = {0};
+    float y, max;
+    set_env("XDG_CACHE_HOME", cache);
+    /* View List: the focus on g01.xci, its row shown, then the wheel a screen down, the focus where it was */
+    dumps = relist_dumps(app, dir, "relist list dumps");
+    go_tab(app, GUI_TAB_GAMES);
+    app->games_y = app->games_to = app->games_v = 0;
+    focus = games_row(app, "g01.xci");
+    assert(focus >= 0 && app->dump_icons.count >= 6 && !app->games.set_count);
+    app->pointed = false;
+    app->browser.selected = app->browser.head + (size_t)focus;
+    render(app);
+    games_boxes(app, &g);
+    games_extent(app, &g, &row_h, &total, &view);
+    y = app->games_y;
+    e.type = SDL_EVENT_MOUSE_WHEEL;
+    e.wheel.integer_y = -(view / row_h / 3 + 1); /* past a screen of rows: the focus's row out of sight */
+    event(app, &e);
+    render(app);
+    games_boxes(app, &g);
+    assert(app->games_y == y - (float)(3 * e.wheel.integer_y * row_h) && app->games_y <= games_max(app, &g));
+    assert((float)(g.lists[UI_GAMES_ROWS].focus * (size_t)row_h) < app->games_y);
+    y = app->games_y;
+    dump_icons_pass(&app->dump_icons);
+    pump(app); /* the answers: listed again */
+    for (k = 0; k < 3; ++k) render(app);
+    assert(app->games.set_count == 1 && games_row(app, "g01.xci") != focus);
+    assert(app->browser.selected == app->browser.head + (size_t)games_row(app, "g01.xci") && app->games_y == y);
+    /* the thumb held at the track's foot, Games listed again meanwhile and once it is let go */
+    games_boxes(app, &g);
+    assert(games_bar(app, &g, &track, &thumb));
+    max = games_max(app, &g);
+    left_button(app, track.x + 1, track.y + track.h - 1, true);
+    assert(app->bar_held && app->games_y == max);
+    games_relist(app);
+    for (k = 0; k < 3; ++k) {
+        pump(app);
+        render(app);
+    }
+    assert(app->bar_held && app->games_y == max);
+    mouse_px(app, track.x + 1, track.y + track.h - 1, false);
+    left_button(app, track.x + 1, track.y + track.h - 1, false);
+    render(app);
+    games_relist(app);
+    for (k = 0; k < 3; ++k) render(app);
+    assert(!app->bar_held && app->games_y == max);
+    free(app->folders[--app->folder_count]);
+    assert(!snx_remove_tree(dumps));
+    free(dumps);
+    /* View Grid, big letters (lines past the area): the focus on g01.xci by the keys, its line in the middle; the
+       grid's thumb held at the track's foot, Games listed again as the answers come, and let go */
+    dumps = relist_dumps(app, dir, "relist grid dumps");
+    app->options[GUI_OPTION_VIEW] = 1;
+    app->menu.text_size = 4;
+    go_tab(app, GUI_TAB_MENU);
+    go_tab(app, GUI_TAB_GAMES);
+    assert(games_grid(app) && !app->games.set_count);
+    focus = games_row(app, "g01.xci");
+    app->pointed = false;
+    app->browser.selected = app->browser.head + (size_t)focus + 1;
+    key(app, SDLK_LEFT);
+    render(app);
+    {
+        const GuiBar* bar = bar_of(app, GUI_LIST_GRID);
+        GuiRect bottom;
+        assert(bar && app->browser.selected == app->browser.head + (size_t)focus);
+        bottom = bar->track;
+        left_button(app, bottom.x + 1, bottom.y + bottom.h - 1, true);
+        assert(app->bar_hold == GUI_LIST_GRID + 1);
+        render(app);
+        assert(app->list_y[GUI_LIST_GRID] == app->list_max[GUI_LIST_GRID] && app->list_max[GUI_LIST_GRID] > 0);
+        y = app->list_y[GUI_LIST_GRID];
+        dump_icons_pass(&app->dump_icons);
+        pump(app); /* the answers, while it is held: listed again */
+        for (k = 0; k < 3; ++k) render(app);
+        assert(app->games.set_count == 1 && games_row(app, "g01.xci") != focus);
+        assert(app->bar_hold == GUI_LIST_GRID + 1 && app->list_y[GUI_LIST_GRID] == y);
+        /* the thumb still at the foot: the lines' foot, which the item's lines moved */
+        mouse_px(app, bottom.x + 1, bottom.y + bottom.h - 1, false);
+        render(app);
+        y = app->list_y[GUI_LIST_GRID];
+        assert(y == app->list_max[GUI_LIST_GRID]);
+        left_button(app, bottom.x + 1, bottom.y + bottom.h - 1, false);
+        games_relist(app);
+        for (k = 0; k < 3; ++k) render(app);
+        assert(!app->bar_hold && app->list_y[GUI_LIST_GRID] == y);
+        assert(app->browser.selected == app->browser.head + (size_t)games_row(app, "g01.xci"));
+    }
+    app->options[GUI_OPTION_VIEW] = 0;
+    app->menu.text_size = text_size;
+    free(app->folders[--app->folder_count]);
+    go_tab(app, GUI_TAB_MENU);
+    set_env("XDG_CACHE_HOME", cache_was);
+    assert(!snx_remove_tree(dumps));
+    assert(!snx_path_exists(cache) || !snx_remove_tree(cache)); /* XDG's alone: elsewhere the menu's own folder */
+    free(dumps);
+    free(cache);
+    free(cache_was);
+}
 static bool wait_taken(const char* path) {
     for (int n = 0; n < 2000; ++n) {
         if (snx_is_file(path) && !remove(path)) return true;
@@ -4491,10 +4638,13 @@ int main(int argc, char** argv) {
     if (argc > 2 && !strcmp(argv[1], "-r") && strstr(argv[2], "queue game")) {
         /* a recompile of the queue: its blocks one at a time, each once the test makes <input>.step (which it takes),
            then how it ended; the threads and the priority it got on its second line, its pid in <input>.pid */
-        const char *threads = "default", *name = argv[2] + strlen(argv[2]);
+        const char *threads = "default", *most = NULL, *name = argv[2] + strlen(argv[2]);
         char *step = snx_format("%s.step", argv[2]), *pid = snx_format("%s.pid", argv[2]), *at;
         for (int i = 3; i < argc; ++i)
-            if (!strncmp(argv[i], "--aot_threads=", 14)) threads = argv[i] + 14; /* the last one given */
+            if (!strncmp(argv[i], "--aot_threads=", 14))
+                threads = argv[i] + 14; /* the last one given */
+            else if (!strncmp(argv[i], "--aot_threads_most=", 19))
+                most = argv[i] + 19;
         while (name > argv[2] && name[-1] != '/' && name[-1] != '\\') --name;
 #ifdef _WIN32
         at = snx_format("%lu", (unsigned long)GetCurrentProcessId());
@@ -4502,9 +4652,9 @@ int main(int argc, char** argv) {
         at = snx_format("%ld", (long)getpid());
 #endif
         assert(!snx_write_file(pid, at, strlen(at)));
-        printf("Recompiling %.*s (1 modules)\nthreads %s, priority %d\n",
+        printf("Recompiling %.*s (1 modules)\nthreads %s%s%s, priority %d\n",
                (int)(strstr(name, ".exe") ? (size_t)(strstr(name, ".exe") - name) : strlen(name)), name, threads,
-               own_priority());
+               most ? " up to " : "", most ? most : "", own_priority());
         for (int b = 1; b <= 4; ++b) {
             printf("  compiled block %d/4: code_00%d, 10 functions (0.1 s)\n", b, b - 1);
             fflush(stdout);
@@ -4526,9 +4676,13 @@ int main(int argc, char** argv) {
         free(step);
         return 0;
     }
-    if (argc == 9 && !strcmp(argv[3], "-x") && !strcmp(argv[4], "--icon")) { /* a dump's icon, as -x --icon writes it */
+    if ((argc == 9 || argc == 10) && !strcmp(argv[argc == 10 ? 4 : 3], "-x") &&
+        !strcmp(argv[argc == 10 ? 5 : 4], "--icon")) { /* a dump's icon, as -x --icon writes it */
         IconJpeg jpeg = {{0}, 0};
-        char* to = snx_path_join(argv[6], "icon.jpg");
+        /* the 3DS driver's SMDH icon is RGBA; its name is argv[1] when the menu is the multicall program */
+        bool ctr = strstr(argv[0], "scarletnx-3ds") != NULL || (argc == 10 && strstr(argv[1], "scarletnx-3ds"));
+        const char *out = argv[argc == 10 ? 7 : 6], *dump = argv[argc == 10 ? 9 : 8];
+        char* to = snx_path_join(out, ctr ? "icon.rgba" : "icon.jpg");
         int rc = 1;
 #ifndef _WIN32
         /* started as the menu starts its drivers (gui_process.h), which works where SDL's processes do not (Android's
@@ -4541,7 +4695,7 @@ int main(int argc, char** argv) {
 #endif
         /* what the dump is: a test's dump whose text is a title.ini, as the driver writes it from its content meta */
         size_t size = 0;
-        char *text = (char*)snx_read_file(argv[8], &size), *ini = snx_path_join(argv[6], "title.ini");
+        char *text = (char*)snx_read_file(dump, &size), *ini = snx_path_join(out, "title.ini");
         GuiDumpTitle title;
         bool dlc = false;
         if (text && strstr(text, "title=")) {
@@ -4550,15 +4704,18 @@ int main(int argc, char** argv) {
         }
         free(ini);
         free(text);
-        if (strstr(argv[8], "hung icon")) /* never answers: the menu stops it */
+        if (strstr(dump, "hung icon")) /* never answers: the menu stops it */
             SDL_Delay(60000);
-        if (strstr(argv[8], "no icon")) {
+        if (ctr) {
+            unsigned char rgba[48 * 48 * 4];
+            memset(rgba, 0xff, sizeof rgba); /* opaque, so the row draws it */
+            rc = snx_write_file(to, rgba, sizeof rgba);
+        } else if (strstr(dump, "no icon")) {
             puts("Reading the dump's Control NCA");
             fflush(stdout);
-            fprintf(stderr, "scarletnx: Games shows no icon for %s: it has no Control NCA\n",
-                    argv[8]); /* as snx_error */
+            fprintf(stderr, "scarletnx: Games shows no icon for %s: it has no Control NCA\n", dump); /* as snx_error */
         } else if (dlc) {
-            printf("%s is a DLC: it has no icon of its own\n", argv[8]);
+            printf("%s is a DLC: it has no icon of its own\n", dump);
             rc = 0;
         } else
             rc = snx_splash_jpeg("wimsy-fuddles", 32, 90, icon_jpeg_write, &jpeg) ||
@@ -4569,7 +4726,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && !strcmp(argv[1], "--settings")) { /* as the runtime lists its settings */
         fputs("Display\tfullscreen\t0\tint\t0\t1\t1 = start in fullscreen\t\t0=0|1=1\n"
               "Graphics\tresolution\t1\tfloat\t0.25\t16\tInternal 3D resolution\t\t\n"
-              "On-screen controls\tcontrols\t0\tint\t0\t1\tThe on-screen controls\tShow controls\t0=Off|1=On\n"
+              "On-screen controls\tcontrols\t2\tint\t0\t2\tThe on-screen controls\tShow controls\t0=Off|1=On|2=Auto\n"
               "On-screen controls/Buttons\tcontrols_a_shown\t\tint\t0\t1\tA control drawn\tA\t0=Hidden|1=Shown\n"
               "On-screen controls/Buttons\tcontrols_b_shown\t\tint\t0\t1\tA control drawn\tB\t0=Hidden|1=Shown\n"
               "User\tuser_uid\t\ttext\t\t\tThe console's user the game plays as, by its uid\tUser uid\t\n",
@@ -4603,23 +4760,26 @@ int main(int argc, char** argv) {
         }
         return status;
     }
-    if (argc == 3 && !strcmp(argv[1], "--fullscreen=1") && !strcmp(argv[2], "--controls=0")) {
+    if (argc == 3 && !strcmp(argv[1], "--fullscreen=1") && !strcmp(argv[2], "--controls=2")) {
         puts("prepared game stdout");
         fputs("prepared game stderr\n", stderr);
         return 0;
     }
     if (argc > 1 && strstr(argv[1], "option flags")) {
         int i = 2;
-        assert(argc == 8 && !strcmp(argv[i++], "--fullscreen=1") && !strcmp(argv[i++], "--controls=0"));
+        assert(argc == 8 && !strcmp(argv[i++], "--fullscreen=1") && !strcmp(argv[i++], "--controls=2"));
         assert(!strcmp(argv[i++], "-S") && !strcmp(argv[i++], "-s"));
         assert(!strcmp(argv[i++], "--data") && argv[i++][0] && i == argc);
         puts("Recompiling option flags\nScarletNX - option flags"); /* the runner's banner: now loading */
         return 0;
     }
     if (argc > 2 && strstr(argv[argv[1][0] == '-' ? 2 : 1], "0100ABCD12340000")) { /* a game or its update */
-        int r = !strcmp(argv[1], "-r");
+        int r = !strcmp(argv[1], "-r"), args = argc;
+        /* a recompile the queue runs gently (on battery) ends with Auto and its ceiling of half the threads, which the last
+           ones given replace, as the menu's own line says */
+        if (args > 2 && !strncmp(argv[args - 1], "--aot_threads_most=", 19)) args -= 2; /* and its --aot_threads=0 */
         assert(strstr(argv[0], "runtime") && snx_is_file(argv[1 + r]));
-        assert(!strcmp(argv[argc - 2], "--data") && argv[argc - 1][0]);
+        assert(!strcmp(argv[args - 2], "--data") && argv[args - 1][0]);
         puts("ScarletNX - an update");
         return 0;
     }
@@ -4631,15 +4791,16 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc > 2 && !strcmp(argv[1], "-r") && strstr(argv[2], "folder game")) { /* R on it: recompiled, not played */
-        int i = 3;
+        int i = 3, args = argc;
+        if (args > 2 && !strncmp(argv[args - 1], "--aot_threads_most=", 19)) args -= 2; /* the Gentle recompile's */
         assert(strstr(argv[0], "runtime") && snx_is_file(argv[2]));
-        assert(i + 2 == argc && !strcmp(argv[i], "--data") && argv[i + 1][0]);
+        assert(i + 2 == args && !strcmp(argv[i], "--data") && argv[i + 1][0]);
         puts("Recompiling folder game (1 modules)\nBuilt folder game");
         return 0;
     }
     if (argc > 1 && strstr(argv[1], "folder game")) { /* a game in a folder of its own, through the menu's driver */
         assert(strstr(argv[0], "runtime") && argc == 6 && snx_is_file(argv[1]) && !strcmp(argv[2], "--fullscreen=1") &&
-               !strcmp(argv[3], "--controls=0") && !strcmp(argv[4], "--data") && argv[5][0]);
+               !strcmp(argv[3], "--controls=2") && !strcmp(argv[4], "--data") && argv[5][0]);
         puts("Recompiling folder game (1 modules)\nBuilt folder game\nScarletNX - folder game");
         return 0;
     }
@@ -4654,7 +4815,7 @@ int main(int argc, char** argv) {
         assert(strstr(argv[1], "game with spaces"));
         bool nx = strstr(argv[0], "runtime") != NULL; /* the program the menu is part of */
         if (nx)
-            assert(argc == 6 && !strcmp(argv[2], "--fullscreen=1") && !strcmp(argv[3], "--controls=0") &&
+            assert(argc == 6 && !strcmp(argv[2], "--fullscreen=1") && !strcmp(argv[3], "--controls=2") &&
                    !strcmp(argv[4], "--data") && argv[5][0]);
         else
             assert(argc == 2);
@@ -5361,18 +5522,18 @@ int main(int argc, char** argv) {
     assert(app.form == GUI_FORM_SETTINGS);
     key(&app, SDLK_RETURN);
     /* a group's settings on the right, a row each with its help in the tips; the group named over them */
-    /* gdbstub, Extract to tmpfs, Extract dump, Java home, Optimization level, LLVM batch, AOT threads, Unit size,
-       Unit cache limit and the LLVM Internals page: the profiler's rows are the game's Debug section's, not the
-       launcher's own */
-    assert(app.form == GUI_FORM_GROUP && app.group == 1 && app.editor.count == 10);
+    /* gdbstub, Extract to tmpfs, Extract dump, Java home, Optimization level, LLVM batch, AOT threads, AOT threads at
+       most, Unit size, Unit cache limit and the LLVM Internals page: the profiler's rows are the game's Debug
+       section's, not the launcher's own */
+    assert(app.form == GUI_FORM_GROUP && app.group == 1 && app.editor.count == 11);
     render(&app);
     shows(&app, "Launch", normal);
     shows_half(&app, "Enables gdbstub", normal); /* in the tips */
-    shows(&app, "-    GDB stub ", yellow); /* its value in the column after the longest name, Optimization level's */
+    shows(&app, "-    GDB stub ", yellow); /* its value in the column after the longest name, AOT threads at most's */
     shows(&app, "-    Extract to tmpfs ", normal);
     {
         char row[64];
-        snprintf(row, sizeof row, "-    %-*s off", (int)strlen("Optimization level"), "Extract dump");
+        snprintf(row, sizeof row, "-    %-*s off", (int)strlen("AOT threads at most"), "Extract dump");
         shows(&app, row, normal);
     }
     { /* Del is said where it does something: on a setting away from its default */
@@ -5527,7 +5688,7 @@ int main(int argc, char** argv) {
         render(&app);
         shows(&app, "Overlay", normal);
         /* the rows' text past the gutter of Buttons' icon */
-        snprintf(line, sizeof line, "-    %-13s %s", "Show controls", "Off [default]"); /* the launcher's choice */
+        snprintf(line, sizeof line, "-    %-13s %s", "Show controls", "Auto [default]"); /* the launcher's choice */
         shows(&app, line, yellow);
         snprintf(line, sizeof line, "- " ICON_LAYOUT_GRID " %-13s %s", "Buttons", ">");
         shows(&app, line, normal);
@@ -7848,10 +8009,10 @@ int main(int argc, char** argv) {
             assert(before && !snx_write_file(app.settings_file, older, sizeof older - 1));
             settings_forget(&app);
             app.message[0] = 0;
-            assert(settings_of(&app) && setting_is(&app, "fullscreen", "0") && setting_is(&app, "controls", "0"));
+            assert(settings_of(&app) && setting_is(&app, "fullscreen", "0") && setting_is(&app, "controls", "2"));
             assert(setting_is(&app, "resolution", "2"));
             said = snx_format("%s: fullscreen=.ini is no longer a value of fullscreen: fullscreen=0 now; controls=.ini "
-                              "is no longer a value of Show controls: controls=0 now",
+                              "is no longer a value of Show controls: controls=2 now",
                               app.settings_file);
             assert(!strcmp(app.message, said));
             free(said);
@@ -8022,7 +8183,7 @@ int main(int argc, char** argv) {
     {
         size_t size;
         char* kept = (char*)snx_read_file(app.run_log, &size);
-        char* line = snx_format("game with spaces;literal.nro --fullscreen=1 --controls=0 --data %s\n", app.data_dir);
+        char* line = snx_format("game with spaces;literal.nro --fullscreen=1 --controls=2 --data %s\n", app.data_dir);
         assert(kept && line && !app.run_out && !strncmp(kept, "$ ", 2) && strstr(kept, line));
         free(line);
         assert(strstr(kept, "driver stdout") && strstr(kept, "driver stderr") && strstr(kept, "\n[ended, status 0]\n"));
@@ -8516,6 +8677,77 @@ int main(int argc, char** argv) {
                 assert(!remove(icon));
                 free(icon);
             }
+            { /* a 3DS game: its .ini's name on its row and the SMDH's icon beside it, drawn at the size of a row's */
+                char *own = snx_path_join(app.games_dir, "0004000001234500"), *ctr, *ini, *icon;
+#ifdef _WIN32
+                ctr = snx_path_join(own, "0004000001234500.exe");
+#else
+                ctr = snx_path_join(own, "0004000001234500");
+#endif
+                ini = snx_path_join(own, "0004000001234500.ini");
+                icon = snx_path_join(own, "icon.rgba");
+                const char* named = "[Game]\nname=A CTR Game\n";
+                unsigned char rgba[48 * 48 * 4];
+                UiRowInfo info = {0};
+                size_t k, lead;
+                assert(own && ctr && ini && icon);
+                assert(!snx_mkdirs(own) && !snx_write_file(ctr, "x", 1) && !snx_make_executable(ctr));
+                assert(!snx_write_file(ini, named, strlen(named)));
+                for (k = 0; k < 48 * 48; ++k) {
+                    rgba[4 * k + 0] = 220;
+                    rgba[4 * k + 1] = 30;
+                    rgba[4 * k + 2] = 30;
+                    rgba[4 * k + 3] = 255;
+                }
+                assert(!snx_write_file(icon, rgba, sizeof rgba));
+                icons_free(&app);
+                list_games(&app);
+                lead = (size_t)games_lead(&app);
+                for (k = 0; k < app.games.count && !(app.games.paths[k] && snx_same_file(app.games.paths[k], ctr));
+                     ++k) {}
+                assert(k < app.games.count && k < app.browser.page_size);
+                assert(ui_games_rows_get_row_info(&app, lead + k, 300, &info) && info.label &&
+                       strstr(info.label, "CTR"));
+                assert(info.image && info.image == game_icon(&app, ctr) && info.image != icon_none(&app));
+                { /* its icon file as a row draws it, scaled: the SMDH's red as the renderer's ARGB word */
+                    unsigned char drawn[GUI_ICON_SIDE * GUI_ICON_SIDE * 4];
+                    Uint32 argb;
+                    assert(!rgba_icon(rgba, sizeof rgba, GUI_ICON_SIDE, drawn));
+                    memcpy(&argb, drawn, sizeof argb);
+                    assert(argb == 0xFFDC1E1Eu);
+                }
+                { /* its recent game takes the name its .ini gives it; a game with no name of its own, another console's
+                     in the folder its title ID names, keeps the name its run gave it */
+                    GuiRecent kept = app.recent;
+                    char *other = snx_path_join(app.games_dir, "PCSA00000"), *vita;
+                    int at;
+#ifdef _WIN32
+                    vita = snx_path_join(other, "PCSA00000.exe");
+#else
+                    vita = snx_path_join(other, "PCSA00000");
+#endif
+                    assert(other && vita && !snx_mkdirs(other) && !snx_write_file(vita, "x", 1) &&
+                           !snx_make_executable(vita));
+                    assert(!gui_recent_add(&app.recent, ctr, GUI_3DS, 1));
+                    assert(!gui_recent_add(&app.recent, vita, GUI_VITA, 1));
+                    assert(gui_recent_rename(&app.recent, vita, "A Vita Game"));
+                    recent_as_games(&app);
+                    for (at = 0; at < app.recent.count && strcmp(app.recent.game[at].path, ctr); ++at) {}
+                    assert(at < app.recent.count && !strcmp(app.recent.game[at].name, "A CTR Game"));
+                    for (at = 0; at < app.recent.count && strcmp(app.recent.game[at].path, vita); ++at) {}
+                    assert(at < app.recent.count && !strcmp(app.recent.game[at].name, "A Vita Game"));
+                    app.recent = kept;
+                    recent_changed(&app);
+                    snx_remove_tree(other);
+                    free(vita);
+                    free(other);
+                }
+                snx_remove_tree(own);
+                free(icon);
+                free(ini);
+                free(ctr);
+                free(own);
+            }
             { /* a dump's icon, asked of the driver (-x --icon, through the menu's processes) into the menu's cache: none
                  until it answers, once, then its row's; an answer an older launcher left there (why.txt) is not read. One
                  the driver gives none for is not asked again in the session, its kind saying why and the launcher's log
@@ -8619,6 +8851,29 @@ int main(int argc, char** argv) {
                 free(dir);
                 free(without);
                 free(with);
+                free(cache);
+                free(cache_was);
+            }
+            { /* a 3DS dump's icon is asked of the 3DS driver, which writes its SMDH's icon as icon.rgba */
+                char* cache_was = getenv("XDG_CACHE_HOME") ? snx_strdup(getenv("XDG_CACHE_HOME")) : NULL;
+                char *cache = snx_path_join(temporary, "ctr icon cache"),
+                     *cia = snx_path_join(temporary, "with icon.cia"), *dir, *rgba, *jpg;
+                set_env("XDG_CACHE_HOME", cache);
+                assert(!snx_write_file(cia, "x", 1));
+                icons_free(&app);
+                assert(game_icon(&app, cia) == icon_loading(&app) && app.dump_icons.count == 1);
+                dump_icons_pass(&app.dump_icons);
+                pump(&app);
+                assert(game_icon(&app, cia) && game_icon(&app, cia) != icon_loading(&app));
+                dir = dump_icon_dir(&app, cia);
+                rgba = snx_path_join(dir, "icon.rgba");
+                jpg = snx_path_join(dir, "icon.jpg");
+                assert(snx_is_file(rgba) && !snx_is_file(jpg)); /* the 3DS driver wrote it, not the Switch one */
+                free(jpg);
+                free(rgba);
+                free(dir);
+                set_env("XDG_CACHE_HOME", cache_was);
+                free(cia);
                 free(cache);
                 free(cache_was);
             }
@@ -15085,6 +15340,7 @@ int main(int argc, char** argv) {
     }
     compile_first(&app, temporary);
     dump_addons(&app, temporary);
+    relist_keeps_scroll(&app, temporary);
     recompile_queue(&app);
 #ifdef SNX_XDG /* the last of the test: SDL keeps the picker it found from then on */
     pickers_asked(&app, temporary, self);

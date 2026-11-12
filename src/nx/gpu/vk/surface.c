@@ -797,12 +797,20 @@ void vk_rt_reload(u64 gva) {
     vk_resource_end(VK_RESOURCE_RT_RELOAD, scope);
 }
 
-/* a depth target whose Vulkan format holds the guest's bytes (Z32F as D32_SFLOAT, Z16 as D16_UNORM): its depth
-   aspect copies out in the guest's own layout. The packed ones (the Z24S8 kinds, Z32F_X24S8) are packed on the GPU
-   (vk_depth_pack); a scaled or multisampled packed one would need a depth blit first and stays on the GPU */
+/* S8's target, the one depth format of a byte a texel: its stencil aspect is the guest's bytes */
+static int stencil_alone(const Surf* s) { return s->f.depth && s->f.bpp == 1; }
+/* a depth target whose Vulkan format holds the guest's bytes (Z32F as D32_SFLOAT, Z16 as D16_UNORM, S8's stencil): its
+   depth (or stencil) aspect copies out in the guest's own layout. The packed ones (the Z24S8 kinds, Z32F_X24S8) are
+   packed on the GPU (vk_depth_pack); a scaled or multisampled packed one would need a depth blit first and stays on
+   the GPU, as a multisampled S8 one, whose samples vk_ms_unpack reads from the depth */
 static int depth_copies_raw(const Surf* s) {
-    return (s->f.vk == VK_FORMAT_D32_SFLOAT || s->f.vk == VK_FORMAT_D16_UNORM) && s->sw == s->w && s->sh == s->h &&
-           (!s->msaa || vk_ms_moves(s));
+    return (s->f.vk == VK_FORMAT_D32_SFLOAT || s->f.vk == VK_FORMAT_D16_UNORM || stencil_alone(s)) && s->sw == s->w &&
+           s->sh == s->h && (!s->msaa || (vk_ms_moves(s) && !stencil_alone(s)));
+}
+static VkImageAspectFlags flush_aspect(const Surf* s) {
+    return !s->f.depth        ? VK_IMAGE_ASPECT_COLOR_BIT
+           : stencil_alone(s) ? VK_IMAGE_ASPECT_STENCIL_BIT
+                              : VK_IMAGE_ASPECT_DEPTH_BIT;
 }
 static int depth_packs(const Surf* s) {
     return !depth_copies_raw(s) && vk_depth_pack_mode(s->fkey & 0xFFFF) >= 0 && s->sw == s->w && s->sh == s->h &&
@@ -852,12 +860,11 @@ static void flush_copy(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 at, u32 pi
             vk_depth_pack(cb, s, layer, buf, at + (u64)(layer - part->layer) * slice, pitch);
             continue;
         }
-        VkBufferImageCopy c = {
-            .bufferOffset = at + (u64)(layer - part->layer) * slice,
-            .bufferRowLength = pitch / s->f.bpp,
-            .imageSubresource = {s->f.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1},
-            .imageOffset = {0, (i32)part->y, 0},
-            .imageExtent = {s->w, part->rows, depth}};
+        VkBufferImageCopy c = {.bufferOffset = at + (u64)(layer - part->layer) * slice,
+                               .bufferRowLength = pitch / s->f.bpp,
+                               .imageSubresource = {flush_aspect(s), 0, layer, 1},
+                               .imageOffset = {0, (i32)part->y, 0},
+                               .imageExtent = {s->w, part->rows, depth}};
         VmaAllocation tm;
         VkImage t = s->sw == s->w && s->sh == s->h ? VK_NULL_HANDLE : vk_unscaled_image(s, 1, &tm);
         if (!t)
@@ -1889,7 +1896,10 @@ static u64 rt_mem_hash(const Surf* s) {
    one game draws its save's thumbnail into a 320x180 target, and reads its texels from memory with no call to the GPU.
    A release watches their bytes (own_watch): the pages are trapped with no copy of the GPU's, and the CPU's first
    access publishes the targets pending there (vk_rt_watch_hit) and lands them. A target that the CPU read lately
-   (vk_own_cpu_read), or that an owner already covers, is published at the release, as a pitch-linear one */
+   (vk_own_cpu_read), or that an owner already covers, is published at the release, as a pitch-linear one.
+
+   Depth targets go in the same lists, in their formats' layouts (flush_bytes): a program that clears one with the 3D
+   engine, waits for the GPU and reads it from memory read the bytes from before the clear */
 typedef struct {
     Surf** s;
     u32 n, cap;
@@ -1916,7 +1926,6 @@ static void drawn_pull(DrawnList* l, const Surf* s, int* in) {
     *in = 0;
 }
 static void linear_note(Surf* s) {
-    if (s->f.depth) return;
     if (s->bl)
         drawn_push(&g_bl, s, &s->in_bl);
     else
@@ -2322,6 +2331,13 @@ void vk_mem_trim(u64 extra, int force) {
     }
     g_trimmed += freed;
     astc_bc_suggest(force, extra, usage, budget, freed, working);
+    /* short of memory, as astc_bc_suggest counts it: BC1 held as ASTC 4x4 goes back to ETC2, half the bytes */
+    if (force)
+        vk_bc1_tight("an image found no memory");
+    else if ((usage > freed ? usage - freed : 0) > budget)
+        vk_bc1_tight("the caches stay past their budget after a trim");
+    else if (working)
+        vk_bc1_tight("a trim took textures and targets the last eight presents used");
     if (short_of) g_trim_dry = g_vk_present + 1;
     if (freed || short_of)
         LOG_LIMIT(20,

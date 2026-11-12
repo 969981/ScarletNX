@@ -43,7 +43,9 @@ static void usage(void) {
          "  --name NAME            Output name (default: the title ID, else the NPDM's or input name)\n"
          "  --outdir DIR           Where the game's folder goes (default: recompiled/)\n"
          "  -O LEVEL               Optimization: 0,1,2,3,s,z (default: 2), the setting opt\n"
-         "  --jobs N               Parallel compiles (default: cores, a quarter left free), the setting aot_threads");
+         "  --jobs N               Parallel compiles (default: 1 to start, then one more each second while the\n"
+         "                         memory holds it, up to the cores with a quarter left free), the setting\n"
+         "                         aot_threads");
     puts("  --jit-cache FILE       Link a profile run's .jitcache into the module as runtime code\n"
          "  --layout FILE          Put the code of these functions first, in this order (hex PCs, one per line):\n"
          "                         a profile's hot functions, as tools/layout.py orders them\n"
@@ -835,6 +837,7 @@ static int make_program(const MakeArgs* a, int index) {
         }
         if (!compile.quiet) printf("LLVM: -O%c, llvm_batch=%s\n", llvm.opt, g_settings.llvm_batch);
         llvm.jobs = compile.jobs;
+        llvm.jobs_open = compile.jobs_open;
         llvm.quiet = compile.quiet;
         llvm.keep_ir = kept;
         llvm.found = &found;
@@ -1084,7 +1087,13 @@ int snx_recompile_game(int argc, char** argv, const SnxPaths* paths) {
         return snx_error("llvm_batch = ipo takes the place of -O1 to -O3, s and z's passes: opt = 0 runs none");
     compile.opt = g_settings.optimization_level;
     gen.chunk_instrs = (size_t)g_settings.unit_size;
-    compile.jobs = g_settings.aot_threads > 0 ? (unsigned)g_settings.aot_threads : snx_build_threads();
+    {
+        char note[160];
+        compile.jobs = snx_aot_threads(g_settings.aot_threads, g_settings.aot_threads_most, note, sizeof note);
+        if (note[0]) fprintf(stderr, "scarletnx: %s\n", note);
+    }
+    /* Auto: up to that many, as the units' memory is measured; 2 when aot_threads_most set that many */
+    compile.jobs_open = g_settings.aot_threads > 0 ? 0 : g_settings.aot_threads_most > 0 ? 2 : 1;
     if (!strcmp(target, "win64"))
         compile.target_win = 1;
     else if (!strcmp(target, "linux"))

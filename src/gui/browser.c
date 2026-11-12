@@ -226,8 +226,34 @@ static char* vita_name(const char* folder) {
     }
     return NULL;
 }
+/* whether path is a game's program in the folder named for it, <folder>/<name> (.exe cut, _code.snxobj on iOS): a 3DS
+   game has no <name>_data folder, so gui_game_folder's test does not hold for it */
+bool gui_game_program(const char* path) {
+    char *folder, *name;
+    const char *leaf, *own;
+    bool found;
+    if (!path || !snx_is_file(path) || !(folder = snx_dirname(path))) return false;
+    leaf = folder + strlen(folder);
+    while (leaf > folder && leaf[-1] != '/' && leaf[-1] != '\\') --leaf;
+    own = path + strlen(path);
+    while (own > path && own[-1] != '/' && own[-1] != '\\') --own;
+    name = snx_strdup(own);
+#ifdef _WIN32
+    if (name && suffix(name, ".exe")) name[strlen(name) - 4] = 0;
+#endif
+#ifdef SNX_IOS
+    if (name && suffix(name, "_code.snxobj")) name[strlen(name) - 12] = 0;
+#endif
+#ifdef __ANDROID__
+    if (name && suffix(name, GAME_CODE)) name[strlen(name) - strlen(GAME_CODE)] = 0;
+#endif
+    found = name && *name && !strcmp(leaf, name);
+    free(name);
+    free(folder);
+    return found;
+}
 /* what the game at path, named name, is shown as: the name in its <name>_data/control.nacp, which the recompile
-   copies there, or a Vita game's in its param.sfo, else name */
+   copies there, or a Vita game's in its param.sfo, or the one its driver recorded in an .ini, else name */
 static char* shown_name(const char* path, const char* name) {
     if (suffix(name, "/")) return extracted_shown(path, name);
     char *folder = snx_dirname(path), *stem = snx_strdup(name), *shown = NULL, nacp[SNX_PATH_SIZE], text[0x200];
@@ -241,6 +267,18 @@ static char* shown_name(const char* path, const char* name) {
     if (bytes && snx_nacp_name(bytes, size, text, sizeof text)) shown = snx_strdup(text);
     free(bytes);
     if (!shown && folder) shown = vita_name(folder);
+    /* the name the driver recorded for a game whose dump carries none: a title ID says nothing */
+    if (!shown && folder && stem) {
+        char* ini = snx_game_ini(folder, stem);
+        if (ini) shown = snx_ini_value(ini, "name");
+        free(ini);
+    }
+    /* the driver's own .ini beside the game, as the 3DS driver writes it (its folder is not divided from the config) */
+    if (!shown && folder && stem) {
+        char* ini = snx_format("%s/%s.ini", folder, stem);
+        if (ini) shown = snx_ini_value(ini, "name");
+        free(ini);
+    }
     free(stem);
     free(folder);
     return shown ? shown : snx_strdup(name);
@@ -269,6 +307,10 @@ char* gui_game_icon(const char* path) {
     for (i = 0; !found && i < sizeof vita / sizeof *vita; ++i)
         if (!snx_path_format(icon, sizeof icon, "%s/%s/sce_sys/icon0.png", folder, vita[i]) && snx_is_file(icon))
             found = snx_strdup(icon);
+    /* a 3DS game has no data folder: its driver writes the SMDH's icon beside the game (icon.rgba) */
+    if (!found && gui_game_program(path) && !snx_path_format(icon, sizeof icon, "%s/icon.rgba", folder) &&
+        snx_is_file(icon))
+        found = snx_strdup(icon);
     free(folder);
     return found;
 }

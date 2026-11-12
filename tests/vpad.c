@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* The on-screen controls (runtime/platform/vpad.c): what fingers on them press, edit mode, the .ini keys, the draw */
+/* The on-screen controls (runtime/platform/vpad.c): what fingers on them press, edit mode, the .ini keys, the draw,
+   and controls=2's Auto by the device's touch screen and gamepads */
 #include "nx/runtime/platform/vpad.h"
 #include <assert.h>
 #include <stdarg.h>
@@ -149,6 +150,32 @@ int main(void) {
     /* off, nothing is taken nor drawn */
     assert(vpad_ini("controls", "0") && !g_settings.show_controls && !vpad_shown());
     assert(!vpad_down(1, mx(SNX_VPAD_A), my(SNX_VPAD_A), safe) && !draw(&l));
+    /* Auto: shown on a touch screen while no gamepad is connected, said; hidden as one connects, a held control let go,
+       said with how many; shown again as the last goes. Hidden on a device with no touch screen */
+    {
+        char said[128];
+        assert(vpad_auto_shown(1, 0) && !vpad_auto_shown(1, 1) && !vpad_auto_shown(0, 0));
+        vpad_auto_said(0, 0, said, sizeof said);
+        assert(!strcmp(said, "controls=2 (Auto): hidden, the device has no touch screen"));
+        vpad_auto_said(1, 2, said, sizeof said);
+        assert(!strcmp(said, "controls=2 (Auto): hidden, 2 gamepads are connected"));
+        assert(vpad_ini("controls", "2") && g_settings.show_controls == 2);
+        vpad_auto(1, 0);
+        assert(vpad_shown() && draw(&l));
+        assert(!strcmp(logged, "controls=2 (Auto): shown, the device has a touch screen and no gamepad\n"));
+        assert(vpad_down(1, mx(SNX_VPAD_A), my(SNX_VPAD_A), safe) && buttons(NULL) == 1);
+        vpad_auto(1, 1);
+        assert(!vpad_shown() && !buttons(NULL) && !draw(&l));
+        assert(!strcmp(logged, "controls=2 (Auto): hidden, 1 gamepad is connected\n"));
+        assert(!vpad_down(2, mx(SNX_VPAD_A), my(SNX_VPAD_A), safe));
+        logged[0] = 0;
+        vpad_auto(1, 2); /* still hidden: no line */
+        assert(!vpad_shown() && !logged[0]);
+        vpad_auto(1, 0);
+        assert(vpad_shown() && strstr(logged, "shown"));
+        assert(vpad_ini("controls", "0") && !vpad_shown()); /* Off whatever the device has */
+        vpad_auto(0, 0);
+    }
     assert(vpad_ini("controls", "1") && g_settings.show_controls);
 
     /* a button held by a finger, then by two; the second lift lets it go. Off the controls, a finger is the game's */
@@ -406,28 +433,41 @@ int main(void) {
         vpad_showcase_input(0, none);
         vpad_showcase_draw(&l, safe, 60, 2);
         assert(l.n > 13 && drawn(&l, LOOK_A) && !drawn(&l, LOOK_A_PRESSED) && drawn(&l, LOOK_DPAD));
-        /* the frames a second, its seven cells last, in the menu's letters as the other lines over the game: at 2
-           here, 16 by 32; and at the greatest that keeps them above the row under them (a quarter of the box's 300,
-           less the gap above), 3, when the menu's are larger */
+        /* the frames a second, its seven cells last, as the stats panel's first line: its letters (stats_scale, 1
+           for the menu's 2 here, 8 by 16), after a blank cell and the gauge's icon; and at the greatest that keeps
+           them above the row under them (a quarter of the box's 300, less the gap above), 3, when the menu's are
+           larger */
         for (k = l.n - 7; k < l.n; ++k)
-            assert(qv(&l.q[k]).ink == UI_GLYPH && qv(&l.q[k]).w == 16 && qv(&l.q[k]).h == 32);
+            assert(qv(&l.q[k]).ink == UI_GLYPH && qv(&l.q[k]).w == 8 && qv(&l.q[k]).h == 16);
+        assert(qv(&l.q[l.n - 9]).w == 16 && l.q[l.n - 9].v == SNX_UI_PICTURE_Y && qv(&l.q[l.n - 10]).w == 8);
         /* on the layer's ground, the menu's ink, which the box is filled with and each of the cells is backed by
-           (ui.h's UI_BACKED), a blank one too; the letters white as the controls */
+           (ui.h's UI_BACKED), a blank one too; the letters the page's colour, as the stats panel's */
         assert(qv(&l.q[0]).ink == UI_SOLID && qv(&l.q[0]).rgba == ui_rgba(THEME(SNX_GUI_THEME_YORHA_INK)) &&
                qv(&l.q[0]).rgba == ui_ground());
-        for (k = l.n - 7; k < l.n; ++k) assert(qv(&l.q[k]).backed && l.q[k].uw == 8 && qv(&l.q[k]).rgba == 0xFFFFFFFFu);
+        for (k = l.n - 7; k < l.n; ++k)
+            assert(qv(&l.q[k]).backed && l.q[k].uw == 8 &&
+                   qv(&l.q[k]).rgba == ui_rgba(THEME(SNX_GUI_THEME_YORHA_PAGE)));
+        /* with the stats panel on, which says the frames a second already, the box draws none */
+        {
+            int with = l.n;
+            g_settings.stats = 1;
+            l.n = 0;
+            vpad_showcase_draw(&l, safe, 60, 2);
+            assert(l.n == with - 10); /* a blank, the icon, a space and the seven cells */
+            g_settings.stats = 0;
+        }
         l.n = 0;
         vpad_showcase_draw(&l, safe, 60, 9);
         for (k = l.n - 7; k < l.n; ++k)
             assert(qv(&l.q[k]).ink == UI_GLYPH && qv(&l.q[k]).w == 24 && qv(&l.q[k]).h == 48);
-        assert(qv(&l.q[l.n - 7]).x == qv(&l.q[0]).x + (500 - 7 * 24) / 2.0f);
+        assert(qv(&l.q[l.n - 7]).x == qv(&l.q[0]).x + (500 - 11 * 24) / 2.0f + 4 * 24);
         l.n = 0;
         vpad_showcase_draw(&l, safe, 60, 2);
         /* white, opaque, as the touch controls */
         assert(drawn(&l, LOOK_A)->rgba == 0xFFFFFFFFu);
         assert(!drawn(&l, LOOK_HOME) && !drawn(&l, LOOK_CAPTURE) && !drawn(&l, LOOK_L3) &&
                !drawn(&l, LOOK_R3) && !drawn(&l, LOOK_STICK_PRESSED));
-        /* "60 FPS" at the box's top, in the font */
+        /* "60 fps" at the box's top, in the font */
         for (i = digits = 0; i < l.n; ++i)
             if (l.q[i].v == SNX_UI_FONT_Y + '6' / 16 * 16 &&
                 (l.q[i].u == SNX_UI_FONT_X + '6' % 16 * 8 || l.q[i].u == SNX_UI_FONT_X + '0' % 16 * 8)) {
@@ -447,8 +487,7 @@ int main(void) {
             assert(qv(&l.q[0]).x == box[k][0] && qv(&l.q[0]).y == box[k][1] && qv(&l.q[0]).w == 500 &&
                    qv(&l.q[0]).h == 300);
             for (i = 0; i < l.n; ++i) /* no frames a second before the first half second */
-                assert(!(l.q[i].u == SNX_UI_FONT_X + 'F' % 16 * 8 &&
-                         l.q[i].v == SNX_UI_FONT_Y + 'F' / 16 * 16));
+                assert(!(l.q[i].u == SNX_UI_FONT_X + 'f' % 16 * 8 && l.q[i].v == SNX_UI_FONT_Y + 'f' / 16 * 16));
         }
         ini_read(where, "tl");
         ini_read(where, "lt");
@@ -509,7 +548,10 @@ int main(void) {
                 l.n = 0;
                 vpad_showcase_draw(&l, twice, 60, 4);
                 assert(l.n == n && qv(&l.q[0]).w == 1000 && qv(&l.q[0]).h == 600);
-                for (i = 0; i < n; ++i)
+                /* the controls twice as large; the frames a second's line, its last ten quads, in the stats panel's
+                   letters at either size (stats_scale: 1 for the menu's 2, 3 for its 4), as that panel's own */
+                for (i = n - 10; i < n; ++i) assert(qv(&l.q[i]).h == 16 * 3 && qv(&one[i]).h == 16);
+                for (i = 0; i < n - 10; ++i)
                     assert(fabsf(qv(&l.q[i]).x - 2 * qv(&one[i]).x) < 0.4f &&
                            fabsf(qv(&l.q[i]).y - 2 * qv(&one[i]).y) < 0.4f &&
                            fabsf(qv(&l.q[i]).w - 2 * qv(&one[i]).w) < 0.4f &&

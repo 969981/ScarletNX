@@ -1374,6 +1374,16 @@ static int create_device(void) {
                                                those of the compute programs that use other lanes' values */
                                             .subgroupSizeControl = g_vk.has_mesh || g_vk.has_cs_warp32,
                                             .computeFullSubgroups = g_vk.has_mesh || g_vk.has_cs_warp32};
+    /* the BC7 encoder's build with packed dot products (astc.c's bc7_pipe), where the GPU has an instruction for
+       them: a GeForce GT 1030 encodes 5% faster with it. Spelled out, they are the same numbers */
+    g_vk.bc7_dot = 0;
+    if (core13 && q13.shaderIntegerDotProduct) {
+        VkPhysicalDeviceVulkan13Properties dp13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+        VkPhysicalDeviceProperties2 dpp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dp13};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &dpp2);
+        g_vk.bc7_dot = dp13.integerDotProduct4x8BitPackedUnsignedAccelerated != 0;
+    }
+    f13.shaderIntegerDotProduct = g_vk.bc7_dot ? VK_TRUE : VK_FALSE;
     void* chain = &f13;
     /* a 1.2 device: those features as its extensions' (vk12_extensions), the 1.3 struct left out */
     VkPhysicalDeviceSynchronization2Features fsync2 = {.sType =
@@ -1882,24 +1892,67 @@ int vk_surface_recreate(void) {
     return 0;
 }
 
+/* the window's release waits this long for each thing another thread holds */
+#define RELEASE_WAIT_NS 2000000000ull
+/* a queue's lock, or with q VK_NULL_HANDLE the swapchain's, taken by until (plat_ns): 0 when another thread held it
+   all that while */
+static int release_lock_by(VkQueue q, u64 until) {
+    while (q ? !vk_queue_trylock(q) : !pm_trylock(&g_vk.sc_lock)) {
+        if (plat_ns() >= until) return 0;
+        plat_sleep_ns(1000000);
+    }
+    return 1;
+}
+/* The window let go for a fatal error's screen (sdl3.c), from the thread that had the error or from the main thread
+   that shows it. No wait here outlasts RELEASE_WAIT_NS: a thread that holds the renderer and doesn't let go (stuck on a
+   lost device), or the recording thread, which an error or a crash stops inside a packet for good (its ring never
+   drains, and a submit or a present it was in keeps the queue's lock or the swapchain's), must not keep the error
+   unseen: a wait with no end on the main thread freezes the window with no error shown */
 int vk_window_release(void) {
-    int waited = 0;
-    /* a thread that holds the renderer and doesn't let go (stuck on a lost device) must not keep the error unseen */
+    u64 until = plat_ns() + RELEASE_WAIT_NS;
+    const char* held = NULL;
+    int released = 0;
     while (!vk_trylock()) {
-        if (++waited == 200) return 0;
+        if (plat_ns() >= until) {
+            WARN("vulkan: thread %u has held the renderer for %llu s: the window is not let go for the error's "
+                 "screen\n",
+                 vk_lock_owner(), RELEASE_WAIT_NS / 1000000000ull);
+            return 0;
+        }
         plat_sleep_ns(10000000);
     }
-    vk_rec_sync();
-    device_wait_idle(); /* a lost device answers at once */
-    pm_lock(&g_vk.sc_lock);
-    if (g_vk.swapchain) swapchain_retire();
-    pm_unlock(&g_vk.sc_lock);
-    if (g_vk.surface) vkDestroySurfaceKHR(g_vk.instance, g_vk.surface, NULL);
-    g_vk.surface = VK_NULL_HANDLE;
+    until = plat_ns() + RELEASE_WAIT_NS; /* the ring's own while, whatever the lock took */
+    if (!vk_rec_sync_until(until))
+        WARN("vulkan: the recording thread has not finished its commands in %llu s: the window is let go without "
+             "them\n",
+             RELEASE_WAIT_NS / 1000000000ull);
+    /* device_wait_idle's locks, then the swapchain's */
+    if (!release_lock_by(g_vk.gfx, until))
+        held = "graphics queue";
+    else {
+        if (g_vk.compute != g_vk.gfx && !release_lock_by(g_vk.compute, until))
+            held = "compute queue";
+        else {
+            vkDeviceWaitIdle(g_vk.dev); /* a lost device answers at once */
+            if (g_vk.compute != g_vk.gfx) vk_queue_unlock(g_vk.compute);
+        }
+        vk_queue_unlock(g_vk.gfx);
+    }
+    if (!held && !release_lock_by(VK_NULL_HANDLE, until)) held = "swapchain";
+    if (!held) {
+        if (g_vk.swapchain) swapchain_retire();
+        pm_unlock(&g_vk.sc_lock);
+        if (g_vk.surface) vkDestroySurfaceKHR(g_vk.instance, g_vk.surface, NULL);
+        g_vk.surface = VK_NULL_HANDLE;
+        released = 1;
+    } else
+        WARN("vulkan: another thread has held the %s's lock for %llu s: the window is not let go for the error's "
+             "screen\n",
+             held, RELEASE_WAIT_NS / 1000000000ull);
     /* every hold of this thread's at once: it won't return to the callers that took them */
     t_vkdepth = 0;
     vk_let_go();
-    return 1;
+    return released;
 }
 
 /* The surface's formats read for a game's HDR output: whether a game is told the display is HDR (g_vk.hdr_display,
