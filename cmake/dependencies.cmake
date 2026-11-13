@@ -234,7 +234,7 @@ if(SNX_JEMALLOC)
     include("${PROJECT_SOURCE_DIR}/cmake/jemalloc.cmake")
 endif()
 
-if((SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY) OR SNX_BUILD_3DS OR snx_vita_runtime OR
+if((SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY) OR SNX_BUILD_3DS OR SNX_BUILD_NDS OR snx_vita_runtime OR
    (SNX_BUILD_ANDROID AND NOT SNX_TOOLS_ONLY))
     # the system's package is named VulkanHeaders
     snx_cpm_local_package(NAME Vulkan-Headers VERSION 1.4.367 FIND_PACKAGE_ARGUMENTS "NAMES VulkanHeaders CONFIG"
@@ -386,9 +386,10 @@ endif()
 set(SNX_SDL3_FROM_SOURCE OFF)
 # The system's SDL3 from find_package, or CPM's pinned source build. FreeBSD's ports package lags the pin (3.4.16
 # against 3.4.18), so CPM's version check refuses it and builds SDL3 itself: SNX_SYSTEM_SDL3 takes the native package
-# instead, which needs only 3.4.16, the version every SDL call in the tree is in. It is the default on FreeBSD, whose
-# build installs the sdl3 package (docs/dev/build.md), and on NetBSD, whose pkgsrc SDL3 is 3.4.16 too (docs/hosts/netbsd.md); the
-# pinned source build is had with -DSNX_SYSTEM_SDL3=OFF
+# instead, from 3.4.12 (cmake/system_sdl3.cmake). It is the default on FreeBSD, whose build installs the sdl3 package
+# (docs/dev/build.md), and on NetBSD, whose pkgsrc SDL3 is 3.4.16 too (docs/hosts/netbsd.md); the pinned source build
+# is had with -DSNX_SYSTEM_SDL3=OFF
+include("${CMAKE_CURRENT_LIST_DIR}/system_sdl3.cmake")
 set(snx_sdl3_system_default OFF)
 if(CMAKE_SYSTEM_NAME MATCHES "^(FreeBSD|NetBSD)$")
     set(snx_sdl3_system_default ON)
@@ -396,18 +397,9 @@ endif()
 option(SNX_SYSTEM_SDL3 "Use the system's SDL3 from find_package, not CPM's pinned source build"
        ${snx_sdl3_system_default})
 if((SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY) OR SNX_BUILD_GUI OR SNX_BUILD_3DS OR snx_vita_runtime OR SNX_BUILD_AGB OR
-   (SNX_BUILD_ANDROID AND NOT SNX_TOOLS_ONLY))
+   SNX_BUILD_NDS OR (SNX_BUILD_ANDROID AND NOT SNX_TOOLS_ONLY))
     if(SNX_SYSTEM_SDL3)
-        find_package(SDL3 3.4.16 CONFIG QUIET)
-        if(NOT SDL3_FOUND)
-            message(FATAL_ERROR "SNX_SYSTEM_SDL3: no SDL3 3.4.16 or newer package found (FreeBSD: pkg install sdl3; "
-                                "NetBSD: pkgin install SDL3). "
-                                "Use -DSNX_SYSTEM_SDL3=OFF for CPM's pinned source build.")
-        endif()
-        if(NOT TARGET SDL3::SDL3)
-            message(FATAL_ERROR "SNX_SYSTEM_SDL3: the system's SDL3 ${SDL3_VERSION} has no SDL3::SDL3 target")
-        endif()
-        message(STATUS "Using the system's SDL3 ${SDL3_VERSION}")
+        snx_system_sdl3()
     else()
     # Prefer a compatible system package. CPM handles the pinned static fallback and user overrides. SDL_ALTIVEC only
     # changes PowerPC builds: SDL's AltiVec blitters prefetch with dstt, which the ISA phased out and qemu's POWER10

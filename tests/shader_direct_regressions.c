@@ -39,7 +39,7 @@ static const char* gradient_cube_path;
 static const char* draw_buffer_paths[10];
 static const char* texture_paths[6];
 static const char* arithmetic_path;
-static const char* beyond_paths[3];
+static const char* beyond_paths[4];
 static const char* attribute_paths[7];
 static const char* pexit_path;
 static const char* global_dynamic_path;
@@ -53,7 +53,8 @@ static const char* legacy_paths[4];
 static const char* rect_paths[3];
 static const char* minmax_paths[2]; /* a TEX and a TXD taking the least of their texels (minmax_samples) */
 static const char* window_paths[3];
-static const char* lone_lane_paths[9];
+static const char* lone_lane_paths[12];
+static const char* quad_read_paths[3];
 static struct {
     char** paths;
     size_t count, capacity;
@@ -3330,6 +3331,34 @@ static void beyond_eden(void) {
     u32* code = translate(&invalid_shared, 1, ST_CS, &info, &words, 1);
     check_refused(code, &info, "ATOMS", "unsupported shared compare-and-swap subop is refused");
     free(code);
+    /* uam compiles barrier() to BAR.SYNC with RZ for its barrier and its thread count (bits 43 and 44 clear): the
+       module the immediate form's 0 and 0 makes */
+    const u64 bar_imm = 0xf0a81b8000070000ull, bar_rz = 0xf0a803800ff7ff00ull;
+    size_t imm_words = 0;
+    u32* imm_code = translate(&bar_imm, 1, ST_CS, &info, &imm_words, 1);
+    check_translated(imm_code, &info, "BAR.SYNC 0x0, 0x0 translates");
+    code = translate(&bar_rz, 1, ST_CS, &info, &words, 1);
+    check_translated(code, &info, "BAR.SYNC RZ, RZ translates");
+    if (code && imm_code) {
+        check(count_opcode(code, words, 224, 0xffffffffu) == 1, "BAR.SYNC RZ, RZ is one control barrier");
+        check(words == imm_words && !memcmp(code, imm_code, words * sizeof *code),
+              "BAR.SYNC RZ, RZ makes the module BAR.SYNC 0x0, 0x0 makes");
+        save_fixture(beyond_paths[3], code, words);
+    }
+    free(imm_code);
+    free(code);
+    const u64 other_bars[] = {
+        0xf0a803800ff70100ull, /* BAR.SYNC R1, RZ: a barrier from a register */
+        0xf0a803800027ff00ull, /* BAR.SYNC RZ, R2: a thread count from a register */
+        0xf0a803801ff7ff00ull, /* BAR.SYNC RZ, RZ with bit 28 set, past the count's register */
+        0xf0a813800407ff00ull, /* BAR.SYNC RZ, 0x40: 64 threads */
+        0xf0a803810ff7ff00ull, /* BAR.ARV RZ, RZ */
+    };
+    for (size_t i = 0; i < sizeof other_bars / sizeof *other_bars; i++) {
+        code = translate(&other_bars[i], 1, ST_CS, &info, &words, 1);
+        check_refused(code, &info, "BAR", "a BAR other than barrier 0 for the whole block is refused");
+        free(code);
+    }
 }
 
 /* AL2P keeps byte offsets, including bit 10, and adds the register before an attribute access. */
@@ -4434,8 +4463,12 @@ static void fswzadd_forms(void) {
     check_translated(code, &info, "FSWZADD translates outside fragment programs");
     if (code) check(count_opcode(code, words, 169, 0xffffffffu) == 1, "FSWZADD 0xcc selects b on the left lanes");
     free(code);
+    /* without fragment subgroups the lane is the pixel's place in its quad, FragCoord's parities */
     code = fswzadd_spirv(fswzadd(0xcc), ST_FS, 0, &info, &words);
-    check_refused(code, &info, "subgroup", "FSWZADD with lanes that differ needs the subgroup's lane");
+    check_translated(code, &info, "FSWZADD with lanes that differ translates without fragment subgroups");
+    if (code)
+        check(has_builtin(code, words, 15) && !has_builtin(code, words, 41) && count_opcode(code, words, 17, 61) == 0,
+              "FSWZADD without fragment subgroups takes its lane from FragCoord");
     free(code);
     int adds[4];
     for (u32 mode = 0; mode < 4; mode++) {
@@ -5269,11 +5302,12 @@ static int no_subgroup(const u32* code, size_t words) {
     return found == 0;
 }
 
-/* A vertex, evaluation or geometry program that votes or shuffles, on a device whose subgroups leave its stage out (an
-   Adreno 830 lists fragment and compute), runs each invocation as lane 0 alone, as the console runs a batch of one
-   vertex or primitive. The forms are those of a game's vertex programs, whose draws were skipped on that phone: a
+/* A vertex, evaluation, geometry or fragment program that votes or shuffles, on a device whose subgroups leave its
+   stage out (an Adreno 830 lists fragment and compute, an Adreno 610 under Turnip compute alone), runs each invocation
+   as one lane alone, as the console runs a batch of one vertex or primitive: a fragment's lane is its place in its
+   quad, from FragCoord. The forms are those of a game's vertex programs, whose draws were skipped on that phone: a
    warp-aggregated atomic (the ballot of the live lanes, whose highest adds their count) and a block branched around
-   when the whole warp agrees, plus SHFL and the other votes. Control and fragment programs still need the subgroup */
+   when the whole warp agrees, plus SHFL and the other votes. Control programs still need the subgroup */
 static void lone_lane_forms(void) {
     const u64 aggregated[] = {
         vote(0, 2, 7, 7, 0),   /* VOTE.ALL R2, PT, PT: the live lanes */
@@ -5298,7 +5332,7 @@ static void lone_lane_forms(void) {
     static const struct {
         int stage;
         const char* what;
-    } stages[] = {{ST_VS, "a vertex"}, {ST_TES, "an evaluation"}, {ST_GS, "a geometry"}};
+    } stages[] = {{ST_VS, "a vertex"}, {ST_TES, "an evaluation"}, {ST_GS, "a geometry"}, {ST_FS, "a fragment"}};
     const struct {
         const u64* instructions;
         int count;
@@ -5312,7 +5346,9 @@ static void lone_lane_forms(void) {
     int fixture = 0;
     for (size_t s = 0; s < sizeof stages / sizeof *stages; s++)
         for (size_t f = 0; f < sizeof forms / sizeof *forms; f++) {
-            u32* code = lone_lane_spirv(forms[f].instructions, forms[f].count, stages[s].stage, 0, &info, &words);
+            /* a fragment program stores no attribute: the branch's result stays in R10 */
+            int count = forms[f].count - (stages[s].stage == ST_FS && forms[f].instructions == uniform);
+            u32* code = lone_lane_spirv(forms[f].instructions, count, stages[s].stage, 0, &info, &words);
             snprintf(what, sizeof what, "%s in %s program translates without subgroups in its stage", forms[f].what,
                      stages[s].what);
             check_translated(code, &info, what);
@@ -5321,10 +5357,13 @@ static void lone_lane_forms(void) {
                          forms[f].what, stages[s].what);
                 check(no_subgroup(code, words), what);
                 check(!info.primitive_split_safe, "a program that votes is never split into primitives");
-                if (fixture < 9) save_fixture(lone_lane_paths[fixture++], code, words);
+                if (stages[s].stage == ST_FS)
+                    check(has_builtin(code, words, 15),
+                          "a fragment's lone lane is its place in its quad, from FragCoord");
+                if (fixture < 12) save_fixture(lone_lane_paths[fixture++], code, words);
             }
             free(code);
-            code = lone_lane_spirv(forms[f].instructions, forms[f].count, stages[s].stage, 1, &info, &words);
+            code = lone_lane_spirv(forms[f].instructions, count, stages[s].stage, 1, &info, &words);
             snprintf(what, sizeof what, "%s in %s program uses the subgroup where its stage has it", forms[f].what,
                      stages[s].what);
             check_translated(code, &info, what);
@@ -5338,14 +5377,87 @@ static void lone_lane_forms(void) {
         check_refused(code, &info, "subgroup ballot/shuffle unavailable", what);
         free(code);
     }
-    u32* code = lone_lane_spirv(others, 4, ST_FS, 0, &info, &words);
-    check_refused(code, &info, "subgroup ballot/shuffle unavailable", "SHFL in a fragment program needs the subgroup");
-    free(code);
-    /* FSWZADD's lanes are a quad's: the lone lane doesn't stand for them */
+    /* FSWZADD's lanes are a quad's: outside a fragment program the lone lane doesn't stand for them */
     const u64 swizzled[] = {vote(0, 2, 7, 7, 0), fswzadd(0xcc)};
+    u32* code = lone_lane_spirv(swizzled, 2, ST_FS, 0, &info, &words);
+    check_translated(code, &info, "VOTE and FSWZADD in a fragment program translate without fragment subgroups");
+    free(code);
     code = lone_lane_spirv(swizzled, 2, ST_VS, 0, &info, &words);
     check_refused(code, &info, "subgroup ballot/shuffle unavailable",
                   "FSWZADD with lanes that differ keeps the subgroup");
+    free(code);
+}
+
+/* SHFL within a fragment program's quad, on a device without fragment subgroups (Turnip on an Adreno 610): the pixel
+   the lane would read is read through fine derivatives of the register's 16-bit halves as floats, one OpDPdxFine for
+   the pixel beside, one OpDPdyFine for the one above or below and both for the one across; a read of its own value
+   takes none, and a SHFL over the whole warp keeps its own. dFdx as the console computes it (SHFL.BFLY 1, then FSWZADD
+   0x99) is the form of a game's fragment program whose draws, 13% of a scene's, that phone skipped */
+static void fragment_quad_reads(void) {
+    static const struct {
+        u32 mode, index, mask;
+        int dx, dy;
+        const char* what;
+    } forms[] = {
+        {3, 1, 0x1c03, 1, 0, "SHFL.BFLY 1 reads the pixel beside"},
+        {3, 2, 0x1c03, 0, 1, "SHFL.BFLY 2 reads the pixel above or below"},
+        {3, 3, 0x1c03, 1, 1, "SHFL.BFLY 3 reads the pixel across"},
+        {0, 2, 0x1c03, 1, 2, "SHFL.IDX 2 reads lane 2's pixel from any of the four"},
+        {1, 1, 0x1c03, 1, 1, "SHFL.UP 1 reads the lane before it: beside, or across from the lower row"},
+        {2, 2, 0x1c03, 0, 1, "SHFL.DOWN 2 reads the lane two after it: below"},
+        {3, 0, 0x1c03, 0, 0, "SHFL.BFLY 0 keeps its own value"},
+        {3, 4, 0x1c03, 0, 0, "SHFL.BFLY 4 leaves the quad and keeps its own value"},
+        {0, 1, 0x1f, 0, 0, "SHFL.IDX over the whole warp keeps its own value"},
+    };
+    ShaderInfo info;
+    size_t words = 0;
+    char what[200];
+    for (size_t k = 0; k < sizeof forms / sizeof *forms; k++) {
+        const u64 instruction = shfl(forms[k].mode, 1, forms[k].index, forms[k].mask);
+        u32* code = lone_lane_spirv(&instruction, 1, ST_FS, 0, &info, &words);
+        snprintf(what, sizeof what, "%s without fragment subgroups", forms[k].what);
+        check_translated(code, &info, what);
+        if (code) {
+            int dx = count_opcode(code, words, 210, 0xffffffffu), dy = count_opcode(code, words, 211, 0xffffffffu);
+            if (dx != forms[k].dx || dy != forms[k].dy)
+                fprintf(stderr, "%s: %d OpDPdxFine and %d OpDPdyFine (expected %d and %d)\n", what, dx, dy, forms[k].dx,
+                        forms[k].dy);
+            check(dx == forms[k].dx && dy == forms[k].dy, what);
+            check(no_subgroup(code, words) && has_builtin(code, words, 15), "a quad's read takes no subgroup");
+            check(count_opcode(code, words, 17, 51) == (forms[k].dx || forms[k].dy),
+                  "DerivativeControl is declared where a fine derivative is read");
+            if (forms[k].mode == 0 && forms[k].mask == 0x1c03) save_fixture(quad_read_paths[0], code, words);
+        }
+        free(code);
+    }
+    /* with them, the quad operations stay */
+    const u64 broadcast = shfl(0, 1, 2, 0x1c03);
+    u32* code = lone_lane_spirv(&broadcast, 1, ST_FS, 1, &info, &words);
+    check_translated(code, &info, "SHFL.IDX 2 in a quad translates with fragment subgroups");
+    if (code)
+        check(count_opcode(code, words, 365, 0xffffffffu) == 1 && count_opcode(code, words, 210, 0xffffffffu) == 0,
+              "SHFL.IDX 2 with fragment subgroups is a quad broadcast, with no derivative");
+    free(code);
+    /* a guarded read runs unguarded, so that a pixel whose guard is false still gives the others its register, and
+       its writes keep their old values where the guard is false: no branch around it */
+    const u64 guarded = shfl(3, 1, 1, 0x1c03) & ~(7ull << 16); /* @P0 */
+    code = lone_lane_spirv(&guarded, 1, ST_FS, 0, &info, &words);
+    check_translated(code, &info, "@P0 SHFL.BFLY 1 translates without fragment subgroups");
+    if (code) {
+        check(count_opcode(code, words, 250, 0xffffffffu) == 0 && count_opcode(code, words, 210, 0xffffffffu) == 1,
+              "@P0 SHFL.BFLY 1 reads the pixel beside with no branch around the derivative");
+        save_fixture(quad_read_paths[1], code, words);
+    }
+    free(code);
+    /* dFdx(R1) into R0: SHFL.BFLY R0, R1, 1, 0x1c03, then FSWZADD R0, R0, R1, 0x99 (nouveau's handleDFDX) */
+    const u64 dfdx[] = {shfl(3, 1, 1, 0x1c03), 0x50F8000000070000ull | 0x99ull << 28 | 1ull << 20};
+    code = lone_lane_spirv(dfdx, 2, ST_FS, 0, &info, &words);
+    check_translated(code, &info, "dFdx as SHFL.BFLY 1 and FSWZADD 0x99 translates without fragment subgroups");
+    if (code) {
+        check(no_subgroup(code, words) && count_opcode(code, words, 210, 0xffffffffu) == 1,
+              "dFdx as SHFL.BFLY 1 and FSWZADD 0x99 reads the pixel beside through a fine derivative");
+        save_fixture(quad_read_paths[2], code, words);
+    }
     free(code);
 }
 
@@ -5455,6 +5567,39 @@ static int chosen_sample(const u64* program, int count, const u32 c2[4], const u
     free(spv);
     memcpy(x, &env.out[0][0], 4);
     return !*why;
+}
+/* A multisample TLD.B takes its handle in Rb and the sample after it, the order of Mesa's compilers since f9d385d77716
+   ("nouveau/codegen: Handle/indirect goes before sample index"). uam's codegen predates it and puts the sample first:
+   edenprobe's fetch through a table of four sample handles comes with the sample in R4 and the handle in R5 */
+static void bindless_multisample_order(void) {
+    u64 fetch[] = {
+        0xe003ff870ff7ff00ull, /* IPA R0, a[0x70] */
+        0x5cb0118000071a00ull, /* F2I.S32 R0, R0 */
+        0xe003ff874ff7ff01ull, /* IPA R1, a[0x74] */
+        0x5cb0118000171a05ull, /* F2I.S32 R5, R1: the sample */
+        0x3848000000470000ull, /* SHL R0, R0, 4 */
+        0xef94002000070004ull, /* LDC R4, c[2][R0]: the handle */
+        0x5c9807800ff70000ull, /* MOV R0, RZ */
+        0x5c9807800ff70001ull, /* MOV R1, RZ */
+        0xdd3c0007a0470000ull, /* TLD.B.MS R0, R0, R4 */
+    };
+    ShaderInfo info;
+    size_t words = 0;
+    g_shader_texture_arrays = 1; /* the device's non-uniform indexing, for the table */
+    u32* code = translate(fetch, 9, ST_FS, &info, &words, 1);
+    check_translated(code, &info, "a multisample TLD.B with its handle in Rb translates");
+    if (code)
+        check(info.ntex == 1 && info.tex[0].flags == (2 | SNX_TEX_INDEXED | 4 << 4) &&
+                  has_image_operands(code, words, 95, 0x40),
+              "it fetches a sample of a multisample element of the handle table, 16 bytes apart");
+    free(code);
+    fetch[3] = 0x5cb0118000171a04ull; /* F2I.S32 R4, R1 */
+    fetch[5] = 0xef94002000070005ull; /* LDC R5, c[2][R0] */
+    code = translate(fetch, 9, ST_FS, &info, &words, 1);
+    check_refused(code, &info, "untracked texture handle R4 of TLD.B",
+                  "uam's order, the sample in Rb, is not read as the handle");
+    free(code);
+    g_shader_texture_arrays = 0;
 }
 /* A TEX.B that chooses among the constant buffer handles that reach it keeps the sample of the one whose word the
    register holds when it runs: c[2][0] under P0, c[2][4] under !P0, and under P1 a value from elsewhere (MOV32I
@@ -6192,7 +6337,7 @@ int main(int argc, char** argv) {
             texture_paths[i] = fixture_path(argv[1], name);
         }
         arithmetic_path = fixture_path(argv[1], "arithmetic");
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             snprintf(name, sizeof name, "beyond_%d", i);
             beyond_paths[i] = fixture_path(argv[1], name);
         }
@@ -6241,9 +6386,13 @@ int main(int argc, char** argv) {
             snprintf(name, sizeof name, "window_%d", i);
             window_paths[i] = fixture_path(argv[1], name);
         }
-        for (int i = 0; i < 9; i++) {
+        for (int i = 0; i < 12; i++) {
             snprintf(name, sizeof name, "lone_lane_%d", i);
             lone_lane_paths[i] = fixture_path(argv[1], name);
+        }
+        for (int i = 0; i < 3; i++) {
+            snprintf(name, sizeof name, "quad_read_%d", i);
+            quad_read_paths[i] = fixture_path(argv[1], name);
         }
         if (g_fixtures.failed) {
             fprintf(stderr, "failed to allocate fixture paths\n");
@@ -6314,8 +6463,10 @@ int main(int argc, char** argv) {
     shfl_quad_forms();
     shfl_predicate();
     lone_lane_forms();
+    fragment_quad_reads();
     fragment_flow_derivatives();
     tex_b_chosen_handle();
+    bindless_multisample_order();
     helper_loop_exit();
     feedback_own_pixel();
     feedback_screen_uv();

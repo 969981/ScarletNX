@@ -41,6 +41,10 @@ enum { AGB_DMA_VBLANK, AGB_DMA_HBLANK, AGB_DMA_FIFO_A, AGB_DMA_FIFO_B };
 
 typedef struct {
     uint32_t source, destination, source_now, destination_now;
+    uint32_t latch; /* the last unit the channel read, which a read of nothing (the BIOS, below EWRAM) moves again */
+    /* the units its transfer moves: DMAxCNT_L as the enable bit found it, which a repeat takes again at its end, so a
+       count written while the channel waits is the next repeat's */
+    uint32_t count_now;
     uint16_t count, control;
 } AgbDmaChannel;
 
@@ -81,12 +85,14 @@ typedef struct AgbBoard {
     uint16_t irq_ie, irq_if, irq_ime;
     uint32_t cpu_halted;       /* the CPU waits for an interrupt (Halt) */
     uint32_t held_cycles;      /* the cycles the bus was busy since the CPU last ran (a DMA's), which it waits out */
+    uint32_t sio_cycles;       /* the cycles left of the serial transfer SIOCNT started, 0 with none */
     uint32_t counted_cycles;   /* while counting is set, the cycles of the accesses through agb_read and agb_write */
     uint8_t counting;
     uint16_t keys;             /* the keypad's keys held, KEYINPUT's bits set (the register reads them inverted) */
     uint32_t bios_prefetch;    /* the opcode the BIOS fetched last, what reads of the BIOS return */
     uint32_t open_bus;         /* the opcode the CPU fetched last, as its last read through the bus hook gave it */
     uint16_t io[AGB_IO_COUNT]; /* the I/O register file; devices claim registers here */
+    uint16_t memcnt[2];        /* the internal memory control at 0x04000800, its two halfwords as written */
     int has_cartridge;
     uint32_t multiboot_size; /* a multiboot program's bytes at EWRAM's start; 0 with a cartridge */
     uint64_t multiboot_hash; /* the program's FNV-1a, which names its recompiled code as a ROM's hash does */
@@ -108,6 +114,8 @@ uint32_t agb_board_entry(const AgbBoard* board);
    0xFFFF a halfword, 0x00FF or 0xFF00 a byte: the other lane keeps the register as written. */
 uint16_t agb_io_read16(AgbBoard* board, uint32_t address);
 void agb_io_write16(AgbBoard* board, uint32_t address, uint16_t value, uint16_t mask);
+/* The serial port's transfer, which ends after its time with no partner's data */
+void agb_sio_step(AgbBoard* board, uint32_t cycles);
 /* Devices request interrupts here. */
 void agb_irq_request(AgbBoard* board, uint32_t mask);
 /* The keypad's keys held now (KEYINPUT's bits set): KEYCNT's interrupt when its keys meet its condition */

@@ -12,6 +12,7 @@
 #include "nx/runtime/options.h"
 #include "nx/gpu/gpu.h"
 #include "nx/gpu/shader/shader.h"
+#include "common/utilities/spirv_emit.h" /* SPV_CAPABILITY_COOPERATIVE_MATRIX_KHR, the scanner's */
 #include "nx/gpu/shader/sm86.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
@@ -320,38 +321,54 @@ const char* vk_corpus_dir(void) {
 const char* vk_spirv_unavailable(const u32* spv, size_t words) {
     for (size_t at = 5; at < words;) { /* the capabilities come first */
         u32 width = spv[at] >> 16;
-        if (!width || at + width > words || (spv[at] & 0xffffu) != 17) break;
-        if (width == 2 && spv[at + 1] == 10 && !g_vk.feat.shaderFloat64) return "shaderFloat64 is unavailable";
-        if (width == 2 && spv[at + 1] == 11 && !g_vk.feat.shaderInt64) return "shaderInt64 is unavailable";
-        if (width == 2 && spv[at + 1] == 9 && !g_shader_float16) return "shaderFloat16 is unavailable";
-        if (width == 2 && spv[at + 1] == 2 && !g_vk.feat.geometryShader) return "geometryShader is unavailable";
-        if (width == 2 && spv[at + 1] == 3 && !g_vk.feat.tessellationShader) return "tessellationShader is unavailable";
-        if (width == 2 && spv[at + 1] == 25 && !g_vk.feat.shaderImageGatherExtended)
+        if (!width || at + width > words || (spv[at] & 0xffffu) != SPV_OP_CAPABILITY) break;
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_FLOAT64 && !g_vk.feat.shaderFloat64)
+            return "shaderFloat64 is unavailable";
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_INT64 && !g_vk.feat.shaderInt64)
+            return "shaderInt64 is unavailable";
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_FLOAT16 && !g_shader_float16)
+            return "shaderFloat16 is unavailable";
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_GEOMETRY && !g_vk.feat.geometryShader)
+            return "geometryShader is unavailable";
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_TESSELLATION && !g_vk.feat.tessellationShader)
+            return "tessellationShader is unavailable";
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_IMAGE_GATHER_EXTENDED && !g_vk.feat.shaderImageGatherExtended)
             return "shaderImageGatherExtended is unavailable";
-        if (width == 2 && spv[at + 1] == 27 && !g_vk.feat.shaderStorageImageMultisample)
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_STORAGE_IMAGE_MULTISAMPLE &&
+            !g_vk.feat.shaderStorageImageMultisample)
             return "shaderStorageImageMultisample is unavailable";
-        if (width == 2 && spv[at + 1] == 42 && !g_vk.feat.shaderResourceMinLod)
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_MIN_LOD && !g_vk.feat.shaderResourceMinLod)
             return "shaderResourceMinLod is unavailable";
-        if (width == 2 && spv[at + 1] == 54 && !g_vk.has_geometry_streams)
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_GEOMETRY_STREAMS && !g_vk.has_geometry_streams)
             return "geometryStreams is unavailable";
-        if (width == 2 && spv[at + 1] == 32 && !g_vk.feat.shaderClipDistance)
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_CLIP_DISTANCE && !g_vk.feat.shaderClipDistance)
             return "shaderClipDistance is unavailable";
-        if (width == 2 && spv[at + 1] == 35 && !g_vk.feat.sampleRateShading) return "sampleRateShading is unavailable";
-        if (width == 2 && spv[at + 1] == 55 && !g_vk.feat.shaderStorageImageReadWithoutFormat)
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_SAMPLE_RATE_SHADING && !g_vk.feat.sampleRateShading)
+            return "sampleRateShading is unavailable";
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT &&
+            !g_vk.feat.shaderStorageImageReadWithoutFormat)
             return "shaderStorageImageReadWithoutFormat is unavailable";
-        if (width == 2 && spv[at + 1] == 56 && !g_vk.feat.shaderStorageImageWriteWithoutFormat)
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT &&
+            !g_vk.feat.shaderStorageImageWriteWithoutFormat)
             return "shaderStorageImageWriteWithoutFormat is unavailable";
-        if (width == 2 && spv[at + 1] == 5378 && !g_vk.has_fragment_interlock)
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_FRAGMENT_SHADER_PIXEL_INTERLOCK_EXT &&
+            !g_vk.has_fragment_interlock)
             return "fragmentShaderPixelInterlock is unavailable";
-        if (width == 2 && spv[at + 1] == 4427 && !g_vk.has_shader_draw_parameters)
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_DRAW_PARAMETERS && !g_vk.has_shader_draw_parameters)
             return "shaderDrawParameters is unavailable";
-        if (width == 2 && spv[at + 1] == 5055 && !g_shader_clock_scopes) return "shaderClock is unavailable";
-        if (width == 2 && spv[at + 1] == 5283 && !g_vk.has_mesh) return "meshShader is unavailable";
-        if (width == 2 && spv[at + 1] == 6912 && !g_shader_mixed_dot)
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_SHADER_CLOCK_KHR && !g_shader_clock_scopes)
+            return "shaderClock is unavailable";
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_MESH_SHADING_EXT && !g_vk.has_mesh)
+            return "meshShader is unavailable";
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_DOT_PRODUCT_FLOAT16_ACC_FLOAT32_VALVE && !g_shader_mixed_dot)
             return "shaderMixedFloatDotProductFloat16AccFloat32 is unavailable";
-        if (width == 2 && (spv[at + 1] == 6022 || spv[at + 1] == 5345 || spv[at + 1] == 5346) && !g_shader_hmma_coop)
+        if (width == 2 &&
+            (spv[at + 1] == SPV_CAPABILITY_COOPERATIVE_MATRIX_KHR ||
+             spv[at + 1] == SPV_CAPABILITY_VULKAN_MEMORY_MODEL ||
+             spv[at + 1] == SPV_CAPABILITY_VULKAN_MEMORY_MODEL_DEVICE_SCOPE) &&
+            !g_shader_hmma_coop)
             return "cooperativeMatrix or the Vulkan memory model is unavailable";
-        if (width == 2 && spv[at + 1] == 6033 && !g_shader_float_atomic_add)
+        if (width == 2 && spv[at + 1] == SPV_CAPABILITY_ATOMIC_FLOAT32_ADD_EXT && !g_shader_float_atomic_add)
             return "shaderBufferFloat32AtomicAdd is unavailable";
         at += width;
     }
@@ -1207,7 +1224,7 @@ VkShaderModule vk_module_spv_location(const u32* source, size_t nw, u32 location
     for (size_t i = 5; i < nw;) {
         u32 count = spv[i] >> 16, op = spv[i] & 0xffffu;
         if (!count || i + count > nw) break;
-        if (op == 71 && count == 4 && spv[i + 2] == 30) {
+        if (op == SPV_OP_DECORATE && count == 4 && spv[i + 2] == SPV_DECORATION_LOCATION) {
             spv[i + 3] = location;
             found++;
         }
@@ -2613,12 +2630,14 @@ static void pf_key(char* out, size_t n, size_t* guest) {
                  (unsigned)sizeof(PfSource), (unsigned)sizeof(PfPipe), (unsigned)sizeof(ShXfb));
     *guest = g > 0 && (size_t)g < n ? (size_t)g : 0;
     if (*guest)
-        snprintf(out + *guest, n - *guest,
-                 " %s%s driver=%u api=%u uuid=%s ftz=%d quad=%d,%d mixed_dot=%d hmma_coop=%d hmma_pairs=%d sizes=%u,%u "
-                 "vertex_bounds=%d",
-                 snx_build_info(), exe, d->driverVersion, d->apiVersion, uuid, g_vk_ftz, g_shader_quad,
-                 g_shader_quad_compute, g_shader_mixed_dot, g_shader_hmma_coop, g_shader_hmma_pairs,
-                 (unsigned)sizeof(ShaderInfo), (unsigned)sizeof(PfShader), g_vk.has_vertex_robustness2);
+        snprintf(
+            out + *guest, n - *guest,
+            " %s%s driver=%u api=%u uuid=%s ftz=%d quad=%d,%d mixed_dot=%d hmma_coop=%d hmma_pairs=%d hmma_stage=%d half_flush=%d "
+            "hmma_f16=%d sizes=%u,%u vertex_bounds=%d",
+            snx_build_info(), exe, d->driverVersion, d->apiVersion, uuid, g_vk_ftz, g_shader_quad,
+            g_shader_quad_compute, g_shader_mixed_dot, g_shader_hmma_coop, g_shader_hmma_pairs, g_shader_hmma_stage,
+            g_shader_half_flush, g_shader_hmma_f16, (unsigned)sizeof(ShaderInfo), (unsigned)sizeof(PfShader),
+            g_vk.has_vertex_robustness2);
 }
 
 void vk_pipeline_file_key(char* out, size_t n, size_t* guest) { pf_key(out, n, guest); }
@@ -2826,6 +2845,12 @@ static u8* ship_window(const u8* p, size_t avail) {
    (seconds). The program's indexed bit and its clip word are the ship pass's guesses, so a draw whose key differs
    still translates and compiles its own, as now (docs/layers/gpu/pipeline-libraries.md, step 8) */
 static void ship_warm(int stage, int indexed, const u32* spv, u32 nw) {
+    /* a part is a library, which a device without VK_EXT_graphics_pipeline_library never promised: there every draw
+       compiles whole, and a part made for it is a create the driver was not given (MoltenVK reads the null
+       rasterization state of a fragment part and ends its pipeline worker) */
+    if (!g_vk.has_gpl) return;
+    /* a control program shares the pre-rasterization part with the vertex program, so it is warmed with its draw */
+    if (stage != ST_VS && stage != ST_FS) return;
     VkShaderModule mod = vk_module_spv(spv, nw);
     if (!mod) return;
     WarmItem* w = calloc(1, sizeof *w);

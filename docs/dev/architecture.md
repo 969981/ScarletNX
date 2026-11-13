@@ -63,13 +63,13 @@ used as Linux syscalls.
 
 `scarletnx` is every driver the build has: `src/multicall/main.c` is the only `main`, and runs
 the driver its name says from the library of the driver's own folder (`snx_switch_program`,
-`snx_ctr_program`, `snx_vita_program`, `scarletnx-gnuabi`, `snx_agb_program`), so LLVM and SDL
+`snx_ctr_program`, `snx_vita_program`, `scarletnx-gnuabi`, `snx_agb_program`, `snx_nds_program`), so LLVM and SDL
 are in one program once. On Linux and macOS `scarletnx-switch`, `scarletnx-3ds`,
-`scarletnx-vita`, `scarletnx-gnuabi` and `scarletnx-agb` are symlinks to it. Windows has no
+`scarletnx-vita`, `scarletnx-gnuabi`, `scarletnx-agb` and `scarletnx-nds` are symlinks to it. Windows has no
 links: the driver's name goes first (`scarletnx.exe scarletnx-3ds ...`), and the launcher runs
 the drivers that way (`snx_menu_has_driver`), as Android's does through `libscarletnx-run.so`.
-A game's copy runs its driver too: a GBA game's by
-its `.ini` (`system=gba`), a 3DS or Vita game's by its title ID, any other the Switch's (or, in a
+A game's copy runs its driver too: a GBA or NDS game's by
+its `.ini` (`system=gba`, `system=nds`), a 3DS or Vita game's by its title ID, any other the Switch's (or, in a
 build without it, the one driver there is). The 3DS and Vita
 drivers read what a module was compiled for from its file before loading it, and compile first
 when it is stale, so a module is loaded once.
@@ -273,6 +273,7 @@ function's arguments, or a field added into a struct's tail padding: for those t
 | 16 | `stx`'s result for a store-exclusive whose range the armed monitor covers |
 | 17 | the FP helpers take FPCR by value and return their result with the FPSR flags they raised, and generated functions call `snx_fp_env` on entry |
 | 18 | a program's modules lie one after another, as the console's loader lays them (`src/nx/loader/loader.h`); the contract is as it was |
+| 19 | the route list names the SDK functions the runtime answers natively (nn::fs, time, pl, ngc, nsd, prepo, codec): a module made before calls the SDK's own code, which opens services no longer served; the contract is as it was |
 
 #### Code the game patches
 

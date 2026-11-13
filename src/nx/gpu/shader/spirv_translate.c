@@ -18,7 +18,8 @@ static void advanced_blend_sample(DirectCtx* c, const ShaderInfo* si, u32 vec4, 
     u32 loaded_image = 0, destination;
     if (sample) {
         loaded_image = spv_emit_load(e, image_type, image);
-        destination = SPV(e, 98, vec4, loaded_image, xy, 64, sample); /* Sample image operand */
+        destination = SPV(e, SPV_OP_IMAGE_READ, vec4, loaded_image, xy, SPV_IMAGE_OPERANDS_SAMPLE,
+                          sample); /* Sample image operand */
     } else
         destination = spv_emit_image_read(e, vec4, image_type, image, xy);
     u32 linear_destination = si->advanced_blend_mask & SH_BLEND_SRGB
@@ -40,7 +41,7 @@ static void advanced_blend_sample(DirectCtx* c, const ShaderInfo* si, u32 vec4, 
     }
     if (sample) {
         u32 args[] = {loaded_image, xy, result, 64, sample};
-        spv_emit_void_op(e, 99, args, 5);
+        spv_emit_void_op(e, SPV_OP_IMAGE_WRITE, args, 5);
     } else
         spv_emit_image_write(e, image_type, image, xy, result);
 }
@@ -58,11 +59,12 @@ static void advanced_blend_epilogue(DirectCtx* c, const ShaderInfo* si, u32 vec4
         pixel = shader_depth_stencil_coordinates(e, c->f32_type, c->u32_type, c->bool_type,
                                                    depth_buffer, position, &inside);
         kept = SPV(e, SPV_OP_LOGICAL_AND, c->bool_type, kept, inside);
-        u32 mask = spv_emit_load(e, c->u32_type,
-                                 spv_emit_interface_scalar_pointer(e, 1, c->u32_type, coverage, 0, c->zero));
+        u32 mask = spv_emit_load(
+            e, c->u32_type, spv_emit_interface_scalar_pointer(e, SPV_STORAGE_INPUT, c->u32_type, coverage, 0, c->zero));
         if (sample_mask_output) {
-            u32 output_mask = spv_emit_load(e, c->u32_type,
-                spv_emit_interface_scalar_pointer(e, 3, c->u32_type, sample_mask_output, 0, c->zero));
+            u32 output_mask = spv_emit_load(
+                e, c->u32_type,
+                spv_emit_interface_scalar_pointer(e, SPV_STORAGE_OUTPUT, c->u32_type, sample_mask_output, 0, c->zero));
             mask = SPV(e, SPV_OP_BITWISE_AND, c->u32_type, mask, output_mask);
         }
         u32 covered = spv_emit_binary(
@@ -72,7 +74,7 @@ static void advanced_blend_epilogue(DirectCtx* c, const ShaderInfo* si, u32 vec4
         incoming = spv_emit_vec4_extract(e, c->f32_type, position, 2);
         front = spv_emit_load(e, c->bool_type, frontface);
     }
-    spv_emit_void_op(e, 5364, NULL, 0); /* OpBeginInvocationInterlockEXT */
+    spv_emit_void_op(e, SPV_OP_BEGIN_INVOCATION_INTERLOCK_EXT, NULL, 0);
     if (depth_buffer)
         kept = shader_depth_stencil_test(e, c->f32_type, c->u32_type, c->bool_type, depth_buffer,
                                            pixel, incoming, front, kept);
@@ -93,8 +95,9 @@ static void advanced_blend_epilogue(DirectCtx* c, const ShaderInfo* si, u32 vec4
         } else
             xy = SPV(e, SPV_OP_COMPOSITE_CONSTRUCT, spv_emit_type_vec2(e, i32), coordinate[0], coordinate[1]);
         if (si->advanced_blend_mask & SH_BLEND_MULTISAMPLE) {
-            u32 mask = spv_emit_load(e, c->u32_type,
-                spv_emit_interface_scalar_pointer(e, 1, c->u32_type, coverage, 0, c->zero));
+            u32 mask = spv_emit_load(
+                e, c->u32_type,
+                spv_emit_interface_scalar_pointer(e, SPV_STORAGE_INPUT, c->u32_type, coverage, 0, c->zero));
             u32 samples = si->advanced_blend_mask >> 8 & 63;
             for (u32 i = 0; i < samples; i++) {
                 u32 bit = spv_emit_constant_u32(e, c->u32_type, 1u << i);
@@ -114,7 +117,8 @@ static void advanced_blend_epilogue(DirectCtx* c, const ShaderInfo* si, u32 vec4
         spv_emit_branch(e, done);
         spv_emit_label(e, done);
     }
-    spv_emit_void_op(e, 5365, NULL, 0); /* OpEndInvocationInterlockEXT; implicitly publishes coherent image writes */
+    spv_emit_void_op(e, SPV_OP_END_INVOCATION_INTERLOCK_EXT, NULL,
+                     0); /* OpEndInvocationInterlockEXT; implicitly publishes coherent image writes */
     /* Coverage-only keeps its native integer output. Kill after the interlock suppresses that output on a late
        failure while retaining stencil fail/depth-fail updates and all original guest shader side effects. */
     u32 reject = spv_emit_id(e), finish = spv_emit_id(e);
@@ -138,6 +142,7 @@ int g_shader_geometry = 1;
 int g_shader_geometry_streams = 1;
 int g_shader_geometry_streams_lines_triangles = 1;
 int g_shader_float16 = 1;
+int g_shader_float64 = 1;
 int g_shader_resource_min_lod = 1;
 int g_shader_dynamic_texture_offsets;
 int g_shader_half_rounding;
@@ -146,8 +151,12 @@ int g_shader_draw_parameters = 1;
 int g_shader_quad = 1;
 int g_shader_quad_compute = 1;
 int g_shader_mixed_dot;
+int g_shader_hmma_coop_tile = 16;
+int g_shader_hmma_f16;
 int g_shader_hmma_coop;
 int g_shader_hmma_pairs;
+int g_shader_half_flush;
+int g_shader_hmma_stage;
 u32 g_shader_mesh_tasks_max;
 int g_shader_float_atomic_add;
 int g_shader_tessellation = 1;
@@ -376,6 +385,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     int has_stack = 0, has_pexit = 0, has_conditional_exit = 0;
     int needs_local = 0, needs_shared = 0, needs_subgroup = 0, needs_atomic_cas = 0, lane_used = 0, needs_quad = 0;
     int votes = 0, swizzle_lanes = 0; /* VOTE or SHFL; FSWZADD whose lanes take different modes */
+    int quad_reads = 0;               /* a fragment program's SHFL within its quad that reads another pixel of it */
     int needs_gather_extended = 0;
     int fp32_flush = 0, fp32_preserve = 0;
     u32 out_reg = 0;
@@ -1477,6 +1487,10 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         if (op->id == O_KIL) has_discard = 1;
         if (op->id == O_VOTE || op->id == O_SHFL) needs_subgroup = votes = 1;
         if (op->id == O_SHFL && stage == ST_FS && g_shader_quad && shader_shfl_quad(insn[i], NULL)) needs_quad = 1;
+        if (op->id == O_SHFL && stage == ST_FS) {
+            u8 dir[4];
+            if (shader_shfl_quad_lanes(insn[i], dir, NULL) && (dir[0] | dir[1] | dir[2] | dir[3])) quad_reads = 1;
+        }
         /* FSWZADD's lanes in a quad are the subgroup's, as SHFL's are, when they don't all do the same */
         if (op->id == O_FSWZADD && shader_fswzadd_lanes(insn[i], B(insn[i], 28, 2)) != 15)
             needs_subgroup = swizzle_lanes = 1;
@@ -1493,13 +1507,26 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
        runs each invocation as a warp whose only active lane is lane 0, as the console runs a batch of one vertex or
        primitive: its ballot is its own bit, VOTE.ALL and VOTE.ANY are its predicate, VOTE.EQ is true, and SHFL keeps
        its own value, which is the console's for its own lane or one out of range and as good as any for a lane
-       that runs nothing. Control programs keep the subgroup: their invocations are the lanes of one warp together */
-    int lone_lane = votes && !swizzle_lanes && !can_subgroup && (stage == ST_VS || stage == ST_TES || stage == ST_GS);
-    int lane_model = (!needs_subgroup || lone_lane) && stage != ST_FS && stage != ST_CS;
+       that runs nothing. Control programs keep the subgroup: their invocations are the lanes of one warp together.
+       A fragment program that votes, shuffles, reads its lane or swizzles across its quad, on a device without
+       subgroups in the fragment stage, runs each invocation as one lane alone too, the lane of its place in its 2x2
+       quad (DirectCtx.quad_lane, from FragCoord): its ballot is that lane's bit, the votes are its predicate,
+       FSWZADD takes the mode of its place, a SHFL within the quad reads the other pixel's register through fine
+       derivatives (emit_thread.c's quad_read; dFdx and dFdy are SHFL.BFLY then FSWZADD on the console) and any other
+       SHFL keeps its own value. Those reads take every pixel of the quad in step, as derivatives do */
+    int quad_lane = stage == ST_FS && !can_subgroup && (votes || swizzle_lanes || lane_used);
+    int lone_lane = quad_lane ||
+                    (votes && !swizzle_lanes && !can_subgroup && (stage == ST_VS || stage == ST_TES || stage == ST_GS));
+    int lane_model = quad_lane || ((!needs_subgroup || lone_lane) && stage != ST_FS && stage != ST_CS);
     int lane_is_invocation = lane_model && stage == ST_TCS;
     if (lane_used && lane_is_invocation) invocation_used = 1;
     if (lane_used && !lane_model) needs_subgroup = 1;
     if (lone_lane) needs_subgroup = 0;
+    if (quad_lane) {
+        needs_quad = 0;
+        needs_fragcoord = 1;
+        if (quad_reads) needs_derivatives = 1;
+    }
     if (needs_f16 && (g_shader_half_rounding & 2)) needs_f64 = 1;
     if (!has_exit) return direct_reject(si, "missing exit");
     if (has_pexit && has_conditional_exit) return direct_reject(si, "conditional EXIT with PEXIT token");
@@ -1853,25 +1880,25 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
          (si->advanced_blend_mask & SH_BLEND_EARLY_TESTS));
     if (post_depth_coverage) {
         spv_emit_extension(&c->emit, "SPV_KHR_post_depth_coverage");
-        spv_emit_capability(&c->emit, 4447); /* SampleMaskPostDepthCoverage */
+        spv_emit_capability(&c->emit, SPV_CAPABILITY_SAMPLE_MASK_POST_DEPTH_COVERAGE);
     }
     if (advanced_blend || si->late_depth) {
         spv_emit_extension(&c->emit, "SPV_EXT_fragment_shader_interlock");
-        spv_emit_capability(&c->emit, 5378); /* FragmentShaderPixelInterlockEXT */
-        if (advanced_blend) spv_emit_capability(&c->emit, 55); /* StorageImageReadWithoutFormat */
+        spv_emit_capability(&c->emit, SPV_CAPABILITY_FRAGMENT_SHADER_PIXEL_INTERLOCK_EXT);
+        if (advanced_blend) spv_emit_capability(&c->emit, SPV_CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT);
         c->blend_end = spv_emit_id(&c->emit);
     }
-    if (stage == ST_TCS || stage == ST_TES) spv_emit_capability(&c->emit, 3); /* Tessellation */
-    if (stage == ST_GS) spv_emit_capability(&c->emit, 2);                     /* Geometry */
-    if (stream_mask) spv_emit_capability(&c->emit, 54); /* GeometryStreams */
+    if (stage == ST_TCS || stage == ST_TES) spv_emit_capability(&c->emit, SPV_CAPABILITY_TESSELLATION);
+    if (stage == ST_GS) spv_emit_capability(&c->emit, SPV_CAPABILITY_GEOMETRY);
+    if (stream_mask) spv_emit_capability(&c->emit, SPV_CAPABILITY_GEOMETRY_STREAMS);
     if (needs_demote || (converge && stage == ST_FS)) {
-        spv_emit_capability(&c->emit, 5379); /* DemoteToHelperInvocation */
+        spv_emit_capability(&c->emit, SPV_CAPABILITY_DEMOTE_TO_HELPER_INVOCATION);
         spv_emit_demote_extension(&c->emit);
     }
     if (needs_f16) spv_emit_float16_capability(&c->emit);
     if (needs_f64) spv_emit_float64_capability(&c->emit);
     if (needs_clock) spv_emit_shader_clock_extension(&c->emit);
-    if (needs_i64) spv_emit_capability(&c->emit, 11); /* Int64 */
+    if (needs_i64) spv_emit_capability(&c->emit, SPV_CAPABILITY_INT64);
     if ((needs_instance || needs_draw_params) && g_shader_draw_parameters && stage == ST_VS)
         spv_emit_draw_parameters_capability(&c->emit);
     if (needs_subgroup || converge) spv_emit_subgroup_capabilities(&c->emit);
@@ -1941,7 +1968,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     if ((layer_output_used && stage != ST_GS) || (layer_input_used && !g_shader_geometry))
         spv_emit_layer_capability(&c->emit);
     else if (layer_input_used && stage != ST_GS)
-        spv_emit_capability(&c->emit, 2); /* Geometry */
+        spv_emit_capability(&c->emit, SPV_CAPABILITY_GEOMETRY);
     if (clip_used || clip_in_used) spv_emit_clip_distance_capability(&c->emit);
     u32 coverage_output = 0, capture_output = 0;
     if (stage == ST_FS)
@@ -1972,23 +1999,26 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
        sample i, and a single-sampled one only bit 0. PIXLD.COVMASK likewise reports the host's coverage */
     u32 sample_mask_output = 0; /* SampleMask, an array of one word */
     if (stage == ST_FS && ((sph[19] & 1u) || (si->advanced_blend_mask & SH_ALPHA_COVERAGE))) {
-        sample_mask_output = spv_emit_interface_variable(&c->emit, 3, c->u32_type, c->u32_type, 1, 20, 0, 0);
+        sample_mask_output =
+            spv_emit_interface_variable(&c->emit, SPV_STORAGE_OUTPUT, c->u32_type, c->u32_type, 1, 20, 0, 0);
         interfaces[count++] = sample_mask_output;
     }
     if (stage != ST_FS && stage != ST_CS) {
         /* a tessellation control program's outputs are arrays of its output vertices */
         u32 per_vertex = stage == ST_TCS ? out_vertices : 0;
         if (stage == ST_VS || (g_shader_stage_point_size && (stage != ST_TCS || point_size_used))) {
-            if (stage == ST_TCS || stage == ST_TES) spv_emit_capability(&c->emit, 23); /* TessellationPointSize */
-            if (stage == ST_GS) spv_emit_capability(&c->emit, 24);  /* GeometryPointSize */
-            point_size = per_vertex ? spv_emit_interface_variable(&c->emit, 3, c->f32_type, c->u32_type,
-                                                                  per_vertex, 1, 0, 0)
+            if (stage == ST_TCS || stage == ST_TES)
+                spv_emit_capability(&c->emit, SPV_CAPABILITY_TESSELLATION_POINT_SIZE);
+            if (stage == ST_GS) spv_emit_capability(&c->emit, SPV_CAPABILITY_GEOMETRY_POINT_SIZE);
+            point_size = per_vertex ? spv_emit_interface_variable(&c->emit, SPV_STORAGE_OUTPUT, c->f32_type,
+                                                                  c->u32_type, per_vertex, 1, 0, 0)
                                     : spv_emit_point_size_output(&c->emit, c->f32_type);
             interfaces[count++] = point_size;
         }
         if (viewport_used) {
             spv_emit_capability(&c->emit, stage == ST_GS ? 57 : 70); /* MultiViewport, ShaderViewportIndex */
-            viewport_output = spv_emit_interface_variable(&c->emit, 3, i32_type, c->u32_type, 0, 10, 0, 0);
+            viewport_output =
+                spv_emit_interface_variable(&c->emit, SPV_STORAGE_OUTPUT, i32_type, c->u32_type, 0, 10, 0, 0);
             interfaces[count++] = viewport_output;
         }
         if (layer_output_used) {
@@ -2001,7 +2031,8 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             clip_count = 8;
             if (per_vertex) {
                 u32 array = spv_emit_type_array(&c->emit, c->f32_type, clip_count);
-                clip_output = spv_emit_interface_variable(&c->emit, 3, array, c->u32_type, per_vertex, 3, 0, 0);
+                clip_output =
+                    spv_emit_interface_variable(&c->emit, SPV_STORAGE_OUTPUT, array, c->u32_type, per_vertex, 3, 0, 0);
             } else
                 clip_output = spv_emit_clip_distance_output(&c->emit, c->f32_type, c->u32_type, clip_count);
             interfaces[count++] = clip_output;
@@ -2026,7 +2057,8 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             xfb_on = xfb_stores;
         }
         if (position_used) {
-            position = per_vertex ? spv_emit_interface_variable(&c->emit, 3, vec4, c->u32_type, per_vertex, 0, 0, 0)
+            position = per_vertex ? spv_emit_interface_variable(&c->emit, SPV_STORAGE_OUTPUT, vec4, c->u32_type,
+                                                                per_vertex, 0, 0, 0)
                                   : spv_emit_position_output(&c->emit, vec4);
             interfaces[count++] = position;
             /* the captured position is a copy, a component a variable at an output location the program leaves
@@ -2077,9 +2109,10 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                     }
                     continue;
                 }
-                output_attrs[i] = per_vertex ? spv_emit_interface_variable(&c->emit, 3, vec4, c->u32_type, per_vertex,
-                                                                           SPV_NOT_BUILTIN, i, 0)
-                                             : spv_emit_output_vec4(&c->emit, vec4, i);
+                output_attrs[i] = per_vertex
+                                      ? spv_emit_interface_variable(&c->emit, SPV_STORAGE_OUTPUT, vec4, c->u32_type,
+                                                                    per_vertex, SPV_NOT_BUILTIN, i, 0)
+                                      : spv_emit_output_vec4(&c->emit, vec4, i);
                 interfaces[count++] = output_attrs[i];
             }
         if (position_slot && position_fix) {
@@ -2100,7 +2133,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                 u32 slot = stream_slots[stream]++;
                 u32 variable = spv_emit_output_component(&c->emit, c->f32_type, slot / 4, slot & 3);
                 stream_capture[b][w] = variable;
-                spv_emit_decorate(&c->emit, variable, 29, &stream, 1);
+                spv_emit_decorate(&c->emit, variable, SPV_DECORATION_STREAM, &stream, 1);
                 spv_emit_xfb_capture(&c->emit, variable, b, si->xfb.stride[b], w * 4);
                 interfaces[count++] = variable;
                 xfb_on = 1;
@@ -2124,58 +2157,65 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                     spv_emit_interface_variable(&c->emit, storage, vec4, c->u32_type, 0, SPV_NOT_BUILTIN, i, 1);
                 interfaces[count++] = patch_vars[i];
             }
-        patch_vertices = spv_emit_interface_variable(&c->emit, 1, c->u32_type, c->u32_type, 0, 14, 0, 0);
+        patch_vertices =
+            spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, c->u32_type, c->u32_type, 0, 14, 0, 0);
         interfaces[count++] = patch_vertices;
     }
     /* PIXLD's sample (SampleId, which shades each sample, with SampleRateShading) and coverage (SampleMask in) */
     u32 sample_id = 0, coverage = 0;
     if (needs_sample_id) {
-        spv_emit_capability(&c->emit, 35); /* SampleRateShading */
-        sample_id = spv_emit_builtin_input_u32(&c->emit, c->u32_type, 18);
+        spv_emit_capability(&c->emit, SPV_CAPABILITY_SAMPLE_RATE_SHADING);
+        sample_id = spv_emit_builtin_input_u32(&c->emit, c->u32_type, SPV_BUILT_IN_SAMPLE_ID);
         interfaces[count++] = sample_id;
     }
     if (needs_coverage) {
-        coverage = spv_emit_interface_variable(&c->emit, 1, c->u32_type, c->u32_type, 1, 20, 0, 0);
+        coverage = spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, c->u32_type, c->u32_type, 1, 20, 0, 0);
         spv_emit_flat(&c->emit, coverage); /* an integer fragment input */
         interfaces[count++] = coverage;
     }
     /* Fragment PrimitiveId can declare Geometry or Tessellation. Without either feature the read is zero. */
     if (stage == ST_FS && primitive_id_used && (g_shader_geometry || g_shader_tessellation)) {
         if (!g_shader_geometry || !layer_input_used) spv_emit_capability(&c->emit, g_shader_geometry ? 2 : 3);
-        primitive_id = spv_emit_interface_variable(&c->emit, 1, c->u32_type, c->u32_type, 0, 7, 0, 0);
+        primitive_id = spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, c->u32_type, c->u32_type, 0, 7, 0, 0);
         spv_emit_flat(&c->emit, primitive_id);
         interfaces[count++] = primitive_id;
     }
     if (between) {
         if (point_in_used) {
             spv_emit_capability(&c->emit, stage == ST_GS ? 24 : 23);
-            point_size_in = spv_emit_interface_variable(&c->emit, 1, c->f32_type, c->u32_type, in_vertices, 1, 0, 0);
+            point_size_in = spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, c->f32_type, c->u32_type,
+                                                        in_vertices, 1, 0, 0);
             interfaces[count++] = point_size_in;
         }
         if (clip_in_used) {
             u32 array = spv_emit_type_array(&c->emit, c->f32_type, 8);
-            clip_input = spv_emit_interface_variable(&c->emit, 1, array, c->u32_type, in_vertices, 3, 0, 0);
+            clip_input =
+                spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, array, c->u32_type, in_vertices, 3, 0, 0);
             interfaces[count++] = clip_input;
         }
         if (position_in_used) {
-            position_in = spv_emit_interface_variable(&c->emit, 1, vec4, c->u32_type, in_vertices, 0, 0, 0);
+            position_in =
+                spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, vec4, c->u32_type, in_vertices, 0, 0, 0);
             interfaces[count++] = position_in;
         }
         if (primitive_id_used || stage == ST_GS) {
-            primitive_id = spv_emit_interface_variable(&c->emit, 1, c->u32_type, c->u32_type, 0, 7, 0, 0);
+            primitive_id =
+                spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, c->u32_type, c->u32_type, 0, 7, 0, 0);
             interfaces[count++] = primitive_id;
         }
         if (stage == ST_GS) {
             /* Vulkan requires a geometry shader to write PrimitiveId for a later fragment shader to read it. */
-            primitive_id_out = spv_emit_interface_variable(&c->emit, 3, c->u32_type, c->u32_type, 0, 7, 0, 0);
+            primitive_id_out =
+                spv_emit_interface_variable(&c->emit, SPV_STORAGE_OUTPUT, c->u32_type, c->u32_type, 0, 7, 0, 0);
             interfaces[count++] = primitive_id_out;
         }
         if (tess_coord_used) {
-            tess_coord = spv_emit_interface_variable(&c->emit, 1, vec3, c->u32_type, 0, 13, 0, 0);
+            tess_coord = spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, vec3, c->u32_type, 0, 13, 0, 0);
             interfaces[count++] = tess_coord;
         }
         if (invocation_used) {
-            invocation_id = spv_emit_interface_variable(&c->emit, 1, c->u32_type, c->u32_type, 0, 8, 0, 0);
+            invocation_id =
+                spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, c->u32_type, c->u32_type, 0, 8, 0, 0);
             interfaces[count++] = invocation_id;
         }
     }
@@ -2201,18 +2241,19 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         input_component_type[i] = component_type;
         int arrays = between || ((pv_mask >> i & 1) && !pv_flat);
         if ((pv_mask >> i & 1) && pv_flat) interpolation = 1; /* the first vertex's value, flat */
-        inputs[i] = arrays ? spv_emit_interface_variable(&c->emit, 1, vector_type, c->u32_type,
+        inputs[i] = arrays ? spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, vector_type, c->u32_type,
                                                          between ? in_vertices : 3, SPV_NOT_BUILTIN, i, 0)
                            : spv_emit_input_vec4(&c->emit, vector_type, i, interpolation);
-        if (arrays && !between) spv_emit_decorate(&c->emit, inputs[i], 5285, NULL, 0); /* PerVertexKHR */
+        if (arrays && !between) spv_emit_decorate(&c->emit, inputs[i], SPV_DECORATION_PER_VERTEX_KHR, NULL, 0);
         interfaces[count++] = inputs[i];
     }
     u32 pv_position[3] = {0, 0, 0}, pv_copy[32][2] = {{0}};
     if (pv_mask && !pv_flat) {
         spv_emit_extension(&c->emit, "SPV_KHR_fragment_shader_barycentric");
-        spv_emit_capability(&c->emit, 5284); /* FragmentBarycentricKHR */
-        pv_position[0] = spv_emit_interface_variable(&c->emit, 1, vec4, c->u32_type, 3, SPV_NOT_BUILTIN, pv_slot, 0);
-        spv_emit_decorate(&c->emit, pv_position[0], 5285, NULL, 0);
+        spv_emit_capability(&c->emit, SPV_CAPABILITY_FRAGMENT_BARYCENTRIC_KHR);
+        pv_position[0] =
+            spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, vec4, c->u32_type, 3, SPV_NOT_BUILTIN, pv_slot, 0);
+        spv_emit_decorate(&c->emit, pv_position[0], SPV_DECORATION_PER_VERTEX_KHR, NULL, 0);
         interfaces[count++] = pv_position[1] = pv_position[2] = pv_position[0];
     } else if (pv_mask) {
         for (u32 k = 0; k < 3; k++)
@@ -2224,52 +2265,53 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     }
     u32 fragcoord = 0;
     if (layer_input_used) {
-        layer_input = spv_emit_builtin_input_u32(&c->emit, i32_type, 9);
+        layer_input = spv_emit_builtin_input_u32(&c->emit, i32_type, SPV_BUILT_IN_LAYER);
         interfaces[count++] = layer_input;
     }
     u32 frontface = 0;
     if (needs_frontface) {
-        frontface = spv_emit_builtin_input_u32(&c->emit, c->bool_type, 17);
+        frontface = spv_emit_builtin_input_u32(&c->emit, c->bool_type, SPV_BUILT_IN_FRONT_FACING);
         interfaces[count++] = frontface;
     }
     /* a[0x2e0] and a[0x2e4] are the point sprite's S and T */
     u32 point_coord = 0;
     if (needs_point_coord) {
-        point_coord = spv_emit_interface_variable(&c->emit, 1, vec2, c->u32_type, 0, 16, 0, 0);
+        point_coord = spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, vec2, c->u32_type, 0, 16, 0, 0);
         interfaces[count++] = point_coord;
     }
     u32 instance_index = 0, vertex_index = 0, base_instance = 0;
     u32 local_input = 0, group_input = 0;
     if (needs_local_id) {
-        local_input = spv_emit_builtin_input_vec3(&c->emit, vec3_u32, 27);
+        local_input = spv_emit_builtin_input_vec3(&c->emit, vec3_u32, SPV_BUILT_IN_LOCAL_INVOCATION_ID);
         interfaces[count++] = local_input;
     }
     if (needs_group_id) {
-        group_input = spv_emit_builtin_input_vec3(&c->emit, vec3_u32, 26);
+        group_input = spv_emit_builtin_input_vec3(&c->emit, vec3_u32, SPV_BUILT_IN_WORKGROUP_ID);
         interfaces[count++] = group_input;
     }
     if (needs_subgroup) {
-        c->subgroup_lane_input = spv_emit_builtin_input_u32(&c->emit, c->u32_type, 41);
+        c->subgroup_lane_input =
+            spv_emit_builtin_input_u32(&c->emit, c->u32_type, SPV_BUILT_IN_SUBGROUP_LOCAL_INVOCATION_ID);
         if (stage == ST_FS) spv_emit_flat(&c->emit, c->subgroup_lane_input);
         interfaces[count++] = c->subgroup_lane_input;
     }
     if (needs_instance || xfb_stores) { /* the stores' vertex places (xfb_write) */
-        instance_index = spv_emit_builtin_input_u32(&c->emit, c->u32_type, 43);
-        vertex_index = spv_emit_builtin_input_u32(&c->emit, c->u32_type, 42);
+        instance_index = spv_emit_builtin_input_u32(&c->emit, c->u32_type, SPV_BUILT_IN_INSTANCE_INDEX);
+        vertex_index = spv_emit_builtin_input_u32(&c->emit, c->u32_type, SPV_BUILT_IN_VERTEX_INDEX);
         interfaces[count++] = instance_index;
         interfaces[count++] = vertex_index;
         if (needs_instance && g_shader_draw_parameters && stage == ST_VS) {
-            base_instance = spv_emit_builtin_input_u32(&c->emit, c->u32_type, 4425); /* BaseInstance */
+            base_instance = spv_emit_builtin_input_u32(&c->emit, c->u32_type, SPV_BUILT_IN_BASE_INSTANCE);
             interfaces[count++] = base_instance;
         }
     }
     u32 base_vertex = 0;
     if (needs_draw_params && g_shader_draw_parameters && stage == ST_VS) {
         if (!base_instance) {
-            base_instance = spv_emit_builtin_input_u32(&c->emit, c->u32_type, 4425); /* BaseInstance */
+            base_instance = spv_emit_builtin_input_u32(&c->emit, c->u32_type, SPV_BUILT_IN_BASE_INSTANCE);
             interfaces[count++] = base_instance;
         }
-        base_vertex = spv_emit_builtin_input_u32(&c->emit, c->u32_type, 4424); /* BaseVertex */
+        base_vertex = spv_emit_builtin_input_u32(&c->emit, c->u32_type, SPV_BUILT_IN_BASE_VERTEX);
         interfaces[count++] = base_vertex;
     }
     if (needs_fragcoord) {
@@ -2279,7 +2321,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     u32 capture_tiles = 0, capture_helper = 0;
     if (stage == ST_FS && (si->advanced_blend_mask & SH_CAPTURE_TILED)) {
         capture_tiles = shader_capture_tiles_declare(&c->emit, c->u32_type, shader_vk_set(ST_FS), SNX_VKB_CAPTURE);
-        capture_helper = spv_emit_builtin_input_u32(&c->emit, c->bool_type, 23); /* HelperInvocation */
+        capture_helper = spv_emit_builtin_input_u32(&c->emit, c->bool_type, SPV_BUILT_IN_HELPER_INVOCATION);
         interfaces[count++] = capture_tiles;
         interfaces[count++] = capture_helper;
     }
@@ -2292,18 +2334,19 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     if (advanced_blend) {
         int array = !!(si->advanced_blend_mask & SH_BLEND_ARRAY);
         if (si->advanced_blend_mask & SH_BLEND_MULTISAMPLE) {
-            spv_emit_capability(&c->emit, 27); /* StorageImageMultisample */
-            if (array) spv_emit_capability(&c->emit, 48); /* ImageMSArray */
-            spv_emit_capability(&c->emit, 56); /* StorageImageWriteWithoutFormat */
-            blend_image_type = spv_emit_type_image(&c->emit, c->f32_type, SPV_DIM_2D, 0, array, 1, 2, 0);
-            blend_image = spv_emit_variable(&c->emit, 0, blend_image_type);
+            spv_emit_capability(&c->emit, SPV_CAPABILITY_STORAGE_IMAGE_MULTISAMPLE);
+            if (array) spv_emit_capability(&c->emit, SPV_CAPABILITY_IMAGE_MS_ARRAY);
+            spv_emit_capability(&c->emit, SPV_CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT);
+            blend_image_type =
+                spv_emit_type_image(&c->emit, c->f32_type, SPV_DIM_2D, 0, array, 1, 2, SPV_IMAGE_FORMAT_UNKNOWN);
+            blend_image = spv_emit_variable(&c->emit, SPV_STORAGE_UNIFORM_CONSTANT, blend_image_type);
             u32 set = shader_vk_set(ST_FS), binding = SNX_VKB_BLEND + (u32)image_info.nimg;
-            spv_emit_decorate(&c->emit, blend_image, 34, &set, 1);
-            spv_emit_decorate(&c->emit, blend_image, 33, &binding, 1);
+            spv_emit_decorate(&c->emit, blend_image, SPV_DECORATION_DESCRIPTOR_SET, &set, 1);
+            spv_emit_decorate(&c->emit, blend_image, SPV_DECORATION_BINDING, &binding, 1);
         } else
             blend_image = spv_emit_storage_image(&c->emit, c->f32_type, shader_vk_set(ST_FS), SNX_VKB_BLEND + (u32)image_info.nimg,
                                                  SPV_DIM_2D, array, 0, &blend_image_type);
-        spv_emit_decorate(&c->emit, blend_image, 23, NULL, 0); /* Coherent */
+        spv_emit_decorate(&c->emit, blend_image, SPV_DECORATION_COHERENT, NULL, 0);
         interfaces[count++] = blend_image;
     }
     if (needs_scale || needs_texel_scale) {
@@ -2450,17 +2493,17 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         if (stage == ST_FS && (needs_frag_ndc || capture_output || needs_texel_scale)) {
             u32 members[5] = {vec4, vec4_u32, vec4, vec4_u32, vec4_u32}, offsets[5] = {16, 32, 80, 96, 112};
             u32 structure = spv_emit_type_struct(&c->emit, members, offsets, 5);
-            spv_emit_decorate(&c->emit, structure, 2, NULL, 0); /* Block */
-            push = spv_emit_variable(&c->emit, 9, structure);   /* PushConstant */
-            push_pointer = spv_emit_type_pointer(&c->emit, 9, c->f32_type);
+            spv_emit_decorate(&c->emit, structure, SPV_DECORATION_BLOCK, NULL, 0);
+            push = spv_emit_variable(&c->emit, SPV_STORAGE_PUSH_CONSTANT, structure);
+            push_pointer = spv_emit_type_pointer(&c->emit, SPV_STORAGE_PUSH_CONSTANT, c->f32_type);
         } else if (point_size && !point_size_used) {
             /* The first vector retains the viewport/draw ABI. Fixed point size has a separate vector at byte48,
                beyond the fragment-stage vectors, so every graphics stage can use one shared pipeline layout. */
             u32 members[2] = {vec4, vec4}, offsets[2] = {0, 48};
             u32 structure = spv_emit_type_struct(&c->emit, members, offsets, 2);
-            spv_emit_decorate(&c->emit, structure, 2, NULL, 0); /* Block */
-            push = spv_emit_variable(&c->emit, 9, structure);   /* PushConstant */
-            push_pointer = spv_emit_type_pointer(&c->emit, 9, c->f32_type);
+            spv_emit_decorate(&c->emit, structure, SPV_DECORATION_BLOCK, NULL, 0);
+            push = spv_emit_variable(&c->emit, SPV_STORAGE_PUSH_CONSTANT, structure);
+            push_pointer = spv_emit_type_pointer(&c->emit, SPV_STORAGE_PUSH_CONSTANT, c->f32_type);
         } else
             push =
                 spv_emit_push_vec4(&c->emit, vec4, c->f32_type, stage == ST_FS ? 16 : 0,
@@ -2475,10 +2518,10 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     }
     spv_emit_entry_str(&c->emit, (SpvShaderStage)stage, fn, "main", interfaces, count); /* ST_ is SPIR-V's model */
     if (xfb_on && !xfb_stores) {
-        spv_emit_capability(&c->emit, 53);               /* TransformFeedback */
-        spv_emit_execution_mode(&c->emit, fn, 11, 0, 0); /* Xfb */
+        spv_emit_capability(&c->emit, SPV_CAPABILITY_TRANSFORM_FEEDBACK);
+        spv_emit_execution_mode(&c->emit, fn, SPV_MODE_XFB, 0, 0);
     }
-    if (stage == ST_TCS) spv_emit_execution_mode(&c->emit, fn, 26, 1, out_vertices); /* OutputVertices */
+    if (stage == ST_TCS) spv_emit_execution_mode(&c->emit, fn, SPV_MODE_OUTPUT_VERTICES, 1, out_vertices);
     if (stage == ST_TES) {
         /* 0xC8: the domain (isolines, triangles, quads), the spacing (equal, fractional odd and even) and the output
            (points, lines, triangles clockwise and counterclockwise) */
@@ -2486,7 +2529,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         spv_emit_execution_mode(&c->emit, fn, domain == 0 ? 25 : domain == 1 ? 22 : 24, 0, 0);
         spv_emit_execution_mode(&c->emit, fn, spacing == 0 ? 1 : spacing == 1 ? 3 : 2, 0, 0);
         spv_emit_execution_mode(&c->emit, fn, output == 2 ? 4 : 5, 0, 0); /* VertexOrderCw, VertexOrderCcw */
-        if (output == 0) spv_emit_execution_mode(&c->emit, fn, 10, 0, 0); /* PointMode */
+        if (output == 0) spv_emit_execution_mode(&c->emit, fn, SPV_MODE_POINT_MODE, 0, 0);
     }
     if (stage == ST_GS) {
         /* the input primitive, the SPH's output topology and vertices, and its threads per input primitive */
@@ -2503,21 +2546,22 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                                                    : 22,
                                 0, 0);
         spv_emit_execution_mode(&c->emit, fn, topology == 1 ? 27 : topology == 6 ? 28 : 29, 0, 0);
-        spv_emit_execution_mode(&c->emit, fn, 26, 1,
+        spv_emit_execution_mode(&c->emit, fn, SPV_MODE_OUTPUT_VERTICES, 1,
                                 passthrough        ? (in_vertices == 4   ? 2
                                                       : in_vertices == 6 ? 3
                                                                          : in_vertices)
                                 : (sph[4] & 0xfff) ? sph[4] & 0xfff
                                                    : 1);
-        spv_emit_execution_mode(&c->emit, fn, 0, 1, invocations ? invocations : 1); /* Invocations */
+        spv_emit_execution_mode(&c->emit, fn, SPV_MODE_INVOCATIONS, 1, invocations ? invocations : 1);
     }
     if (stage == ST_CS) spv_emit_local_size(&c->emit, fn, si->cs_local[0], si->cs_local[1], si->cs_local[2]);
     if (stage == ST_FS) spv_emit_fragment_origin_upper_left(&c->emit, fn);
-    if (advanced_blend || si->late_depth) spv_emit_execution_mode(&c->emit, fn, 5366, 0, 0); /* PixelInterlockOrderedEXT */
-    if (post_depth_coverage) spv_emit_execution_mode(&c->emit, fn, 4446, 0, 0); /* PostDepthCoverage */
+    if (advanced_blend || si->late_depth)
+        spv_emit_execution_mode(&c->emit, fn, SPV_MODE_PIXEL_INTERLOCK_ORDERED_EXT, 0, 0);
+    if (post_depth_coverage) spv_emit_execution_mode(&c->emit, fn, SPV_MODE_POST_DEPTH_COVERAGE, 0, 0);
     if (stage == ST_FS && (si->early_fragment_tests || si->coverage_early_tests ||
                           (si->advanced_blend_mask & SH_BLEND_EARLY_TESTS)))
-        spv_emit_execution_mode(&c->emit, fn, 9, 0, 0); /* EarlyFragmentTests */
+        spv_emit_execution_mode(&c->emit, fn, SPV_MODE_EARLY_FRAGMENT_TESTS, 0, 0);
     if (depth_output) spv_emit_fragment_depth_replacing(&c->emit, fn);
     spv_emit_float_controls(&c->emit, fn, fp32_flush && !fp32_preserve && can_flush == SH_FTZ_MODE, can_preserve,
                             needs_f64 && can_preserve_f64);
@@ -2583,7 +2627,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         /* the guarantee those lanes need, and the one a quad's have for derivatives where the device gives it */
         if (structure && (converge || (quad_flow && g_shader_maximal_reconvergence))) {
             spv_emit_extension(&c->emit, "SPV_KHR_maximal_reconvergence");
-            spv_emit_execution_mode(&c->emit, fn, 6023, 0, 0); /* MaximallyReconvergesKHR */
+            spv_emit_execution_mode(&c->emit, fn, SPV_MODE_MAXIMALLY_RECONVERGES_KHR, 0, 0);
         }
         if (structure) {
             se.st = structure;
@@ -2614,8 +2658,9 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         u32 one = spv_emit_constant_f32(&c->emit, c->f32_type, 1);
         u32 value[4] = {one, one, one, one};
         spv_emit_store(&c->emit, capture_output, spv_emit_constant_vec4(&c->emit, vec4, value));
-        u32 pointer = SPV(&c->emit, SPV_OP_ACCESS_CHAIN, spv_emit_type_pointer(&c->emit, 9, c->u32_type), push,
-                          shader_u32(c, 4), c->zero);
+        u32 pointer =
+            SPV(&c->emit, SPV_OP_ACCESS_CHAIN, spv_emit_type_pointer(&c->emit, SPV_STORAGE_PUSH_CONSTANT, c->u32_type),
+                push, shader_u32(c, 4), c->zero);
         c->primitive_base = spv_emit_load(&c->emit, c->u32_type, pointer);
     }
     if (capture_tiles) {
@@ -2628,15 +2673,31 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                                    spv_emit_load(&c->emit, vec4, fragcoord), layer, live);
     }
     /* in the function's first block, so that every read has them */
+    if (quad_lane) {
+        u32 parity[2];
+        for (u32 k = 0; k < 2; k++) {
+            u32 pixel = spv_emit_unary(&c->emit, SPV_OP_CONVERT_F_TO_U, c->u32_type,
+                                       shader_input_component(c, vec4, fragcoord, c->f32_type, k));
+            parity[k] = spv_emit_binary(&c->emit, SPV_OP_BITWISE_AND, c->u32_type, pixel, shader_u32(c, 1));
+            c->quad_sign[k] =
+                spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->f32_type,
+                                 spv_emit_binary(&c->emit, SPV_OP_I_NOT_EQUAL, c->bool_type, parity[k], c->zero),
+                                 spv_emit_constant_f32(&c->emit, c->f32_type, -1.0f),
+                                 spv_emit_constant_f32(&c->emit, c->f32_type, 1.0f));
+        }
+        c->quad_lane = spv_emit_binary(
+            &c->emit, SPV_OP_BITWISE_OR, c->u32_type, parity[0],
+            spv_emit_binary(&c->emit, SPV_OP_SHIFT_LEFT_LOGICAL, c->u32_type, parity[1], shader_u32(c, 1)));
+    }
     u32 frag_ndc[2] = {0, 0}, pv_weight[2] = {0, 0};
     if (needs_frag_ndc) shader_frag_ndc(c, fragcoord, vec4, push, push_pointer, frag_ndc);
     if (pv_mask) shader_frag_weights(c, vec4, pv_position, pv_flat, frag_ndc, pv_weight);
     for (clip = 0; clip < clip_count; clip++) {
         u32 index = shader_u32(c, clip);
         u32 ptr = stage == ST_TCS
-            ? spv_emit_interface_scalar_pointer(&c->emit, 3, c->f32_type, clip_output,
-                 shader_input(c, c->u32_type, invocation_id), index)
-            : spv_emit_output_element_pointer(&c->emit, c->f32_type, clip_output, index);
+                      ? spv_emit_interface_scalar_pointer(&c->emit, SPV_STORAGE_OUTPUT, c->f32_type, clip_output,
+                                                          shader_input(c, c->u32_type, invocation_id), index)
+                      : spv_emit_output_element_pointer(&c->emit, c->f32_type, clip_output, index);
         spv_emit_store(&c->emit, ptr, zero_f);
     }
     if (has_flow && !structure) {
@@ -2889,7 +2950,10 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             if (shader_flow_has_cc(op) && B(w, 0, 5) != 15)
                 condition = cc_and(c, condition, shader_cc_test(c, B(w, 0, 5)));
             if (skip_helper) condition = cc_and(c, condition, cc_not(c, shader_lane_dead(c)));
-            if (shader_pure_op(op) && !skip_helper && !(shader_flow_has_cc(op) && B(w, 0, 5) != 15))
+            /* a fragment's lone-lane VOTE and SHFL change nothing but their writes either, and a SHFL's reads
+               through derivatives want every pixel of the quad in step, whose guards may differ */
+            if ((shader_pure_op(op) || (quad_lane && (op == O_VOTE || op == O_SHFL))) && !skip_helper &&
+                !(shader_flow_has_cc(op) && B(w, 0, 5) != 15))
                 c->guard = condition;
             else {
                 u32 execute = spv_emit_id(&c->emit);

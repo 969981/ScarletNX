@@ -31,6 +31,7 @@
 #include "nx/hle/hle.h"
 #include "nx/hle/services/services.h"
 #include "nx/runtime/arm.h"
+#include "nx/runtime/main.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
 #include "common/utilities/common.h"
@@ -41,6 +42,8 @@
 #define SYM_MOUNT_ROM          "_ZN2nn2fs8MountRomEPKcPvm"
 #define SYM_MOUNT_ROM_NAME     "_ZN2nn2fs8MountRomEPKc"
 #define SYM_QUERY_ROM_CACHE    "_ZN2nn2fs22QueryMountRomCacheSizeEPm"
+#define SYM_MOUNT_ROM_PROGRAM  "_ZN2nn2fs8MountRomEPKciPvm"
+#define SYM_QUERY_ROM_PROGRAM  "_ZN2nn2fs22QueryMountRomCacheSizeEPmi"
 #define SYM_UNMOUNT            "_ZN2nn2fs7UnmountEPKc"
 #define SYM_OPEN_FILE          "_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci"
 #define SYM_CLOSE_FILE         "_ZN2nn2fs9CloseFileENS0_10FileHandleE"
@@ -81,14 +84,18 @@
 #define SYM_TIME_STAMP_RAW     "_ZN2nn2fs27GetFileTimeStampRawForDebugEPNS0_16FileTimeStampRawEPKc"
 #define SYM_COMMIT             "_ZN2nn2fs6CommitEPKc"
 #define SYM_IS_PATH_MOUNTED    "_ZN2nn2fs13IsPathMountedEPKc"
+#define SYM_IS_MOUNTED         "_ZN2nn2fs9IsMountedEPKc"
 #define SYM_PATH_MAX           "_ZN2nn2fs16GetPathLengthMaxEPmPKc"
 #define SYM_ENTRY_NAME_MAX     "_ZN2nn2fs21GetEntryNameLengthMaxEPmPKc"
 #define SYM_UTF16_PATH_MAX     "_ZN2nn2fs21GetUtf16PathLengthMaxEPbPmPKc"
 #define SYM_UTF16_NAME_MAX     "_ZN2nn2fs26GetUtf16EntryNameLengthMaxEPbPmPKc"
 #define SYM_COMMIT_OPT         "_ZN2nn2fs6CommitEPKcRKNS0_12CommitOptionE"
 #define SYM_COMMIT_SAVE        "_ZN2nn2fs14CommitSaveDataEPKc"
+#define SYM_COMMIT_NAMES       "_ZN2nn2fs6CommitEPKPKci"
 #define SYM_READ_CACHE_LIST    "_ZN2nn2fs20ReadCacheStorageListEPiPNS0_16CacheStorageInfoENS0_22CacheStorageListHandleEi"
 #define SYM_CLOSE_CACHE_LIST   "_ZN2nn2fs21CloseCacheStorageListENS0_22CacheStorageListHandleE"
+#define SYM_ENABLE_FILE_CACHE  "_ZN2nn2fs29EnableIndividualFileDataCacheEPKcPvm"
+#define SYM_DISABLE_FILE_CACHE "_ZN2nn2fs30DisableIndividualFileDataCacheEPKc"
 
 /* a Result of the fs module (2): the description above bit 9 */
 #define FSR(d) ((u32)2 | (u32)(d) << 9)
@@ -107,6 +114,7 @@ enum {
     R_NEGATIVE_SIZE = FSR(6062),
     R_NULL_ARGUMENT = FSR(6063),
     R_BAD_MOUNT_NAME = FSR(6065),
+    R_COMMIT_NAME_COUNT = FSR(6071), /* Commit of more mounts than COMMIT_NAMES_MAX */
     R_BAD_OPEN_MODE = FSR(6072),
     R_BAD_DIR_MODE = FSR(6074),
     R_READ_ONLY = FSR(6364),       /* the RomFS refuses a change of its tree */
@@ -482,16 +490,19 @@ static u64 rom_cache_size(const NRom* rm) {
 /* ---- handles */
 
 /* A native handle as the game holds it, of a file or a directory (dir), slot i at generation gen. A 64-bit game's:
-   bit 63, the kind in bit 62, the generation and the index. A 32-bit game's FileHandle and DirectoryHandle are one
-   pointer of 4 bytes: bit 0 set, which no pointer to the SDK's accessor (a heap object) has, bit 1 for a directory,
-   the index in bits 2 to 11 and the low 20 bits of the generation above them */
+   bit 63, the kind in bit 62, the generation and the index above the low 4 bits, which stay 0: the console's handle
+   is a pointer to an accessor the SDK allocates, and a game may keep flags of its own in those bits and mask them off
+   before it passes the handle back. A 32-bit game's FileHandle and DirectoryHandle are one pointer of 4 bytes: bit 0
+   set, which no pointer to the SDK's accessor (a heap object) has, bit 1 for a directory, the index in bits 2 to 11
+   and the low 20 bits of the generation above them */
 #define H32_NATIVE   1u
 #define H32_DIR      2u
 #define H32_GEN_MASK 0xfffffu
+#define H64_LOW      4 /* the low bits a 64-bit handle leaves 0 */
 typedef char nnfs_index_fits_a_handle32[NFILES <= 1024 && NDIRS <= 1024 ? 1 : -1]; /* the index's 10 bits */
 static u64 handle_make(int dir, u32 gen, u32 i) {
     if (g_arm_mod) return H32_NATIVE | (dir ? H32_DIR : 0) | i << 2 | (gen & H32_GEN_MASK) << 12;
-    return (dir ? TAG_DIR : TAG_FILE) | (u64)gen << 32 | (u64)i;
+    return (dir ? TAG_DIR : TAG_FILE) | (u64)gen << 32 | (u64)i << H64_LOW;
 }
 /* h's slot and generation when it is a native handle of the kind, and the bits of a slot's generation it holds: 1 */
 static int handle_parts(u64 h, int dir, u32* i, u32* gen, u32* gen_mask) {
@@ -502,8 +513,8 @@ static int handle_parts(u64 h, int dir, u32* i, u32* gen, u32* gen_mask) {
         *gen_mask = H32_GEN_MASK;
         return 1;
     }
-    if ((h & TAG_MASK) != (dir ? TAG_DIR : TAG_FILE)) return 0;
-    *i = (u32)(h & 0xffffffffu);
+    if ((h & TAG_MASK) != (dir ? TAG_DIR : TAG_FILE) || (h & ((1u << H64_LOW) - 1))) return 0;
+    *i = (u32)(h & 0xffffffffu) >> H64_LOW;
     *gen = (u32)(h >> 32) & 0x3fffffffu;
     *gen_mask = 0x3fffffffu;
     return 1;
@@ -531,6 +542,10 @@ static int is_native(u64 h) { return g_arm_mod ? (h & H32_NATIVE) != 0 : (h & TA
 /* a native handle that no live object has: the game passed a closed one, which the SDK's own code would read freed
    memory for */
 SNX_NORETURN static void stale(const char* function, u64 h) {
+    if (!g_arm_mod && (h & ((1u << H64_LOW) - 1)))
+        fatal("nn::fs::%s: the game passed the handle %llx, whose low %d bits a native handle has clear: flags of the "
+              "game's own left in it, or a save state from a runtime that put a handle's index there",
+              function, (unsigned long long)h, H64_LOW);
     fatal("nn::fs::%s: the game passed the handle %llx, which is closed", function, (unsigned long long)h);
 }
 /* the native file of h, with the lock taken: the caller unlocks */
@@ -602,15 +617,19 @@ static u32 mount_image(CPU* c, const char* function, u64 name, u64 cache, u64 ca
     return 0;
 }
 
-u32 nnfs_mount_rom(CPU* c, u64 name, u64 cache, u64 cache_size) {
+/* MountRom(name, cache, cache_size), whose own code is the function symbol's */
+static u32 mount_rom(CPU* c, const char* symbol, u64 name, u64 cache, u64 cache_size) {
     pm_lock(&g_nnfs.lock);
     if (game_rom()) {
         pm_unlock(&g_nnfs.lock);
-        return (u32)sdk_own(c, SYM_MOUNT_ROM);
+        return (u32)sdk_own(c, symbol);
     }
     u32 r = mount_image(c, "MountRom", name, cache, cache_size, 0);
     pm_unlock(&g_nnfs.lock);
     return done("MountRom", r);
+}
+u32 nnfs_mount_rom(CPU* c, u64 name, u64 cache, u64 cache_size) {
+    return mount_rom(c, SYM_MOUNT_ROM, name, cache, cache_size);
 }
 
 /* MountRom(name): the SDK allocates its cache itself (SetAllocator's allocator) and frees it at Unmount; the native
@@ -629,17 +648,36 @@ u32 nnfs_mount_rom_name(CPU* c, u64 name) {
     return done("MountRom", r);
 }
 
-u32 nnfs_query_mount_rom_cache_size(CPU* c, u64 size) {
+static u32 query_rom_cache_size(CPU* c, const char* symbol, u64 size) {
     pm_lock(&g_nnfs.lock);
     if (game_rom()) {
         pm_unlock(&g_nnfs.lock);
-        return (u32)sdk_own(c, SYM_QUERY_ROM_CACHE);
+        return (u32)sdk_own(c, symbol);
     }
     u64 n = rom_cache_size(rom_at(0));
     pm_unlock(&g_nnfs.lock);
     if (!size) return done("QueryMountRomCacheSize", R_NULL_ARGUMENT);
     put_size(c, size, n);
     return 0;
+}
+u32 nnfs_query_mount_rom_cache_size(CPU* c, u64 size) { return query_rom_cache_size(c, SYM_QUERY_ROM_CACHE, size); }
+
+/* MountRom and QueryMountRomCacheSize for the program of the application at index, whose RomFS the SDK opens: this
+   program's own when index is this program's (g_program, 0 for a game of one program), answered as the overloads
+   without an index are. The native layer has no other program's RomFS, so the game stops, naming both */
+static void own_program(const char* function, i32 index) {
+    if (index != g_program)
+        fatal("nn::fs::%s: the game asks for the RomFS of program %d of its application, and this is program %d, the "
+              "only one whose RomFS the runtime mounts",
+              function, index, g_program);
+}
+u32 nnfs_mount_rom_program(CPU* c, u64 name, i32 index, u64 cache, u64 cache_size) {
+    own_program("MountRom", index);
+    return mount_rom(c, SYM_MOUNT_ROM_PROGRAM, name, cache, cache_size);
+}
+u32 nnfs_query_mount_rom_cache_size_program(CPU* c, u64 size, i32 index) {
+    own_program("QueryMountRomCacheSize", index);
+    return query_rom_cache_size(c, SYM_QUERY_ROM_PROGRAM, size);
 }
 
 /* The data storage of id (an add-on content's, or a system archive's, as OpenDataStorageByDataId gives it), its tables
@@ -815,6 +853,16 @@ u32 nnfs_mount_temporary_storage(CPU* c, u64 name) {
     return mount_save(c, "MountTemporaryStorage", name, g_nobody, SAVE_TEMPORARY, 0, 0);
 }
 
+/* IsMounted: a native mount's name is mounted, though the SDK's own table never holds it (a game that asks before it
+   opens a file would refuse every file of the mount); any other name is that table's to answer */
+int nnfs_is_mounted(CPU* c, u64 name) {
+    pm_lock(&g_nnfs.lock);
+    int m = mount_named(name ? gstr(c, name) : NULL);
+    pm_unlock(&g_nnfs.lock);
+    if (m >= 0) return 1;
+    return (int)(sdk_own(c, SYM_IS_MOUNTED) & 1);
+}
+
 void nnfs_unmount(CPU* c, u64 name) {
     pm_lock(&g_nnfs.lock);
     int m = mount_named(name ? gstr(c, name) : NULL);
@@ -951,7 +999,15 @@ static u32 file_read(const char* function, u64 h, u64 read_out, int want_read, i
         return R_OUT_OF_RANGE;
     /* the game's RomFS is one storage whatever mount reads it (the SDK read it through one IStorage); another
        image is its own */
-    fs_pace_read(rm->game ? (const void*)&g_hle.fs : (const void*)&rm->st, data + (u64)offset, count);
+    u64 wait = fs_pace_read(rm->game ? (const void*)&g_hle.fs : (const void*)&rm->st, data + (u64)offset, count);
+    if (wait) {
+        /* off the thread's core, as the console's storage read blocks the thread and its core runs the others: a
+           movie's decoder, on the core of its read-ahead, set up too late to free its first buffers otherwise */
+        KThread* t = kthread_cur();
+        core_leave(t);
+        plat_sleep_ns((i64)wait);
+        core_enter(t);
+    }
     *n = count;
     return 0;
 }
@@ -1464,15 +1520,69 @@ u32 nnfs_get_file_time_stamp_raw(CPU* c, u64 stamp, u64 path) {
     return time_stamp(c, SYM_TIME_STAMP_RAW, "GetFileTimeStampRawForDebug", stamp, path, 1);
 }
 
-/* a commit of a native mount: a save writes its note, and the RomFS has nothing to commit */
-static u32 commit(CPU* c, const char* symbol, const char* function, u64 name) {
-    pm_lock(&g_nnfs.lock);
-    int m = mount_named(name ? gstr(c, name) : NULL);
-    u32 r = 0;
-    if (m < 0) {
-        pm_unlock(&g_nnfs.lock);
-        return (u32)sdk_own(c, symbol);
+/* ---- a file's data cache
+
+   EnableIndividualFileDataCache (SDK 6 on; read in 6.5, 7.3, 11.4, 16.2 and 20.5) has the SDK read a whole file into the
+   game's buffer and answer the file's later reads from it, on a mount that takes such a cache: a RomFS or a save, and
+   not the SD card (its mount registers without one). Here a read is the host's own on every native mount, so no cache
+   is kept and the buffer stays as the game gave it. What remains are the SDK's checks, in its order: a buffer
+   (NullptrArgument), and on a mount that takes a cache the file, opened to read (that open's Result), and room for it
+   (InvalidSize, 6062). A second Enable of one file, which the SDK refuses with fs 70, is not seen: nothing is kept to
+   see it. Disable ends a cache that was never made, as the SDK's does for a file it does not hold */
+
+/* whether native mount m is the SD card's (lock held): the mount the SDK keeps no file data cache on */
+static int mount_is_sd_card(int m) {
+    FsNode* sd;
+    if (g_hle.nnfs.mounts[m].kind != MOUNT_SAVE || fs_sd_root(&sd)) return 0;
+    fs_lock();
+    int is = mount_root(m) == sd;
+    fs_root_release(sd);
+    fs_unlock();
+    return is;
+}
+u32 nnfs_enable_individual_file_data_cache(CPU* c, u64 path, u64 buffer, u64 size) {
+    char p[PATH_MAX_LEN + 1];
+    u32 r;
+    int m = path_take(c, path, p, &r);
+    if (m < 0) return (u32)sdk_own(c, SYM_ENABLE_FILE_CACHE);
+    if (!r && !buffer) r = R_NULL_ARGUMENT;
+    u64 n = 0;
+    if (!r && g_hle.nnfs.mounts[m].kind == MOUNT_ROM) {
+        const NRom* rm = rom_at(g_hle.nnfs.mounts[m].rom);
+        int is_dir = 0;
+        u32 e = 0;
+        r = rom_lookup(rm, p, &is_dir, &e);
+        if (!r && is_dir) r = R_PATH_NOT_FOUND;
+        if (!r) n = rom_file_u64(rm, e, 16);
+    } else if (!r && !mount_is_sd_card(m)) {
+        FileData fd = {0};
+        fs_lock();
+        r = fs_file_open(mount_root(m), p, 1, &fd);
+        if (!r) {
+            n = fd.node->size;
+            fs_file_close(&fd);
+        }
+        fs_unlock();
     }
+    if (!r && (i64)n > (i64)size) r = R_NEGATIVE_SIZE; /* InvalidSize, which a negative size also gives */
+    pm_unlock(&g_nnfs.lock);
+    return done("EnableIndividualFileDataCache", r);
+}
+void nnfs_disable_individual_file_data_cache(CPU* c, u64 path) {
+    char p[PATH_MAX_LEN + 1];
+    u32 r;
+    int m = path_take(c, path, p, &r);
+    if (m < 0) {
+        sdk_own(c, SYM_DISABLE_FILE_CACHE);
+        return;
+    }
+    pm_unlock(&g_nnfs.lock);
+    if (r) stop("DisableIndividualFileDataCache", r); /* the SDK stops on any failure of it */
+}
+
+/* a commit of native mount m (lock held): a save writes its note, and the RomFS has nothing to commit */
+static u32 commit_mount(int m) {
+    u32 r = 0;
     if (g_hle.nnfs.mounts[m].kind == MOUNT_SAVE) {
         const FsData* fs = &g_hle.fs.fss[g_hle.nnfs.mounts[m].fss];
         fs_lock();
@@ -1483,6 +1593,16 @@ static u32 commit(CPU* c, const char* symbol, const char* function, u64 name) {
             fs_root_commit(fs->root, (int)fs->noted);
         fs_unlock();
     }
+    return r;
+}
+static u32 commit(CPU* c, const char* symbol, const char* function, u64 name) {
+    pm_lock(&g_nnfs.lock);
+    int m = mount_named(name ? gstr(c, name) : NULL);
+    if (m < 0) {
+        pm_unlock(&g_nnfs.lock);
+        return (u32)sdk_own(c, symbol);
+    }
+    u32 r = commit_mount(m);
     pm_unlock(&g_nnfs.lock);
     return done(function, r);
 }
@@ -1493,11 +1613,35 @@ u32 nnfs_commit_option(CPU* c, u64 name, u64 option) {
 }
 u32 nnfs_commit_save_data(CPU* c, u64 name) { return commit(c, SYM_COMMIT_SAVE, "CommitSaveData", name); }
 
+/* Commit(names, count), the mounts the SDK commits together, at most COMMIT_NAMES_MAX of them: the array checked
+   first, then the count, which may be 0. Each native mount commits as Commit does, in the order given; the console
+   commits them in one go, and here a commit that fails comes after the ones before it are made. A name the native
+   layer did not mount runs the SDK's own code for the whole call */
+#define COMMIT_NAMES_MAX 10
+u32 nnfs_commit_names(CPU* c, u64 names, i32 count) {
+    int m[COMMIT_NAMES_MAX];
+    u32 r = 0;
+    if (!names) return done("Commit", R_NULL_ARGUMENT);
+    if ((u32)count > COMMIT_NAMES_MAX) return done("Commit", R_COMMIT_NAME_COUNT);
+    pm_lock(&g_nnfs.lock);
+    for (i32 k = 0; k < count; k++) {
+        u64 name = snx_ld_le64(hook_host(c, names + 8 * (u64)k));
+        m[k] = mount_named(name ? gstr(c, name) : NULL);
+        if (m[k] < 0) {
+            pm_unlock(&g_nnfs.lock);
+            return (u32)sdk_own(c, SYM_COMMIT_NAMES);
+        }
+    }
+    for (i32 k = 0; k < count && !r; k++) r = commit_mount(m[k]);
+    pm_unlock(&g_nnfs.lock);
+    return done("Commit", r);
+}
+
 /* ---- save data and cache storage that the console makes through am and the file system service. The host's folders
    take what a game writes, so nothing is ever missing space: a save and a cache storage are made when they are
    mounted (fs_save_root), and these answer as the runtime's am and fs services do */
 
-#define LIST_HANDLE (TAG_DIR | 0xffffffffu) /* the native cache storage list: an index no directory has */
+#define LIST_HANDLE (TAG_DIR | 0xfffffff0u) /* the native cache storage list: generation 0, which no directory has */
 
 u32 nnfs_ensure_save_data(CPU* c, u64 uid) {
     (void)c, (void)uid;

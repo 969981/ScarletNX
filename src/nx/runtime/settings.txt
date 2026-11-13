@@ -280,6 +280,17 @@ setting Vulkan Video decode
     help 1 = H.264 and AV1 movies decode on the GPU with Vulkan Video (FFmpeg's Vulkan decoder), each where the GPU and
     help its driver have a decode queue for it. Experimental. 0 = FFmpeg decodes them on the CPU. VP9 movies always
     help decode on the CPU
+setting Apple video decode
+    key apple_video
+    only macos
+    label VideoToolbox decode
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help 1 = AV1 movies decode on the Apple GPU's media engine with VideoToolbox, and the CPU only copies the picture
+    help into the game's image. 0 = FFmpeg decodes them on the CPU with dav1d. A stream the media engine doesn't take
+    help decodes on the CPU either way, and the log says which one has it
 setting Vulkan driver
     key vulkan_driver
     only macos
@@ -1361,6 +1372,19 @@ setting Compute dispatches
     startup
     words Off|On
     help 0 = skips every compute shader dispatch, to see whether a bug is in one
+setting HMMA in half floats
+    key hmma_f16
+    int 0 1
+    default 0
+    startup
+    words Off|On
+    help An SM86 HMMA's products and their sum in half floats, two products an instruction, where the f32 sum the
+    help console's tensor core keeps takes two: on a device whose matrix unit the driver does not offer (every
+    help MoltenVK so far), that is 2 and a half times the frames a second one game's upscaler gets. A result is then
+    help up to 0.4% of its products' size off, more than that of itself where they cancel, and a product or partial
+    help sum past 65504 is an infinity. 0 = the f32 sum, as exact as the console's. A device with the mixed dot
+    help product (VK_VALVE_shader_mixed_float_dot_product) or without shaderFloat16 keeps the f32 sum, and the log
+    help says so
 setting Vulkan allocation cap
     key vk_max_allocation_mb
     int 0 INT_MAX
@@ -1593,6 +1617,15 @@ setting CTR SVC trace
     words Off|Failures|All
     help 1 = logs each SVC the 3DS game makes that answers a failure (r0 with its top bit set), 2 = every SVC, with
     help the thread, its pc and r0 to r3 before and after
+setting CTR stand in
+    key ctr_stand_in
+    int 0 2
+    default 1
+    words Off|On|Every draw
+    help 1 = with async_pipelines=1, on a GPU with shader objects, a draw whose shaders are still being made is drawn
+    help with stand-in shaders, one that runs the vertex program from a buffer and one that reads the texture
+    help environment as it goes, where they draw it as its own would, instead of being skipped; 0 skips it; 2 draws
+    help every draw they draw with them, to test them
 setting CTR GPU trace
     key ctr_gpu_trace
     int 0 1
@@ -1695,9 +1728,10 @@ setting Vita lockstep steps
 
 # ---- the Vulkan extensions ----
 
-# One setting per Vulkan extension the Switch's renderer can use (gpu/vk/device.c), auto by default: ScarletNX decides
-# whether to use it (gpu/vk/extension_bans.c, by the extension bans), and the driver says whether it is there.
-# settingsgen checks each against the Khronos registry and makes its key, the name in lowercase, and help
+# One setting per Vulkan extension the renderers can use (the Switch's gpu/vk/device.c, the 3DS's), auto by default:
+# ScarletNX decides whether to use it (common/gpu/vk/extension_bans.c, by the extension bans), and the driver says
+# whether it is there. settingsgen checks each against the Khronos registry and makes its key, the name in lowercase,
+# and help
 table g_vk_extensions_ini vulkan
 setting @VK_ANDROID_external_memory_android_hardware_buffer
 setting @VK_EXT_attachment_feedback_loop_dynamic_state
@@ -1734,6 +1768,7 @@ setting @VK_EXT_robustness2
 setting @VK_EXT_sample_locations
 setting @VK_EXT_shader_atomic_float
 setting @VK_EXT_shader_demote_to_helper_invocation
+setting @VK_EXT_shader_object
 setting @VK_EXT_transform_feedback
 setting @VK_EXT_vertex_attribute_divisor
 setting @VK_EXT_vertex_input_dynamic_state
@@ -1935,5 +1970,14 @@ setting GBA covers
     help box from libretro-thumbnails, downloaded as the game is made: the ROM's CRC-32 names the game in
     help libretro-database's No-Intro list, and the box under that name goes in the game's folder as icon.png. A ROM the
     help list does not have, or a game with no box there, keeps Wimsy and its row says which name was looked for
+setting GBA colors
+    label Colors
+    key gba_color
+    text 8
+    default gba
+    words gba=GBA screen|raw=Raw
+    help The colors a GBA game shows. GBA screen = as the original GBA's unlit screen showed them: the game's colors,
+    help painted strong for that screen, come out softer and darker (near's color emulation article, Talarubi's
+    help formula). Raw = as the game writes them, the same as mGBA without a shader
 
 section GBA: g_gba_ini    launcher

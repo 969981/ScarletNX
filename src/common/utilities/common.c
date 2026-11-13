@@ -1406,6 +1406,12 @@ static int copy_beside(const char* from, const char* folder, const char* leaf) {
     char* to = snx_path_join(folder, leaf);
     int rc = 0;
     if (!to) return snx_error("cannot name the Vulkan driver %s in %s", leaf, folder);
+    /* a build tree's driver can be another name of this game's, a link to it: removing the game's first would take
+       the source away, and the game has the driver already */
+    if (snx_same_file(from, to)) {
+        free(to);
+        return 0;
+    }
     if (snx_is_file(to) && snx_remove_tree(to))
         rc = snx_error("cannot remove the Vulkan driver at %s: %s", to, snx_os_error(error, sizeof error));
     else if (snx_link_file(from, to) && snx_copy_file(from, to))
@@ -1692,8 +1698,15 @@ char* snx_user_dir(int kind) {
     free(data);
     return dir;
 }
-/* the same folder, each resolved: one reached through a link is still it */
-static int same_folder(const char* a, const char* b) { return snx_path_within(a, b) && snx_path_within(b, a); }
+/* the same folder, each resolved: one reached through a link is still it. One this process cannot resolve (/sdcard to
+   a shell run as the Android app) is no folder of its, where snx_path_within counts it within anything */
+static int same_folder(const char* a, const char* b) {
+    char *ra = snx_absolute(a), *rb = snx_absolute(b);
+    int same = ra && rb && snx_path_within(ra, rb) && snx_path_within(rb, ra);
+    free(ra);
+    free(rb);
+    return same;
+}
 int snx_app_dir(const char* folder) {
     char *user = snx_user_data_dir(), *full = snx_absolute(folder);
     const char* base = full;
@@ -2260,6 +2273,22 @@ SnxU64 snx_footprint(void) {
 #else
     return 0;
 #endif
+}
+void snx_unit_line(char* out, size_t size, size_t done, size_t count, const char* name, const char* label, int cached,
+                   double seconds, SnxU64 used) {
+    if (cached)
+        snprintf(out, size, "  compiled block %zu/%zu: %s, %s (cached)", done, count, name, label);
+    else if (used)
+        snprintf(out, size, "  compiled block %zu/%zu: %s, %s (%.1f s, %llu MiB in use)", done, count, name, label,
+                 seconds, (unsigned long long)(used >> 20));
+    else
+        snprintf(out, size, "  compiled block %zu/%zu: %s, %s (%.1f s)", done, count, name, label, seconds);
+}
+void snx_report_unit(size_t done, size_t count, const char* name, const char* label, int cached, double seconds) {
+    char line[512];
+    snx_unit_line(line, sizeof line, done, count, name, label, cached, seconds, cached ? 0 : snx_footprint());
+    puts(line);
+    fflush(stdout);
 }
 SnxU64 snx_process_cpu_ns(void) {
 #ifdef _WIN32

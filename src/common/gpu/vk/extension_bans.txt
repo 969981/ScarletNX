@@ -2,7 +2,7 @@
 # Copyright 2026 the ScarletNX contributors
 #
 # The drivers known to break a Vulkan extension or feature: which driver, which versions, on which system, what breaks,
-# and who found it. The renderer reads this before it turns anything on (gpu/vk/extension_bans.c): an "off" line takes
+# and who found it. The renderer reads this before it turns anything on (common/gpu/vk/extension_bans.c): an "off" line takes
 # the extension out of the device's list, or turns the feature off where the renderer can do without it, and the log
 # says which, on which device, driver and version, and why. A "warn" line is only said: a ban another project lifted,
 # one not proven for the way this renderer uses the feature, or a part it has no way around. Compiled in
@@ -70,13 +70,23 @@ shaderInt64 | warn | qualcomm | * | any | * | has 64-bit integers and atomics tu
 # each exact, and adds them)
 OpConvertSToF | off | turnip | * | any | * | truncates a 32-bit signed integer it converts to a float, where the console rounds to nearest even (seen on an Adreno 610) | edenprobe's intmath suite on an Adreno 610 phone (2026-11-11) | edenprobe:intmath: a signed integer converts to the nearest float, ties to even | 2026-11-11 broken on 26.2.99 (Adreno 610) | -
 OpConvertUToF | off | turnip | * | any | * | truncates a 32-bit unsigned integer it converts to a float, where the console rounds to nearest even (seen on an Adreno 610) | edenprobe's intmath suite on an Adreno 610 phone (2026-11-11) | edenprobe:intmath: an unsigned integer converts to the nearest float, ties to even | 2026-11-11 broken on 26.2.99 (Adreno 610) | -
+Fma | warn | qualcomm | * | any | * | rounds an Fma's product before the add, as OpFMul then OpFAdd, where the console's FFMA keeps it exact (seen on an Adreno 830) | #1654 | edenprobe:fmath: a multiply and an add in one call | 2026-11-12 broken on 512.800.48 (Adreno 830) | -
+Fma | warn | turnip | * | any | * | rounds an Fma's product before the add, as OpFMul then OpFAdd, where the console's FFMA keeps it exact (seen on an Adreno 610) | #1654 | edenprobe:fmath: a multiply and an add in one call | 2026-11-12 broken on 26.2.99 (Adreno 610) | -
+OpImageSampleExplicitLod | warn | qualcomm | * | any | * | picks a Grad sample's level of detail from its gradients once for each 2x2 quad, so a pixel whose gradients differ from its quad neighbour's reads the neighbour's level (seen on an Adreno 830) | #1916 | edenprobe:lod: textureGrad along x picks levels 0 to 3 | 2026-11-12 broken on 512.800.48 (Adreno 830) | -
+OpImageSampleExplicitLod | warn | turnip | * | any | * | picks a Grad sample's level of detail from its gradients once for each 2x2 quad, so a pixel whose gradients differ from its quad neighbour's reads the neighbour's level (seen on an Adreno 610) | #1916 | edenprobe:lod: textureGrad along x picks levels 0 to 3 | 2026-11-12 broken on 26.2.99 (Adreno 610) | -
+VK_STENCIL_FACE_BACK_BIT | warn | qualcomm | * | any | * | gives back faces the front face's stencil reference when vkCmdSetStencilReference sets the two apart, in Z24S8 and ZF32_X24S8 (seen on an Adreno 830) | edenprobe 0.12.0's stencil suite on an Adreno 830 phone (2026-11-12) | edenprobe:stencil: z24s8: each winding takes its own face's reference | 2026-11-12 broken on 512.800.48 (Adreno 830) | -
+ClipDistance | warn | qualcomm | * | any | * | fails to make a pipeline whose evaluation stage reads clip distances and writes them on (VK_ERROR_UNKNOWN, its log saying the shader did not compile), and the draws that need it are dropped (seen on an Adreno 830) | edenprobe 0.12.0's geometry suite on an Adreno 830 phone (2026-11-12) | edenprobe:geometry: a positive first clip distance passed on by the evaluation stage clips nothing | 2026-11-12 broken on 512.800.48 (Adreno 830) | -
 
 # Presentation
 VK_KHR_present_id2 | off | nvidia | < 595.0.0 | any | * | hangs games at their first frames with present_id2 and present_wait2 (590.48, with Smooth Motion on) | DXVK dxvk_device_info.cpp:610, issue 5507 | new:edenprobe:a windowed run with frame_pacing=2 | never | -
 
 # Subgroup operations by stage (device.c: the stage leaves the ones whose programs the translator gives ballot, shuffle
-# and arithmetic, and a program of it that votes or shuffles runs each invocation as lane 0 alone)
+# and arithmetic, and a program of it that votes or shuffles runs each invocation as one lane alone)
 VK_SHADER_STAGE_GEOMETRY_BIT | off | turnip | * | any | * | lists the geometry stage for subgroup operations (supportedStages) and gives wrong ballot and shuffle results there, which lost a game's meshes and textures; Qualcomm's own driver does not list the stage | Eden PR 4344 (b846577037, 2026-09-01) | new:headless:a geometry shader's ballot and shuffle results read back | never | -
+
+# Shuffles whose index differs between lanes (device.c: an SM86 HMMA takes A and B through shared memory, its gathers
+# being such shuffles; SHFL and the other warp instructions keep them)
+OpGroupNonUniformShuffle | off | turnip | * | any | * | compiles a shuffle whose index differs between invocations into a loop, a hardware shuffle for each distinct index, as many as 32 for an HMMA's gather: an Adreno 610 ran the HMMA bench 35 times faster staged through shared memory (684.9 ms a dispatch to 19.6), where Qualcomm's driver on an Adreno 830 and RADV ran it 5.4 and 2.2 times slower so; no feature or property says it | Mesa's src/freedreno/ir3/ir3_lower_subgroups.c (make_shuffle_uniform, main of 2026-11-04: every Adreno with shfl); ScarletNX #2037 | new:headless:an HMMA program's dispatch timed gathered and staged, as shader_sm86_gpu's SNX_HMMA_BENCH does | 2026-11-13 a loop on 26.2.99 (Adreno 610) | -
 
 # Descriptors (without heaps, graphics descriptors use buffers or sets)
 VK_EXT_descriptor_heap | off | amd-proprietary | * | any | * | crashes a game at start with descriptor heaps (Adrenalin 26.7.1 on an RX 7900 XTX) | DXVK 076922bd24 (2026-09-19), issue 5837 | headless:--vk_descriptors_mode=3 | never | -

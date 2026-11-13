@@ -859,6 +859,9 @@ VkFmt vk_tic_format_3d(u32 w0, int srgb);
 int vk_format_storage_write(VkFormat f);
 /* whether a sampler may take the least or greatest of the texels its linear filter reads of f (min/max reduction) */
 int vk_format_minmax_filter(VkFormat f);
+/* the header component (its swizzle's 2 R or 3 G) a depth and stencil texture format keeps its stencil in, 0 for none;
+   and whether a header's first component is that one: a view of the stencil */
+u32 vk_tic_stencil_component(u32 format);
 int vk_tic_reads_stencil(const u32* tic);
 /* sRGB and linear views of the same bytes: the twin of a color format, or the format itself when it has none */
 VkFormat vk_srgb_as(VkFormat f, int srgb);
@@ -1080,9 +1083,20 @@ int vk_gfx_image_unrecorded(const Surf* s); /* s has a write-back whose copy isn
 void vk_gfx_image_mem_need(u64 gva, u64 size);
 void vk_gfx_image_guest_need(u64 cpu, u64 size); /* by guest memory (size ~0: all of it) */
 int vk_gfx_image_pending(u64 gva, u64 size);
+/* the same, but for the entries of self: its own writes are in self, which a texture of self samples as they are */
+int vk_gfx_image_pending_besides(u64 gva, u64 size, const Surf* self);
+/* the entries added so far, and pages they gained by a GMMU change: unchanged, no entry is pending where none was */
+u64 vk_gfx_image_adds(void);
 void vk_gfx_image_land(void);
-/* at a release: the storage images' write-backs recorded, to land once their submit is done (vk_lock) */
+/* at a release: the storage images' write-backs recorded, to land once their submit is done (vk_lock). A kept one
+   whose span the CPU hasn't touched stays kept, its image published when something needs its bytes */
 void vk_gfx_image_put_aside(void);
+/* the CPU is about to touch guest memory [cpu, cpu + size) (own.c's landing): the kept storage images a release
+   passed over there published first (vk_lock) */
+void vk_gfx_image_cpu_need(u64 cpu, u64 size);
+/* a draw reads [gva, gva + size) as a buffer (buffer.c buf_get): the kept storage images a release passed over there
+   published first, as their owner holds the bytes from before their draws (vk_lock) */
+void vk_gfx_image_read_need(u64 gva, u64 size);
 /* a recorded write-back waits to land (unsubmitted: in the submit being recorded) */
 int vk_gfx_image_in_flight(int unsubmitted);
 /* the submissions up to sub are done: the write-backs recorded in them land (cmd.c's landing, vk_lock) */
@@ -1105,6 +1119,8 @@ int vk_surf_publish(Surf* s);
    NULL when they couldn't be read back) */
 int vk_surf_keep_begin(Surf* s, VkImageKeep* k);
 int vk_surf_keep_end(Surf* s, const VkImageKeep* k, u8** original);
+/* k's owner still owns s's span whole: the CPU hasn't touched it since the bind (vk_lock) */
+int vk_surf_keep_whole(const Surf* s, const VkImageKeep* k);
 /* a release: the pitch-linear color targets drawn since the last one published, for the CPU to read. The block linear
    color targets drawn since then, which the CPU reads only now and then, are watched (own_watch): the CPU's first
    access publishes them (vk_rt_watch_hit). One the CPU read lately is published at once, as the pitch-linear ones */
@@ -1325,8 +1341,9 @@ int vk_guest_owned_whole(u64 gva, u64 size, u64* tag);
 int vk_guest_owned_by(u64 gva, u64 size, u64 serial);
 /* everything recorded so far done before what follows reads or writes what it did (the engines' steps) */
 void vk_all_barrier(VkCommandBuffer cb);
-/* rows rows of row_bytes from src (rows src_pitch apart) over dst's rows (dst_pitch apart), a region a row */
-void vk_copy_rows(VkCommandBuffer cb, VkBuffer src, u64 src_at, u32 src_pitch, VkBuffer dst, u64 dst_at, u32 dst_pitch,
+/* rows rows of row_bytes from src (rows src_pitch apart) over dst's rows (dst_pitch apart), a region a row; a negative
+   pitch steps down from row 0's offset */
+void vk_copy_rows(VkCommandBuffer cb, VkBuffer src, u64 src_at, i64 src_pitch, VkBuffer dst, u64 dst_at, i64 dst_pitch,
                   u32 row_bytes, u32 rows);
 
 /* texconv.c: a format the host can't take as it is (f->conv but ASTC, and packed depth and stencil), converted on the
@@ -1357,10 +1374,13 @@ int vk_tc_convert(VkCommandBuffer cb, const VkFmt* f, u32 w, u32 rows, u32 slice
    written in whole words: pairs rounded up to 4). 0 past the device's limits */
 int vk_tc_nv12_uv(VkCommandBuffer cb, u32 pairs, u32 rows, VkBuffer in, u64 u_at, u64 v_at, u32 in_pitch, VkBuffer out,
                   u64 out_at, u32 out_pitch);
+/* the bytes of SPIR-V the pipeline of a conversion of mode (texconv_modes.glsl's TC_*) compiles from, its first pass's
+   for the ASTC build */
+u64 vk_tc_spirv_bytes(u32 mode);
 /* the DMA copy engine's remap (gpu.h's GpuDmaOp) of lines lines: each line in at in_at + y * in_pitch (bytes, any
    alignment), out at out_at + y * out_pitch (words), which holds the destination's own bytes already for the
    components that keep them. 0 past the device's limits */
-int vk_tc_dma_remap(VkCommandBuffer cb, const GpuDmaOp* o, u32 lines, VkBuffer in, u64 in_at, u32 in_pitch,
+int vk_tc_dma_remap(VkCommandBuffer cb, const GpuDmaOp* o, u32 lines, VkBuffer in, u64 in_at, i64 in_pitch,
                     VkBuffer out, u64 out_at, u32 out_pitch);
 /* the 2D blit's gather (gpu.h's GpuBlit): rows rows of nb bytes into out at out_at (rows out_pitch bytes apart, a
    multiple of 4), pixels of bpp bytes from source rows in_pitch bytes apart at src_at in in, through the column and

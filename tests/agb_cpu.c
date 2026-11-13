@@ -616,6 +616,40 @@ int main(void) {
         result = 1;
     }
     {
+        /* ARM code in RAM that stores an instruction over its own code through r15: the console runs the one written
+           past the two it has fetched (r0 = 9 below, not 3), and the one it already fetched as it was (r1 = 4, not 8),
+           which the next pass through it runs as written */
+        static const uint32_t code[] = {
+            0xE59F201C, /* 0x600 ldr r2, [pc, #28]: mov r0, #9 */
+            0xE58F2004, /* 0x604 str r2, [pc, #4]: over 0x610 */
+            0xE59F2018, /* 0x608 ldr r2, [pc, #24]: mov r1, #8 */
+            0xE58F2000, /* 0x60C str r2, [pc]: over 0x614, which the CPU fetched already */
+            0xE3A00003, /* 0x610 mov r0, #3 */
+            0xE3A01004, /* 0x614 mov r1, #4 */
+            0xEAFFFFFE, /* 0x618 b . */
+            0,          /* 0x61C */
+            0,          /* 0x620 */
+            0xE3A00009, /* 0x624 mov r0, #9 */
+            0xE3A01008, /* 0x628 mov r1, #8 */
+        };
+        uint32_t written = 0;
+        for (uint32_t i = 0; i < sizeof code / sizeof code[0]; ++i) agb_write32(&board, 0x03000600 + i * 4, code[i]);
+        cpu.arm.r[0] = cpu.arm.r[1] = 0;
+        cpu.arm.r[15] = 0x03000600;
+        cpu.arm.cpsr = 0x9F;
+        board.cpu_halted = 0;
+        CHECK(!agb_cpu_run(&board, &cpu, &recomp, 2000, audio, AGB_APU_RATE, &written, error, sizeof error));
+        if (cpu.arm.r[0] != 9 || cpu.arm.r[1] != 4 || cpu.arm.r[15] != 0x03000618) {
+            fprintf(stderr,
+                    "agb_cpu: code that wrote over itself left r0 = %u (9), r1 = %u (4), pc 0x%08X (0x03000618)\n",
+                    cpu.arm.r[0], cpu.arm.r[1], cpu.arm.r[15]);
+            return 1;
+        }
+        cpu.arm.r[15] = 0x03000610;
+        CHECK(!agb_cpu_run(&board, &cpu, &recomp, 2000, audio, AGB_APU_RATE, &written, error, sizeof error));
+        CHECK(cpu.arm.r[0] == 9 && cpu.arm.r[1] == 8);
+    }
+    {
         /* a sound driver function SoundDriverGetJumpList named returns at once, as the BIOS's bx lr: here to Thumb
            code that puts 7 in r0 and spins, interrupts off */
         uint32_t written = 0;
@@ -628,6 +662,60 @@ int main(void) {
         board.cpu_halted = 0;
         CHECK(!agb_cpu_run(&board, &cpu, &recomp, 2000, audio, AGB_APU_RATE, &written, error, sizeof error));
         CHECK(cpu.arm.r[0] == 7 && cpu.arm.r[15] == 0x03000202 && (cpu.arm.cpsr & SNX_ARM_T));
+    }
+    {
+        /* LDRSH at an odd address through the bus hook reads the byte there sign extended, as the ARM7TDMI does: the
+           palette's 0x80FF read at 0x05000001 gives 0xFFFFFF80 (mGBA's suite's memory.c, S16 unaligned) */
+        uint32_t written = 0;
+        agb_write16(&board, 0x05000000, 0x80FF);
+        agb_write32(&board, 0x03000700, 0xE1D100F0); /* ldrsh r0, [r1] */
+        agb_write32(&board, 0x03000704, 0xEAFFFFFE); /* b . */
+        cpu.arm.r[0] = 0;
+        cpu.arm.r[1] = 0x05000001;
+        cpu.arm.r[15] = 0x03000700;
+        cpu.arm.cpsr = 0x9F;
+        board.cpu_halted = 0;
+        CHECK(!agb_cpu_run(&board, &cpu, &recomp, 2000, audio, AGB_APU_RATE, &written, error, sizeof error));
+        if (cpu.arm.r[0] != 0xFFFFFF80) {
+            fprintf(stderr, "agb_cpu: LDRSH at 0x05000001 read 0x%08X, not 0xFFFFFF80\n", cpu.arm.r[0]);
+            return 1;
+        }
+    }
+    {
+        /* SMULLS and UMULLS set C as the ARM7TDMI's Booth multiplier leaves it, which the console's results in mGBA's
+           suite (multiply-long.c) show: operands, then the flags of each */
+        static const uint32_t code[] = {
+            0xE328F000, /* msr cpsr_f, #0 */
+            0xE0D89190, /* smulls r9, r8, r0, r1 */
+            0xE10F2000, /* mrs r2, cpsr */
+            0xE328F000, /* msr cpsr_f, #0 */
+            0xE0989190, /* umulls r9, r8, r0, r1 */
+            0xE10F3000, /* mrs r3, cpsr */
+            0xEAFFFFFE, /* b . */
+        };
+        static const struct {
+            uint32_t rm, rs, smull, umull; /* the flags, CPSR's top nibble */
+        } cases[] = {
+            {0x00000000, 0x80000000, 0x6, 0x4}, /* 0 * $80 */
+            {0x00000001, 0x80000000, 0xA, 0x0}, /* 1 * $80 */
+            {0xFFFFFFFF, 0xFFFFFFFF, 0x0, 0xA}, /* -1 * -1 */
+            {0x80000001, 0x80000001, 0x0, 0x2}, /* $81 * $81 */
+        };
+        for (uint32_t i = 0; i < sizeof code / sizeof code[0]; ++i) agb_write32(&board, 0x03000800 + i * 4, code[i]);
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
+            uint32_t written = 0;
+            cpu.arm.r[0] = cases[i].rm;
+            cpu.arm.r[1] = cases[i].rs;
+            cpu.arm.r[15] = 0x03000800;
+            cpu.arm.cpsr = 0x9F;
+            board.cpu_halted = 0;
+            CHECK(!agb_cpu_run(&board, &cpu, &recomp, 2000, audio, AGB_APU_RATE, &written, error, sizeof error));
+            if (cpu.arm.r[2] >> 28 != cases[i].smull || cpu.arm.r[3] >> 28 != cases[i].umull) {
+                fprintf(stderr, "agb_cpu: 0x%08X * 0x%08X: SMULLS flags %X (%X), UMULLS %X (%X)\n", cases[i].rm,
+                        cases[i].rs, cpu.arm.r[2] >> 28, cases[i].smull, cpu.arm.r[3] >> 28, cases[i].umull);
+                return 1;
+            }
+        }
     }
     {
         /* a Thumb BX PC two bytes past a word lands in ARM state at an address with bit 1 set, as a compiler's

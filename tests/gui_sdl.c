@@ -4871,7 +4871,7 @@ static bool wait_taken(const char* path) {
    in the --data folder, a launch a line of the plan, each line's words "pass=N", "fail=SUITE" and
    "summary=P,F,S,C"; the launches counted beside the report, each after its lines are there */
 static void fake_probe(int argc, char** argv) {
-    char *card = NULL, *runs, *report, *counter, *plan, *line, *word, *last, *text;
+    char *card = NULL, *runs, *report, *counter, *part, *plan, *line, *word, *last, *text;
     int launch, i;
     size_t size;
     for (i = 1; i + 1 < argc; ++i)
@@ -4920,10 +4920,13 @@ static void fake_probe(int argc, char** argv) {
         assert(out && fputs(text, out) >= 0 && !fclose(out));
     }
     free(text);
-    /* counted once its report is written: the test ends a launch (ESC) when it sees the count, and a launch ended
-       before its report leaves no run to go on with */
+    /* counted once its report is written, and put in place whole: the test ends a launch (ESC) as soon as the count's
+       file is there, and a launch ended before its report leaves no run to go on with, one ended before its count's
+       value an empty count */
     text = snx_format("%d", launch + 1);
-    assert(!snx_write_file(counter, text, strlen(text)));
+    part = snx_format("%s.part", counter);
+    assert(!snx_write_file(part, text, strlen(text)) && !plat_replace_file(part, counter));
+    free(part);
     free(text);
     free(plan);
     free(last);
@@ -5725,7 +5728,7 @@ int main(int argc, char** argv) {
     char* input = snx_path_join(temporary, "game with spaces;literal.nro");
     assert(!snx_write_file(input, "0", 1));
     const char* names[] = {"runtime", "scarletnx-gnuabi", "scarletnx-3ds", "scarletnx-vita", "scarletnx-agb",
-                           "scarletnx-android"};
+                           "scarletnx-nds",    "scarletnx-android"};
     for (size_t i = 0; i < sizeof names / sizeof *names; ++i) {
 #ifdef _WIN32
         char* filename = snx_format("%s.exe", names[i]);
@@ -5936,6 +5939,10 @@ int main(int argc, char** argv) {
     assert(app.menu.selected == GUI_GBA);
     render(&app);
     shows(&app, "- " ICON_GAMEPAD " Load GBA/MultiBoot ROM", yellow);
+    key(&app, SDLK_RIGHT);
+    assert(app.menu.selected == GUI_NDS);
+    render(&app);
+    shows(&app, "- " ICON_GAMEPAD " Load NDS ROM", yellow);
     key(&app, SDLK_RIGHT);
     assert(app.menu.selected == GUI_ANDROID);
     render(&app);
@@ -6350,7 +6357,8 @@ int main(int argc, char** argv) {
     /* ESC goes back to the groups, on the one it came from */
     key(&app, SDLK_ESCAPE);
     assert(app.editing && app.form == GUI_FORM_SETTINGS && app.editor.row == 1);
-    /* GBA's, after Launch: Covers, None by default, then Box art (libretro-thumbnails), Del back to None */
+    /* GBA's, after Launch: Covers, None by default, then Box art (libretro-thumbnails), Del back to None; Colors,
+       GBA screen by default, then Raw, Del back to GBA screen */
     {
         char line[64];
         key(&app, SDLK_DOWN);
@@ -6358,7 +6366,7 @@ int main(int argc, char** argv) {
         shows(&app, "- " ICON_GAMEPAD " GBA", yellow);
         shows_half(&app, "Covers", normal); /* the group's help names its setting */
         key(&app, SDLK_RETURN);
-        assert(app.form == GUI_FORM_GROUP && app.group == 2 && app.editor.count == 1);
+        assert(app.form == GUI_FORM_GROUP && app.group == 2 && app.editor.count == 2);
         render(&app);
         shows(&app, "GBA", normal);
         snprintf(line, sizeof line, "- %-8s %s", "Covers", "None [default]"); /* no row of it opens a page: no gutter */
@@ -6371,6 +6379,17 @@ int main(int argc, char** argv) {
         shows(&app, line, yellow);
         key(&app, SDLK_DELETE);
         assert(setting_is(&app, "gba_covers", NULL));
+        key(&app, SDLK_DOWN);
+        render(&app);
+        snprintf(line, sizeof line, "- %-8s %s", "Colors", "GBA screen [default]");
+        shows(&app, line, yellow);
+        key(&app, SDLK_RIGHT);
+        assert(setting_is(&app, "gba_color", "raw"));
+        render(&app);
+        snprintf(line, sizeof line, "- %-8s %s", "Colors", "Raw *");
+        shows(&app, line, yellow);
+        key(&app, SDLK_DELETE);
+        assert(setting_is(&app, "gba_color", NULL));
         key(&app, SDLK_ESCAPE);
         assert(app.form == GUI_FORM_SETTINGS && app.editor.row == 2);
     }
@@ -8961,6 +8980,7 @@ int main(int argc, char** argv) {
     key(&app, SDLK_LEFT);
     key(&app, SDLK_LEFT);
     key(&app, SDLK_LEFT);
+    key(&app, SDLK_LEFT);
     /* a load opens the screen its file is picked on at once: games/ is Games' now, not an option under it */
     assert(app.menu.selected == GUI_SWITCH);
     pump(&app);
@@ -9516,7 +9536,8 @@ int main(int argc, char** argv) {
                                 {"card.3ds", GUI_3DS, "3DS game, opened with scarletnx-3ds"},
                                 {"homebrew.vpk", GUI_VITA, "Vita VPK, opened with scarletnx-vita"},
                                 {"homebrew.gba", GUI_GBA, "GBA ROM, played with scarletnx-agb"},
-                                {"homebrew.mb", GUI_GBA, "GBA MultiBoot ROM, played with scarletnx-agb"}};
+                                {"homebrew.mb", GUI_GBA, "GBA MultiBoot ROM, played with scarletnx-agb"},
+                                {"homebrew.nds", GUI_NDS, "NDS ROM, played with scarletnx-nds"}};
                 GuiRecent was = app.recent;
                 GuiGamesBoxes none = {0};
                 char kind[192], listed[192];

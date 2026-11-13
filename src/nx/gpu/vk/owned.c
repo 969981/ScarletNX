@@ -479,6 +479,9 @@ static void own_wait(u64 writer) {
     }
     if (writer > done) vk_wait_submit(writer); /* handed to the recording thread: it submits it */
 }
+/* own.c's, under vk_lock before a landing looks for its entries: the storage images the guest released, which the
+   release left on the GPU, published over those pages first */
+static void own_claim(u64 lo, u64 hi) { vk_gfx_image_cpu_need(lo, hi - lo); }
 /* a landing's bytes: the write tracking takes them as they were left, and the GPU mirror lets go of its copy's
    shadow */
 static void own_landed(u64 addr, u64 size, const u8* bytes) {
@@ -499,7 +502,8 @@ int vk_own_init(void) {
                   .writer = own_writer,
                   .wait = own_wait,
                   .resolve = vk_rt_watch_hit,
-                  .refresh = vk_rt_watch_hit};
+                  .refresh = vk_rt_watch_hit,
+                  .claim = own_claim};
     g_owned.traps = !own_init(&h);
     return g_owned.traps ? 0 : -1;
 }
@@ -868,16 +872,16 @@ void vk_all_barrier(VkCommandBuffer cb) {
     VkDependencyInfo d = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &b};
     rec_CmdPipelineBarrier2(cb, &d);
 }
-void vk_copy_rows(VkCommandBuffer cb, VkBuffer src, u64 src_at, u32 src_pitch, VkBuffer dst, u64 dst_at,
-                  u32 dst_pitch, u32 row_bytes, u32 rows) {
+void vk_copy_rows(VkCommandBuffer cb, VkBuffer src, u64 src_at, i64 src_pitch, VkBuffer dst, u64 dst_at, i64 dst_pitch,
+                  u32 row_bytes, u32 rows) {
     VkBufferCopy c[64];
     u32 y = 0;
     if (!row_bytes) return;
     while (y < rows) {
         u32 n = 0;
         for (; y < rows && n < sizeof c / sizeof *c; y++, n++) {
-            c[n].srcOffset = src_at + (u64)y * src_pitch;
-            c[n].dstOffset = dst_at + (u64)y * dst_pitch;
+            c[n].srcOffset = src_at + (u64)(y * src_pitch);
+            c[n].dstOffset = dst_at + (u64)(y * dst_pitch);
             c[n].size = row_bytes;
         }
         rec_CmdCopyBuffer(cb, src, dst, n, c);

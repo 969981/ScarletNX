@@ -17,7 +17,7 @@
 #include "nx/gpu/vk/descriptors.h"
 #include "nx/gpu/vk/descriptor_heaps.h"
 #include "nx/gpu/texture/astc_bc.h"
-#include "nx/gpu/vk/extension_bans.h"
+#include "common/gpu/vk/extension_bans.h"
 #include "nx/gpu/vk/hdr_swapchain.h"
 #include "common/gpu/vk/swapchain.h"
 #include "common/gpu/vk/vk_common.h"
@@ -407,13 +407,19 @@ static int coop_f16_f32(VkPhysicalDevice phys) {
     for (u32 i = 0; i < n; i++)
         props[i] = (VkCooperativeMatrixPropertiesKHR){.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR};
     vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(phys, &n, props);
-    for (u32 i = 0; i < n; i++)
-        if (props[i].MSize == 16 && props[i].NSize == 16 && props[i].KSize == 16 &&
-            props[i].AType == VK_COMPONENT_TYPE_FLOAT16_KHR && props[i].BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-            props[i].CType == VK_COMPONENT_TYPE_FLOAT32_KHR && props[i].ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
-            !props[i].saturatingAccumulation && props[i].scope == VK_SCOPE_SUBGROUP_KHR)
-            return 1;
-    return 0;
+    int tile = 0;
+    for (u32 i = 0; i < n; i++) {
+        int size = (int)props[i].MSize;
+        if ((size != 8 && size != 16) || props[i].NSize != props[i].MSize || props[i].KSize != props[i].MSize ||
+            props[i].AType != VK_COMPONENT_TYPE_FLOAT16_KHR || props[i].BType != VK_COMPONENT_TYPE_FLOAT16_KHR ||
+            props[i].CType != VK_COMPONENT_TYPE_FLOAT32_KHR ||
+            props[i].ResultType != VK_COMPONENT_TYPE_FLOAT32_KHR || props[i].saturatingAccumulation ||
+            props[i].scope != VK_SCOPE_SUBGROUP_KHR)
+            continue;
+        if (size == 16) return 16; /* one product an HMMA, where the driver has the wider tile */
+        tile = 8;
+    }
+    return tile;
 }
 
 /* An Ounce's mesh draws (render.c): VK_EXT_mesh_shader's mesh stage, and its task stage when the device has one. The
@@ -545,8 +551,9 @@ static void log_subgroups(u32 size, VkSubgroupFeatureFlags operations, VkShaderS
         (unsigned)operations, (unsigned)stages, with[0] ? with : "no",
         g_vk_subgroup_stages || !stages ? "" : ", as they need 32 lanes or more, ballot, shuffle and arithmetic");
     if (without[0])
-        LOG("vulkan: %s programs have no subgroup: a vertex, evaluation or geometry one among them that votes or "
-            "shuffles runs each invocation as lane 0 alone, and a control, fragment or compute one is not translated\n",
+        LOG("vulkan: %s programs have no subgroup: a vertex, evaluation, geometry or fragment one among them that "
+            "votes or shuffles runs each invocation as one lane alone (a fragment's reads within its quad through fine "
+            "derivatives), and a control or compute one is not translated\n",
             without);
 }
 
@@ -1347,18 +1354,47 @@ static int create_device(void) {
     /* shaders pick an indexed texture per invocation from an array (SNX_VKB_TEXARRAY) */
     g_shader_texture_arrays = q12.shaderSampledImageArrayNonUniformIndexing != 0;
     g_shader_float16 = q12.shaderFloat16 != 0;
+    g_shader_float64 = have.shaderFloat64 != 0;
     /* its f16 vectors are Float16's, so shaderFloat16 too */
     g_shader_mixed_dot = has_mixed_dot && qmixdot.shaderMixedFloatDotProductFloat16AccFloat32 && g_shader_float16;
     g_shader_float_atomic_add = has_atomic_float && qatomic_float.shaderBufferFloat32AtomicAdd;
-    /* its f16 matrices are Float16's, its modules the Vulkan memory model's, and its matrices span a subgroup of 32 */
-    g_shader_hmma_coop = has_coop && qcoop.cooperativeMatrix && g_shader_float16 && q12.vulkanMemoryModel &&
-                                 q12.vulkanMemoryModelDeviceScope && g_vk.has_cs_warp32 && coop_f16_f32(g_vk.phys)
-                             ? (int)g_vk.props.limits.maxComputeSharedMemorySize
-                             : 0;
+    if (shader_hmma_f16_unused())
+        LOG("vulkan: hmma_f16=1 asks for HMMA's sums in half floats; they stay in f32, as hmma_f16=0's: %s\n",
+            shader_hmma_f16_unused());
+    /* its f16 matrices are Float16's, its modules the Vulkan memory model's, and its matrices span a subgroup of 32.
+       The tile is the 8 or the 16 its vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR offers: Metal's
+       simdgroup_matrix is 8x8x8, so an SM86 HMMA is four products there and one where the tile is 16 */
+    /* A subgroup of 32 lanes, which is what an HMMA and its matrices span: has_cs_warp32 where the device lets a
+       pipeline ask for one, or where its subgroups are already 32 and compute has them (Metal's are, at every
+       stage). Gating the matrix unit on the request alone left every driver whose size is fixed without it */
+    int warp32 = g_vk.has_cs_warp32 || (subgroup.subgroupSize == 32 &&
+                                        (g_vk_subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT) != 0);
+    int coop_tile = has_coop && qcoop.cooperativeMatrix && g_shader_float16 && q12.vulkanMemoryModel &&
+                            q12.vulkanMemoryModelDeviceScope && warp32
+                        ? coop_f16_f32(g_vk.phys)
+                        : 0;
+    g_shader_hmma_coop = coop_tile ? (int)g_vk.props.limits.maxComputeSharedMemorySize : 0;
+    g_shader_hmma_coop_tile = coop_tile ? coop_tile : 16;
+    if (coop_tile)
+        LOG("vulkan: HMMA runs on the device's cooperative matrices, %dx%dx%d a product, shared memory's own "
+            "fragments after the program's\n",
+            coop_tile, coop_tile, coop_tile);
     f12.vulkanMemoryModel = f12.vulkanMemoryModelDeviceScope = g_shader_hmma_coop != 0;
-    /* RADV makes a shuffle's xor of 4 a DPP move from GFX10, the devices with subgroups of 32, and a shuffle at any
-       other index a permute through LDS: an RX 6700 XT's HMMA bench (SNX_HMMA_BENCH) ran 9.7% faster */
-    g_shader_hmma_pairs = p12.driverID == VK_DRIVER_ID_MESA_RADV && g_vk.has_cs_warp32;
+    /* HMMA off the matrix unit: pairs of lanes on RADV with subgroups of 32 (an RX 6700 XT's HMMA bench ran 9.7%
+       faster), and A and B through shared memory where the driver loops for a shuffle whose index differs between
+       lanes, which no feature or property tells, so the table does */
+    int compute_subgroups = (g_vk_subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+    shader_hmma_choose(compute_subgroups, p12.driverID == VK_DRIVER_ID_MESA_RADV && g_vk.has_cs_warp32,
+                       vk_ban("OpGroupNonUniformShuffle", compute_subgroups, ban_say) != 0,
+                       (int)g_vk.props.limits.maxComputeSharedMemorySize);
+    if (compute_subgroups) {
+        char way[256];
+        shader_hmma_way(way, sizeof way);
+        LOG("vulkan: an SM86 compute program's HMMA: %s\n", way);
+    }
+    /* shaderDenormPreserveFloat16 is the device's word that it can keep f16 subnormals: without it an SM86 program
+       packs those by hand (sm86_translate.c's pack_half), as Turnip on an Adreno 610 flushed them to zero */
+    g_shader_half_flush = !p12.shaderDenormPreserveFloat16;
     g_shader_half_rounding = 0;
     if (q12.shaderFloat16 && p12.shaderRoundingModeRTEFloat16 && p12.shaderDenormPreserveFloat16 &&
         p12.shaderSignedZeroInfNanPreserveFloat16 &&

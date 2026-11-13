@@ -213,6 +213,25 @@ a grid in world space, then the cell's list, in a loop) is bound as no texture, 
 indexed on the GPU would sample them, but the renderer would have to make each texture such a handle can name, which
 no draw tells it.
 
+A program whose FADD, FMUL, FFMA or I2F has a directed rounding mode is translated through f64, which keeps the
+rounding exact. Apple's GPUs have no `shaderFloat64`, and the runtime skipped each such program: one game's title
+sequence drew black, and 10 of its compute programs never ran. `g_shader_float64` is the device's capability now, and
+the translator keeps those operations in f32, as rounds to nearest, where it is 0. A float scale of FMUL is a power
+of two, so it stays exact.
+
+`snx-shaderc DIR --sm86 --no-doubles --out DIR` translates a recorded compute program again, as a device without
+doubles has it, and without the game (`--sm86` needs no header, which a compute program has none of). Of one game's 14
+compute programs, 10 make a pipeline on KosmicKrisp and 4, its largest (1 MB of SPIR-V and more), do not: the Metal
+compiler service ends with an XPC error after Mesa's own retries, about 30 s each, and the game lost 220 s of presents
+before it ran again. MoltenVK makes all 14. The modules pass `spirv-val`, and the validation layer says nothing of
+them, so the programs are not in doubt: a compiler service that crashes on one of them is the driver's, and the
+largest are the ones it cannot take.
+
+A program that still holds f64, which the runtime no longer emits on such a device, fails sooner and says why: Mesa's
+Metal backend prints itself into the module as `t192 = ALU u2f64` and the Metal compiler rejects the text, so
+KosmicKrisp has no conversion to a double at all. The game shows its title menu on either driver, after the stall on
+KosmicKrisp, and `vulkan_driver=moltenvk` skips the stall.
+
 ## Surfaces
 
 An Ounce game's block linear surfaces use another GOB: bits 5 and 6 of a byte's offset in it are swapped, so x

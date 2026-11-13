@@ -430,6 +430,9 @@ extern int g_shader_geometry_streams;
 extern int g_shader_geometry_streams_lines_triangles;
 /* shaderFloat16, which fp16 texture results need. 1 offline */
 extern int g_shader_float16;
+/* shaderFloat64, which SM86's directed rounding keeps its exactness with. 1 offline: a device without doubles rounds
+   those operations as its floats do, as Round to Nearest, and the shader still runs (Apple's GPUs have no doubles) */
+extern int g_shader_float64;
 /* shaderResourceMinLod: fragment TEX.LC uses the MinLod image operand. 1 offline. */
 extern int g_shader_resource_min_lod;
 /* maintenance8 permits a runtime Offset operand on texture samples. 0 for portable offline output. */
@@ -468,6 +471,13 @@ extern int g_shader_quad_compute;
    HMMA sums each pair of f16 products into its f32 accumulator with one OpFDot2MixAcc32VALVE (v_dot2_f32_f16 on AMD)
    instead of unpacking both pairs to f32. 0 offline */
 extern int g_shader_mixed_dot;
+/* The hmma_f16 setting: an SM86 HMMA's products and their sum in half floats, two products to an OpFma where the f32
+   sum takes two instructions, for a device whose driver offers no matrix unit (every MoltenVK so far). Its results
+   are about 1e-3 off the console's f32 sum; 0, the default, is the f32 sum the console's tensor core keeps */
+extern int g_shader_hmma_f16;
+/* Why HMMA sums in f32 where hmma_f16 asks for the half sums, the device's lack or better (the log's words), else NULL:
+   the mixed dot product takes two products an instruction in f32, and the halves need shaderFloat16 */
+const char* shader_hmma_f16_unused(void);
 /* VK_KHR_cooperative_matrix's 16x16x16 product of f16 A and B into an f32 accumulator in subgroup scope, in compute,
    with the Vulkan memory model (vulkanMemoryModel, vulkanMemoryModelDeviceScope) and compute subgroups of 32 that a
    pipeline can require: the device's maxComputeSharedMemorySize, else 0. An SM86 compute program's HMMAs are then each
@@ -479,6 +489,26 @@ extern int g_shader_hmma_coop;
    (sm86_translate.c's hmma). RADV with subgroups of 32 (GFX10 on): half of the B permutes through LDS become DPP
    moves. 0 offline */
 extern int g_shader_hmma_pairs;
+/* the way a compute program's HMMA takes with the flags above, in words for the log, into out (n bytes) */
+void shader_hmma_way(char* out, size_t n);
+/* an SM86 HMMA off the cooperative matrices takes A and B from the other lanes through shared memory, a slot a warp,
+   where the driver compiles a shuffle whose index differs between lanes into a loop over the distinct indices (an
+   "off" line on OpGroupNonUniformShuffle in vk/extension_bans.txt: Turnip, whose Adreno 610 ran the HMMA bench 35
+   times faster so, 684.9 ms a dispatch to 19.6). Where the shuffles are the hardware's they stay: staged, an Adreno
+   830 ran 5.4 and an RX 6700 XT 2.2 times slower. The device's maxComputeSharedMemorySize, else 0 (offline) */
+extern int g_shader_hmma_stage;
+/* g_shader_hmma_pairs and g_shader_hmma_stage from what vk/device.c reads of the device: subgroup operations in
+   compute (subgroups), RADV with subgroups of 32 a pipeline can require (radv_warp32: its xor of 4 is a DPP move
+   where a shuffle at any other index is a permute through LDS), an "off" line on OpGroupNonUniformShuffle that holds
+   for its driver (shuffle_loops), and its maxComputeSharedMemorySize */
+void shader_hmma_choose(int subgroups, int radv_warp32, int shuffle_loops, int shared_max);
+/* The device may flush f16 subnormals (no shaderDenormPreserveFloat16), as Turnip on an Adreno 610 does in
+   PackHalf2x16: an SM86 program packs its halves below 2^-14 exactly then (sm86_translate.c's pack_half). 0 offline */
+extern int g_shader_half_flush;
+/* The tile that device's cooperative matrices come in, when it has them: 16 for an M by N by K of 16x16x16, which
+   RADV offers, 8 for Metal's simdgroup_matrix of 8x8x8, which a MoltenVK with VK_KHR_cooperative_matrix reports
+   (hmma_coop). One SM86 HMMA is four 8x8x8 products there and one 16x16x16 otherwise */
+extern int g_shader_hmma_coop_tile;
 /* the most mesh workgroups one task workgroup can launch (maxMeshWorkGroupCount[0] and maxMeshWorkGroupTotalCount,
    the less of them): a task program's count, read from its payload's header, is clamped to it, as a count past it is
    undefined behavior that can hang the GPU. 0 offline: not clamped */

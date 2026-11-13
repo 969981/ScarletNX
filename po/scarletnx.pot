@@ -2315,6 +2315,10 @@ msgid "Runs a GBA ROM or MultiBoot ROM on the emulated AGB board"
 msgstr ""
 
 #: src/gui/main.c
+msgid "Recompiles a DS card image, then runs it"
+msgstr ""
+
+#: src/gui/main.c
 msgid "Runs an Android app's .apk, .xapk or .apks"
 msgstr ""
 
@@ -2353,6 +2357,10 @@ msgstr ""
 
 #: src/gui/main.c
 msgid "GBA game, ready to run"
+msgstr ""
+
+#: src/gui/main.c
+msgid "NDS game, ready to run"
 msgstr ""
 
 #: src/gui/main.c
@@ -2403,6 +2411,10 @@ msgstr ""
 
 #: src/gui/main.c
 msgid "GBA ROM, played with scarletnx-agb"
+msgstr ""
+
+#: src/gui/main.c
+msgid "NDS ROM, played with scarletnx-nds"
 msgstr ""
 
 #: src/gui/main.c
@@ -6076,6 +6088,10 @@ msgid "Load GBA/MultiBoot ROM"
 msgstr ""
 
 #: src/gui/ui.txt
+msgid "Load NDS ROM"
+msgstr ""
+
+#: src/gui/ui.txt
 msgid "Load Android APK/XAPK"
 msgstr ""
 
@@ -6577,6 +6593,18 @@ msgstr ""
 
 #: src/nx/runtime/settings.txt
 msgid "The picture a GBA game made from a ROM shows in Games. None = Wimsy, as a game with no icon. Box art = its box from libretro-thumbnails, downloaded as the game is made: the ROM's CRC-32 names the game in libretro-database's No-Intro list, and the box under that name goes in the game's folder as icon.png. A ROM the list does not have, or a game with no box there, keeps Wimsy and its row says which name was looked for"
+msgstr ""
+
+#: src/nx/runtime/settings.txt
+msgid "GBA colors"
+msgstr ""
+
+#: src/nx/runtime/settings.txt
+msgid "Colors"
+msgstr ""
+
+#: src/nx/runtime/settings.txt
+msgid "The colors a GBA game shows. GBA screen = as the original GBA's unlit screen showed them: the game's colors, painted strong for that screen, come out softer and darker (near's color emulation article, Talarubi's formula). Raw = as the game writes them, the same as mGBA without a shader"
 msgstr ""
 
 #: src/nx/runtime/settings.txt
