@@ -57,6 +57,9 @@ uint8_t agb_rom_open_bus8(uint32_t address) { return (uint8_t)((address >> 1 & 0
 /* A byte of the cartridge windows at 0x08000000, 0x0A000000 and 0x0C000000, each holding the image over its extent. */
 static uint8_t rom8(const AgbBoard* board, uint32_t address) {
     uint32_t offset = address & (AGB_ROM_MAX - 1);
+    /* the GPIO port's registers, once a write reached it, over the header's bytes in every window */
+    if (board->gpio.touched && offset - AGB_GPIO_DATA < sizeof board->gpio.view)
+        return board->gpio.view[offset - AGB_GPIO_DATA];
     if (board->has_cartridge && offset < agb_cartridge_extent(&board->cartridge))
         return board->cartridge.data[offset % board->cartridge.size];
     return agb_rom_open_bus8(offset);
@@ -87,13 +90,10 @@ uint32_t agb_access_cycles(const AgbBoard* board, uint32_t address, unsigned wid
     return 1 + (sequential ? s : n) + (width == 32 ? 1 + s : 0);
 }
 
-/* Bits 28 to 31 select no region: past the flat map's two halves (0x0 and its mirror 0x8), a read gives the open bus,
-   the opcode the CPU fetched last at the read's lane, and a write goes nowhere, as mGBA's GBALoadBad and its stores have
-   it. A game's table lookup that goes past its data lands there */
-static int unused(uint32_t address) {
-    uint32_t top = address >> 28;
-    return top != 0 && top != 8;
-}
+/* Where the console decodes nothing a read gives the open bus, the opcode the CPU fetched last at the read's lane, and a
+   write goes nowhere, as mGBA's GBALoadBad and its stores have it: past the BIOS up to EWRAM, and past the 28 bits it
+   decodes (GBATEK's 10000000-FFFFFFFF). A game's table lookup that goes past its data lands there */
+static int unused(uint32_t address) { return address >> 28 || (address >= AGB_BIOS_SIZE && address < 0x02000000); }
 
 uint8_t agb_read8(AgbBoard* board, uint32_t address) {
     if (board->counting) board->counted_cycles += agb_access_cycles(board, address, 8, 1);
@@ -186,6 +186,7 @@ void agb_write16(AgbBoard* board, uint32_t address, uint16_t value) {
         agb_eeprom_write(board, value, 1); /* a store of the CPU's is a transfer of one */
         return;
     }
+    if (agb_gpio_write(board, address, value)) return;
     uint8_t* p = region8(board, address);
     if (p) snx_st_le16(p, value);
 }

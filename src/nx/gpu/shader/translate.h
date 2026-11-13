@@ -90,6 +90,9 @@ typedef struct {
        driver drop a quad's remaining helpers from execution while they still hold the loop open: AMD's Windows
        compiler then repeats the loop with no lane left to end it, until the GPU is reset. */
     u32 discarded;
+    /* A fragment program with loops: the Function variable that counts the back-edges a lane took (0: none).
+       shader_helper_loop_exit reads it */
+    u32 helper_rounds;
     u32 blend_end;     /* one final fragment epilogue, reached after all guest control flow and alpha tests */
     u32 primitive_base; /* capture slices preserve the original fragment PrimitiveId through push constants */
     u32 branch_cond;   /* with structured flow, the condition of the branch that ends the block, 0 for always */
@@ -226,6 +229,9 @@ int shader_direct_track_cbuf_word(const ShFlow* f, u32 index, u32 reg, u32* bank
 int shader_direct_track_image_handle(const ShFlow* f, u32 index, u32 reg, u32* bank, u32* off, int depth);
 int shader_direct_track_image_handle_pair(const ShFlow* f, u32 index, u32 reg, u32* bank, u32* off, u32* bank2,
                                           u32* off2, int depth);
+/* the most constant buffer handles one TEX.B chooses among (shader_direct_handle_candidates) */
+#define SH_HANDLE_CANDIDATES 4
+int shader_direct_handle_candidates(const ShFlow* f, u32 index, u32 reg, u32* banks, u32* offs, int max);
 int shader_al2p_predicate_unseen(const ShFlow* f, u32 at);
 u32 shader_direct_indexed_handle(const ShFlow* f, u32 index, u32 reg, int stage, u32* ldc);
 int shader_direct_bindless_matches(const ShTex* t, u32 bank, int handle_count, u32 bank2, u32 off2, u32 indexed,
@@ -282,6 +288,9 @@ int shader_dc_color_func(const ShaderInfo* si, int slot);
 u32 shader_dc_compare(DirectCtx* c, int func, u32 reference, u32 texel);
 u32 shader_indexed_is_depth(DirectCtx* c, int slot);
 u32 shader_dc_compare_indexed(DirectCtx* c, int slot, u32 reference, u32 texel);
+int shader_minmax_of(const ShaderInfo* si, int slot);
+u32 shader_minmax_direct(DirectCtx* c, u32 vec4_type, u32 sampled_type, u32 sampler, u32 coords, int array, u32 offset,
+                         int dynamic, int reduce);
 u32 shader_sample_dref(DirectCtx* c, const ShaderInfo* si, int slot, u32 vec4_type, u32 coords, u32 dref, int use_lod,
                        u32 lod);
 void shader_scaled_fetch(DirectCtx* c, u32 push, u32 fragcoord, u32 vec4, int slot, u32 i32_type, u32* x, u32* y);
@@ -335,6 +344,9 @@ void shader_geometry_passthrough(DirectCtx* c, const ShaderInfo* si, u32 vertice
 void shader_dynamic_pop(DirectCtx* c, u32 stack_ptr, const u32 stack[32], u32 kind_value, u32 fallback, u32* found,
                         u32* destination, u32* new_sp);
 int shader_structure_step(DirectCtx* c, StructEmit* se);
+/* A helper lane leaves a loop after this many back-edges of its invocation (shader_helper_loop_exit) */
+#define SH_HELPER_LOOP_ROUNDS 65536u
+u32 shader_helper_loop_exit(DirectCtx* c);
 
 /* value, of from_type, as to_type (both 32-bit scalars): a constant's bits as a constant of to_type, a value cast
    in this block as what that cast made or was made from, else its bitcast. A register copied and then read as a

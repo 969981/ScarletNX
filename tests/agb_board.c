@@ -58,6 +58,94 @@ static void make_rom(uint8_t* rom) {
     rom[0xBC] = 3;
     fix_checksum(rom);
 }
+/* the cartridge clock's serial line as the clock library drives it through the GPIO port: a byte out, from bit 0, each
+   bit set on SIO with SCK low and taken as SCK rises, chip select high */
+static void rtc_send(AgbBoard* board, uint8_t byte) {
+    for (unsigned i = 0; i < 8; ++i) {
+        uint16_t sio = (uint16_t)((byte >> i & 1) << 1);
+        agb_write16(board, 0x080000C4, 4 | sio);
+        agb_write16(board, 0x080000C4, 5 | sio);
+    }
+}
+/* a byte in: SIO an input, each bit the clock's after SCK falls, from bit 0 */
+static uint8_t rtc_receive(AgbBoard* board) {
+    uint8_t byte = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        agb_write16(board, 0x080000C4, 4);
+        byte |= (uint8_t)((agb_read16(board, 0x080000C4) >> 1 & 1) << i);
+        agb_write16(board, 0x080000C4, 5);
+    }
+    return byte;
+}
+/* a command to the clock: chip select low then high with SCK high, its byte, then for a read SIO turned into an input */
+static void rtc_command(AgbBoard* board, uint8_t command) {
+    agb_write16(board, 0x080000C6, 7);
+    agb_write16(board, 0x080000C4, 1);
+    agb_write16(board, 0x080000C4, 5);
+    rtc_send(board, command);
+    if (command & 0x80) agb_write16(board, 0x080000C6, 5);
+}
+/* The real-time clock a cartridge with the clock library's tag has on its GPIO port: the date and time it reads, in BCD,
+   its status register's 24 hour mode, the port's registers as they read back or not, and none without the tag */
+static int check_rtc(void) {
+    static const uint8_t date[7] = {0x26, 0x11, 0x12, 0x04, 0x22, 0x30, 0x45}; /* 2026-11-12, a Thursday, 22:30:45 */
+    static const uint8_t leap[7] = {0x00, 0x02, 0x29, 0x02, 0x13, 0x00, 0x07}; /* 2000-02-29, a Tuesday, 13:00:07 */
+    char error[256];
+    uint8_t* rom = (uint8_t*)malloc(ROM_SIZE);
+    AgbBoard board;
+    CHECK(rom);
+    make_rom(rom);
+    memcpy(rom + 0x180, "SIIRTC_V001", 11);
+    rom[0xC4] = 0x11, rom[0xC6] = 0x22, rom[0xC8] = 0x33;
+    agb_board_init(&board);
+    CHECK(!agb_board_insert(&board, rom, ROM_SIZE, error, sizeof error));
+    CHECK(board.gpio.rtc);
+    /* before a write the port's registers read as the ROM's bytes */
+    CHECK(agb_read16(&board, 0x080000C4) == 0x11 && agb_read8(&board, 0x080000C8) == 0x33);
+    agb_write16(&board, 0x080000C8, 1); /* the port reads back */
+    board.gpio.clock = 847837845;       /* 2026-11-12 22:30:45 */
+    rtc_command(&board, 0xA6);          /* read the date and time */
+    for (unsigned i = 0; i < 7; ++i) {
+        uint8_t got = rtc_receive(&board);
+        if (got != date[i]) {
+            fprintf(stderr, "agb_board: the clock's byte %u is 0x%02X, not 0x%02X\n", i, got, date[i]);
+            return 1;
+        }
+    }
+    agb_write16(&board, 0x080000C4, 1); /* chip select low: the transfer ends */
+    /* the registers read back in every cartridge window: SIO an input still, chip select low, SCK high */
+    CHECK(agb_read16(&board, 0x080000C6) == 5 && agb_read16(&board, 0x0A0000C8) == 1 &&
+          agb_read16(&board, 0x0C0000C4) == 3);
+    board.gpio.clock = 5144407; /* 2000-02-29 13:00:07, a leap day */
+    rtc_command(&board, 0xA6);
+    for (unsigned i = 0; i < 7; ++i) CHECK(rtc_receive(&board) == leap[i]);
+    /* the status register: 0x40 (24 hours) as the clock starts; written 0, the time reads its hour in 12 hours */
+    rtc_command(&board, 0xC6);
+    CHECK(rtc_receive(&board) == 0x40);
+    rtc_command(&board, 0x46);
+    rtc_send(&board, 0x00);
+    rtc_command(&board, 0xC6);
+    CHECK(rtc_receive(&board) == 0x00);
+    rtc_command(&board, 0xE6); /* the time alone: hour, minute, second */
+    CHECK(rtc_receive(&board) == 0x01 && rtc_receive(&board) == 0x00 && rtc_receive(&board) == 0x07);
+    /* write-only, the port's registers read zeros */
+    agb_write16(&board, 0x080000C8, 0);
+    CHECK(agb_read16(&board, 0x080000C4) == 0 && agb_read16(&board, 0x080000C6) == 0);
+    agb_board_destroy(&board);
+
+    /* no tag, no clock: the store goes nowhere and the ROM's bytes stay */
+    make_rom(rom);
+    rom[0xC6] = 0x5A;
+    agb_board_init(&board);
+    CHECK(!agb_board_insert(&board, rom, ROM_SIZE, error, sizeof error));
+    CHECK(!board.gpio.rtc);
+    agb_write16(&board, 0x080000C8, 1);
+    agb_write16(&board, 0x080000C6, 7);
+    CHECK(agb_read8(&board, 0x080000C6) == 0x5A && agb_read16(&board, 0x080000C8) == 0);
+    agb_board_destroy(&board);
+    free(rom);
+    return 0;
+}
 
 int main(void) {
     uint8_t* rom = (uint8_t*)malloc(ROM_SIZE);
@@ -163,16 +251,29 @@ int main(void) {
     agb_write32(&board, 0x00000000, 0);
     board.bios_prefetch = AGB_BIOS_PREFETCH_SWI;
     CHECK(agb_read32(&board, 0x00000000) == AGB_BIOS_PREFETCH_SWI);
-    /* past the 28 bits the console decodes (but for the mirror at bit 31) nothing answers: a read gives the open bus at
-       its lane and a write goes nowhere, as mGBA's GBALoadBad */
+    /* where the console decodes nothing, past the BIOS up to EWRAM and past the 28 bits (0x8xxxxxxx too), a read gives
+       the open bus at its lane and a write goes nowhere, as mGBA's GBALoadBad */
     board.open_bus = 0x0A000005;
     CHECK(agb_read32(&board, 0x2E00A610) == 0x0A000005 && agb_read16(&board, 0xFFFFFFFE) == 0x0A00 &&
           agb_read8(&board, 0x10000001) == 0x00 && agb_read8(&board, 0x7FFFFFF3) == 0x0A);
+    CHECK(agb_read32(&board, 0x00004000) == 0x0A000005 && agb_read16(&board, 0x01FFFFFE) == 0x0A00 &&
+          agb_read8(&board, 0x80000000) == 0x05);
     agb_write32(&board, 0x2E00A610, 0x12345678);
     agb_write8(&board, 0x9E000000, 0x77);
     CHECK(agb_read32(&board, 0x2E00A610) == 0x0A000005);
+    /* bit 31 mirrors nothing: a word there reads the open bus, not EWRAM's, and a store of any width there reaches
+       neither EWRAM nor the save memory */
+    agb_save_reset(&board, AGB_SAVE_SRAM);
     agb_write32(&board, 0x02000040, 0x5A5A5A5A);
-    CHECK(agb_read32(&board, 0x82000040) == 0x5A5A5A5A);
+    {
+        uint8_t saved[2] = {agb_read8(&board, 0x0E000040), agb_read8(&board, 0x0E000044)};
+        agb_write32(&board, 0x82000040, 0x11111111);
+        agb_write16(&board, 0x82000044, 0x2222);
+        agb_write8(&board, 0x8E000040, 0x33);
+        CHECK(agb_read32(&board, 0x82000040) == 0x0A000005 && agb_read32(&board, 0x02000040) == 0x5A5A5A5A);
+        CHECK(agb_read8(&board, 0x0E000040) == saved[0] && agb_read8(&board, 0x0E000044) == saved[1] &&
+              !board.save.dirty);
+    }
 
     /* the cartridge windows hold the image once, and past it the bus still holds address / 2 */
     CHECK(agb_read32(&board, 0x08000000) == board.cartridge.entry);
@@ -381,6 +482,7 @@ int main(void) {
     CHECK(!board.has_cartridge && !board.cartridge.data);
 
     free(rom);
+    if (check_rtc()) return 1;
     puts("agb_board: ok");
     return 0;
 }

@@ -231,14 +231,40 @@ int main(void) {
     CHECK(map.base[0x08000400] == 0x00 && map.base[0x08000401] == 0x02 && map.base[0x0C000402] == 0x01);
     CHECK(agb_read32(&board, 0x0A000400) == 0x02010200);
     {
-        /* a region and its mirrors are one memory in the flat map: EWRAM's every 256 KiB and past bit 31, VRAM's last
-           32 KiB of each 128 KiB the 32 KiB above the bitmap. volatile: the compiler sees two addresses where the
-           host maps one page, and may read the mirror before the store */
+        /* a region and its mirrors are one memory in the flat map: EWRAM's every 256 KiB, VRAM's last 32 KiB of each
+           128 KiB the 32 KiB above the bitmap; past the 28 bits the console decodes there is no mirror. volatile: the
+           compiler sees two addresses where the host maps one page, and may read the mirror before the store */
         volatile uint8_t* flat = map.base;
         flat[0x0203FFF0] = 0x5A;
-        CHECK(flat[0x0207FFF0] == 0x5A && flat[0x8203FFF0] == 0x5A);
+        CHECK(flat[0x0207FFF0] == 0x5A && flat[0x8203FFF0] == 0);
         flat[0x06010004] = 0xA5;
         CHECK(flat[0x06018004] == 0xA5 && flat[0x06038004] == 0xA5);
+    }
+    {
+        /* the ARM7TDMI writes a loaded PC with bits 1 and 0 dropped and stays in ARM state: LDR PC from 0x02000501 reads
+           the word at 0x02000500 rotated by 8 (0x03000AC3, so 0x03000AC0), whose code stores 5, then LDM {PC} loads
+           0x03000B01 and runs ARM code at 0x03000B00, which stores 6 */
+        static const uint32_t first[] = {0xE3A00005, 0xE5830000, 0xE8998000};
+        static const uint32_t second[] = {0xE3A01006, 0xE5831004, 0xEAFFFFFE};
+        uint32_t written = 0;
+        agb_write32(&board, 0x03000A80, 0xE598F000); /* ldr pc, [r8] */
+        for (uint32_t i = 0; i < 3; ++i) {
+            agb_write32(&board, 0x03000AC0 + i * 4, first[i]);
+            agb_write32(&board, 0x03000B00 + i * 4, second[i]);
+        }
+        agb_write32(&board, 0x02000500, 0x000AC303);
+        agb_write32(&board, 0x02000510, 0x03000B01);
+        agb_write16(&board, 0x04000208, 0); /* IME off */
+        cpu.arm.r[3] = 0x02000600;
+        cpu.arm.r[8] = 0x02000501;
+        cpu.arm.r[9] = 0x02000510;
+        cpu.arm.r[15] = 0x03000A80;
+        cpu.arm.cpsr = 0x1F;
+        board.cpu_halted = 0;
+        CHECK(!agb_cpu_run(&board, &cpu, &recomp, AGB_SCANLINE_CYCLES * AGB_FRAME_LINES, audio, AGB_APU_RATE, &written,
+                           error, sizeof error));
+        CHECK(agb_read32(&board, 0x02000600) == 5 && agb_read32(&board, 0x02000604) == 6);
+        CHECK(!(cpu.arm.cpsr & SNX_ARM_T) && cpu.arm.r[15] == 0x03000B08);
     }
     {
         /* a block that ends past a frame's cycles, at each frame: 200 moves and the branch back in IWRAM, 203 cycles (a
@@ -309,6 +335,78 @@ int main(void) {
         CHECK(cpu.arm.r[5] == 0);
         CHECK(!agb_cpu_run(&board, &cpu, &recomp, 100, audio, AGB_APU_RATE, NULL, error, sizeof error));
         CHECK(cpu.arm.r[5] > 0);
+    }
+    {
+        /* the cartridge's ROM takes no writes: a word, a halfword, a byte and an STM into the literal pool at 0xF0 leave
+           it as it was, for the loads after them and in the flat map (a game that stored into a table of its own there
+           called the entry it had overwritten) */
+        static const uint32_t code[] = {
+            0xE59F0028, /* ldr r0, [pc, #40]: 0x080000F0 */
+            0xE59F1028, /* ldr r1, [pc, #40]: 0x12345678 */
+            0xE5801000, /* str r1, [r0] */
+            0xE1C010B4, /* strh r1, [r0, #4] */
+            0xE5C01008, /* strb r1, [r0, #8] */
+            0xE280200C, /* add r2, r0, #12 */
+            0xE8820002, /* stmia r2, {r1} */
+            0xE5903000, /* ldr r3, [r0] */
+            0xE5904004, /* ldr r4, [r0, #4] */
+            0xE5905008, /* ldr r5, [r0, #8] */
+            0xE590600C, /* ldr r6, [r0, #12] */
+            0xEAFFFFFE, /* b . */
+            0x080000F0, 0x12345678,
+        };
+        static const uint32_t pool[] = {0x04000004, 0x04000208, 0x04000200, 0x03007FFC};
+        for (uint32_t i = 0; i < sizeof code / sizeof code[0]; ++i) agb_write32(&board, 0x03000E00 + i * 4, code[i]);
+        cpu.arm.r[15] = 0x03000E00;
+        cpu.arm.cpsr = 0x9F;
+        cpu.over = 0;
+        board.cpu_halted = 0;
+        board.held_cycles = 0;
+        CHECK(!agb_cpu_run(&board, &cpu, &recomp, 200, audio, AGB_APU_RATE, NULL, error, sizeof error));
+        for (uint32_t i = 0; i < 4; ++i) {
+            const uint8_t* flat = map.base + 0x080000F0 + i * 4;
+            uint32_t kept =
+                (uint32_t)flat[0] | (uint32_t)flat[1] << 8 | (uint32_t)flat[2] << 16 | (uint32_t)flat[3] << 24;
+            if (cpu.arm.r[3 + i] != pool[i] || kept != pool[i]) {
+                fprintf(stderr,
+                        "agb_cpu: the ROM word at 0x%08X reads 0x%08X and holds 0x%08X after a store, not 0x%08X\n",
+                        0x080000F0 + i * 4, cpu.arm.r[3 + i], kept, pool[i]);
+                goto done;
+            }
+        }
+    }
+    {
+        /* a cartridge clock's GPIO port: halfword stores from recompiled code reach it, and its registers read back in
+           the flat window the code reads the cartridge from. Direction 7 and data 5 (SCK and chip select high) */
+        static const uint32_t code[] = {
+            0xE59F0020, /* ldr r0, [pc, #32]: 0x080000C4 */
+            0xE3A01001, /* mov r1, #1 */
+            0xE1C010B4, /* strh r1, [r0, #4]: control, the port reads back */
+            0xE3A01007, /* mov r1, #7 */
+            0xE1C010B2, /* strh r1, [r0, #2]: direction */
+            0xE3A01005, /* mov r1, #5 */
+            0xE1C010B0, /* strh r1, [r0]: data */
+            0xE1D030B0, /* ldrh r3, [r0] */
+            0xE1D040B2, /* ldrh r4, [r0, #2] */
+            0xEAFFFFFE, /* b . */
+            0x080000C4,
+        };
+        for (uint32_t i = 0; i < sizeof code / sizeof code[0]; ++i) agb_write32(&board, 0x03000F00 + i * 4, code[i]);
+        agb_gpio_reset(&board, 1);
+        cpu.arm.r[3] = cpu.arm.r[4] = 0xFFFF;
+        cpu.arm.r[15] = 0x03000F00;
+        cpu.arm.cpsr = 0x9F;
+        cpu.over = 0;
+        board.cpu_halted = 0;
+        board.held_cycles = 0;
+        CHECK(!agb_cpu_run(&board, &cpu, &recomp, 200, audio, AGB_APU_RATE, NULL, error, sizeof error));
+        if (cpu.arm.r[3] != 5 || cpu.arm.r[4] != 7) {
+            fprintf(stderr, "agb_cpu: the GPIO port reads data 0x%X and direction 0x%X after the stores, not 5 and 7\n",
+                    cpu.arm.r[3], cpu.arm.r[4]);
+            goto done;
+        }
+        agb_gpio_reset(&board, 0);
+        memset(map.base + 0x080000C4, 0, 6); /* the image's bytes there */
     }
     {
         /* an S-bit write to the PC in system mode, which has no SPSR, sets the flags and keeps the mode, as mGBA does: a

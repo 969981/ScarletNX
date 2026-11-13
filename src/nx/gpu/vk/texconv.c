@@ -7,6 +7,7 @@
    conversion build for the blits that convert between pixel formats (TC_BLIT_CONVERT), each made the first time it
    is used. Uses are on g_vk.gfx, under vk_lock() */
 #include "nx/gpu/vk/vk.h"
+#include "nx/gpu/vk/ledger.h"
 #include "nx/gpu/vk/descriptors.h"
 #include "nx/gpu/texture/texconv_spv.h" /* compiled from texconv.comp by the build (cmake/glsl.cmake) */
 #include "nx/gpu/texture/texconv_modes.glsl"
@@ -26,7 +27,7 @@ static VkPipeline g_tc_pipe[6]; /* texconv.comp's, its ETC2 build's, its ASTC bu
 /* the ASTC build's work lists (texconv.comp's Work): the blocks each pass leaves to a later one, two lists of a word a
    block after a head of four words each, as large as the largest dispatch yet */
 static VkBuffer g_tc_work;
-static VmaAllocation g_tc_work_mem;
+static DevMem g_tc_work_mem;
 static u64 g_tc_work_size;
 #define TC_WORK_HEAD 32u
 
@@ -69,13 +70,13 @@ static int tc_work(u64 blocks) {
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    DevMemWant ai = {.at = DM_DEVICE};
     VkBuffer buf;
-    VmaAllocation mem;
+    DevMem mem;
     if (bi.size > g_vk.props.limits.maxStorageBufferRange ||
-        !VK_OK(vk_buffer_create(g_vk.vma, &bi, &ai, &buf, &mem, NULL)))
+        !VK_OK(vk_buffer_create(&bi, &ai, &buf, &mem, NULL)))
         return 0;
-    vk_mem_track(mem);
+    vk_mem_track(mem, VK_OWN_CONVERT);
     if (g_tc_work) vk_defer_buffer(g_tc_work, g_tc_work_mem);
     g_tc_work = buf;
     g_tc_work_mem = mem;

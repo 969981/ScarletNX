@@ -7,6 +7,7 @@
 * [How a pass is written](#how-a-pass-is-written)
 * [Value numbering](#value-numbering)
 * [Integer folds and identities](#integer-folds-and-identities)
+* [Known bits](#known-bits)
 * [Dead code](#dead-code)
 * [Tests](#tests)
 
@@ -77,12 +78,13 @@ The same walk folds an instruction before it looks it up, so what it folds to is
 with (spirv-opt's constant folding and instruction simplification, for what the translators write). Only 32-bit
 integers of either sign and booleans, on constants that are no specialization constants:
 
-- on constants alone: `OpIAdd`, `OpISub`, `OpIMul`, the bitwise ones, `OpNot`, `OpSNegate`, the three shifts (by less
-  than 32), `OpBitFieldUExtract` and `OpBitFieldSExtract` (a field that ends by bit 32), the integer comparisons, the
-  logical instructions, and an `OpBitcast` between the two signs;
-- one operand that decides: `x & 0`, `x * 0`, `x | ~0`, `x - x`, `x ^ x`, `false && x`, `true || x`;
-- one operand that leaves the other: `x + 0`, `x - 0`, `x | 0`, `x ^ 0`, a shift by 0, `x * 1`, `x & ~0`, `x & x`,
-  `x | x`, `true && x`, `false || x`, `x && x`, `x || x`, with the constant on either side of what commutes;
+- on constants alone: `OpIMul` and the logical instructions; every other integer instruction on constants has all
+  its bits known (below);
+- one operand that decides: `x - x`, `x ^ x`, `false && x`, `true || x` (`x & 0`, `x * 0` and `x | ~0` by their
+  known bits);
+- one operand that leaves the other: `x + 0`, `x - 0`, `x | 0`, `x ^ 0`, a shift by 0, `x * 1`, `x & x`, `x | x`,
+  `true && x`, `false || x`, `x && x`, `x || x`, with the constant on either side of what commutes (`x & ~0` by its
+  known bits);
 - of any type: an `OpSelect` whose condition is a constant or whose two values are one id, and an `OpBitcast` to
   the type its operand has, or of a bitcast from that type.
 
@@ -93,6 +95,37 @@ instruction left, so a module never grows. Float arithmetic, divisions and a dec
 
 On the Maxwell translator's modules: `x + 0` for a register's offset, masks and shifts of immediates, selects on a
 constant condition, and bitcasts there and back.
+
+## Known bits
+
+The walk also keeps, for each 32-bit integer value, the bits known 0 and the bits known 1 (LLVM's known bits), two
+words per id: a constant's are all known; an instruction's come from its operands':
+
+- `&`, `|`, `^`, `~`, a select (what both values know) and a bitcast between the two signs, bit by bit;
+- `OpIAdd`, `OpISub` and `OpSNegate` with the carries: a bit is known where both operands' bits and the carry into
+  it are (LLVM's `computeForAddCarry`);
+- `OpIMul`: the low zeros of the two operands add up, and so do their high zeros past 32;
+- the three shifts by a constant amount below 32, and `OpBitFieldUExtract`, `OpBitFieldSExtract` and
+  `OpBitFieldInsert` with a constant offset and count that end by bit 32;
+- nothing of a load, a phi, a function's parameter, or an operand of another type.
+
+What it folds:
+
+- an instruction whose result has every bit known: `((x << 4) + 480 >> 2) & 3` is 0, `(x & 0xffff) >> 16` is 0;
+- an integer comparison the ranges decide, each operand's least value its known 1s and its most its bits that may
+  be 1 (for a signed one, in the order the sign bit flipped gives): `0 > (x & 0x7fffffff)` is false, `(x & 0xff) <
+  256` true; and an operand compared with itself (`x < x` is false, `x <= x` true);
+- `a & b` where every bit of `a` that may be 1 is known 1 in `b`, `a | b` where every bit of `b` that may be 1 is
+  known 1 in `a`, and `OpBitFieldUExtract` from bit 0 that keeps every bit of its base that may be 1 (signed, one
+  whose base's bits from its sign bit up are all known alike): each is `a`.
+
+A boolean is known only as a constant, which the folds above take already. The comparisons then fold the selects
+and logical instructions on them as constants.
+
+On the Maxwell translator's modules it removes the component of an indexed constant buffer read: the translator
+splits an address made of a register shifted by 4 plus an offset into a vec4's index and `(address >> 2) & 3`, and
+the low bits of such an address are known. Also the sign tests of masked values (an absolute value or a clamp of what
+cannot be negative) and the fields past a value's width.
 
 ## Dead code
 
@@ -117,6 +150,8 @@ that never read them.
 ## Tests
 
 - `spirv_opt` (`tests/spirv_opt.c`), `spirv_opt_values` (`tests/spirv_opt_values.c`) and `spirv_opt_fold`
-  (`tests/spirv_opt_fold.c`): each rule above on a module written word by word.
+  (`tests/spirv_opt_fold.c`): each rule above on a module written word by word. `spirv_opt_fold` also makes 4000
+  modules at random (a fixed sequence) of values with a few unknown bits, runs each before and after the pass on
+  every value of those bits, and checks they store the same.
 - `vulkan_headless`, `check_translation_dead_code` and `check_translation_values`: the runtime's module is the
   translator's with the passes run, and the device takes it.

@@ -129,6 +129,7 @@ static void advanced_blend_epilogue(DirectCtx* c, const ShaderInfo* si, u32 vec4
 }
 
 int g_shader_texture_arrays;
+u32 g_shader_tex_array = SNX_TEX_ARRAY;
 u32 g_shader_uniform_cbufs = 18;
 int g_shader_stage_point_size;
 int g_shader_output_layer = 1;
@@ -146,6 +147,7 @@ int g_shader_quad = 1;
 int g_shader_quad_compute = 1;
 int g_shader_mixed_dot;
 int g_shader_hmma_coop;
+int g_shader_hmma_pairs;
 u32 g_shader_mesh_tasks_max;
 int g_shader_float_atomic_add;
 int g_shader_tessellation = 1;
@@ -390,6 +392,9 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         if (sph[19] & 2u) used[out_reg + 1] = 1;
     }
     int has_exit = 0, mixed_sample_invariant = stage == ST_FS;
+    /* the TEX.B instructions that choose among constant buffer handles, and the first one (ShaderInfo.chosen_tex) */
+    u32 chosen_tex = 0;
+    char chosen_why[sizeof si->chosen_why] = {0};
     for (u32 i = 11; i < n; i++) {
         if (!IDX_OK(i)) continue;
         const Op* op = flow->op[i];
@@ -1238,18 +1243,40 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             handle_count =
                 bindless ? shader_direct_track_image_handle_pair(flow, i, b, &bank, &off, &bank2, &off2, 0) : 0;
             if (handle_count == 1) indexed = shader_direct_indexed_handle(flow, i, b, stage, &ldc);
-            if (bindless && !handle_count) return shader_untracked_handle(si, "texture", insn, i, b);
+            /* a handle the writes don't agree on: each constant buffer handle that can reach it, chosen when it runs */
+            u32 cand_bank[SH_HANDLE_CANDIDATES], cand_off[SH_HANDLE_CANDIDATES];
+            int candidates = bindless && !handle_count ? shader_direct_handle_candidates(flow, i, b, cand_bank,
+                                                                                         cand_off, SH_HANDLE_CANDIDATES)
+                                                       : 1;
+            if (!candidates) return shader_untracked_handle(si, "texture", insn, i, b);
+            if (bindless && !handle_count && chosen_tex++ == 0) {
+                int at = snprintf(chosen_why, sizeof chosen_why, "TEX.B at %x, R%u:", i * 8, b);
+                for (int cand = 0; cand < candidates && at > 0 && (size_t)at < sizeof chosen_why; cand++)
+                    at += snprintf(chosen_why + at, sizeof chosen_why - (size_t)at, "%s c[%u][0x%x]", cand ? "," : "",
+                                   cand_bank[cand], cand_off[cand] * 4);
+            }
             int type = B(insn[i], 28, 3) >> 1;
             int array = B(insn[i], 28, 1), shadow = B(insn[i], 50, 1);
-            int read_slot = shader_direct_add_typed_slot(textures, &texture_count, off, type, array, shadow, 0,
-                                                         bindless, bank, handle_count, bank2, off2, indexed, ldc);
-            if (read_slot < 0) return direct_reject(si, "texture descriptor count");
-            tex_read |= 1ull << read_slot;
+            int read_slot = -1;
+            for (int cand = 0; cand < candidates; cand++) {
+                if (bindless && !handle_count) {
+                    bank = cand_bank[cand];
+                    off = cand_off[cand];
+                }
+                read_slot =
+                    shader_direct_add_typed_slot(textures, &texture_count, off, type, array, shadow, 0, bindless, bank,
+                                                 handle_count ? handle_count : 1, bank2, off2, indexed, ldc);
+                if (read_slot < 0) return direct_reject(si, "texture descriptor count");
+                tex_read |= 1ull << read_slot;
+                if (!handle_count && bindless) tex_elsewhere |= 1ull << read_slot;
+            }
             u32 coordinate = a + (array || clamp), dimensions = type == 0 ? 1 : type >= 2 ? 3 : 2;
             int plain = type == 1 && !array && !shadow && !offset_enabled && !clamp && mode <= 1;
-            if (stage == ST_FS && screen_sample(flow, i, sph, plain, a, a < 254 ? a + 1 : 255, &screen_in, &screen_ndc))
+            if ((handle_count || !bindless) && stage == ST_FS &&
+                screen_sample(flow, i, sph, plain, a, a < 254 ? a + 1 : 255, &screen_in, &screen_ndc))
                 tex_screen |= 1ull << read_slot;
-            else if (stage == ST_FS && uv_sample(flow, i, sph, plain, a, a < 254 ? a + 1 : 255, &uv_in))
+            else if ((handle_count || !bindless) && stage == ST_FS &&
+                     uv_sample(flow, i, sph, plain, a, a < 254 ? a + 1 : 255, &uv_in))
                 tex_uv |= 1ull << read_slot;
             else
                 tex_elsewhere |= 1ull << read_slot;
@@ -1857,6 +1884,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
        zeros (shader_float_ftz): without the import its OpExtInst named id 0, which NVIDIA's SPIR-V front end (615.78)
        crashed on, a shader of FADD and FMUL with nothing else from the set */
     if (fp32_flush && soft_ftz_on && can_preserve) needs_glsl = 1;
+    if (si->tex_minmax_mask) needs_glsl = 1; /* a min/max sample's fractions and extremes (shader_minmax_sample) */
     if (needs_glsl) c->glsl = spv_emit_glsl450_import(&c->emit);
     u32 fn = spv_emit_id(&c->emit), label = spv_emit_id(&c->emit);
     u32 void_type = spv_emit_type_void(&c->emit);
@@ -2315,16 +2343,16 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                                  shader_same_indexed_kind(textures, si->tex_int_mask, si->tex_sint_mask, same, i)))
                 same++;
             if (same == i) { /* the first slot of its kind declares the kind's arrays */
-                c->tex_array[i] =
-                    spv_emit_sampler_image_array_ex(&c->emit, scalar, c->u32_type, shader_vk_set(stage), SNX_VKB_TEXARRAY,
-                                                 textures[i].type == 0 ? 1 : textures[i].type, textures[i].array, 0,
-                                                 !!(textures[i].flags & 2), SNX_TEX_ARRAY, &c->sampled_type[i]);
+                c->tex_array[i] = spv_emit_sampler_image_array_ex(
+                    &c->emit, scalar, c->u32_type, shader_vk_set(stage), SNX_VKB_TEXARRAY,
+                    textures[i].type == 0 ? 1 : textures[i].type, textures[i].array, 0, !!(textures[i].flags & 2),
+                    g_shader_tex_array, &c->sampled_type[i]);
                 interfaces[count++] = c->tex_array[i];
                 if (textures[i].shadow) {
                     c->tex_depth[i] =
                         spv_emit_sampler_image_array(&c->emit, c->f32_type, c->u32_type, shader_vk_set(stage),
                                                      SNX_VKB_TEXDEPTH, textures[i].type == 0 ? 1 : textures[i].type,
-                                                     textures[i].array, 1, SNX_TEX_ARRAY, &c->tex_depth_type[i]);
+                                                     textures[i].array, 1, g_shader_tex_array, &c->tex_depth_type[i]);
                     interfaces[count++] = c->tex_depth[i];
                 }
             } else {
@@ -2568,6 +2596,15 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     /* every OpVariable comes before the first block's other instructions, the clip distances' stores included */
     if (has_flow && !structure) pc = spv_emit_function_variable_init(&c->emit, reg_ptr, shader_u32(c, 11));
     if (structure && structure->uses_flag) se.flag = spv_emit_function_variable_init(&c->emit, reg_ptr, c->zero);
+    /* a fragment program with loops counts the back-edges a lane takes, which ends a helper lane's loop
+       (shader_helper_loop_exit) */
+    int loops = has_flow && !structure;
+    for (u32 k = 0; structure && k < structure->nscopes && !loops; k++) loops = structure->scope[k].loop;
+    if (stage == ST_FS && loops) {
+        c->helper_rounds = spv_emit_function_variable_init(&c->emit, reg_ptr, c->zero);
+        spv_emit_capability(&c->emit, SPV_CAPABILITY_DEMOTE_TO_HELPER_INVOCATION); /* IsHelperInvocationEXT */
+        spv_emit_demote_extension(&c->emit);
+    }
     c->discarded = (has_flow && stage == ST_FS) || advanced_blend || si->late_depth
                        ? spv_emit_function_variable_init(&c->emit, pred_ptr, c->false_value)
                        : 0;
@@ -2899,6 +2936,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         spv_emit_label(&c->emit, dispatch_merge);
         u32 next_pc = spv_emit_load(&c->emit, c->u32_type, pc);
         u32 finished = spv_emit_binary(&c->emit, SPV_OP_I_EQUAL, c->bool_type, next_pc, shader_u32(c, UINT32_MAX));
+        if (c->helper_rounds) finished = cc_or(c, finished, shader_helper_loop_exit(c));
         spv_emit_branch_conditional(&c->emit, finished, loop_merge, loop_continue);
         spv_emit_label(&c->emit, loop_continue);
         spv_emit_branch(&c->emit, loop_header);
@@ -2943,6 +2981,8 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     free(gb_at);
     ShaderInfo next = {0};
     next.stage = stage;
+    next.chosen_tex = chosen_tex;
+    memcpy(next.chosen_why, chosen_why, sizeof next.chosen_why);
     next.flow_base = si->flow_base;
     next.advanced_blend = si->advanced_blend;
     next.advanced_blend_mask = si->advanced_blend_mask;
@@ -2968,6 +3008,8 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     next.tex_sint_mask = si->tex_sint_mask;
     next.tex_dc_color_mask = si->tex_dc_color_mask;
     next.tex_dc_color_funcs = si->tex_dc_color_funcs;
+    next.tex_minmax_mask = si->tex_minmax_mask;
+    next.tex_minmax_max = si->tex_minmax_max;
     next.in_unfed_mask = si->in_unfed_mask;
     next.ntex = texture_count;
     /* a slot sampled both ways would need both of the vertex stage's mappings: it reads elsewhere */

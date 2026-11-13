@@ -658,7 +658,6 @@ foreach(suite ${snx_fs_suites})
 endforeach()
 if(TARGET hactool_internals)
     target_compile_options(snx-test-fs-service PRIVATE -Wno-unused-parameter)
-    snx_swipc(snx-test-fs-service ROOT "${PROJECT_SOURCE_DIR}/src/nx" FILES hle/services/types.swipc hle/filesystem/fs.swipc)
     # fs.c reads a game's dump in place through the driver's container.c and hactool
     target_sources(snx-test-fs-service PRIVATE "${PROJECT_SOURCE_DIR}/src/nx/runtime/driver/container.c"
 )
@@ -1133,6 +1132,14 @@ snx_test_target(snx-test-hook-adapters 99)
 target_include_directories(snx-test-hook-adapters PRIVATE "${PROJECT_SOURCE_DIR}/src")
 snx_hookgen(snx-test-hook-adapters SPEC "${CMAKE_CURRENT_SOURCE_DIR}/hook/test.hook" A32)
 add_test(NAME hook_adapters COMMAND snx-test-hook-adapters)
+# hook_install on a 32-bit game (src/nx/hle/hook/hook.c) over tests/hook/a32_marked.hook: the hooks of the 32-bit
+# program's table take their functions' slots of the code table, with the runtime stubbed
+add_executable(snx-test-hook-install-a32 hook_install_a32.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/version.c")
+snx_test_target(snx-test-hook-install-a32 23)
+target_include_directories(snx-test-hook-install-a32 PRIVATE "${PROJECT_SOURCE_DIR}/src")
+snx_service_swipc(snx-test-hook-install-a32)
+snx_hookgen(snx-test-hook-install-a32 SPEC "${CMAKE_CURRENT_SOURCE_DIR}/hook/a32_marked.hook" A32_MARKED)
+add_test(NAME hook_install_a32 COMMAND snx-test-hook-install-a32)
 # versioned hooks and struct layouts (tests/hook/versions.hook): the entries by version, the layout variant each
 # adapter passes, the SDK labels a module's bytes hold and the entry hook_select picks for a module's version
 add_executable(snx-test-hook-versions hook_versions.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/version.c")
@@ -1153,7 +1160,7 @@ add_executable(snx-test-hook-install hook_install.c "${PROJECT_SOURCE_DIR}/src/n
 snx_test_target(snx-test-hook-install 23)
 target_include_directories(snx-test-hook-install PRIVATE "${PROJECT_SOURCE_DIR}/src")
 snx_service_swipc(snx-test-hook-install)
-snx_hookgen(snx-test-hook-install SPEC "${CMAKE_CURRENT_SOURCE_DIR}/hook/install.hook")
+snx_hookgen(snx-test-hook-install SPEC "${CMAKE_CURRENT_SOURCE_DIR}/hook/install.hook" A32_MARKED)
 add_test(NAME hook_install COMMAND snx-test-hook-install)
 # the route list (src/nx/loader/hook_routes.c): hookgen --routes over three specs (tests/hook/routes.hook,
 # versions.hook and address.hook), the runtime's own list, its lookup and the hashes a module carries, and the build
@@ -1309,7 +1316,14 @@ foreach(bad IN ITEMS
         address_short 2 "a build ID is an even number of hex digits, 16 to 64"
         address_zero 2 "a build ID of zeros names no build"
         address_twice 4 "0123456789abcdef:40 is hooked on line 2 too"
-        address_keyword 2 "expected 'hook' after the address")
+        address_keyword 2 "expected 'hook' after the address"
+        a32_uses 4 "a hook that holds for a 32-bit program too uses no struct"
+        a32_twice 4 "f is hooked on line 3 too"
+        a32_word_twice 3 "the a32 before hook says it already"
+        a32_keyword 3 "expected 'hook' after a32"
+        a32_pure 3 "verify mode checks no hook of a 32-bit program"
+        a32_versions_overlap 4 "f's versions overlap line 3's"
+        a32_versions_malformed 3 "malformed version '2.x'")
     if(NOT DEFINED bad_name)
         set(bad_name "${bad}")
     elseif(NOT DEFINED bad_line)
@@ -1324,6 +1338,11 @@ foreach(bad IN ITEMS
         unset(bad_line)
     endif()
 endforeach()
+# a declaration for a 32-bit program alone, with --a32, which gives that program every hook's declaration
+add_test(NAME hookgen_refuses_a32_all COMMAND snx-hookgen --a32 --out "${CMAKE_CURRENT_BINARY_DIR}/refused.inc"
+         "${CMAKE_CURRENT_SOURCE_DIR}/hook/bad/a32_all.hook")
+set_tests_properties(hookgen_refuses_a32_all PROPERTIES
+                     PASS_REGULAR_EXPRESSION "a32_all.hook:4: .*one for it alone needs --a32-marked")
 add_executable(snx-test-swipc-dispatch swipc_dispatch.c)
 snx_test_target(snx-test-swipc-dispatch 23)
 snx_swipc(snx-test-swipc-dispatch ROOT "${PROJECT_SOURCE_DIR}" FILES tests/swipc/test.swipc tests/swipc/other.swipc)
@@ -1480,12 +1499,58 @@ if(TARGET OpenSSL::Crypto AND NOT SNX_TOOLS_ONLY)
     endif()
     add_test(NAME misc_service COMMAND snx-test-misc-service)
 
-    # time.c's clocks, time zones and shared memory, with the guest clock and the kernel objects stubbed
-    add_executable(snx-test-time-service time_service.c)
-    snx_test_target(snx-test-time-service 23)
-    snx_service_swipc(snx-test-time-service hle/services/time.swipc)
-    target_link_libraries(snx-test-time-service PRIVATE OpenSSL::Crypto)
-    add_test(NAME time_service COMMAND snx-test-time-service)
+    # the native nn::time (nn/time.c): its handlers on a stand-in CPU, with the guest clock and the lock stubbed
+    add_executable(snx-test-nn-time nn_time.c)
+    snx_test_target(snx-test-nn-time 23)
+    snx_service_swipc(snx-test-nn-time)
+    snx_hookgen(snx-test-nn-time SPEC "${PROJECT_SOURCE_DIR}/src/nx/nn/time.hook" A32_MARKED)
+    target_link_libraries(snx-test-nn-time PRIVATE OpenSSL::Crypto)
+    add_test(NAME nn_time COMMAND snx-test-nn-time)
+    # the native nn::fs (nn/fs.c): a path's mount and limits as the SDK's C library asks them, and a system archive
+    # mounted by its data id, with the file server's core stubbed
+    add_executable(snx-test-nn-fs nn_fs.c)
+    snx_test_target(snx-test-nn-fs 23)
+    snx_service_swipc(snx-test-nn-fs)
+    snx_hookgen(snx-test-nn-fs SPEC "${PROJECT_SOURCE_DIR}/src/nx/nn/fs.hook" A32_MARKED)
+    add_test(NAME nn_fs COMMAND snx-test-nn-fs)
+    # the native nn::pctl (nn/pctl.c): the answers of a console with no parental controls set
+    add_executable(snx-test-nn-pctl nn_pctl.c)
+    snx_test_target(snx-test-nn-pctl 23)
+    target_include_directories(snx-test-nn-pctl PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    snx_hookgen(snx-test-nn-pctl SPEC "${PROJECT_SOURCE_DIR}/src/nx/nn/pctl.hook" A32_MARKED)
+    add_test(NAME nn_pctl COMMAND snx-test-nn-pctl)
+    # the native nn::nsd (nn/nsd.c): the names of the servers in the retail environment
+    add_executable(snx-test-nn-nsd nn_nsd.c)
+    snx_test_target(snx-test-nn-nsd 23)
+    target_include_directories(snx-test-nn-nsd PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    snx_hookgen(snx-test-nn-nsd SPEC "${PROJECT_SOURCE_DIR}/src/nx/nn/nsd.hook" A32_MARKED)
+    add_test(NAME nn_nsd COMMAND snx-test-nn-nsd)
+    # the native nn::ngc (nn/ngc.c): the profanity filter's checks, with no word lists
+    add_executable(snx-test-nn-ngc nn_ngc.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/version.c")
+    snx_test_target(snx-test-nn-ngc 23)
+    target_include_directories(snx-test-nn-ngc PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    snx_hookgen(snx-test-nn-ngc SPEC "${PROJECT_SOURCE_DIR}/src/nx/nn/ngc.hook")
+    add_test(NAME nn_ngc COMMAND snx-test-nn-ngc)
+    # the native nn::prepo (nn/prepo.c): Save in the two report layouts, and SDK 20's limit
+    add_executable(snx-test-nn-prepo nn_prepo.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/version.c")
+    snx_test_target(snx-test-nn-prepo 23)
+    snx_service_swipc(snx-test-nn-prepo)
+    snx_hookgen(snx-test-nn-prepo SPEC "${PROJECT_SOURCE_DIR}/src/nx/nn/prepo.hook" A32_MARKED)
+    add_test(NAME nn_prepo COMMAND snx-test-nn-prepo)
+    # the native audio outs (nn/audio.c): what OpenAudioOut writes into the game's AudioOut, the buffers' play and
+    # release on the clock, the buffer event, and audio.hook's table
+    add_executable(snx-test-nn-audio nn_audio.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/version.c")
+    snx_test_target(snx-test-nn-audio 23)
+    snx_service_swipc(snx-test-nn-audio)
+    snx_hookgen(snx-test-nn-audio SPEC "${PROJECT_SOURCE_DIR}/src/nx/nn/audio.hook" A32_MARKED)
+    add_test(NAME nn_audio COMMAND snx-test-nn-audio)
+    # the native audio renderer (nn/audio_renderer.c): the parameters, the handle, RequestUpdateAudioRenderer over a
+    # stand-in SDK's managers, and audio_renderer.hook's table by SDK version
+    add_executable(snx-test-nn-audio-renderer nn_audio_renderer.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/version.c")
+    snx_test_target(snx-test-nn-audio-renderer 23)
+    snx_service_swipc(snx-test-nn-audio-renderer)
+    snx_hookgen(snx-test-nn-audio-renderer SPEC "${PROJECT_SOURCE_DIR}/src/nx/nn/audio_renderer.hook" A32_MARKED)
+    add_test(NAME nn_audio_renderer COMMAND snx-test-nn-audio-renderer)
 endif()
 
 # Inline software keyboard protocol and applet completion events.
@@ -1900,6 +1965,12 @@ snx_test_target(snx-test-collection-programs 99)
 target_link_libraries(snx-test-collection-programs PRIVATE scarletnx-common)
 add_test(NAME collection_programs COMMAND snx-test-collection-programs)
 
+# the rows of a program a collection's program started (common/utilities/program_start.c), the runtime's screen and
+# the launcher's page: each one known, each one not known as "?", a row a screen can't say left out
+add_executable(snx-test-program-start program_start.c "${PROJECT_SOURCE_DIR}/src/common/utilities/program_start.c")
+snx_test_target(snx-test-program-start 99)
+add_test(NAME program_start COMMAND snx-test-program-start)
+
 # a start's mark (common/utilities/run_mark.c): made, ended, said by the next start, a held one left, a long folder,
 # a look that deletes none
 add_executable(snx-test-run-mark run_mark.c)
@@ -2201,7 +2272,7 @@ if(NOT SNX_TOOLS_ONLY)
     # pitch linear, a converted format; a format uploaded as it is needs no level-sized buffer
     add_executable(snx-test-tex-upload-rows tex_upload_rows.c tracy_stubs.c)
     snx_test_target(snx-test-tex-upload-rows 23)
-    target_compile_definitions(snx-test-tex-upload-rows PRIVATE SNX_TEST_VMA_STUBS=1)
+    target_compile_definitions(snx-test-tex-upload-rows PRIVATE SNX_TEST_DEVMEM_STUBS=1)
     target_link_libraries(snx-test-tex-upload-rows PRIVATE snx_nx_flags)
     add_test(NAME tex_upload_rows COMMAND snx-test-tex-upload-rows)
     # the file of shaders and pipelines kept across runs (gpu/vk/pipeline_file.c): records back as written, pipelines
@@ -2220,6 +2291,23 @@ if(NOT SNX_TOOLS_ONLY)
     add_executable(snx-test-vk-resource-stats vk_resource_stats.c)
     snx_test_target(snx-test-vk-resource-stats 11)
     add_test(NAME vk_resource_stats COMMAND snx-test-vk-resource-stats)
+    # the shape of a set of ranges (gpu/vk/range_shape.c), which the buffer cache's measurements report: the bytes
+    # held twice, the joined pieces, the granules they touch and the sizes
+    add_executable(snx-test-vk-range-shape vk_range_shape.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/range_shape.c")
+    snx_test_target(snx-test-vk-range-shape 11)
+    add_test(NAME vk_range_shape COMMAND snx-test-vk-range-shape)
+    # the calculations of the texture cache's measurements (gpu/vk/tex_census.c): a key's hash, the table of evicted
+    # keys, a texture among the guest's live texture objects, the sums by host format and ASTC block size
+    add_executable(snx-test-vk-tex-census vk_tex_census.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/tex_census.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/range_shape.c")
+    snx_test_target(snx-test-vk-tex-census 11)
+    add_test(NAME vk_tex_census COMMAND snx-test-vk-tex-census)
+    # the registry of the guest's live texture objects (gpu/guest_textures.c): counted addresses, each in reach while
+    # the table grows and while others leave it
+    add_executable(snx-test-guest-textures guest_textures.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/guest_textures.c")
+    snx_test_target(snx-test-guest-textures 11)
+    target_link_libraries(snx-test-guest-textures PRIVATE scarletnx-platform) # the registry's PMutex
+    add_test(NAME guest_textures COMMAND snx-test-guest-textures)
     # the BC7 cache of ASTC levels (gpu/vk/bc7_cache.c), without a GPU: every input that changes a level's blocks
     # changes its key, records come back as written and from the file in a later run, another version or a damaged
     # record starts the file over or drops the record, a record cut short is cut off, and the bound starts it over
@@ -2516,7 +2604,7 @@ if(SNX_TEST_EDENPROBE AND Python3_Interpreter_FOUND AND NOT CMAKE_CROSSCOMPILING
         add_test(NAME edenprobe_vk_memory_${snx_memory}
             COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/edenprobe.py" run
                 --runtime $<TARGET_FILE:scarletnx> --nro "${snx_edenprobe_nro}"
-                --mode "quick notime cpu fs video display kernel audio"
+                --mode "quick notime cpu fs video display kernel audio hooks"
                 --out "${CMAKE_CURRENT_BINARY_DIR}/edenprobe-vk_memory-${snx_memory}"
                 --baseline "${PROJECT_SOURCE_DIR}/tests/edenprobe/linux-x86_64.txt" --timeout 120
                 --setting vk_memory=${snx_memory})
@@ -2999,19 +3087,22 @@ add_test(NAME nvn_section COMMAND snx-test-nvn-section)
 
 # the shared fonts pl.c hands out when a game folder has none: the stand-ins compiled in (cmake/shared_fonts.cmake)
 if(NOT SNX_TOOLS_ONLY)
-    add_executable(snx-test-pl-fonts pl_fonts.c "${PROJECT_SOURCE_DIR}/src/nx/hle/services/pl_font.c" "${PROJECT_BINARY_DIR}/generated/shared_fonts.c")
+    add_executable(snx-test-pl-fonts pl_fonts.c "${PROJECT_SOURCE_DIR}/src/nx/nn/pl_font.c" "${PROJECT_BINARY_DIR}/generated/shared_fonts.c")
     snx_test_target(snx-test-pl-fonts 23)
-    snx_service_swipc(snx-test-pl-fonts hle/services/pl.swipc)
+    snx_service_swipc(snx-test-pl-fonts)
+    snx_hookgen(snx-test-pl-fonts SPEC "${PROJECT_SOURCE_DIR}/src/nx/nn/pl.hook" A32_MARKED)
     add_test(NAME pl_fonts COMMAND snx-test-pl-fonts)
 endif()
 
-# audout and hwopus in a fixture, with FFmpeg's Opus decoder for the hwopus decoders that open. FFmpeg::avcodec comes
+# aud:u and the hardware Opus decoder (nn/codec.c) in a fixture, with FFmpeg's Opus decoder for the decoders that open. FFmpeg::avcodec comes
 # from cmake/dependencies.cmake, before this folder, in every build but a tools-only one, which checks the fixture
 # without it (SNX_NO_H264, which no runtime build defines)
 if(SNX_TOOLS_ONLY)
     add_executable(snx-test-audio-out audio_out.c)
     snx_test_target(snx-test-audio-out 11)
     snx_service_swipc(snx-test-audio-out hle/services/audio.swipc)
+    snx_hookgen(snx-test-audio-out SPEC "${PROJECT_SOURCE_DIR}/src/nx/nn/codec.hook")
+    target_sources(snx-test-audio-out PRIVATE "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/version.c")
     target_compile_definitions(snx-test-audio-out PRIVATE SNX_NO_H264)
     if(NOT WIN32)
         target_link_libraries(snx-test-audio-out PRIVATE m)
@@ -3021,6 +3112,8 @@ else()
     add_executable(snx-test-audio-opus audio_out.c)
     snx_test_target(snx-test-audio-opus 11)
     snx_service_swipc(snx-test-audio-opus hle/services/audio.swipc)
+    snx_hookgen(snx-test-audio-opus SPEC "${PROJECT_SOURCE_DIR}/src/nx/nn/codec.hook")
+    target_sources(snx-test-audio-opus PRIVATE "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/version.c")
     target_link_libraries(snx-test-audio-opus PRIVATE FFmpeg::avcodec)
     if(NOT WIN32)
         target_link_libraries(snx-test-audio-opus PRIVATE m)
@@ -3314,6 +3407,11 @@ add_test(NAME draw_state_mx COMMAND snx-test-draw-state-mx)
 add_executable(snx-bench-write-pages EXCLUDE_FROM_ALL bench_write_pages.c
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/write_pages.c")
 snx_test_target(snx-bench-write-pages 11)
+# the free space of a block of device memory (src/nx/gpu/vk/space.c)
+add_executable(snx-test-vk-space vk_space.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/space.c")
+snx_test_target(snx-test-vk-space 99)
+target_include_directories(snx-test-vk-space PRIVATE "${PROJECT_SOURCE_DIR}/src")
+add_test(NAME vk_space COMMAND snx-test-vk-space)
 add_executable(snx-test-pending-pages pending_pages.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/pending_pages.c")
 snx_test_target(snx-test-pending-pages 23)
 target_link_libraries(snx-test-pending-pages PRIVATE scarletnx-filesystem Threads::Threads) # pend_lock's PMutex
@@ -3323,6 +3421,11 @@ add_executable(snx-test-quad-indices quad_indices.c)
 snx_test_target(snx-test-quad-indices 99)
 target_include_directories(snx-test-quad-indices PRIVATE "${PROJECT_SOURCE_DIR}/src")
 add_test(NAME quad_indices COMMAND snx-test-quad-indices)
+# a draw's primitives made into lines or points on the CPU: polygons in the polygon mode Line or Point, and line loops
+add_executable(snx-test-polygon-edges polygon_edges.c)
+snx_test_target(snx-test-polygon-edges 99)
+target_include_directories(snx-test-polygon-edges PRIVATE "${PROJECT_SOURCE_DIR}/src")
+add_test(NAME polygon_edges COMMAND snx-test-polygon-edges)
 add_executable(snx-test-unattended-script unattended_script.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c"
     "${PROJECT_SOURCE_DIR}/src/common/platform/file.c"
         "${PROJECT_SOURCE_DIR}/src/common/platform/file_map.c" "${PROJECT_SOURCE_DIR}/src/common/platform/file_share.c"
@@ -3558,6 +3661,9 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     add_executable(snx-test-vk-indexed-handles vk_indexed_handles.c)
     snx_test_target(snx-test-vk-indexed-handles 99)
     add_test(NAME vk_indexed_handles COMMAND snx-test-vk-indexed-handles)
+    add_executable(snx-test-vk-texture-arrays vk_texture_arrays.c)
+    snx_test_target(snx-test-vk-texture-arrays 99)
+    add_test(NAME vk_texture_arrays COMMAND snx-test-vk-texture-arrays)
     add_executable(snx-test-vk-inline-bank vk_inline_bank.c)
     snx_test_target(snx-test-vk-inline-bank 99)
     add_test(NAME vk_inline_bank COMMAND snx-test-vk-inline-bank)
@@ -3565,8 +3671,7 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
         "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/tess_passthrough.c"
         "${PROJECT_SOURCE_DIR}/src/common/utilities/spirv_emit.c")
     snx_test_target(snx-test-vk-tess-passthrough 11)
-    target_include_directories(snx-test-vk-tess-passthrough PRIVATE "${volk_SOURCE_DIR}"
-        "${snx_vma_include_dir}")
+    target_include_directories(snx-test-vk-tess-passthrough PRIVATE "${volk_SOURCE_DIR}")
     target_link_libraries(snx-test-vk-tess-passthrough PRIVATE Vulkan::Headers)
     add_test(NAME vk_tess_passthrough COMMAND snx-test-vk-tess-passthrough)
     # the shader lookups' tables hold a frame's keys (src/nx/gpu/vk/lookup_ways.h)
@@ -3589,34 +3694,29 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     add_test(NAME vk_descriptor_encoding COMMAND snx-test-vk-descriptor-encoding)
     add_executable(snx-test-vk-descriptor-heaps vk_descriptor_heaps.c)
     snx_test_target(snx-test-vk-descriptor-heaps 11)
-    target_include_directories(snx-test-vk-descriptor-heaps PRIVATE "${volk_SOURCE_DIR}"
-        "${snx_vma_include_dir}")
+    target_include_directories(snx-test-vk-descriptor-heaps PRIVATE "${volk_SOURCE_DIR}")
     target_link_libraries(snx-test-vk-descriptor-heaps PRIVATE Vulkan::Headers)
     add_test(NAME vk_descriptor_heaps COMMAND snx-test-vk-descriptor-heaps)
     add_executable(snx-test-vk-descriptor-heap-batch vk_descriptor_heap_batch.c)
     snx_test_target(snx-test-vk-descriptor-heap-batch 11)
-    target_include_directories(snx-test-vk-descriptor-heap-batch PRIVATE "${volk_SOURCE_DIR}"
-        "${snx_vma_include_dir}")
+    target_include_directories(snx-test-vk-descriptor-heap-batch PRIVATE "${volk_SOURCE_DIR}")
     target_link_libraries(snx-test-vk-descriptor-heap-batch PRIVATE Vulkan::Headers)
     add_test(NAME vk_descriptor_heap_batch COMMAND snx-test-vk-descriptor-heap-batch)
     add_executable(snx-test-vk-descriptor-objects vk_descriptor_objects.c
         "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/descriptor_objects.c")
     snx_test_target(snx-test-vk-descriptor-objects 11)
-    target_include_directories(snx-test-vk-descriptor-objects PRIVATE "${volk_SOURCE_DIR}"
-        "${snx_vma_include_dir}")
+    target_include_directories(snx-test-vk-descriptor-objects PRIVATE "${volk_SOURCE_DIR}")
     target_link_libraries(snx-test-vk-descriptor-objects PRIVATE Vulkan::Headers)
     add_test(NAME vk_descriptor_objects COMMAND snx-test-vk-descriptor-objects)
     add_executable(snx-test-vk-checkpoints vk_checkpoints.c)
     snx_test_target(snx-test-vk-checkpoints 11)
-    target_include_directories(snx-test-vk-checkpoints PRIVATE "${volk_SOURCE_DIR}"
-        "${snx_vma_include_dir}")
+    target_include_directories(snx-test-vk-checkpoints PRIVATE "${volk_SOURCE_DIR}")
     target_link_libraries(snx-test-vk-checkpoints PRIVATE Vulkan::Headers)
     add_test(NAME vk_checkpoints COMMAND snx-test-vk-checkpoints)
     add_executable(snx-test-vk-descriptor-heap-setup vk_descriptor_heap_setup.c
         "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/descriptor_heaps.c")
     snx_test_target(snx-test-vk-descriptor-heap-setup 11)
-    target_include_directories(snx-test-vk-descriptor-heap-setup PRIVATE "${volk_SOURCE_DIR}"
-        "${snx_vma_include_dir}")
+    target_include_directories(snx-test-vk-descriptor-heap-setup PRIVATE "${volk_SOURCE_DIR}")
     target_link_libraries(snx-test-vk-descriptor-heap-setup PRIVATE Vulkan::Headers)
     add_test(NAME vk_descriptor_heap_setup COMMAND snx-test-vk-descriptor-heap-setup)
     add_executable(snx-test-vk-advanced-blend vk_advanced_blend.c)

@@ -51,6 +51,7 @@ static const char* fswzadd_path;
 static const char* surface_op_paths[7];
 static const char* legacy_paths[4];
 static const char* rect_paths[3];
+static const char* minmax_paths[2]; /* a TEX and a TXD taking the least of their texels (minmax_samples) */
 static const char* window_paths[3];
 static const char* lone_lane_paths[9];
 static struct {
@@ -1355,6 +1356,67 @@ static void hfma2_immediate(void) {
     }
 }
 
+/* An F32 operand of a half instruction (HADD2 R0, R7.F32, RZ, or HADD2 R0, RZ, c[0][0]) gives the F16 that rounds to
+   nearest even: 65520 and past it an infinity of its sign, as yuzu, Eden and Ryujinx convert it and
+   vulkan_texture_half.inc expects; below it the value rounds into the range. A NaN made an F16 is +0, as Eden makes
+   it, so R1 = R0 - R0 is 0 for an infinity too (a frac of a coordinate past the range). Run on the CPU
+   (support/spv_eval.c), the halves read as an integer render target's bits */
+static void half_f32_operand_range(void) {
+    static const struct {
+        u32 operand, halves;
+        const char* what;
+    } cases[] = {
+        {0x4b979000u, 0x7c007c00u, "19865600 is an infinity"},
+        {0x477ff000u, 0x7c007c00u, "65520, the tie past 65504, rounds to an infinity"},
+        {0xcf000000u, 0xfc00fc00u, "-2147483648 is a negative infinity"},
+        {0x477fef00u, 0x7bff7bffu, "65519 rounds to 65504"},
+        {0x477fe000u, 0x7bff7bffu, "65504 stays 65504"},
+        {0x3f800000u, 0x3c003c00u, "1 stays 1"},
+        {0x7f800000u, 0x7c007c00u, "an infinity stays an infinity"},
+        {0x7fc00000u, 0x00000000u, "a NaN becomes +0, as Eden converts it to an F16"},
+    };
+    const u64 hadd2_f32 = 0x5D10000000070000ull | 7ull << 8 | 255ull << 20 | 1ull << 47; /* HADD2 R0, R7.F32, RZ */
+    const u64 hadd2_cbuf = 0x7A80000000070000ull | 255ull << 8;                          /* HADD2 R0, RZ, c[0][0] */
+    const u64 hadd2_sub = 0x5D10000000070001ull | 1ull << 31;                            /* HADD2 R1, R0, -R0 */
+    for (size_t k = 0; k < 2 * sizeof cases / sizeof *cases; k++) {
+        size_t i = k / 2;
+        int cbuf = k % 2;
+        const u64 program[] = {mov32i(7, cases[i].operand), cbuf ? hadd2_cbuf : hadd2_f32, hadd2_sub};
+        ShaderInfo info = {0};
+        size_t words = 0, slots;
+        u64* code = guest_program(program, 3, NULL, &slots);
+        if (!code) return;
+        set_sph(code, 18, 0xf);
+        info.rt_int_mask = 1;
+        u32* spv = spirv_of(code, slots * sizeof *code, ST_FS, &info, &words, 1, 1, 1, 1);
+        free(code);
+        check_translated(spv, &info, "HADD2 of an F32 operand translates");
+        if (!spv) continue;
+        SpvEvalEnv env = {0};
+        float one[4] = {1.0f, 1.0f, 1.0f, 0.0f};
+        u32 scale[4];
+        memcpy(scale, one, sizeof one);
+        u32 constants[4] = {cases[i].operand, 0, 0, 0};
+        env.ubo[SNX_VKB_RS] = scale;
+        env.ubo_words[SNX_VKB_RS] = 4;
+        env.ubo[SNX_VKB_CB] = constants;
+        env.ubo_words[SNX_VKB_CB] = 4;
+        const char* why = spv_eval(spv, words, &env);
+        u32 halves = env.out[0][0], difference = env.out[0][1];
+        int nan = (cases[i].halves & 0x7c00u) == 0x7c00u && (cases[i].halves & 0x3ffu);
+        int same = nan ? (halves & 0x7c00u) == 0x7c00u && (halves & 0x3ffu) && (halves >> 16 & 0x7c00u) == 0x7c00u &&
+                             (halves >> 16 & 0x3ffu)
+                       : halves == cases[i].halves;
+        if (why || !same || difference)
+            fprintf(stderr, "HADD2 R0, %s with %08x: %s, R0 = %08x (%08x expected), R0 - R0 = %08x\n",
+                    cbuf ? "RZ, c[0][0]" : "R7.F32, RZ", cases[i].operand, why ? why : "ran", halves, cases[i].halves,
+                    difference);
+        check(!why && same, cases[i].what);
+        check(!why && !difference, "R0 - R0 is 0, Inf - Inf too (a NaN made an F16 is +0)");
+        free(spv);
+    }
+}
+
 static void fragment_storage_images(void) {
     /* the same store and atomic on 2D array surfaces (bits 33-35 set to 4), as Pokemon Legends Z-A's fragment
        programs write them (issue #440): the layer in the coordinates' third register */
@@ -1523,7 +1585,10 @@ static void guarded_handle_merges(void) {
     memcpy(variant, both_sides, sizeof variant);
     variant[4] = other_load & under_p0;
     code = translate(variant, 7, ST_FS, &info, &words, 1);
-    check_refused(code, &info, "untracked texture handle", "different handles under each side stay refused");
+    check_translated(code, &info, "different handles under each side are each bound");
+    check(code && info.ntex == 2 && info.tex[0].bindless && info.tex[1].bindless && info.tex[0].bl_cbuf == 2 &&
+              info.tex[1].bl_cbuf == 2 && info.tex[0].cbuf_off + info.tex[1].cbuf_off == 1,
+          "the sample chooses between c[2][0] and c[2][4] by the handle's value");
     free(code);
     memcpy(variant, both_sides, sizeof variant);
     variant[2] = fmul_r5;
@@ -1548,7 +1613,10 @@ static void guarded_handle_merges(void) {
     memcpy(variant, if_else, sizeof variant);
     variant[2] = other_load;
     code = translate(variant, 7, ST_FS, &info, &words, 1);
-    check_refused(code, &info, "untracked texture handle", "different handles on each side of an SSY stay refused");
+    check_translated(code, &info, "different handles on each side of an SSY are each bound");
+    check(code && info.ntex == 2 && info.tex[0].bl_cbuf == 2 && info.tex[1].bl_cbuf == 2 &&
+              info.tex[0].cbuf_off + info.tex[1].cbuf_off == 1,
+          "the sample after the SSY chooses between both handles");
     free(code);
     memcpy(variant, if_else, sizeof variant);
     variant[2] = fmul_r5;
@@ -3522,6 +3590,82 @@ static void rect_textures(void) {
     }
 }
 
+/* A sampler's min/max reduction the program takes itself (ShaderInfo.tex_minmax_mask, the key; tex_minmax_max for
+   the greatest): TEX and TXD of a 2D texture become four gathers, one a component, and the least or greatest of the
+   texels their footprint weighs, which the evaluator runs on a 4x4 texture. At (0.5, 0.5) the footprint is texels 1
+   and 2 of both rows; at (0.375, 0.5) x lands on texel 1's centre, and column 2 weighs nothing. Without the key the
+   program samples as it did. MOV32I R4, u; MOV32I R5, v; TEX R0, R4, 2D (RGBA) or TXD R0, R4, R8, 2D */
+static float minmax_bits_f32(u32 bits) {
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+static void minmax_samples(void) {
+    const u64 tex = 0xc000000000000000ull | 0x10ull << 36 | 7ull << 51 | 0xfull << 31 | 2ull << 28 | 0xffull << 20 |
+                    7ull << 16 | 4ull << 8;
+    const u64 txd = 0xde00000000000000ull | 7ull << 51 | 0x10ull << 36 | 0xfull << 31 | 2ull << 28 | 8ull << 20 |
+                    7ull << 16 | 4ull << 8;
+    /* each component's gather: (i, j + 1), (i + 1, j + 1), (i + 1, j), (i, j) */
+    static const float gathered[4][4] = {{5, 1, 2, 7}, {0.25f, 0.5f, 0.75f, 1}, {-1, -2, -3, -4}, {8, 8, 9, 6}};
+    static const struct {
+        float u, v;
+        float least[4], greatest[4];
+    } at[] = {{0.5f, 0.5f, {1, 0.25f, -4, 6}, {7, 1, -1, 9}}, {0.375f, 0.5f, {5, 0.25f, -4, 6}, {7, 1, -1, 8}}};
+    const u64* forms[2] = {&tex, &txd};
+    static const char* names[2] = {"TEX", "TXD"};
+    for (int k = 0; k < 2; k++)
+        for (u32 greatest = 0; greatest < 2; greatest++)
+            for (u32 c = 0; c < sizeof at / sizeof *at; c++) {
+                u32 u, v;
+                memcpy(&u, &at[c].u, 4);
+                memcpy(&v, &at[c].v, 4);
+                const u64 program[3] = {mov32i(4, u), mov32i(5, v), *forms[k]};
+                size_t slots, words = 0;
+                u64* code = guest_program(program, 3, NULL, &slots);
+                if (!code) continue;
+                code[9] = 0xf; /* the header's outputs: render target 0's RGBA, from R0-R3 */
+                ShaderInfo info = {0};
+                info.tex_minmax_mask = 1;
+                info.tex_minmax_max = greatest;
+                u32* spv = spirv_of(code, slots * sizeof *code, ST_FS, &info, &words, 1, 1, 1, 1);
+                free(code);
+                check_translated(spv, &info, "a min/max sample translates");
+                if (!spv) continue;
+                check(info.tex_minmax_mask == 1 && info.tex_minmax_max == greatest,
+                      "a min/max sample's key outlives the translation, for the bind that reads it");
+                check(count_opcode(spv, words, 96, 0xffffffffu) == 4 &&
+                          count_opcode(spv, words, 87, 0xffffffffu) + count_opcode(spv, words, 88, 0xffffffffu) == 0,
+                      "a min/max sample is four gathers and no sample");
+                SpvEvalEnv env = {0};
+                env.image_size[SNX_VKB_TEX][0] = env.image_size[SNX_VKB_TEX][1] = 4;
+                for (u32 g = 0; g < 4; g++)
+                    for (u32 t = 0; t < 4; t++) memcpy(&env.gather[SNX_VKB_TEX][g][t], &gathered[g][t], 4);
+                u32 scale[4] = {0x3f800000, 0x3f800000, 0x3f800000, 0};
+                env.ubo[SNX_VKB_RS] = scale;
+                env.ubo_words[SNX_VKB_RS] = 4;
+                env.push[7] = 8;
+                const char* why = spv_eval(spv, words, &env);
+                const float* want = greatest ? at[c].greatest : at[c].least;
+                int same = !why && env.out_written[0];
+                for (u32 g = 0; same && g < 4; g++) same = !memcmp(&env.out[0][g], &want[g], 4);
+                if (!same)
+                    fprintf(stderr, "%s's %s at (%g, %g): %s; read %g %g %g %g, want %g %g %g %g\n", names[k],
+                            greatest ? "greatest" : "least", (double)at[c].u, (double)at[c].v, why ? why : "ran",
+                            (double)minmax_bits_f32(env.out[0][0]), (double)minmax_bits_f32(env.out[0][1]),
+                            (double)minmax_bits_f32(env.out[0][2]), (double)minmax_bits_f32(env.out[0][3]),
+                            (double)want[0], (double)want[1], (double)want[2], (double)want[3]);
+                check(same, "a min/max sample takes the least or greatest of the texels its footprint weighs");
+                if (!greatest && !c) save_fixture(minmax_paths[k], spv, words);
+                free(spv);
+            }
+    ShaderInfo info;
+    size_t words = 0;
+    u32* plain = translate(&tex, 1, ST_FS, &info, &words, 1);
+    check(plain && count_opcode(plain, words, 96, 0xffffffffu) == 0 && count_opcode(plain, words, 87, 0xffffffffu) == 1,
+          "without the key a sample is one sample and no gather");
+    free(plain);
+}
+
 /* One game's culling geometry program stores RZ or a MOV32I's 1 to the viewport mask (AST a[0x3a0]): no viewport or
    viewport 0 alone, no broadcast, so the program is the one without the store, word for word. A mask the translation
    can't know (R0, an attribute's), one of more viewports (3) and a mask of 1 beside a written viewport index are
@@ -5266,6 +5410,213 @@ static u32* flow_lod_spirv(const u64* instructions, int count, int can_subgroup,
     free(code);
     return result;
 }
+/* FSETP P<predicate>, PT, RZ, c[3][word]: whether 0 < the constant, which the test sets as it runs */
+static u64 fsetp_cbuf3(u32 predicate, u32 word) {
+    return (0x4bb1838c30f7ff07ull & ~(0x3fffull << 20) & ~(7ull << 3)) | (u64)word << 20 | (u64)predicate << 3;
+}
+/* A TEX.B whose handle the writes don't agree on, run on the CPU (support/spv_eval.c): the x of its sample, each
+   slot's texel 1 + the word of the constant buffer handle it was bound for (1 for c[2][0], 2 for c[2][4]), 0 when
+   none was chosen. c2 is bank 2's first words, c3 bank 3's (the predicates' constants), int_mask the slots of
+   integer textures (ShaderInfo.tex_int_mask) */
+static int chosen_sample(const u64* program, int count, const u32 c2[4], const u32 c3[4], u64 int_mask,
+                         ShaderInfo* info, float* x, const char** why) {
+    size_t words = 0, slots;
+    u64* code = guest_program(program, count, NULL, &slots);
+    *why = "out of memory";
+    if (!code) return 0;
+    set_sph(code, 18, 0xf);
+    memset(info, 0, sizeof *info);
+    info->tex_int_mask = int_mask;
+    u32* spv = spirv_of(code, slots * sizeof *code, ST_FS, info, &words, 1, 1, 1, 1);
+    free(code);
+    *why = info->first_unsupported;
+    if (!spv || info->unsupported) {
+        free(spv);
+        return 0;
+    }
+    SpvEvalEnv env = {0};
+    float one[4] = {1.0f, 1.0f, 1.0f, 0.0f};
+    u32 scale[4], bank2[4], bank3[4];
+    memcpy(scale, one, sizeof one);
+    memcpy(bank2, c2, sizeof bank2);
+    memcpy(bank3, c3, sizeof bank3);
+    env.ubo[SNX_VKB_RS] = scale;
+    env.ubo_words[SNX_VKB_RS] = 4;
+    env.ubo[SNX_VKB_CB + 2] = bank2;
+    env.ubo_words[SNX_VKB_CB + 2] = 4;
+    env.ubo[SNX_VKB_CB + 3] = bank3;
+    env.ubo_words[SNX_VKB_CB + 3] = 4;
+    for (int slot = 0; slot < info->ntex && SNX_VKB_TEX + slot < 64; slot++) {
+        float texel = 1.0f + (float)info->tex[slot].cbuf_off;
+        memcpy(&env.texel[SNX_VKB_TEX + slot][0], &texel, 4);
+    }
+    env.steps_max = 100000;
+    *why = spv_eval(spv, words, &env);
+    free(spv);
+    memcpy(x, &env.out[0][0], 4);
+    return !*why;
+}
+/* A TEX.B that chooses among the constant buffer handles that reach it keeps the sample of the one whose word the
+   register holds when it runs: c[2][0] under P0, c[2][4] under !P0, and under P1 a value from elsewhere (MOV32I
+   0x777), which is c[2][0]'s texture when c[2][0] holds 0x777 and zeros when no candidate does */
+static void tex_b_chosen_handle(void) {
+    const u64 tex_b = 0xdeb8000000070000ull | (2ull << 28) | (1ull << 37) | (6ull << 20) | (1ull << 31); /* R0.x */
+    const u64 under_p0 = ~(0xfull << 16), not_p0 = 8ull << 16;
+    const u64 load = 0x4c98078800070006ull, other_load = 0x4c98078800170006ull; /* MOV R6, c[2][0] / c[2][4] */
+    const u64 elsewhere = (mov32i(6, 0x777) & under_p0) | 1ull << 16;           /* @P1 MOV32I R6, 0x777 */
+    const u64 program[] = {
+        fsetp_cbuf3(0, 0), fsetp_cbuf3(1, 1), load & under_p0, (other_load & under_p0) | not_p0, elsewhere, tex_b};
+    static const struct {
+        u32 c2[4], c3[4];
+        u64 int_mask;
+        float x;
+        const char* what;
+    } cases[] = {
+        {{0x00100001u, 0x00200002u}, {0x3f800000u, 0}, 0, 1.0f, "under P0 the sample is c[2][0]'s"},
+        {{0x00100001u, 0x00200002u}, {0, 0}, 0, 2.0f, "under !P0 the sample is c[2][4]'s"},
+        {{0x777u, 0x00200002u},
+         {0, 0x3f800000u},
+         0,
+         1.0f,
+         "a value from elsewhere equal to c[2][0]'s word is its texture"},
+        {{0x00100001u, 0x00200002u},
+         {0, 0x3f800000u},
+         0,
+         0.0f,
+         "a value from elsewhere equal to no candidate's reads 0"},
+        /* c[2][0] an integer texture's handle, c[2][4] a float one's: each is kept with the bits it samples */
+        {{0x00100001u, 0x00200002u}, {0x3f800000u, 0}, 1, 1.0f, "an integer texture's sample is kept as its bits"},
+        {{0x00100001u, 0x00200002u}, {0, 0}, 1, 2.0f, "a float texture beside an integer one is kept too"},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        ShaderInfo info;
+        const char* why;
+        float x = -1.0f;
+        int ran = chosen_sample(program, 6, cases[i].c2, cases[i].c3, cases[i].int_mask, &info, &x, &why);
+        if (!ran || x != cases[i].x)
+            fprintf(stderr, "TEX.B chosen handle case %zu: %s, %d slots, x %g (%g expected)\n", i, ran ? "ran" : why,
+                    info.ntex, (double)x, (double)cases[i].x);
+        check(ran && info.ntex == 2 && x == cases[i].x, cases[i].what);
+    }
+    /* what the log says of a program that chooses (vk/pipeline.c): how many TEX.B do, and the first one's place,
+       handle register and candidates; nothing for a TEX.B with one handle */
+    const u64 one_handle[] = {load, tex_b};
+    for (int one = 0; one < 2; one++) {
+        ShaderInfo info;
+        const char* why;
+        float x;
+        const char* note = one ? "" : "TEX.B at 88, R6: c[2][0x0], c[2][0x4]";
+        int ran = one ? chosen_sample(one_handle, 2, cases[0].c2, cases[0].c3, 0, &info, &x, &why)
+                      : chosen_sample(program, 6, cases[0].c2, cases[0].c3, 0, &info, &x, &why);
+        if (!ran || info.chosen_tex != (u32)!one || strcmp(info.chosen_why, note))
+            fprintf(stderr, "TEX.B note: %s, %u choosing, \"%s\" (\"%s\" expected)\n", ran ? "ran" : why,
+                    info.chosen_tex, info.chosen_why, note);
+        check(ran && info.chosen_tex == (u32)!one && !strcmp(info.chosen_why, note),
+              one ? "a TEX.B with one handle leaves no note" : "the note names the TEX.B, its register and candidates");
+    }
+    /* In a loop with a BRK (so the reaching definitions aren't known), the write after the TEX.B that the loop carries
+       back to it is a candidate too: the first round samples c[2][0] or c[2][4] by P0, the second c[2][8], and P1,
+       set in the first round, ends the loop after the second sample */
+    const u64 pbk = 0xe2a000000007000full | (u64)((flow_word(9) - flow_word(4)) * 8) << 20; /* PBK to 9 */
+    const u64 looped[] = {fsetp_cbuf3(0, 0),     load & under_p0,  (other_load & under_p0) | not_p0, pbk, tex_b,
+                          0xe34000000001000full, /* @P1 BRK */
+                          0x4c98078800270006ull, /* MOV R6, c[2][8] */
+                          fsetp_cbuf3(1, 1),     flow_bra(8, 4, 7)};
+    const u32 words3[4] = {0x00100001u, 0x00200002u, 0x00300003u, 0};
+    for (u32 p0 = 0; p0 < 2; p0++) {
+        const u32 c3[4] = {p0 ? 0x3f800000u : 0, 0x3f800000u, 0, 0};
+        ShaderInfo info;
+        const char* why;
+        float x = -1.0f;
+        int ran = chosen_sample(looped, 9, words3, c3, 0, &info, &x, &why);
+        if (!ran || x != 3.0f || info.ntex != 3)
+            fprintf(stderr, "TEX.B in a loop with P0 %u: %s, %d slots, x %g after the second round (3 expected)\n", p0,
+                    ran ? "ran" : why, info.ntex, (double)x);
+        check(ran && info.ntex == 3 && x == 3.0f,
+              "a handle the loop carries back to the TEX.B from a write after it is one of its candidates");
+    }
+    /* the same write after a TEX.B that no loop comes back to, a BRK after both: no candidate */
+    const u64 after_pbk = 0xe2a000000007000full | (u64)((flow_word(7) - flow_word(5)) * 8) << 20; /* PBK to 7 */
+    const u64 after[] = {
+        fsetp_cbuf3(0, 0),     load & under_p0,      (other_load & under_p0) | not_p0, tex_b, after_pbk,
+        0xe34000000001000full, 0x4c98078800270006ull};
+    const u32 c3[4] = {0x3f800000u, 0, 0, 0};
+    ShaderInfo info;
+    const char* why;
+    float x = -1.0f;
+    int ran = chosen_sample(after, 7, words3, c3, 0, &info, &x, &why);
+    if (!ran || x != 1.0f || info.ntex != 2)
+        fprintf(stderr, "TEX.B before a BRK: %s, %d slots, x %g (1 expected)\n", ran ? "ran" : why, info.ntex,
+                (double)x);
+    check(ran && info.ntex == 2 && x == 1.0f, "a write after the TEX.B that no loop carries back is no candidate");
+}
+/* A fragment program's loop ends for a helper lane after SH_HELPER_LOOP_ROUNDS back-edges, and runs as written for the
+   other lanes: a loop with no way out but EXIT kills the helper, a loop with a BRK lets it on past the loop, and the
+   dispatch loop of a program with calls ends for it. Run on the CPU (support/spv_eval.c) as a helper and as a lane
+   that is not one; a vertex program and a fragment program without loops don't ask whether a lane is a helper */
+static void helper_loop_exit(void) {
+    enum { IS_HELPER = 5381 };
+    /* @P1 BRA to the EXIT at 4, then a loop of @P0 EXIT and a BRA back to it: P0 and P1 are never set, and the
+       loop's only way out is its EXIT */
+    const u64 endless[] = {flow_bra(0, 4, 1), mov32i(0, 1), 0xe30000000000000full, flow_bra(3, 2, 7)};
+    const u64 pbk = 0xe2a000000007000full | (u64)((flow_word(3) - flow_word(1)) * 8) << 20;  /* PBK to 3 */
+    const u64 breaks[] = {pbk, 0xe34000000000000full, flow_bra(2, 1, 7), mov32i(0, 0x1234)}; /* @P0 BRK */
+    const u64 cal = 0xe260000000070040ull | (u64)((flow_word(2) - flow_word(1)) * 8) << 20;  /* CAL 2 */
+    const u64 called[] = {cal, EXIT, flow_bra(2, 2, 7), 0xe32000000007000full};              /* RET */
+    const struct {
+        const u64* instructions;
+        int count, killed;
+        u32 out;
+        const char* what;
+    } cases[] = {
+        {endless, 4, 1, 0, "a helper in a loop no lane leaves but by EXIT ends there"},
+        {breaks, 4, 0, 0x1234, "a helper in a loop with a BRK goes on past the loop"},
+        {called, 4, 0, 0, "a helper in the dispatch loop of a program with calls leaves it"},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        ShaderInfo info = {0};
+        size_t words = 0, slots;
+        u64* code = guest_program(cases[i].instructions, cases[i].count, NULL, &slots);
+        if (!code) return;
+        set_sph(code, 18, 0xf);
+        info.rt_int_mask = 1;
+        u32* spv = spirv_of(code, slots * sizeof *code, ST_FS, &info, &words, 1, 1, 1, 1);
+        free(code);
+        check_translated(spv, &info, "a fragment program with a loop translates");
+        if (!spv) continue;
+        for (int helper = 1; helper >= 0; helper--) {
+            SpvEvalEnv env = {0};
+            float one[4] = {1.0f, 1.0f, 1.0f, 0.0f};
+            u32 scale[4];
+            memcpy(scale, one, sizeof one);
+            env.ubo[SNX_VKB_RS] = scale;
+            env.ubo_words[SNX_VKB_RS] = 4;
+            env.helper = helper;
+            env.steps_max = 32u * 65536u; /* room for a helper's 65536 back-edges (SH_HELPER_LOOP_ROUNDS) */
+            const char* why = spv_eval(spv, words, &env);
+            int ended = !why && env.killed == cases[i].killed && (!cases[i].out || env.out[0][0] == cases[i].out);
+            if (helper ? !ended : !why)
+                fprintf(stderr, "helper loop case %zu as %s: %s, killed %d, R0 %08x\n", i,
+                        helper ? "a helper" : "a lane that is not one", why ? why : "ended", env.killed, env.out[0][0]);
+            check(helper ? ended : why && !strcmp(why, "too many steps"),
+                  helper ? cases[i].what : "a lane that is not a helper runs the loop as written");
+        }
+        free(spv);
+    }
+    const u64 straight[] = {mov32i(0, 1)};
+    for (int stage = 0; stage < 2; stage++) {
+        ShaderInfo info;
+        size_t words = 0;
+        u32* spv = translate(stage ? straight : endless, stage ? 1 : 4, stage ? ST_FS : ST_VS, &info, &words, 1);
+        check_translated(spv, &info,
+                         stage ? "a fragment program without loops translates" : "a vertex loop translates");
+        if (spv)
+            check(count_opcode(spv, words, IS_HELPER, 0xffffffffu) == 0,
+                  stage ? "a fragment program without loops doesn't count back-edges"
+                        : "a vertex program's loop doesn't count back-edges");
+        free(spv);
+    }
+}
 /* A fragment program with flow and a sample that takes its level from derivatives, on a device whose subgroups leave
    the fragment stage out (Turnip on an Adreno 610 lists compute only, llvmpipe's have 8 lanes): the program's own
    branches and loops as structured constructs, with no subgroup operation and no dispatch loop, and
@@ -5882,6 +6233,10 @@ int main(int argc, char** argv) {
             snprintf(name, sizeof name, "rect_%d", i);
             rect_paths[i] = fixture_path(argv[1], name);
         }
+        for (int i = 0; i < 2; i++) {
+            snprintf(name, sizeof name, "minmax_%d", i);
+            minmax_paths[i] = fixture_path(argv[1], name);
+        }
         for (int i = 0; i < 3; i++) {
             snprintf(name, sizeof name, "window_%d", i);
             window_paths[i] = fixture_path(argv[1], name);
@@ -5913,6 +6268,7 @@ int main(int argc, char** argv) {
     f2f_half_rounding();
     saturate_nan();
     hfma2_immediate();
+    half_f32_operand_range();
     tlds_fp16();
     scaled_texel_fetch();
     query_only_volume();
@@ -5950,6 +6306,7 @@ int main(int argc, char** argv) {
     attribute_pointer();
     legacy_varyings_forms();
     rect_textures();
+    minmax_samples();
     viewport_mask();
     indexed_attribute_load();
     structured_flow();
@@ -5958,6 +6315,8 @@ int main(int argc, char** argv) {
     shfl_predicate();
     lone_lane_forms();
     fragment_flow_derivatives();
+    tex_b_chosen_handle();
+    helper_loop_exit();
     feedback_own_pixel();
     feedback_screen_uv();
     texture_unread_slots();

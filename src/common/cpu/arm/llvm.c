@@ -231,6 +231,15 @@ static void branch_exchange(ArmIR* a, LLVMValueRef target) {
     PUT(a, cpsr, bor(a, band(a, GET(a, cpsr), c32(a, ~SNX_ARM_T)), shl(a, thumb, 5)));
     setreg(a, 15, band(a, target, c32(a, ~1u)));
 }
+/* A load or an ALU result written to the PC in ARM state. The ARM7TDMI (ARMv4T) does not interwork there: bits 1 and 0
+   are dropped and the state stays ARM, as mGBA's ARMWritePC has it; only BX changes the state. Later cores branch with
+   the state from bit 0 */
+static void arm_write_pc(ArmIR* a, LLVMValueRef value) {
+    if (arm7tdmi(a))
+        setreg(a, 15, band(a, value, c32(a, ~3u)));
+    else
+        branch_exchange(a, value);
+}
 static LLVMValueRef arithmetic(ArmIR* a, LLVMValueRef x, LLVMValueRef y, LLVMValueRef cin, int flags) {
     LLVMValueRef wide = add(a, add(a, z64(a, x), z64(a, y)), z64(a, cin));
     LLVMValueRef result = LLVMBuildTrunc(a->b, wide, a->i32, "");
@@ -289,7 +298,7 @@ static void data(ArmIR* a) {
         if (a->profile == SNX_ARM_PROFILE_ARM11)
             setreg(a, 15, band(a, r, c32(a, ~3u)));
         else
-            branch_exchange(a, r);
+            arm_write_pc(a, r);
     } else
         setreg(a, d, r);
 }
@@ -394,6 +403,9 @@ static LLVMValueRef memptr(ArmIR* a, LLVMValueRef addr) {
    window and video memory, 0x0D the EEPROM a cartridge may have there, 0x0E and 0x0F the save memory. */
 #define SNX_ARM_IO_REGIONS                                                                                             \
     (1u << 0x00 | 1u << 0x01 | 1u << 0x04 | 1u << 0x05 | 1u << 0x06 | 1u << 0x07 | 1u << 0x0D | 1u << 0x0E | 1u << 0x0F)
+/* Stores reach the hook from the cartridge's ROM, 0x08 to 0x0C, as well: the flat window holds the image there, and the
+   console's ROM takes no writes, so a game's store into a table of its own leaves the table as it was */
+#define SNX_ARM_IO_STORE_REGIONS (SNX_ARM_IO_REGIONS | 1u << 0x08 | 1u << 0x09 | 1u << 0x0A | 1u << 0x0B | 1u << 0x0C)
 /* A write through the hook that returns nonzero ends the block once its instruction is done (yield_check), with R15
    the next instruction's: the board has something to run first, a DMA holding the bus while the CPU waits */
 static void yield_after(ArmIR* a, LLVMValueRef result) {
@@ -409,14 +421,13 @@ static void yield_check(ArmIR* a) {
     LLVMBuildRetVoid(a->b);
     LLVMPositionBuilderAtEnd(a->b, go);
 }
-/* addresses past the console's 28 bits, but for the mirror at bit 31 the flat window keeps, go to the hook as well:
-   nothing answers them there, which the board gives as the open bus */
-static LLVMValueRef io_route(ArmIR* a, LLVMValueRef addr, LLVMValueRef fn) {
+/* addresses past the console's 28 bits go to the hook as well: nothing answers them there, which the board gives as the
+   open bus */
+static LLVMValueRef io_route(ArmIR* a, LLVMValueRef addr, LLVMValueRef fn, uint32_t regions) {
     LLVMValueRef top = lsr(a, addr, 24), high = lsr(a, addr, 28);
-    LLVMValueRef route = band(a, LLVMBuildLShr(a->b, c32(a, SNX_ARM_IO_REGIONS), band(a, top, c32(a, 31)), ""),
+    LLVMValueRef route = band(a, LLVMBuildLShr(a->b, c32(a, regions), band(a, top, c32(a, 31)), ""),
                               z32(a, cmp(a, LLVMIntULT, top, c32(a, 32))));
-    LLVMValueRef unused =
-        band(a, z32(a, cmp(a, LLVMIntNE, high, c32(a, 0))), z32(a, cmp(a, LLVMIntNE, high, c32(a, 8))));
+    LLVMValueRef unused = z32(a, cmp(a, LLVMIntNE, high, c32(a, 0)));
     route = bor(a, band(a, route, c32(a, 1)), unused);
     return band(a, route, z32(a, cmp(a, LLVMIntNE, fn, LLVMConstNull(a->ptr))));
 }
@@ -468,7 +479,7 @@ static LLVMValueRef readmem(ArmIR* a, LLVMValueRef addr, unsigned bytes, int sig
     LLVMBasicBlockRef io = block(a, "io"), mem = block(a, "mem"), done = block(a, "read");
     LLVMValueRef incoming[2], joined;
     LLVMBasicBlockRef from[2];
-    LLVMBuildCondBr(a->b, cmp(a, LLVMIntNE, io_route(a, addr, fn), c32(a, 0)), io, mem);
+    LLVMBuildCondBr(a->b, cmp(a, LLVMIntNE, io_route(a, addr, fn, SNX_ARM_IO_REGIONS), c32(a, 0)), io, mem);
     LLVMPositionBuilderAtEnd(a->b, mem);
     {
         LLVMValueRef value = LLVMBuildLoad2(a->b, type, memptr(a, aligned), "");
@@ -530,7 +541,7 @@ static void writemem(ArmIR* a, LLVMValueRef addr, unsigned bytes, LLVMValueRef v
     LLVMValueRef fn = get(a, offsetof(SnxArmCPU, io), a->ptr);
     LLVMBasicBlockRef io = block(a, "io"), mem = block(a, "mem"), done = block(a, "written");
     PUT(a, exclusive_valid, c32(a, 0));
-    LLVMBuildCondBr(a->b, cmp(a, LLVMIntNE, io_route(a, addr, fn), c32(a, 0)), io, mem);
+    LLVMBuildCondBr(a->b, cmp(a, LLVMIntNE, io_route(a, addr, fn, SNX_ARM_IO_STORE_REGIONS), c32(a, 0)), io, mem);
     LLVMPositionBuilderAtEnd(a->b, mem);
     {
         LLVMValueRef narrow = bytes < 4 ? LLVMBuildTrunc(a->b, value, type, "") : value;
@@ -563,7 +574,7 @@ static LLVMValueRef readmem_list(ArmIR* a, LLVMValueRef addr, unsigned bytes) {
     LLVMBasicBlockRef io = block(a, "io"), mem = block(a, "mem"), done = block(a, "read");
     LLVMValueRef incoming[2], joined;
     LLVMBasicBlockRef from[2];
-    LLVMBuildCondBr(a->b, cmp(a, LLVMIntNE, io_route(a, addr, fn), c32(a, 0)), io, mem);
+    LLVMBuildCondBr(a->b, cmp(a, LLVMIntNE, io_route(a, addr, fn, SNX_ARM_IO_REGIONS), c32(a, 0)), io, mem);
     LLVMPositionBuilderAtEnd(a->b, mem);
     {
         LLVMValueRef value = LLVMBuildLoad2(a->b, type, memptr(a, addr), "");
@@ -593,7 +604,7 @@ static void writemem_list(ArmIR* a, LLVMValueRef addr, unsigned bytes, LLVMValue
     LLVMTypeRef type = LLVMIntTypeInContext(a->ctx, bytes * 8);
     LLVMValueRef fn = get(a, offsetof(SnxArmCPU, io), a->ptr);
     LLVMBasicBlockRef io = block(a, "io"), mem = block(a, "mem"), done = block(a, "written");
-    LLVMBuildCondBr(a->b, cmp(a, LLVMIntNE, io_route(a, addr, fn), c32(a, 0)), io, mem);
+    LLVMBuildCondBr(a->b, cmp(a, LLVMIntNE, io_route(a, addr, fn, SNX_ARM_IO_STORE_REGIONS), c32(a, 0)), io, mem);
     LLVMPositionBuilderAtEnd(a->b, mem);
     {
         LLVMValueRef narrow = bytes < 4 ? LLVMBuildTrunc(a->b, value, type, "") : value;
@@ -636,14 +647,14 @@ static void memory(ArmIR* a, SnxA32Kind kind) {
     /* With unaligned support on (ARMv6 SCTLR.U, the model ordinary transfers follow), LDRD and STRD need word
        alignment only. Doubleword alignment is the legacy U=0 rule, and libctru's file code loads 64-bit offsets
        from word-aligned structures */
-    unsigned alignment = pair || (load && d == 15) ? 4 : 1;
+    unsigned alignment = pair || (load && d == 15 && !arm7tdmi(a)) ? 4 : 1; /* the ARM7TDMI rotates a misaligned PC */
     transfer_begin(a, addr, pair ? 8 : bytes, alignment, !load, pair);
     if (load) {
         value = readmem(a, addr, bytes, sign);
         if (pair) second = readmem(a, add(a, addr, c32(a, 4)), 4, 0);
         /* Check a loaded PC before committing writeback. */
         if (d == 15)
-            branch_exchange(a, value);
+            arm_write_pc(a, value);
         else
             setreg(a, d, value);
         if (pair) setreg(a, d + 1, second);
@@ -680,7 +691,7 @@ static void multiple(ArmIR* a) {
                                               : reg(a, i));
             ++index;
         }
-    if (load && values[15]) branch_exchange(a, values[15]);
+    if (load && values[15]) arm_write_pc(a, values[15]);
     index = 0;
     for (unsigned i = 0; i < 16; ++i)
         if (values[i]) {

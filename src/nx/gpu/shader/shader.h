@@ -183,6 +183,10 @@ typedef struct {
        order */
     u64 tex_dc_color_mask;
     u32 tex_dc_color_funcs;
+    /* FS and compute key: texture slots whose filtered samples take the least of their texels in the program (the
+       greatest in tex_minmax_max), as their sampler asks and the device's sampler can't (vk/render.c
+       vk_tex_minmax_in_program, shader_minmax_sample). A fragment program's key holds the first SH_MINMAX_SLOTS */
+    u64 tex_minmax_mask, tex_minmax_max;
     /* FS: texture slots every read of which is a texel fetch at the fragment's own pixel (TLD or TLDS of a 2D texture
        at gl_FragCoord's integer x and y, level 0, no offset): the only ones a draw may sample in place while it
        renders to them (vk/render.c), each fragment reading what earlier draws left at its pixel */
@@ -260,6 +264,11 @@ typedef struct {
     u32 nmemh;
     u32 memh_none;     /* texture instructions whose handle from memory is SH_PROBE_NONE, */
     char memh_why[64]; /* and why the first is */
+    /* TEX.B instructions whose handle the writes don't agree on, which sample each constant buffer handle that reaches
+       them and keep the sample of the one whose word the register holds (shader_direct_handle_candidates): a handle
+       equal to none of them samples zeros, which the log says once a program, naming the first such TEX.B */
+    u32 chosen_tex;
+    char chosen_why[96]; /* "TEX.B at <byte offset>, R<handle>: c[<bank>][<byte>], ..." */
     u32 spec;          /* the specialization constants the module declares: bit SH_SPEC_ of each */
 } ShaderInfo;
 /* A fragment module's specialization constants, by SpecId: state a draw has before its program runs, which the
@@ -349,6 +358,7 @@ static inline void shader_query_hint_unpack(const u32 words[SH_QUERY_WORDS], u8 
     }
 }
 #define SH_DC_COLOR_MAX  10 /* slots tex_dc_color_funcs has room for */
+#define SH_MINMAX_SLOTS    15 /* slots a fragment program's key has room for in tex_minmax_mask (vk/pipeline.c) */
 /* Each stage has a descriptor set (shader_vk_set), its bindings grouped by kind. */
 #define SNX_VKB_CB       0                         /* 18 constant buffers */
 #define SNX_VKB_SSBO     18                        /* 16 global memory buffers */
@@ -401,6 +411,9 @@ static inline void shader_query_hint_unpack(const u32 words[SH_QUERY_WORDS], u8 
 /* Device capabilities the renderer sets before translating: */
 /* sampled image arrays indexed per invocation (non-uniform indexing) */
 extern int g_shader_texture_arrays;
+/* the elements of each of those arrays: SNX_TEX_ARRAY, or fewer where the device binds fewer combined image samplers
+   (vk_pipeline_init, vk/texture_arrays.h); a test may set fewer before the renderer starts */
+extern u32 g_shader_tex_array;
 /* constant buffers from this slot up are read-only storage buffers, on a device with fewer uniform buffers a stage
    than the 18 slots and the renderer's own need (18: none) */
 extern u32 g_shader_uniform_cbufs;
@@ -461,6 +474,11 @@ extern int g_shader_mixed_dot;
    one OpCooperativeMatrixMulAddKHR on fragments staged in shared memory after the program's (sm86_translate.c's
    hmma_coop), where the two fit in that size. 0 offline */
 extern int g_shader_hmma_coop;
+/* an SM86 HMMA off the cooperative matrices gathers its B fragment in pairs of lanes 4 apart, which multiply by the
+   same 16 words of it: each shuffles in half of them and takes the other half from its pair with a xor of 4
+   (sm86_translate.c's hmma). RADV with subgroups of 32 (GFX10 on): half of the B permutes through LDS become DPP
+   moves. 0 offline */
+extern int g_shader_hmma_pairs;
 /* the most mesh workgroups one task workgroup can launch (maxMeshWorkGroupCount[0] and maxMeshWorkGroupTotalCount,
    the less of them): a task program's count, read from its payload's header, is clamped to it, as a count past it is
    undefined behavior that can hang the GPU. 0 offline: not clamped */

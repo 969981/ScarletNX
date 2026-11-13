@@ -154,6 +154,16 @@ setting Fullscreen
     words Off|On
     help 1 = starts fullscreen, except in timed test runs. -f or --fullscreen=0 sets it for one run, and F11 or
     help Alt+Enter switches while the game runs without changing it
+setting Transition screen
+    key transition_screen
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help 1 = when a program of a collection starts another (a game picked in its menu), the new program's window shows
+    help the loading screen from a quarter second after it opens until the game draws: the game's name and cover, and
+    help what is known of the program as its steps (its number, the program that started it, the user, the version, the
+    help DLCs, the GPU, its title ID, the build). The launcher's run screen shows it while no window is open
 setting Language
     key language
     int 0 17
@@ -1289,6 +1299,33 @@ setting Buffer copy stats
     startup
     words Off|On
     help 1 = logs what the renderer copies between guest memory and its buffers, and why it waits for their results
+setting Sparse texture sharing
+    key vk_sparse_share
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help 1 = the blocks of a sparse texture that show the same memory of the game share one piece of GPU memory, where
+    help the GPU can bind memory to more than one place of an image. 0 = each block has its own
+setting Staging memory
+    key vk_stage_memory
+    int 0 2
+    default 0
+    startup
+    words Auto|Sequential|Cached
+    help Which host memory holds the buffers that the CPU fills each frame for the GPU to read (uploads, uniforms,
+    help vertices that change). 1 = memory for writes in order, which a driver can map write-combined: small copies
+    help into it are slow there. 2 = cached memory, where the GPU has such a type. 0 = 2 on Intel's Mesa driver, else 1
+setting Buffer pages
+    key vk_buffer_pages
+    int 0 2
+    default 1
+    startup
+    words Off|Read|Read and write
+    help 1 = keeps the guest memory that draws read by page, in sparse buffers: ranges that overlap share their bytes,
+    help and a range that did not change is not copied again. 2 = also keeps what a draw writes to guest memory there,
+    help on the GPU, until the game's CPU code touches it. 0 = by the range each draw asks for. It needs a GPU with
+    help sparse buffers and working write tracking, and stays off without them
 setting NVN storage ordering
     key nvn_storage_order
     int 0 2

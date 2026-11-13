@@ -26,6 +26,7 @@
 #include "nx/gpu/vk/pipeline_parts.h"
 #include "nx/gpu/vk/internal_spv.h"
 #include "nx/gpu/vk/tess_passthrough.h"
+#include "nx/gpu/vk/texture_arrays.h"
 #include "nx/gpu/renderer.h"
 #include "nx/gpu/shader/shipped.h"
 #include "nx/gpu/shipped_pass.h"
@@ -528,7 +529,7 @@ void vk_pool_sizes(VkDescriptorPoolSize* sz, u32 sets, u32 array_sets) {
             if (i < SNX_VKB_TEXARRAY)
                 n++;
             else if (g_shader_texture_arrays)
-                arrays += (i == SNX_VKB_TEXARRAY || i == SNX_VKB_TEXDEPTH) ? SNX_TEX_ARRAY : 1;
+                arrays += (i == SNX_VKB_TEXARRAY || i == SNX_VKB_TEXDEPTH) ? g_shader_tex_array : 1;
         }
         sz[k] = (VkDescriptorPoolSize){ty[k], n * sets + arrays * array_sets};
     }
@@ -549,6 +550,7 @@ VkShaderStageFlags vk_set_stages(int s) {
     if (s < 0 || s >= 5) return 0;
     return vis[s] | (s == shader_vk_set(ST_MS) || s == shader_vk_set(ST_TS) ? g_vk.mesh_stages : 0);
 }
+u32 vk_texture_array_elements(void) { return g_shader_texture_arrays ? g_shader_tex_array : 0; }
 int vk_dslayout_arrays(VkDescriptorSetLayout layout) {
     for (u32 s = 0; s < 5; s++)
         if (layout && layout == g_vk_dslayout[1][s]) return g_shader_texture_arrays;
@@ -592,12 +594,18 @@ void vk_pipeline_init(void) {
     pm_lock_announce(&g_pipeline.xlate_lock, "shader translate");
     /* the tessellation and geometry stages' sets come after the first two, where the device binds that many */
     g_vk_stage_sets = g_vk.props.limits.maxBoundDescriptorSets >= 5 ? 5 : 2;
-    /* A compact array holds the unique handles selected by all indexed tables. */
-    if (g_vk.props.limits.maxPerStageDescriptorSamplers < SH_MAXTEX + 2 * SNX_TEX_ARRAY ||
-        g_vk.props.limits.maxPerStageDescriptorSampledImages < SH_MAXTEX + 2 * SNX_TEX_ARRAY ||
-        g_vk.props.limits.maxDescriptorSetSamplers < 5 * (SH_MAXTEX + 2 * SNX_TEX_ARRAY) ||
-        g_vk.props.limits.maxDescriptorSetSampledImages < 5 * (SH_MAXTEX + 2 * SNX_TEX_ARRAY))
-        g_shader_texture_arrays = 0;
+    /* A compact array holds the unique handles selected by all indexed tables: SNX_TEX_ARRAY of them, or as many as
+       the device binds beside a stage's own SH_MAXTEX (texture_arrays.h), the line saying why where fewer */
+    {
+        const VkPhysicalDeviceLimits* l = &g_vk.props.limits;
+        SnxVkTextureLimits tl = {l->maxPerStageDescriptorSamplers, l->maxPerStageDescriptorSampledImages,
+                                 l->maxDescriptorSetSamplers, l->maxDescriptorSetSampledImages};
+        char line[640];
+        g_shader_tex_array =
+            snx_vk_texture_array_say(line, sizeof line, g_shader_texture_arrays, &tl, SH_MAXTEX, g_shader_tex_array);
+        g_shader_texture_arrays = g_shader_tex_array != 0;
+        if (line[0]) LOG("%s\n", line);
+    }
     cbufs_fit_limits();
     for (int s = 0; s < 5; s++) {
         VkDescriptorSetLayoutBinding b[SNX_VKB_END];
@@ -619,12 +627,6 @@ void vk_pipeline_init(void) {
         g_vk.image_slots[shader_stage[s]] = image_slots;
         g_vk.buffer_image_slots[shader_stage[s]] = buffer_slots;
         if (!s) g_vk_buffer_image_slots = buffer_slots;
-        /* A compact array holds the unique handles selected by all indexed tables. */
-        if (g_vk.props.limits.maxPerStageDescriptorSamplers < SH_MAXTEX + 2 * SNX_TEX_ARRAY ||
-            g_vk.props.limits.maxPerStageDescriptorSampledImages < SH_MAXTEX + 2 * SNX_TEX_ARRAY ||
-            g_vk.props.limits.maxDescriptorSetSamplers < 5 * (SH_MAXTEX + 2 * SNX_TEX_ARRAY) ||
-            g_vk.props.limits.maxDescriptorSetSampledImages < 5 * (SH_MAXTEX + 2 * SNX_TEX_ARRAY))
-            g_shader_texture_arrays = 0;
         for (i = 0; i < SNX_VKB_END; i++) {
             if (i == SNX_VKB_CAPTURE && (s != 1 || !vk_capture_tiles_supported())) continue;
             /* Each graphics stage has storage bindings within both per-stage and whole-pipeline limits. */
@@ -634,7 +636,7 @@ void vk_pipeline_init(void) {
             b[count++] = (VkDescriptorSetLayoutBinding){
                 .binding = i,
                 .descriptorType = binding_type(i),
-                .descriptorCount = (i == SNX_VKB_TEXARRAY || i == SNX_VKB_TEXDEPTH) ? SNX_TEX_ARRAY : 1,
+                .descriptorCount = (i == SNX_VKB_TEXARRAY || i == SNX_VKB_TEXDEPTH) ? g_shader_tex_array : 1,
                 .stageFlags = vk_set_stages(s)};
         }
         for (int arrays = 0; arrays < 2; arrays++) {
@@ -857,7 +859,9 @@ static void sh_key_info(ShaderInfo* si, int stage, const u32 mask[26], const ShX
         si->tex_dc_color_mask = mask[7] | (u64)mask[8] << 32;
         si->tex_dc_color_funcs = mask[9];
         si->in_unfed_mask = mask[10];
-        si->early_fragment_tests = mask[11];
+        si->early_fragment_tests = mask[11] & 1;
+        si->tex_minmax_mask = mask[11] >> 1 & ((1u << SH_MINMAX_SLOTS) - 1);
+        si->tex_minmax_max = mask[11] >> (1 + SH_MINMAX_SLOTS) & ((1u << SH_MINMAX_SLOTS) - 1);
         si->tex_rect_mask = mask[12] | (u64)mask[13] << 32;
         shader_query_hint_unpack(mask + 14, si->tex_query_hint);
         si->prim_mask = mask[6]; /* the generics the draw's mesh program writes per primitive (vk_shader_mesh) */
@@ -975,6 +979,13 @@ static VkSh* sh_make(const u8* code, u32 mlen, u64 h, int stage, const u32 mask[
         s->failed = 1;
     /* an Ounce program's texture handles that it loads at addresses that differ from invocation to invocation: no
        texture each (SH_PROBE_NONE), which the log says once a program */
+    /* TEX.B instructions that choose among the constant buffer handles that reach them by the handle's value: one
+       equal to none samples zeros, which the log says once a program */
+    if (!s->failed && s->si.chosen_tex)
+        LOG_LIMIT(64,
+                  "vulkan: program %016llx chooses the texture of %u TEX.B%s when it runs, among the constant buffer "
+                  "handles that reach it: a handle equal to none of them samples (0, 0, 0, 0) (%s)\n",
+                  (unsigned long long)h, s->si.chosen_tex, s->si.chosen_tex == 1 ? "" : "s", s->si.chosen_why);
     if (!s->failed && s->si.memh_none)
         LOG_LIMIT(64, "vulkan: program %016llx samples %u texture%s as none, whose handles it loads from memory at "
                       "addresses no draw gives (%s)\n",
@@ -1002,15 +1013,16 @@ VkSh* vk_shader_get(const DsState* ds, u64 gva, u64 gva_a, int stage, u64 int_ma
                     u32 rt_sint, u32 clip, u64 dc_color, u32 dc_funcs, u32 unfed, u64 rect, const ShXfb* xfb,
                     const u8* query_hint, u64 advanced_blend, u32 advanced_mask, u32 img_int, u32 img_sint) {
     return vk_shader_get_ex(ds, gva, gva_a, stage, int_mask, sint_mask, rt_int, rt_sint, clip, dc_color, dc_funcs,
-                            unfed, rect, xfb, query_hint, advanced_blend, advanced_mask, img_int, img_sint, 0);
+                            unfed, rect, xfb, query_hint, advanced_blend, advanced_mask, img_int, img_sint, 0, 0);
 }
 VkSh* vk_shader_get_ex(const DsState* ds, u64 gva, u64 gva_a, int stage, u64 int_mask, u64 sint_mask, u32 rt_int,
                        u32 rt_sint, u32 clip, u64 dc_color, u32 dc_funcs, u32 unfed, u64 rect, const ShXfb* xfb,
                        const u8* query_hint, u64 advanced_blend, u32 advanced_mask, u32 img_int, u32 img_sint,
-                       u32 fs_config) {
+                       u32 fs_config, u32 minmax) {
     /* a vertex program's is its position's copy (ShaderInfo.position_copy) */
     if ((fs_config & ~SH_FS_CONFIG_MASK) || (fs_config && stage != ST_FS && (stage != ST_VS || fs_config > 32)))
         return NULL;
+    if ((minmax >> 2 * SH_MINMAX_SLOTS) || (minmax && stage != ST_FS)) return NULL;
     const DsPrograms* p = ds ? &ds->prog : NULL;
     pf_merge();
     g_pipeline.sh_ds = ds;
@@ -1029,6 +1041,8 @@ VkSh* vk_shader_get_ex(const DsState* ds, u64 gva, u64 gva_a, int stage, u64 int
     mask[24] = (img_int & 255) | fs_config << 8;
     mask[25] = img_sint;
     if (stage == ST_FS && p) mask[11] = p->early_z;
+    /* the min/max textures above the early tests' bit, in a word every key has */
+    if (stage == ST_FS) mask[11] |= minmax << 1;
     if (stage == ST_FS) {
         mask[21] = (u32)advanced_blend;
         mask[22] = (u32)(advanced_blend >> 32);
@@ -2531,6 +2545,9 @@ static void pf_key(char* out, size_t n, size_t* guest) {
     const char* commit = snx_build_commit();
     size_t len = strlen(commit);
     char exe[64] = "", uuid[33];
+    /* 0 no texture arrays, 1 arrays of SNX_TEX_ARRAY (every file's word before arrays came smaller), else 1 and the
+       elements */
+    u32 arrays = !g_shader_texture_arrays ? 0u : g_shader_tex_array == SNX_TEX_ARRAY ? 1u : 1u + g_shader_tex_array;
     u32 caps[] = {(u32)g_vk.has_divisor,
                   (u32)g_vk.has_dynamic_stride,
                   (u32)g_vk.has_shader_draw_parameters,
@@ -2543,7 +2560,7 @@ static void pf_key(char* out, size_t n, size_t* guest) {
                   g_vk.advanced_blend_caps.correlated_overlap,
                   g_vk.advanced_blend_caps.all_operations,
                   (u32)g_vk.has_fragment_interlock,
-                  (u32)g_shader_texture_arrays,
+                  arrays,
                   (u32)g_shader_stage_point_size,
                   (u32)g_shader_output_layer,
                   (u32)g_shader_geometry,
@@ -2597,11 +2614,11 @@ static void pf_key(char* out, size_t n, size_t* guest) {
     *guest = g > 0 && (size_t)g < n ? (size_t)g : 0;
     if (*guest)
         snprintf(out + *guest, n - *guest,
-                 " %s%s driver=%u api=%u uuid=%s ftz=%d quad=%d,%d mixed_dot=%d hmma_coop=%d sizes=%u,%u "
+                 " %s%s driver=%u api=%u uuid=%s ftz=%d quad=%d,%d mixed_dot=%d hmma_coop=%d hmma_pairs=%d sizes=%u,%u "
                  "vertex_bounds=%d",
                  snx_build_info(), exe, d->driverVersion, d->apiVersion, uuid, g_vk_ftz, g_shader_quad,
-                 g_shader_quad_compute, g_shader_mixed_dot, g_shader_hmma_coop, (unsigned)sizeof(ShaderInfo),
-                 (unsigned)sizeof(PfShader), g_vk.has_vertex_robustness2);
+                 g_shader_quad_compute, g_shader_mixed_dot, g_shader_hmma_coop, g_shader_hmma_pairs,
+                 (unsigned)sizeof(ShaderInfo), (unsigned)sizeof(PfShader), g_vk.has_vertex_robustness2);
 }
 
 void vk_pipeline_file_key(char* out, size_t n, size_t* guest) { pf_key(out, n, guest); }

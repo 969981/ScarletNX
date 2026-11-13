@@ -44,7 +44,7 @@ static int cbown_case(GpuChannel* channel, u32 cb, u32 own, u32 cpu_word, u8 fil
     channel->r3d_dirty = ~0u;
     mx_draw_state_sync(channel);
     vk_lock();
-    VkOwnRes* owner = vk_own_res_new(16);
+    VkOwnRes* owner = vk_own_res_new(16, VK_OWN_BY_DRAW);
     CHECK(owner && !owned_test_fill(owner->buf, 0, 16, fill));
     vk_own_publish_owned(OPR_CPU + own, 16, owner, 0);
     CHECK(own_lookup(OPR_CPU + own, 16, NULL, 0) == 1);
@@ -111,7 +111,7 @@ static int owned_word(void) {
     snx_st_le32(bytes, word);
     CHECK(!gmem_write(gva + 0x10, bytes, sizeof bytes));
     vk_lock();
-    VkOwnRes* owner = vk_own_res_new(16);
+    VkOwnRes* owner = vk_own_res_new(16, VK_OWN_BY_DRAW);
     CHECK(owner && !owned_test_fill(owner->buf, 0, 16, 0x77));
     vk_own_publish_owned(cpu + 0x800, 16, owner, 0);
     CHECK(own_lookup(cpu + 0x800, 16, NULL, 0) == 1);
@@ -136,7 +136,6 @@ static int owned_word(void) {
    level goes up unkeyed (its bytes aren't hashed), a later one on pages of its own is keyed, and the owner stays */
 /* the texture's memory and address in vulkan_astc_later.inc's layout, apart from its cases' */
 #define OPR_ASTC_INDEX 12
-#define OPR_BC7_PATH "vulkan_headless_owned_reads.vkbc7"
 static int owned_astc_key(void) {
     static const AlCase c = {"ASTC 8x8 256x256 beside an owner", NVN_FORMAT_RGBA_ASTC_8x8, 256, 256, 1, 0};
     const int had = g_settings.astc_mode;
@@ -168,10 +167,11 @@ static int owned_astc_key(void) {
     al_fill(&x);
     gmmu_map(gbase, base, AL_SPAN);
     later_drain(); /* what the checks before left to the encoder */
-    remove(OPR_BC7_PATH);
-    vk_astc_cache_open(OPR_BC7_PATH); /* the keys are made only where a cache takes the levels */
+    char cache[sizeof g_cachedir + 40];
+    al_cache_path(cache, sizeof cache, "vulkan_headless_owned_reads.vkbc7");
+    CHECK(!al_cache_open(cache)); /* the keys are made only where a cache takes the levels */
     vk_lock();
-    VkOwnRes* owner = vk_own_res_new(16);
+    VkOwnRes* owner = vk_own_res_new(16, VK_OWN_BY_DRAW);
     CHECK(owner && !owned_test_fill(owner->buf, 0, 16, 0x3c));
     vk_own_publish_owned(own, 16, owner, 0);
     CHECK(own_lookup(own, 16, NULL, 0) == 1);
@@ -187,7 +187,7 @@ static int owned_astc_key(void) {
                 all, kept ? "kept" : "gone", landed ? "landed" : "nothing landed");
     later_drain();
     vk_bc7_cache_close();
-    remove(OPR_BC7_PATH);
+    remove(cache);
     gmmu_space_unmap(gbase, AL_SPAN);
     mem_unmap(base, AL_SPAN);
     g_settings.astc_mode = had;
@@ -221,7 +221,7 @@ static int owned_nvn_record(void) {
     gpu_call_poll(opr_gate, NULL, q - 1); /* the queue's lane (nvn_replay.c): its submission waits behind it */
     nvn_replay_submit(q, 1, handles, &ready, &shown);
     vk_lock();
-    VkOwnRes* owner = vk_own_res_new(16);
+    VkOwnRes* owner = vk_own_res_new(16, VK_OWN_BY_DRAW);
     CHECK(owner && !owned_test_fill(owner->buf, 0, 16, fill));
     vk_own_publish_owned(own, 16, owner, 0);
     CHECK(own_lookup(own, 16, NULL, 0) == 1);

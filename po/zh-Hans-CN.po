@@ -2246,6 +2246,10 @@ msgid "Old Files"
 msgstr ""
 
 #: src/gui/main.c
+msgid "Last Run"
+msgstr ""
+
+#: src/gui/main.c
 msgid "Status"
 msgstr "状态"
 
@@ -2289,6 +2293,10 @@ msgstr "上次输出："
 #, c-format
 msgid "In use: %s"
 msgstr "使用中：%s"
+
+#: src/gui/main.c
+msgid "  (file not found)"
+msgstr ""
 
 #: src/gui/main.c
 msgid "Show More"
@@ -2432,6 +2440,11 @@ msgstr "生成方式：O%c，仅 JIT"
 #, c-format
 msgid "Made with: O%c, AOT %s"
 msgstr "生成方式：O%c，AOT %s"
+
+#: src/gui/main.c
+#, c-format
+msgid "Not found: %s"
+msgstr ""
 
 #: src/gui/main.c
 #, c-format
@@ -3796,6 +3809,52 @@ msgstr "（没有主题文件夹）"
 msgid "was"
 msgstr "原为"
 
+#: src/gui/main.c
+#, c-format
+msgid "the kernel's out-of-memory killer ended it (oom_kill %lld to %lld in %s), and it held %s"
+msgstr ""
+
+#: src/gui/main.c
+msgid "the system ended it: a crash, its memory limit (jetsam), or a close from the app switcher"
+msgstr ""
+
+#: src/gui/main.c
+msgid "a crash (whose report ends its log), a kill (by the system for its memory, or by the user) or a power loss, which the system does not name"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s, status %d, importance %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Android stopped it: %s (%s%s%s)"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Android says %s (%s%s%s)"
+msgstr ""
+
+#: src/gui/main.c
+msgid "none recorded by Android"
+msgstr ""
+
+#: src/gui/main.c
+msgid "none recorded"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "PSS %s, RSS %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s. The report: %s"
+msgstr "%s。报告：%s"
+
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
 #: src/gui/main.c
 #, snx-keys
@@ -3911,6 +3970,11 @@ msgstr "%s：初始设置将再次询问"
 
 #: src/gui/main.c
 #, c-format
+msgid "Continue: %s holds no run of edenprobe left before its summary"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
 msgid "The setup was not kept, so it asks again: %s"
 msgstr "初始设置未保存，将再次询问：%s"
 
@@ -4021,6 +4085,21 @@ msgid "Changed in older versions"
 msgstr "旧版本中的变更"
 
 #: src/gui/main.c
+#, c-format
+msgid "Android stopped %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s stopped before its summary"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s stopped"
+msgstr ""
+
+#: src/gui/main.c
 msgid "Install Type"
 msgstr "安装类型"
 
@@ -4049,6 +4128,14 @@ msgstr "提示：--no-setup 可跳过初始设置"
 
 #: src/gui/main.c
 msgid "Tip: Settings > App > Move Old Files moves them later"
+msgstr ""
+
+#: src/gui/main.c
+msgid "Tip: Settings > App > GPU Drivers' Continue goes on with it later"
+msgstr ""
+
+#: src/gui/main.c
+msgid "Tip: Share Log sends the game's log"
 msgstr ""
 
 #: src/gui/main.c
@@ -4092,6 +4179,40 @@ msgstr "已清理：%d 项完成，%d 项未完成"
 #, c-format
 msgid "Changed %d/%d"
 msgstr "变更 %d/%d"
+
+#: src/gui/main.c
+msgid "started"
+msgstr ""
+
+#: src/gui/main.c
+msgid "end"
+msgstr ""
+
+#: src/gui/main.c
+msgid "memory"
+msgstr ""
+
+#: src/gui/main.c
+msgid "log"
+msgstr ""
+
+#: src/gui/main.c
+msgid "it ended with an exit, or before its game wrote a log"
+msgstr ""
+
+#: src/gui/main.c
+msgid "none since it started"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Continue goes on from its journal: %d case so far"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Continue goes on from its journal: %d cases so far"
+msgstr ""
 
 #: src/gui/main.c
 msgid "size"
@@ -4239,6 +4360,10 @@ msgstr "设置 > 应用"
 #: src/gui/main.c
 msgid "Library folders"
 msgstr "游戏库文件夹"
+
+#: src/gui/main.c
+msgid "Removed from Games"
+msgstr ""
 
 #: src/gui/main.c
 msgid "Closing ScarletNX"
@@ -4438,6 +4563,11 @@ msgstr "已用 ESC 中止。"
 
 #: src/gui/main.c
 #, c-format
+msgid "Program ended abnormally (status %d): %s."
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
 msgid "Program ended abnormally (status %d)."
 msgstr "程序异常结束（状态 %d）。"
 
@@ -4507,6 +4637,14 @@ msgid "Use"
 msgstr "使用"
 
 #: src/gui/main.c
+msgid "Locate..."
+msgstr ""
+
+#: src/gui/main.c
+msgid "Remove from Games"
+msgstr ""
+
+#: src/gui/main.c
 #, c-format
 msgid "Each theme shows as the focus reaches it: Enter keeps it, ESC goes back to %s"
 msgstr "焦点到哪个主题就显示哪个：Enter 保留，ESC 回到 %s"
@@ -4535,6 +4673,26 @@ msgstr "查看进度"
 #, snx-key
 msgid "Mods"
 msgstr "模组"
+
+#: src/gui/main.c
+#, c-format
+msgid "Removed games not kept: %s could not be written (%s)."
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Locate...: the folder picker could not open: %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Locate...: the file picker could not open: %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s is off Games: %s is not found. Its folder %s stays, and Games lists it again once that file is back."
+msgstr ""
 
 #: src/gui/main.c
 #, c-format
@@ -4620,11 +4778,6 @@ msgstr "已清除崩溃列表，用例：%d 个"
 #, c-format
 msgid "edenprobe left no report in %s"
 msgstr "edenprobe 未在 %s 中留下报告"
-
-#: src/gui/main.c
-#, c-format
-msgid "%s. The report: %s"
-msgstr "%s。报告：%s"
 
 #: src/gui/main.c
 #, c-format
@@ -5202,6 +5355,110 @@ msgstr "更新"
 
 #: src/gui/main.c
 #, c-format
+msgid "%s could not be taken away (%s)"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s could not be linked to %s (%s)"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s/app cannot be named"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s, hashed %016llX"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "the ROM hashed %016llX"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s (%s), hashed %016llX"
+msgstr ""
+
+#: src/gui/main.c
+msgid "its sce_sys/param.sfo names no TITLE_ID"
+msgstr ""
+
+#: src/gui/main.c
+msgid "it has no exefs/main.npdm"
+msgstr ""
+
+#: src/gui/main.c
+msgid "the driver said nothing of its title"
+msgstr ""
+
+#: src/gui/main.c
+msgid "the driver could not be asked"
+msgstr ""
+
+#: src/gui/main.c
+msgid "Locate...: no folder was picked."
+msgstr ""
+
+#: src/gui/main.c
+msgid "Locate...: no file was picked."
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s is no extracted game (exefs/ with its main): %s keeps %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s is no dumped Vita game (sce_sys/param.sfo): %s keeps %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s is no GBA ROM (.gba): %s keeps %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s is no 3DS game (.cia, .cci, .3ds, .cxi): %s keeps %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s is no NSP or XCI: %s keeps %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Locate...: reading the title of %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Not taken: %s is %s, and %s was made from %s; it keeps %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Not taken: the title of %s does not read (%s); %s keeps %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Not kept: %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s plays from %s now."
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
 msgid "%s%s %s is not there"
 msgstr "%s%s %s 不存在"
 
@@ -5743,6 +6000,31 @@ msgstr "%s 无法读取（内存不足）：显示 %s"
 #, c-format
 msgid "No themes/%s/theme.ini could be read: it shows %s"
 msgstr "无法读取 themes/%s/theme.ini：显示 %s"
+
+#: src/gui/title.c
+#, c-format
+msgid "its z3ds stream does not decompress: %s"
+msgstr ""
+
+#: src/gui/title.c
+msgid "its z3ds header or stream does not read"
+msgstr ""
+
+#: src/gui/title.c
+msgid "a z3ds file, which this build does not decompress"
+msgstr ""
+
+#: src/gui/title.c
+msgid "it is no CIA, cartridge image or NCCH, alone or in a bundle"
+msgstr ""
+
+#: src/gui/title.c
+msgid "it does not read"
+msgstr ""
+
+#: src/gui/title.c
+msgid "it is too short to be a GBA ROM"
+msgstr ""
 
 #: src/gui/ui.txt
 msgid "Load Switch NSP/XCI/NRO"
