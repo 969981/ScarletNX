@@ -776,6 +776,10 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
                     (unsigned long long)(upload_bytes >> 20), (unsigned long long)partial,
                     (unsigned long long)(partial_bytes >> 20), (unsigned long long)slow_frames,
                     (unsigned long long)(slowest_ns / 1000000));
+                if (vk_shader_folds())
+                    LOG("vulkan: %llu of those shaders translated again, to hold more of their draws' constant buffer "
+                        "words as constants\n",
+                        (unsigned long long)vk_shader_folds());
                 slow_frames = slowest_ns = 0;
                 if (g_vk.has_gpl) {
                     u64 made[4], hits[4], make_ms[4], links, link_ms, opts, opt_ms;
@@ -890,10 +894,13 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
             }
             vk_tex_report_log();
             LOG("vulkan: %llu draws sampled a target they render to in place (%llu barriers in passes, %llu passes "
-                "begun again), %llu through a copy; %llu copies of targets written\n",
+                "begun again, %llu drawn two times, %llu feedback draws kept in place), %llu through a copy; %llu "
+                "copies of targets written\n",
                 (unsigned long long)g_vk_fb_draws, (unsigned long long)g_vk_fb_barriers,
-                (unsigned long long)g_vk_fb_restarts, (unsigned long long)g_vk_rt_copies,
-                (unsigned long long)g_vk_rt_copy_writes);
+                (unsigned long long)g_vk_fb_restarts, (unsigned long long)g_vk_predraws,
+                (unsigned long long)g_vk_predraw_refused,
+                (unsigned long long)g_vk_rt_copies, (unsigned long long)g_vk_rt_copy_writes);
+            vk_predraw_report();
             if (g_vk_capture_draws || g_vk_capture_capped)
                 LOG("vulkan: %llu draws captured a primitive at a time (%llu primitives), %llu skipped past %u "
                     "primitives\n",

@@ -179,6 +179,7 @@ typedef struct {
        pipeline flag, and ordered within the pass by a barrier there (dynamicRenderingLocalRead) or else by beginning
        the pass again */
     int has_feedback, has_feedback_dynamic, has_local_read;
+    int feedback_mode; /* VK_FEEDBACK_*: how a draw reads a color target it writes, at its own pixel (device.c) */
     /* VK_EXT_conditional_rendering: a render enable comparing a samples-passed count not known yet with zero
        predicates its draws on the GPU (gpu/vk/query.c) instead of waiting for the count */
     int has_cond_render;
@@ -604,6 +605,12 @@ VkDescriptorPool vk_desc_pool_new(u32 array_sets);
 #define VK_POOL_ARRAY_SETS_MORE        256
 #define VK_POOL_ARRAY_SETS_FOR(layout) (vk_dslayout_arrays(layout) ? VK_POOL_ARRAY_SETS_MORE : VK_POOL_ARRAY_SETS)
 u32 vk_desc_pools(void);                 /* the pools that exist, made on any thread */
+/* A frame slot's pools past the most that its last VK_DESC_POOL_USES uses took go, at its reset (vk_desc_pools_keep):
+   a load's burst of sets made pools that its steady frames never reach again. Long, as making a pool again is a
+   hitch: 18-32 ms for a frame's pool on Qualcomm's driver, and with 64 uses a game's steady frames made one again
+   every few seconds */
+#define VK_DESC_POOL_USES 512
+void vk_desc_pools_keep(VkDescriptorPool* pools, int* npool, int* peak, u32* uses, int took);
 void vk_desc_taken(VkDescriptorSetLayout layout, u32 n); /* n sets of layout taken from a frame's pools */
 u64 vk_desc_array_sets(void);                            /* the sets of the arrays layouts taken so far */
 int vk_dslayout_arrays(VkDescriptorSetLayout layout);    /* one of the stage layouts with the texture arrays */
@@ -965,6 +972,7 @@ typedef struct Surf {
     struct Surf* crop;
     u32 crop_gen;
     u64 crop_epoch; /* a snapshot's g_vk_texture_epoch when it was last copied (vk_rt_snapshot) */
+    u8 predraw;     /* a copy in crop that is a feedback draw's save attachment of set predraw - 1 (vk_rt_save) */
     struct Surf* next;
     /* the recency list it is in (surface.c): textures, render targets (parked ones too), or none (copies, the CPU
        frame), with the device memory its image takes. A list runs from the least recently used to the most */
@@ -1046,6 +1054,7 @@ int vk_rt_same_layout(const Surf* s, u32 w, u32 h, int bl, u32 bh, u32 pitch); /
 /* a copy of a target, for a draw that samples it while writing it. pixels: the target's pixels are brought into the
    copy; 0 for a program that only asks the texture's size or levels, which takes the copy as it is */
 Surf* vk_rt_snapshot(Surf* rt, int pixels);
+Surf* vk_rt_save(Surf* rt, u32 set);
 Surf* vk_rt_for_cpu(u64 cpu_addr, u32 w, u32 h); /* the render target the guest presents from that memory */
 /* a render target read where its guest memory is (a texture, a present): reload it if the GPU wrote its memory */
 void vk_rt_note_read(Surf* s);
@@ -2002,7 +2011,7 @@ const char* vk_corpus_dir(void);
 int vk_cb_reads_hold(const VkCbReads* reads, VkCbReader read);
 typedef struct VkSh {
     u64 hash;
-    u32 mask[26]; /* vk_shader_get's masks, including the geometry passthrough skip mask */
+    u32 mask[SH_KEY_WORDS]; /* vk_shader_get's masks, including the geometry passthrough skip mask */
     int stage;
     VkCbReads cbr;
     ShaderInfo si;
@@ -2012,10 +2021,14 @@ typedef struct VkSh {
     int shipped; /* a program the game ships, translated before a draw asked for it: 2 once one found it */
     u32 clen, clen_a;
     u64 qh, qh_a;
+    /* cb_fold.h: the constant buffer words the translation holds as constants; whether a draw asked for one that
+       folds more; whether those words stopped holding once */
+    u32 nfold;
+    u8 fold_asked, fold_broke;
     struct VkSh* next;
 } VkSh;
 /* Generated graphics modules share the persistent shader/pipeline ownership and cache. Caller holds vk_lock. */
-VkSh* vk_shader_generated_find(u64 hash, int stage, const u32 mask[26]);
+VkSh* vk_shader_generated_find(u64 hash, int stage, const u32 mask[SH_KEY_WORDS]);
 void vk_shader_generated_record(VkSh* shader, const u32* spv, size_t words, const u8* source, u32 bytes);
 
 /* the pipeline layout whose sets have no texture array bindings: compute's, and the one push constants go through
@@ -2029,6 +2042,9 @@ extern int g_vk_preserve_infnan64;
 extern int g_vk_flush_denorm;
 /* SH_FTZ_*: how translations get the console's FP32 flush to zero, from g_vk_flush_denorm and vk_ftz_native */
 extern int g_vk_ftz;
+/* whether the translations made from now on fold constant buffer words (cb_fold.h): they do, but in a test of the
+   difference */
+void vk_cb_fold_switch(int on);
 /* ftz_probe.c: 1 when the device flushes FP32 subnormals in FADD, FMUL and FFMA as the console's FTZ does, in a module
    that declares no denormal mode (it runs a compute shader and waits for it: at the renderer's start only) */
 int vk_ftz_native(void);
@@ -2061,11 +2077,14 @@ VkSh* vk_shader_get(const DsState* ds, u64 gva, u64 gva_a, int stage, u64 int_ma
                     const u8* query_hint, u64 advanced_blend, u32 advanced_mask, u32 img_int, u32 img_sint);
 /* vk_shader_get with a fragment program's configuration (SH_FS_CONFIG_MASK) or a vertex program's position copy
    (fs_config), and a fragment program's min/max textures (minmax: the first SH_MINMAX_SLOTS slots of
-   ShaderInfo.tex_minmax_mask, then theirs of tex_minmax_max from bit SH_MINMAX_SLOTS on) */
+   ShaderInfo.tex_minmax_mask, then theirs of tex_minmax_max from bit SH_MINMAX_SLOTS on), and a fragment program's
+   ShaderInfo.predraw_slots (predraw). early: the fragment program declares early fragment tests though the guest
+   didn't ask, where they give the same result (a pre-draw capture's stores would otherwise stop the GPU's early
+   depth culling) */
 VkSh* vk_shader_get_ex(const DsState* ds, u64 gva, u64 gva_a, int stage, u64 int_mask, u64 sint_mask, u32 rt_int,
                        u32 rt_sint, u32 clip, u64 dc_color, u32 dc_funcs, u32 unfed, u64 rect, const ShXfb* xfb,
                        const u8* query_hint, u64 advanced_blend, u32 advanced_mask, u32 img_int, u32 img_sint,
-                       u32 fs_config, u32 minmax);
+                       u32 fs_config, u32 minmax, u64 predraw, int early);
 /* An Ounce's task or mesh program at gva (stage ST_TS or ST_MS), with the fields of its key k: vk_shader_get with the
    fields in the key's words, and the per-primitive SPH that k names read from the program's code area. A fragment
    program drawn after a mesh program takes the generics that it writes per primitive (ShaderInfo.prim_mask) in the
@@ -2151,6 +2170,9 @@ VkPipeline vk_pipeline_now(VkPipeline h, int* pending);
 /* so far: pipelines made, how many of them the pipeline cache had, ms the workers took making them, ms the GPU thread
    waited for new ones, shaders translated, ms translating them */
 void vk_pipeline_stats(u64* pipes, u64* hits, u64* make_ms, u64* wait_ms, u64* shaders, u64* shader_ms);
+/* of those shaders, the ones translated beside a translation of their program that held, to hold more of a draw's
+   constant buffer words as constants (cb_fold.h) */
+u64 vk_shader_folds(void);
 /* with pipeline libraries, so far: the parts made by part (vertex input, pre-rasterization, fragment shader,
    fragment output), how many of them the pipeline cache had and ms making them; the fast links and their ms; the
    optimized pipelines made in the background and their ms */
@@ -2346,6 +2368,14 @@ extern u64 g_vk_targets_kept;
    through a copy instead (gpu/vk/render.c); the times a target's pixels were copied into a copy of it, for those draws
    and for textures that read a target as another size or format (gpu/vk/texture.c) */
 extern u64 g_vk_fb_draws, g_vk_fb_barriers, g_vk_fb_restarts, g_vk_rt_copies, g_vk_rt_copy_writes;
+/* g_vk.feedback_mode, from the device's features and vendor (device.c): in place (attachment feedback loops), the
+   two draws of render.c predraw_run, or in place with the pre-draw capture in a fragment interlock (vk/predraw.c) */
+#define VK_FEEDBACK_IN_PLACE  0
+#define VK_FEEDBACK_PREDRAW   1
+#define VK_FEEDBACK_INTERLOCK 2
+extern u64 g_vk_predraws;        /* feedback draws drawn two times (render.c predraw_run) */
+extern u64 g_vk_predraw_refused; /* and those that stayed in place, which the log says why of */
+void vk_predraw_report(void);   /* logs the counts of each reason (render.c) */
 /* rendering passes begun; clears recorded as vkCmdClearAttachments; attachments a pass began by clearing (its load
    op) and by loading as DONT_CARE */
 extern u64 g_vk_passes, g_vk_clear_cmds, g_vk_clear_loads, g_vk_dontcare_loads;

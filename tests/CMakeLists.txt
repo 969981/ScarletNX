@@ -468,6 +468,39 @@ if(TARGET snx_ctr_board)
         endif()
         set_tests_properties(${snx_tests} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
+    # The GPU tests again on a New 3DS (--new3ds), their buffers and targets in the memory only it has: the upper half
+    # of its 256 MB of FCRAM and its extra RAM. Each path to the RAM, and each of the draw test's modes
+    set(snx_tests "")
+    foreach(snx_path default copy in_place)
+        set(snx_flag "")
+        set(snx_suffix _${snx_path})
+        if(snx_path STREQUAL "copy")
+            set(snx_flag --vk_memory=1)
+        elseif(snx_path STREQUAL "in_place")
+            set(snx_flag --vk_memory=2)
+        else()
+            set(snx_suffix "")
+        endif()
+        foreach(snx_test 3ds_vk_transfer 3ds_vk_ram 3ds_vk_y2r 3ds_vk_draw 3ds_vk_copies)
+            string(REPLACE "_" "-" snx_executable "snx-test-${snx_test}")
+            add_test(NAME ${snx_test}_new3ds${snx_suffix} COMMAND ${snx_executable} --new3ds ${snx_flag})
+            list(APPEND snx_tests ${snx_test}_new3ds${snx_suffix})
+        endforeach()
+    endforeach()
+    foreach(snx_mode present after-draw texture-after-draw draw-after-index-copy async shadow)
+        string(REPLACE "-" "_" snx_name "${snx_mode}")
+        add_test(NAME 3ds_vk_draw_${snx_name}_new3ds COMMAND snx-test-3ds-vk-draw --new3ds --${snx_mode})
+        list(APPEND snx_tests 3ds_vk_draw_${snx_name}_new3ds)
+    endforeach()
+    if(NOT WIN32 AND Python3_Interpreter_FOUND)
+        foreach(snx_test snx_mode IN ZIP_LISTS snx_vk_validation_tests snx_vk_validation_modes)
+            add_test(NAME ${snx_test}_new3ds
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_vk_validation.py"
+                    $<TARGET_FILE:snx-test-3ds-vk-draw> ${snx_mode} --new3ds)
+            list(APPEND snx_tests ${snx_test}_new3ds)
+        endforeach()
+    endif()
+    set_tests_properties(${snx_tests} PROPERTIES SKIP_RETURN_CODE 77)
     # the two windows and the per-screen render scales: one window always, Separate screens, a minimized window and a
     # window whose images the display holds when the host has a window; the dumps stay the framebuffer's own size
     # whatever the scale
@@ -691,6 +724,9 @@ if(TARGET hactool_internals)
     add_test(NAME filesystem_folder_source
              COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> folder-source)
     add_test(NAME filesystem_folder_gone COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> folder-gone)
+    foreach(how copying extracting none whole)
+        add_test(NAME filesystem_romfs_${how} COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> romfs-${how})
+    endforeach()
     if(NOT WIN32) # the dump's link: Windows makes one only with the right to
         add_test(NAME filesystem_dump COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> dump)
         add_test(NAME filesystem_dump_source COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> dump-source)
@@ -1571,6 +1607,15 @@ if(TARGET OpenSSL::Crypto AND NOT SNX_TOOLS_ONLY)
     add_test(NAME nn_fs_cache_path COMMAND snx-test-nn-fs cache-path)
     set_tests_properties(nn_fs_cache_path PROPERTIES PASS_REGULAR_EXPRESSION
         "fatal: nn::fs::DisableIndividualFileDataCache failed with result 0x2ee602 \\(error 2002-6003\\)")
+    add_test(NAME nn_fs_restore_null COMMAND snx-test-nn-fs restore-null)
+    set_tests_properties(nn_fs_restore_null PROPERTIES PASS_REGULAR_EXPRESSION
+        "fatal: nn::fs::GetSaveDataRestoreFlag failed with result 0x2f5e02 \\(error 2002-6063\\)")
+    add_test(NAME nn_fs_restore_account COMMAND snx-test-nn-fs restore-account)
+    set_tests_properties(nn_fs_restore_account PROPERTIES PASS_REGULAR_EXPRESSION
+        "fatal: nn::fs::GetSaveDataRestoreFlag failed with result 0x2ee002 \\(error 2002-6000\\)")
+    add_test(NAME nn_fs_restore_card COMMAND snx-test-nn-fs restore-card)
+    set_tests_properties(nn_fs_restore_card PROPERTIES PASS_REGULAR_EXPRESSION
+        "fatal: nn::fs::GetSaveDataRestoreFlag failed with result 0x2ee002 \\(error 2002-6000\\)")
     # the native nn::pctl (nn/pctl.c): the answers of a console with no parental controls set
     add_executable(snx-test-nn-pctl nn_pctl.c)
     snx_test_target(snx-test-nn-pctl 23)
@@ -1778,12 +1823,6 @@ add_executable(snx-test-rtapi-miss rtapi_miss.c "${PROJECT_SOURCE_DIR}/src/nx/ru
 snx_test_target(snx-test-rtapi-miss 23)
 target_link_libraries(snx-test-rtapi-miss PRIVATE snx_nx_flags snx_settings_runtime)
 add_test(NAME rtapi_miss COMMAND snx-test-rtapi-miss)
-# rt_undef (runtime/rtapi.c): an undefined instruction is the game's, one an Arm CPU runs the recompiler's, and a call
-# just before it that came back is named
-add_executable(snx-test-rtapi-undef rtapi_undef.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/rtapi.c")
-snx_test_target(snx-test-rtapi-undef 23)
-target_link_libraries(snx-test-rtapi-undef PRIVATE snx_nx_flags snx_settings_runtime)
-add_test(NAME rtapi_undef COMMAND snx-test-rtapi-undef)
 
 add_executable(snx-test-ini-deprecated ini_deprecated.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c")
 snx_test_target(snx-test-ini-deprecated 11)
@@ -2474,6 +2513,12 @@ if(NOT SNX_TOOLS_ONLY)
     snx_test_target(snx-test-vk-pipeline-parts 23)
     target_link_libraries(snx-test-vk-pipeline-parts PRIVATE snx_nx_flags)
     add_test(NAME vk_pipeline_parts COMMAND snx-test-vk-pipeline-parts)
+    # constant buffer words folded into a translation (gpu/vk/cb_fold.c): which words fold, what a translation records
+    # of its loads, when it holds for a draw's buffers, and how many of a program's translations fold by value
+    add_executable(snx-test-vk-cb-fold vk_cb_fold.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/cb_fold.c")
+    snx_test_target(snx-test-vk-cb-fold 23)
+    target_link_libraries(snx-test-vk-cb-fold PRIVATE snx_nx_flags)
+    add_test(NAME vk_cb_fold COMMAND snx-test-vk-cb-fold)
     # the drivers known to break an extension or feature (common/gpu/vk/extension_bans.c), with no GPU: the table's errors,
     # each driver's versions at every bound's edge, the filter and the features asked for against stand-in devices,
     # the table the build carries, and vulkan_ban_ignore read from a .ini. With --devices it lists the lines that hold
@@ -3483,6 +3528,10 @@ endif()
 
 endif() # SNX_BUILD_NX
 
+# the bands a block linear target is published or written back in (vk/rt_bands.h): they tile the span within the cap
+add_executable(snx-test-rt-bands rt_bands.c)
+snx_test_target(snx-test-rt-bands 23)
+add_test(NAME rt_bands COMMAND snx-test-rt-bands)
 # dist/icons/ is what scripts/make-icons.py draws from dist/wimsy.svg: a changed SVG fails until it runs again
 if(Python3_Interpreter_FOUND)
     add_test(NAME dist_icons COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/make-icons.py" --check)

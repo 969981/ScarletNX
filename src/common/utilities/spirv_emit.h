@@ -63,6 +63,10 @@ typedef struct {
        barriers' and atomics' acquire and release semantics then also make memory visible and available, as GLSL450
        implies, and spv_emit_load_nonprivate and spv_emit_store_nonprivate access memory other invocations share */
     int vulkan_memory_model;
+    /* the memory semantics' storage class bit of "shared" memory, for the shared atomics and the control barrier: 0 for
+       WorkgroupMemory, or UniformMemory (0x40) for a program whose shared memory a storage buffer holds (a block that
+       asks for more than the device gives, vk/compute.c), so that its barriers and atomics order that buffer's words */
+    uint32_t shared_semantics;
     /* known's index: open addressing on a power of two, each slot an entry of known plus one (0 free), at most half
        full, so finding one asks a slot or two, not every type and constant made; its size follows from known_count */
     uint32_t* known_slots;
@@ -507,6 +511,8 @@ void spv_emit_init(SpvEmitter* e, size_t estimated_function_words);
 /* the SPIR-V version of the modules spv_emit_init starts from then on: 0x00010600 (1.6) until it is set. A Vulkan 1.2
    device takes 1.5 at most */
 void spv_emit_set_version(uint32_t version);
+/* that version */
+uint32_t spv_emit_version(void);
 void spv_emit_destroy(SpvEmitter* e);
 uint32_t spv_emit_id(SpvEmitter* e);
 /* the GLSL.std.450 import, made on the first call */
@@ -654,6 +660,8 @@ void spv_emit_label(SpvEmitter* e, uint32_t label);
 uint32_t spv_emit_function_variable(SpvEmitter* e, uint32_t pointer_type);
 uint32_t spv_emit_function_variable_init(SpvEmitter* e, uint32_t pointer_type, uint32_t initial_value);
 uint32_t spv_emit_load(SpvEmitter* e, uint32_t result_type, uint32_t pointer);
+/* OpPhi of two values: a when control came from block from_a, b from from_b */
+uint32_t spv_emit_phi2(SpvEmitter* e, uint32_t result_type, uint32_t a, uint32_t from_a, uint32_t b, uint32_t from_b);
 /* The common forms: an instruction of op, its result type, a new id and one, two or three operands, the id returned.
    unary takes OpFConvert (a float of one width to another), the conversions between floats and integers, OpBitcast,
    OpNot, OpBitReverse, OpBitCount, OpLogicalNot, OpFNegate, OpIsNan and OpReadClockKHR (its operand the scope);

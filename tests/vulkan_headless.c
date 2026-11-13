@@ -223,6 +223,33 @@ static int check_desc_pool_arrays(void) {
            held[0][0], held[0][1], held[1][0], held[1][1], n, vk_desc_pools() - pools);
     return 0;
 }
+/* A burst of sets in one frame (a load) makes pools the slot's later frames never reach: after a window of
+   VK_DESC_POOL_USES uses of the slot that each take one pool, the others are destroyed */
+static int check_desc_pool_keep(void) {
+    if (g_vk.has_descriptor_buffers) {
+        puts("descriptor pools kept: descriptor buffers here, the frames' pools hold no stage sets");
+        return 0;
+    }
+    vk_lock();
+    vk_finish();
+    vk_frame_next();
+    u32 before = vk_desc_pools();
+    for (u32 i = 0; i < 3 * 1024 + 1; i++) CHECK(vk_desc_alloc(g_vk_dslayout[0][1]) != VK_NULL_HANDLE);
+    u32 burst = vk_desc_pools();
+    for (u32 i = 0; i < 2 * VK_FRAMES * VK_DESC_POOL_USES + VK_FRAMES; i++) {
+        vk_frame_next();
+        CHECK(vk_desc_alloc(g_vk_dslayout[0][1]) != VK_NULL_HANDLE);
+    }
+    u32 after = vk_desc_pools();
+    vk_finish();
+    vk_frame_next();
+    vk_unlock();
+    CHECK(after + 3 <= burst); /* the burst's slot held 4 pools or more, one of them stays */
+    printf(
+        "descriptor pools kept: %u before a burst of 3073 sets, %u after it, %u once %u uses of each slot took one\n",
+        before, burst, after, 2 * VK_DESC_POOL_USES);
+    return 0;
+}
 /* Graphics descriptor tables fill the frame's descriptor memory. vk_frame_check, which runs before a draw's setup,
    moves on to the next frame while the tables of one more draw still fit: the setup itself never submits for room */
 static int check_descriptor_room(void) {
@@ -5159,6 +5186,67 @@ static int flush_parts_case(u64 gva, u64 cpu, u32 width_reg, u32 h, u32 layout, 
     }
     return bad;
 }
+/* A target over what one owner may hold, published (a watched page touched by the CPU): an owner a band of rows of
+   blocks over its span, each landing when the CPU touches it, rather than a write-back that let the span's pages go
+   before writing them over a second later (a 512 MiB RGBA16F one, edenprobe's tex8k, read on another thread
+   meanwhile: #2094). A block linear RGBA16F target of 256x128, 256 KiB, loaded from guest memory holding a pattern,
+   its red cleared to 0.25 alone, and published under a cap of 64 KiB: the publish takes it, owners hold its bytes in
+   more than one band, and every byte read from guest memory is where the guest's layout has it, red 0.25 and the
+   pattern in the others (each band's owner read from its own start). The publish refused it, and the caller wrote it
+   back */
+/* flush_pattern with no half NaN or infinity: an odd byte, a half's high one, has its exponent under 31 */
+static u8 band_pattern(u64 i) { return i % 2 ? flush_pattern(i) & 0x3B : flush_pattern(i); }
+static int check_publish_bands(void) {
+    const u64 cpu = HEAP_BASE + 0xC00000, gva = 0xB000000ull, cap = g_vk.alloc_cap;
+    const u32 w = 256, h = 128, bpp = 8;
+    const u64 size = (u64)w * bpp * h;
+    CHECK(mem_map(cpu, 0x100000, MS_NORMAL, PERM_RW) == 0);
+    gmmu_map(gva, cpu, 0x100000);
+    GpuChannel* ch = calloc(1, sizeof *ch);
+    u8* got = malloc(size);
+    CHECK(ch && got);
+    u32* r = ch->r3d;
+    for (u64 i = 0; i < size; i++) GP(cpu)[i] = band_pattern(i);
+    r[0x487] = 1;
+    r[0x200] = (u32)(gva >> 32);
+    r[0x201] = (u32)gva;
+    r[0x202] = w;
+    r[0x203] = h;
+    r[0x204] = 0xCA; /* R16G16B16A16_FLOAT */
+    r[0x205] = 0;    /* block linear, 1 GOB a block */
+    r[0x206] = 1;
+    r[0x207] = (u32)(size >> 2);
+    float colour[4] = {0.25f, 0, 0, 0};
+    memcpy(&r[0x360], colour, sizeof colour);
+    engine_clear(ch, 1 << 2); /* red alone */
+    vk_render_end();
+    Surf* t = vk_rt_find(gva);
+    CHECK(t);
+    vk_lock();
+    g_vk.alloc_cap = 64 << 10;
+    int published = vk_surf_publish(t);
+    g_vk.alloc_cap = cap;
+    vk_unlock();
+    int owners = own_traps() ? own_lookup(cpu, size, NULL, 0) : 2;
+    if (!published || owners < 2) {
+        fprintf(stderr, "a target over one owner: published %d, %d owners over its span\n", published, owners);
+        return 1;
+    }
+    CHECK(!gmem_read(gva, got, size));
+    for (u64 i = 0; i < size; i++) { /* a texel's first two bytes are its red, as 0.25 is 0x3400 */
+        u8 want = i % 8 == 0 ? 0x00 : i % 8 == 1 ? 0x34 : band_pattern(i);
+        if (got[i] != want) {
+            fprintf(stderr, "a target published in bands: byte %llu holds %02x, not %02x\n", (unsigned long long)i,
+                    got[i], want);
+            return 1;
+        }
+    }
+    free(got);
+    free(ch);
+    CHECK(mem_unmap(cpu, 0x100000) == 0);
+    printf("A target over one owner is published a band at a time, %d owners, and lands whole\n", owners);
+    return 0;
+}
 static int check_flush_parts(void) {
     const u64 cpu = HEAP_BASE + 0xC00000, gva = 0xB000000ull;
     CHECK(mem_map(cpu, 0x100000, MS_NORMAL, PERM_RW) == 0);
@@ -5340,6 +5428,12 @@ static int check_blit_bands(void) {
     printf("blit bands: %llu frames ended between bands\n", (unsigned long long)ended);
     CHECK(!failed && ended >= 2);
     return 0;
+}
+
+/* the sample masks (SET_MULTISAMPLE_SAMPLE_MASK) as reset_3d starts a channel, every sample: a test's channel starts
+   zeroed, and a mask of 0 keeps its draws off their targets */
+static void all_samples(u32* r) {
+    for (u32 i = 0; i < 4; i++) r[MAXWELL3D_SAMPLE_MASK + i] = 0xFFFF;
 }
 
 /* a block linear A8B8G8R8 target of w by h at gva (blocks 2^bh GOBs high) cleared to red or blue */
@@ -6493,6 +6587,7 @@ static void results_copied(u64 cpu, u64 len) { vk_own_cpu_touched(cpu, len); }
 #include "vulkan_alpha_coverage.inc"
 #include "vulkan_indexed_feedback.inc"
 #include "vulkan_scaled_fragment.inc"
+#include "vulkan_slices_from_targets.inc"
 #include "vulkan_targetless_stores.inc"
 #include "vulkan_storage_image_keep.inc"
 #include "vulkan_uma_imports.inc"
@@ -6706,6 +6801,17 @@ static int check_vk12_way(void) {
     } else {
         CHECK(g_vk.api >= VK_API_VERSION_1_3 && version == 0x00010600u && g_vk.feat12.pNext == &g_vk.feat13);
     }
+    /* the shader cache's file keys on that version past its guest part: a vk_api=1.2 run translates again the shaders
+       a 1.3 run on the same device kept in SPIR-V 1.6, which the 1.2 way takes not, and keeps the file's pipelines */
+    char key[1024], other[1024];
+    size_t guest = 0, other_guest = 0;
+    CHECK(spv_emit_version() == version);
+    vk_pipeline_file_key(key, sizeof key, &guest);
+    spv_emit_set_version(version == 0x00010600u ? 0x00010500u : 0x00010600u);
+    vk_pipeline_file_key(other, sizeof other, &other_guest);
+    spv_emit_set_version(version);
+    CHECK(guest && other_guest == guest && !memcmp(key, other, guest));
+    CHECK(strcmp(key + guest, other + other_guest) != 0);
     /* a device with all of them but dynamic rendering, its store op NONE from the EXT */
     VkExtensionProperties list[16] = {{0}};
     static const char* const have[] = {
@@ -7209,6 +7315,13 @@ static int run_headless(int argc, char** argv) {
         printf("PASS headless Vulkan resolution scale only: %u validation messages\n", g_vk_validation_messages);
         return 0;
     }
+    if (getenv("SNX_TEST_SLICES_ONLY")) { /* textures taking their slices from targets alone, for their mutants */
+        CHECK(!check_slices_from_targets());
+        vk_finish();
+        vk_pipeline_quiesce();
+        printf("PASS headless Vulkan slices from targets only: %u validation messages\n", g_vk_validation_messages);
+        return 0;
+    }
     if (getenv("SNX_TEST_GPUPROF_POOL_ONLY")) { /* a smaller pool than the profile asks for, alone */
         CHECK(!check_gpuprof_small_pool());
         printf("PASS headless Vulkan profile pool only: %u validation messages\n", g_vk_validation_messages);
@@ -7411,6 +7524,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_storage_image_formats());
     CHECK(!check_scaled_compute());
     CHECK(!check_scaled_fragment());
+    CHECK(!check_slices_from_targets());
     CHECK(!check_volume_surface_atomics());
     CHECK(!check_layered_surface_loads());
     CHECK(!check_rect_textures());
@@ -7461,6 +7575,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_shader_invalidation());
     CHECK(!check_indirect_dispatch_once());
     CHECK(!check_shared_clamp());
+    CHECK(!check_shared_spill());
     CHECK(!check_vic());
     CHECK(!check_vic_chain(shot));
     CHECK(!check_nvdec_vic());
@@ -7470,6 +7585,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_dma_bands());
     CHECK(!check_dma_bands_frames());
     CHECK(!check_flush_parts());
+    CHECK(!check_publish_bands());
     CHECK(!check_vic_bands());
     CHECK(!check_dma_texture());
     CHECK(!check_sparse_volume());
@@ -7526,6 +7642,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_sparse_texture());
     CHECK(!check_sparse_texture_shared());
     CHECK(!check_desc_pool_arrays());
+    CHECK(!check_desc_pool_keep());
     /* the pipeline workers: pipeline_threads when given, else all the CPUs but two, two to twelve */
     CHECK(snx_vk_pipeline_workers(0, 8) == 6 && snx_vk_pipeline_workers(0, 12) == 10 &&
           snx_vk_pipeline_workers(0, 4) == 2 && snx_vk_pipeline_workers(0, 0) == 2 &&

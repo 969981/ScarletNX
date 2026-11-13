@@ -12,6 +12,7 @@ static struct {
 } g_spirv_emit = {0x00010600};
 
 void spv_emit_set_version(uint32_t version) { g_spirv_emit.version = version; }
+uint32_t spv_emit_version(void) { return g_spirv_emit.version; }
 
 /* s at a capacity of at least need words: doubled from 512 (a small shader's section, so most grow once or never)
    until it holds them. Out of line, so the test that calls it stays small enough to be inlined everywhere */
@@ -835,6 +836,12 @@ uint32_t spv_emit_function_variable_init(SpvEmitter* e, uint32_t pointer_type, u
     return id;
 }
 
+uint32_t spv_emit_phi2(SpvEmitter* e, uint32_t result_type, uint32_t a, uint32_t from_a, uint32_t b, uint32_t from_b) {
+    uint32_t id = spv_emit_id(e);
+    EMIT(&e->functions, SPV_OP_PHI, result_type, id, a, from_a, b, from_b);
+    return id;
+}
+
 uint32_t spv_emit_load(SpvEmitter* e, uint32_t result_type, uint32_t pointer) {
     uint32_t id = spv_emit_id(e);
     EMIT(&e->functions, SPV_OP_LOAD, result_type, id, pointer);
@@ -869,6 +876,10 @@ uint32_t spv_emit_memory_semantics(const SpvEmitter* e, uint32_t semantics) {
     if (semantics & 0xc) semantics |= 0x2000; /* Release, AcquireRelease: MakeAvailable */
     return semantics;
 }
+/* the storage class bit of shared memory's semantics (SpvEmitter.shared_semantics) */
+static uint32_t shared_class(const SpvEmitter* e) {
+    return e->shared_semantics ? e->shared_semantics : SPV_MEMORY_SEMANTICS_WORKGROUP_MEMORY;
+}
 uint32_t spv_emit_atomic_shared_u32(SpvEmitter* e, uint32_t u32_type, uint32_t opcode, uint32_t pointer,
                                     uint32_t value) {
     assert(opcode == SPV_OP_ATOMIC_EXCHANGE || opcode == SPV_OP_ATOMIC_I_ADD || opcode == SPV_OP_ATOMIC_S_MIN ||
@@ -881,9 +892,9 @@ uint32_t spv_emit_atomic_shared_u32(SpvEmitter* e, uint32_t u32_type, uint32_t o
     put(&e->functions, pointer);
     put(&e->functions, spv_emit_constant_u32(e, u32_type, 2));     /* Workgroup scope */
     /* AcquireRelease | WorkgroupMemory */
-    put(&e->functions, spv_emit_constant_u32(e, u32_type,
-                                             spv_emit_memory_semantics(e, SPV_MEMORY_SEMANTICS_ACQUIRE_RELEASE |
-                                                                              SPV_MEMORY_SEMANTICS_WORKGROUP_MEMORY)));
+    put(&e->functions,
+        spv_emit_constant_u32(e, u32_type,
+                              spv_emit_memory_semantics(e, SPV_MEMORY_SEMANTICS_ACQUIRE_RELEASE | shared_class(e))));
     put(&e->functions, value);
     return id;
 }
@@ -915,9 +926,8 @@ uint32_t spv_emit_atomic_load_shared_u32(SpvEmitter* e, uint32_t u32_type, uint3
     put(&e->functions, pointer);
     put(&e->functions, spv_emit_constant_u32(e, u32_type, 2));     /* Workgroup scope */
     /* Acquire | WorkgroupMemory */
-    put(&e->functions, spv_emit_constant_u32(e, u32_type,
-                                             spv_emit_memory_semantics(e, SPV_MEMORY_SEMANTICS_ACQUIRE |
-                                                                              SPV_MEMORY_SEMANTICS_WORKGROUP_MEMORY)));
+    put(&e->functions, spv_emit_constant_u32(
+                           e, u32_type, spv_emit_memory_semantics(e, SPV_MEMORY_SEMANTICS_ACQUIRE | shared_class(e))));
     return id;
 }
 
@@ -930,13 +940,12 @@ uint32_t spv_emit_atomic_compare_exchange_shared_u32(SpvEmitter* e, uint32_t u32
     put(&e->functions, pointer);
     put(&e->functions, spv_emit_constant_u32(e, u32_type, 2));     /* Workgroup scope */
     /* AcquireRelease | WorkgroupMemory */
-    put(&e->functions, spv_emit_constant_u32(e, u32_type,
-                                             spv_emit_memory_semantics(e, SPV_MEMORY_SEMANTICS_ACQUIRE_RELEASE |
-                                                                              SPV_MEMORY_SEMANTICS_WORKGROUP_MEMORY)));
+    put(&e->functions,
+        spv_emit_constant_u32(e, u32_type,
+                              spv_emit_memory_semantics(e, SPV_MEMORY_SEMANTICS_ACQUIRE_RELEASE | shared_class(e))));
     /* Acquire | WorkgroupMemory */
-    put(&e->functions, spv_emit_constant_u32(e, u32_type,
-                                             spv_emit_memory_semantics(e, SPV_MEMORY_SEMANTICS_ACQUIRE |
-                                                                              SPV_MEMORY_SEMANTICS_WORKGROUP_MEMORY)));
+    put(&e->functions, spv_emit_constant_u32(
+                           e, u32_type, spv_emit_memory_semantics(e, SPV_MEMORY_SEMANTICS_ACQUIRE | shared_class(e))));
     put(&e->functions, desired);
     put(&e->functions, expected);
     return id;
@@ -961,10 +970,11 @@ void spv_emit_control_barrier(SpvEmitter* e, uint32_t u32_type) {
     instruction(&e->functions, SPV_OP_CONTROL_BARRIER, 4);
     put(&e->functions, spv_emit_constant_u32(e, u32_type, 2));     /* Workgroup execution scope */
     put(&e->functions, spv_emit_constant_u32(e, u32_type, 2));     /* Workgroup memory scope */
-    /* AcquireRelease | WorkgroupMemory */
+    /* AcquireRelease | WorkgroupMemory, and UniformMemory where a storage buffer holds the shared memory */
     put(&e->functions, spv_emit_constant_u32(e, u32_type,
                                              spv_emit_memory_semantics(e, SPV_MEMORY_SEMANTICS_ACQUIRE_RELEASE |
-                                                                              SPV_MEMORY_SEMANTICS_WORKGROUP_MEMORY)));
+                                                                              SPV_MEMORY_SEMANTICS_WORKGROUP_MEMORY |
+                                                                              shared_class(e))));
 }
 void spv_emit_memory_barrier(SpvEmitter* e, uint32_t u32_type, uint32_t scope, uint32_t semantics) {
     instruction(&e->functions, SPV_OP_MEMORY_BARRIER, 3);
