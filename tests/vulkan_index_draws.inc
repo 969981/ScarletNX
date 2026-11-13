@@ -937,7 +937,9 @@ static int shadow_map_cases(GpuChannel* channel, u64 target, u64 address) {
    TXQ of the 4x4 target is the quad's red, less 4: the quad is green when the query answers 4, and no copy is
    written, before a copy of the target exists and with one left by an earlier draw. Between the two a fragment
    program fetches the target's texel (0, 0) for every pixel: that draw has the pixels it found copied, the clear's
-   blue */
+   blue. It fetches it again after the 3D engine's texture data cache invalidation, then after a fragment barrier:
+   each of those makes the earlier draws' writes visible to texture reads, so each draw has the target copied again
+   (g_vk_texture_epoch) */
 static int query_target_case(GpuChannel* channel, u64 target, u64 address) {
     const u64 query = address + 0x5000, fetch = address + 0x5400, pool = address + 0x1F000, samplers = pool + 0x100,
               cbuf = pool + 0x200;
@@ -984,8 +986,15 @@ static int query_target_case(GpuChannel* channel, u64 target, u64 address) {
     r[0x982] = 2;
     DrawCall call = {.topology = 7, .first = 4, .count = 4, .instances = 1};
     int ok = 1;
-    for (u32 round = 0; ok && round < 3; round++) {
-        int fetches = round == 1, stage = fetches ? 4 : 0;
+    static const char* const what[5] = {"a vertex program asks its width",
+                                        "a fragment program fetches the target's texel",
+                                        "a vertex program asks its width",
+                                        "a fragment program fetches the target's texel after a texture data cache "
+                                        "invalidation",
+                                        "a fragment program fetches the target's texel after a fragment barrier"};
+    for (u32 round = 0; ok && round < 5; round++) {
+        int fetches = round == 1 || round >= 3, stage = fetches ? 4 : 0;
+        if (round >= 3) g_renderer->method_barrier(round == 3 ? 2 : 0);
         u64 written = g_vk_rt_copy_writes, through = g_vk_rt_copies;
         r[0x811] = fetches ? 0 : (u32)(query - address);
         r[0x851] = fetches ? (u32)(fetch - address) : 0x10000;
@@ -1002,9 +1011,8 @@ static int query_target_case(GpuChannel* channel, u64 target, u64 address) {
             fprintf(stderr,
                     "target query: draw %u (%s): %u green, %u blue, %u red, %llu copies of the target written, %llu "
                     "draws through a copy\n",
-                    round,
-                    fetches ? "a fragment program fetches the target's texel" : "a vertex program asks its width",
-                    px.green, px.blue, px.red, (unsigned long long)written, (unsigned long long)through);
+                    round, what[round], px.green, px.blue, px.red, (unsigned long long)written,
+                    (unsigned long long)through);
     }
     r[0x811] = 0;
     r[0x851] = 0x10000; /* the harness's programs again */
@@ -1024,7 +1032,9 @@ static int query_target_case(GpuChannel* channel, u64 target, u64 address) {
    from the bottom is in place again under a viewport of negative height. With clip set, the mapping is the fragment
    program's (ShaderInfo.pos_out_mask, screen_ndc): the vertex program writes the generic as its position itself, and
    the sample is at the generic's (x / w / 2 + 1/2, y / w / 2 + 1/2), or -y / w / 2 + 1/2 counted from the bottom. The
-   same rounds, the generic loaded apart from the position in place of the stored w */
+   same rounds, the generic loaded apart from the position in place of the stored w. Each round writes the target's
+   texels anew and puts a texture barrier before its draw, as the console's texture reads see those writes only after
+   one */
 #define OWN_FFMA(d, a, c, scale, negc)                                                                                 \
     (0x32a0000000070000ull | (u64)((scale) >> 12 & 0x7ffff) << 20 | (u64)((scale) >> 31) << 56 | (u64)(c) << 39 |      \
      (u64)(negc) << 49 | (u64)(a) << 8 | (u64)(d))
@@ -1149,6 +1159,7 @@ static int own_target_case(GpuChannel* channel, u64 target, u64 address, int cli
             vk_surf_wrote(surface);
             vk_rt_drawn(surface);
             vk_surf_touch(surface);
+            g_renderer->method_barrier(0); /* NVN's ORDER_FRAGMENTS | INVALIDATE_TEXTURE */
             vk_render_draw(&channel->ds, &call, &channel->owner);
             loops = g_vk_fb_draws - loops, written = g_vk_rt_copy_writes - written, through = g_vk_rt_copies - through;
             ok = g_vk_drawn == drawn + 1;

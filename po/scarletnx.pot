@@ -175,11 +175,72 @@ msgstr ""
 
 #: src/gui/clean.c
 #, c-format
-msgid "Not moved: it cannot be read: %s"
+msgid "Its files are in %s, which could not take its place: %s"
 msgstr ""
 
 #: src/gui/clean.c
+#, c-format
+msgid "Not moved: it cannot be read: %s"
+msgstr ""
+
+#: src/gui/clean.c src/gui/main.c
 msgid "Removed: it was empty"
+msgstr ""
+
+#: src/gui/clean.c
+msgid "Stays: a save, which Delete All never deletes: Move All moves it"
+msgstr ""
+
+#: src/gui/clean.c
+#, c-format
+msgid "Stays: it holds saves (%s), which Delete All never deletes: Move All moves it"
+msgstr ""
+
+#: src/gui/clean.c
+#, c-format
+msgid "Stays: %s cannot be read (%s), so Delete All cannot tell it holds no save"
+msgstr ""
+
+#: src/gui/clean.c
+#, c-format
+msgid "Stays: %s is a link to a folder, which Delete All does not follow, so it cannot tell it holds no save"
+msgstr ""
+
+#: src/gui/clean.c
+msgid "Stays: the console's keys, which Delete All never deletes: Move All moves them"
+msgstr ""
+
+#: src/gui/clean.c
+#, c-format
+msgid "Stays: it holds the console's keys (%s), which Delete All never deletes: Move All moves them"
+msgstr ""
+
+#: src/gui/clean.c
+#, c-format
+msgid "Not deleted: %s is mounted inside it, whose files would go with it"
+msgstr ""
+
+#: src/gui/clean.c
+#, c-format
+msgid "Not deleted: %s"
+msgstr ""
+
+#: src/gui/clean.c
+#, c-format
+msgid "Deleted, with %s"
+msgstr ""
+
+#: src/gui/clean.c
+#, c-format
+msgid "Deletes it, with %s"
+msgstr ""
+
+#: src/gui/clean.c
+msgid "Deleted"
+msgstr ""
+
+#: src/gui/clean.c
+msgid "Deletes it"
 msgstr ""
 
 #: src/gui/editor.c
@@ -1495,6 +1556,10 @@ msgid "Outside the app, Android checks every file access: games may run slower."
 msgstr ""
 
 #: src/gui/main.c
+msgid "Overwrite users.ini? It is kept as users.ini.old"
+msgstr ""
+
+#: src/gui/main.c
 msgid "A compile goes: exiting ScarletNX stops it, its work lost."
 msgstr ""
 
@@ -1515,11 +1580,30 @@ msgid "Left by older versions"
 msgstr ""
 
 #: src/gui/main.c
+msgid "The games' own saves"
+msgstr ""
+
+#: src/gui/main.c
 msgid "While the app is in testing, Android's Settings > Apps > ScarletNX > Storage > Clear storage takes the menu's files above, with every game, save and key in the app"
 msgstr ""
 
 #: src/gui/main.c
-msgid "counting"
+msgid "An older version left these where this one no longer looks: each folder, what moved and where it is now"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "and %d more, which Share Log lists"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "and %d more: Up/Down, PgUp/PgDn and the wheel go over them"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Delete All: %d done, %d not"
 msgstr ""
 
 #: src/gui/main.c
@@ -1535,11 +1619,6 @@ msgstr ""
 #: src/gui/main.c
 #, c-format
 msgid "Clean Old Settings: %d done"
-msgstr ""
-
-#: src/gui/main.c
-#, c-format
-msgid "and %d more, which Share Log lists"
 msgstr ""
 
 #: src/gui/main.c
@@ -1624,6 +1703,10 @@ msgstr ""
 
 #: src/gui/main.c
 msgid "No"
+msgstr ""
+
+#: src/gui/main.c
+msgid "Overwrite"
 msgstr ""
 
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
@@ -2156,6 +2239,14 @@ msgid "Notice"
 msgstr ""
 
 #: src/gui/main.c
+msgid "Old Files"
+msgstr ""
+
+#: src/gui/main.c
+msgid "Last Run"
+msgstr ""
+
+#: src/gui/main.c
 msgid "Status"
 msgstr ""
 
@@ -2176,7 +2267,7 @@ msgid "Recompiles a PS Vita homebrew .vpk, then runs it"
 msgstr ""
 
 #: src/gui/main.c
-msgid "Runs a GBA ROM on the emulated AGB board"
+msgid "Runs a GBA ROM or MultiBoot ROM on the emulated AGB board"
 msgstr ""
 
 #: src/gui/main.c
@@ -2259,6 +2350,10 @@ msgid "Vita VPK, opened with scarletnx-vita"
 msgstr ""
 
 #: src/gui/main.c
+msgid "GBA MultiBoot ROM, played with scarletnx-agb"
+msgstr ""
+
+#: src/gui/main.c
 msgid "GBA ROM, played with scarletnx-agb"
 msgstr ""
 
@@ -2268,6 +2363,11 @@ msgstr ""
 
 #: src/gui/main.c
 msgid "A dump, prepared when it runs"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid ". No box art: %s"
 msgstr ""
 
 #: src/gui/main.c
@@ -2520,7 +2620,7 @@ msgid "GPU Drivers"
 msgstr ""
 
 #: src/gui/main.c
-msgid "Vulkan drivers for Adreno and Xclipse GPUs on Android (Turnip, RADV): add, remove, and the one games use"
+msgid "Vulkan drivers for Adreno, Mali and Xclipse GPUs on Android (Turnip, PanVK, RADV): add, remove, and the one games use"
 msgstr ""
 
 #: src/gui/main.c
@@ -3086,7 +3186,7 @@ msgid "Add Driver"
 msgstr ""
 
 #: src/gui/main.c
-msgid "A driver package's zip, a meta.json and the driver's libraries at its top as Turnip's releases are: unpacked into gpu_drivers/ of the user's data folder"
+msgid "A driver package's zip, a meta.json and the driver's libraries at its top as Turnip's and PanVK's releases are: unpacked into gpu_drivers/ of the user's data folder"
 msgstr ""
 
 #: src/gui/main.c
@@ -3322,6 +3422,82 @@ msgstr ""
 #: src/gui/main.c
 #, c-format
 msgid "Not downloaded: %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "cannot write %s: %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "cannot read %s: %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s, CRC-32 %08X, is no game of libretro-database's No-Intro list"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "the name %s makes a link past %zu bytes"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "libretro-thumbnails has no box of %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "GET %s: %zu bytes that are no PNG"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "no room for the path of %s's icon.png"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s: no box art: no thread: %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s: no box art: %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s: box art of %s, from libretro-thumbnails"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "; the No-Intro list is not kept: %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s: no box art: no game of %s names it as its source"
+msgstr ""
+
+#: src/gui/main.c
+msgid "this build of the launcher has no HTTPS client"
+msgstr ""
+
+#: src/gui/main.c
+msgid "no cache folder to keep the No-Intro list in"
+msgstr ""
+
+#: src/gui/main.c
+msgid "too many games wait for theirs: make it again once they are done"
+msgstr ""
+
+#: src/gui/main.c
+msgid "no memory to ask for it"
 msgstr ""
 
 #: src/gui/main.c
@@ -3621,6 +3797,44 @@ msgstr ""
 msgid "was"
 msgstr ""
 
+#: src/gui/main.c
+#, c-format
+msgid "the kernel's out-of-memory killer ended it (oom_kill %lld to %lld in %s), and it held %s"
+msgstr ""
+
+#: src/gui/main.c
+msgid "the system ended it: a crash, its memory limit (jetsam), or a close from the app switcher"
+msgstr ""
+
+#: src/gui/main.c
+msgid "a crash (whose report ends its log), a kill (by the system for its memory, or by the user) or a power loss, which the system does not name"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s, status %d, importance %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Android stopped it: %s (%s%s%s)"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Android says %s (%s%s%s)"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "PSS %s, RSS %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s. The report: %s"
+msgstr ""
+
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
 #: src/gui/main.c
 #, snx-keys
@@ -3672,6 +3886,12 @@ msgstr ""
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
 #: src/gui/main.c
 #, snx-keys
+msgid "Left/Right: choose. Enter: OK. PgUp/PgDn: page. ESC: exit."
+msgstr ""
+
+#. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
+#: src/gui/main.c
+#, snx-keys
 msgid "Up/Down: row. Left/Right: change. Enter: change. ESC: back."
 msgstr ""
 
@@ -3710,6 +3930,20 @@ msgid "The system's random number generator failed: no uid for a new user"
 msgstr ""
 
 #: src/gui/main.c
+msgid "Delete All deletes none of these: a save and the console's keys are only moved"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Delete All? %d deleted, %d stay: a save and the console's keys are only moved"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Delete All? %d deleted"
+msgstr ""
+
+#: src/gui/main.c
 #, c-format
 msgid "%s: the setup asks again"
 msgstr ""
@@ -3721,6 +3955,11 @@ msgstr ""
 
 #: src/gui/main.c
 msgid "no folder for setup.ini"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Continue: %s holds no run of edenprobe left before its summary"
 msgstr ""
 
 #: src/gui/main.c
@@ -3794,7 +4033,19 @@ msgid "Later"
 msgstr ""
 
 #: src/gui/main.c
-msgid "Overwrite"
+msgid "Clean Now"
+msgstr ""
+
+#: src/gui/main.c
+msgid "Not Now"
+msgstr ""
+
+#: src/gui/main.c
+msgid "Move All"
+msgstr ""
+
+#: src/gui/main.c
+msgid "Delete All"
 msgstr ""
 
 #: src/gui/main.c
@@ -3811,6 +4062,21 @@ msgstr ""
 
 #: src/gui/main.c
 msgid "Changed in older versions"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Android stopped %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s stopped before its summary"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s stopped"
 msgstr ""
 
 #: src/gui/main.c
@@ -3838,6 +4104,18 @@ msgstr ""
 
 #: src/gui/main.c
 msgid "Tip: --no-setup skips the setup"
+msgstr ""
+
+#: src/gui/main.c
+msgid "Tip: Settings > App > Move Old Files moves them later"
+msgstr ""
+
+#: src/gui/main.c
+msgid "Tip: Settings > App > GPU Drivers' Continue goes on with it later"
+msgstr ""
+
+#: src/gui/main.c
+msgid "Tip: Share Log sends the game's log"
 msgstr ""
 
 #: src/gui/main.c
@@ -3874,7 +4152,74 @@ msgstr ""
 
 #: src/gui/main.c
 #, c-format
+msgid "Cleaned: %d done, %d not"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
 msgid "Changed %d/%d"
+msgstr ""
+
+#: src/gui/main.c
+msgid "started"
+msgstr ""
+
+#: src/gui/main.c
+msgid "end"
+msgstr ""
+
+#: src/gui/main.c
+msgid "memory"
+msgstr ""
+
+#: src/gui/main.c
+msgid "log"
+msgstr ""
+
+#: src/gui/main.c
+msgid "it ended with an exit, or before its game wrote a log"
+msgstr ""
+
+#: src/gui/main.c
+msgid "none since it started"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Continue goes on from its journal: %d case so far"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Continue goes on from its journal: %d cases so far"
+msgstr ""
+
+#: src/gui/main.c
+msgid "size"
+msgstr ""
+
+#: src/gui/main.c
+msgid "counting"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%d game"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%d games"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Old Files %d/%d"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Move All: %d done, %d not"
 msgstr ""
 
 #: src/gui/main.c
@@ -4046,6 +4391,48 @@ msgid "Removed %s"
 msgstr ""
 
 #: src/gui/main.c
+msgid "Nothing in it to move"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%d moved to %s"
+msgstr ""
+
+#: src/gui/main.c
+msgid "1 entry moves"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%d entries move"
+msgstr ""
+
+#: src/gui/main.c
+msgid "Not moved: run it from its dump once, then move its saves (docs/user/deprecations.md)"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%d moved to %s, %d not: %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%d entries move, %d stay: %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%d not moved: %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%d stay: %s"
+msgstr ""
+
+#: src/gui/main.c
 #, c-format
 msgid "Not moved: run it from its dump once, which makes %s, then move its saves (docs/user/deprecations.md)"
 msgstr ""
@@ -4053,6 +4440,20 @@ msgstr ""
 #: src/gui/main.c
 #, c-format
 msgid "Not moved: %s is not in the data folder, which these settings go by"
+msgstr ""
+
+#: src/gui/main.c
+msgid "Not there any more"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%d deleted, %d not: %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Deletes %d, %d stay: %s"
 msgstr ""
 
 #: src/gui/main.c
@@ -4072,10 +4473,6 @@ msgstr ""
 #: src/gui/main.c
 #, c-format
 msgid "Move Old Files? %d move"
-msgstr ""
-
-#: src/gui/main.c
-msgid "Nothing to clean: no [Deprecated] in a game's .ini, no old keys"
 msgstr ""
 
 #: src/gui/main.c
@@ -4104,6 +4501,10 @@ msgid "Clean Old Settings? %d old key"
 msgstr ""
 
 #: src/gui/main.c
+msgid "Nothing to clean: no [Deprecated] in a game's .ini, no old keys"
+msgstr ""
+
+#: src/gui/main.c
 msgid "Every setting is at its default"
 msgstr ""
 
@@ -4115,11 +4516,6 @@ msgstr ""
 #: src/gui/main.c
 #, c-format
 msgid "Reset to Defaults? %d setting changes"
-msgstr ""
-
-#: src/gui/main.c
-#, c-format
-msgid "Cleaned: %d done, %d not"
 msgstr ""
 
 #: src/gui/main.c
@@ -4139,6 +4535,11 @@ msgstr ""
 
 #: src/gui/main.c
 msgid "Aborted with ESC."
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Program ended abnormally (status %d): %s."
 msgstr ""
 
 #: src/gui/main.c
@@ -4324,11 +4725,6 @@ msgstr ""
 #: src/gui/main.c
 #, c-format
 msgid "edenprobe left no report in %s"
-msgstr ""
-
-#: src/gui/main.c
-#, c-format
-msgid "%s. The report: %s"
 msgstr ""
 
 #: src/gui/main.c
@@ -5466,7 +5862,7 @@ msgid "Load Vita VPK"
 msgstr ""
 
 #: src/gui/ui.txt
-msgid "Load GBA ROM"
+msgid "Load GBA/MultiBoot ROM"
 msgstr ""
 
 #: src/gui/ui.txt
@@ -5713,6 +6109,18 @@ msgstr ""
 msgid "background_recompile =, Auto by default: Gentle on battery, Full on the charger"
 msgstr ""
 
+#: src/common/utilities/setup.c
+msgid "A save's files"
+msgstr ""
+
+#: src/common/utilities/setup.c
+msgid "in the save's folder itself"
+msgstr ""
+
+#: src/common/utilities/setup.c
+msgid "the save's last commit in its 0/, the copy the game works in in its 1/: Move Old Files moves them"
+msgstr ""
+
 #: src/nx/runtime/ini.c
 msgid "macOS only"
 msgstr ""
@@ -5947,4 +6355,20 @@ msgstr ""
 
 #: src/nx/runtime/settings.txt
 msgid "LLVM Internals"
+msgstr ""
+
+#: src/nx/runtime/settings.txt
+msgid "GBA covers"
+msgstr ""
+
+#: src/nx/runtime/settings.txt
+msgid "Covers"
+msgstr ""
+
+#: src/nx/runtime/settings.txt
+msgid "The picture a GBA game made from a ROM shows in Games. None = Wimsy, as a game with no icon. Box art = its box from libretro-thumbnails, downloaded as the game is made: the ROM's CRC-32 names the game in libretro-database's No-Intro list, and the box under that name goes in the game's folder as icon.png. A ROM the list does not have, or a game with no box there, keeps Wimsy and its row says which name was looked for"
+msgstr ""
+
+#: src/nx/runtime/settings.txt
+msgid "GBA"
 msgstr ""

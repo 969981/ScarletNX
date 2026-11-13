@@ -3,7 +3,8 @@
 /* The launcher's setup (gui/main.c's setup_*) on the real renderer and its events, in a home of its own: the pages a
    first start goes through and what each writes (a portable copy, the language, the games and dumps folders, the keys,
    the first user), what it refuses, the user's page with users.ini there, the fixed uid kept for its saves, a notice
-   alone after an update, --debug, the question's place as options-dialog says, and Skip */
+   alone after an update, --debug, the question's place as options-dialog says, Skip, and the Last Run page of a run
+   the menu did not see end */
 #include <SDL3/SDL.h>
 /* the keyboards main.c asks for: SDL keeps no count, and one asked for and dropped in a frame stays up on Android */
 static int keyboards;
@@ -86,6 +87,112 @@ static const char* choice_before(const App* app) {
     const char* labels[4];
     assert(setup_labels(app, labels) > app->setup_choice.focus);
     return app->setup_choice.focus ? labels[app->setup_choice.focus - 1] : NULL;
+}
+/* the render's pixel x, y in c */
+static bool px_is(App* app, int x, int y, GuiRgb c) {
+    SDL_Surface* image = read_px(app, x, y, 1, 1);
+    Uint8 r = 0, g = 0, b = 0; /* read on: Windows' assert can return */
+    bool is;
+    assert(image && SDL_ReadSurfacePixel(image, 0, 0, &r, &g, &b, NULL));
+    is = r == c.r && g == c.g && b == c.b;
+    SDL_DestroySurface(image);
+    return is;
+}
+/* WCAG 2's contrast ratio of two colours, 1 to 21 */
+static double luminance(GuiRgb c) {
+    const Uint8 v[3] = {c.r, c.g, c.b};
+    double l[3];
+    for (int i = 0; i < 3; ++i) {
+        double s = v[i] / 255.0;
+        l[i] = s <= 0.04045 ? s / 12.92 : SDL_pow((s + 0.055) / 1.055, 2.4);
+    }
+    return 0.2126 * l[0] + 0.7152 * l[1] + 0.0722 * l[2];
+}
+static double contrast(GuiRgb a, GuiRgb b) {
+    double x = luminance(a) + 0.05, y = luminance(b) + 0.05;
+    return x > y ? x / y : y / x;
+}
+/* the page's choices drawn as rows top to bottom, want's labels ("" the row between the two groups: a label, no box,
+   its row's room the only one between them) each with its icon (icons.h's, as gui_screen.h writes it), each a row's step
+   under the one before, the one in focus focus's: the marker, the icon and the label drawn in its row in the focus's
+   look, the others' in ink; but red's (NULL: none), which has no way back, framed on the page and written in the failure
+   colour, and in focus filled with it and written in the page's; and yellow's, which wants care, so in the warning
+   colour */
+static void rows_show(App* app, const char* const* want, const char* const* icons, int n, const char* focus,
+                      const char* red, const char* yellow) {
+    const GuiTheme* t = &app->theme;
+    GuiSetupBoxes b;
+    int i, x, y, s = app->scale;
+    char label[64];
+    render(app);
+    setup_boxes(app, &b);
+    app->choices_of = GUI_CHOICES_SETUP;
+    assert(b.choices.count == n);
+    for (i = 0; i < n; ++i) {
+        UiRowInfo info = {0};
+        GuiRect box = choice_box(app, &b.choices, i);
+        bool focused = !strcmp(want[i], focus), danger = red && !strcmp(want[i], red);
+        bool care = yellow && !strcmp(want[i], yellow);
+        GuiRgb tone = danger ? t->failure : t->warning;
+        assert(ui_choices_rows_get_row_info(app, (size_t)i, box.w, &info) && !strcmp(info.label, want[i]));
+        assert(!want[i][0] == !!(info.attr & UI_ATTR_LABEL));
+        assert(danger == !!(info.attr & UI_ATTR_DANGER) && care == !!(info.attr & UI_ATTR_CAUTION));
+        assert(focused == (b.choices.lists[UI_CHOICES_ROWS].focus == (size_t)i));
+        if (i) assert(box.y - choice_box(app, &b.choices, i - 1).y == item_h(app) + 2 * s);
+        if (!want[i][0]) {
+            assert(!info.icon && !icons[i][0]);
+            continue;
+        }
+        is_icon(icons[i], info.icon);
+        snprintf(label, sizeof label, "%s%s %s", t->marker, icons[i], want[i]);
+        assert(find_text(app, label,
+                         rgb(danger || care ? focused ? t->page : tone
+                             : !focused     ? t->ink
+                             : t->focus_bar ? t->page
+                                            : t->focus),
+                         1, &x, &y));
+        assert(y >= box.y && y < box.y + box.h);
+        if (danger || care) /* its frame, or its fill; and inside the frame, before the marker, the page or the fill */
+            assert(px_is(app, box.x, box.y + box.h / 2, tone) &&
+                   px_is(app, box.x + s, box.y + s, focused ? tone : t->page));
+    }
+}
+/* Move All, in focus, asked first as Settings > App's Move Old Files asks: line the question; Cancel moves nothing and
+   keeps the page; then Move taken */
+static void move_all_asked(App* app, const char* line) {
+    key(app, SDLK_RETURN);
+    if (!app->confirm.shown || app->confirm.ask != GUI_ASK_MOVE || strcmp(app->ask_line, line))
+        fprintf(stderr, "gui_setup.c: Move All asked \"%s\", not \"%s\"\n", app->confirm.shown ? app->ask_line : "",
+                line);
+    assert(app->confirm.shown && app->confirm.ask == GUI_ASK_MOVE && !strcmp(app->ask_line, line) && !app->left_did);
+    key(app, SDLK_ESCAPE);
+    assert(!app->confirm.shown && !app->left_did && app->setup_on);
+    key(app, SDLK_RETURN);
+    key(app, SDLK_RIGHT);
+    key(app, SDLK_RETURN);
+}
+/* Overwrite, in focus on the user's page, asked first: users.ini kept as users.ini.old, Overwrite in the warning
+   colour; Cancel keeps the page as it was, not typing; then Overwrite taken */
+static void overwrite_asked(App* app) {
+    UiRowInfo over = {0};
+    key(app, SDLK_RETURN);
+    assert(app->confirm.shown && app->confirm.ask == GUI_ASK_OVERWRITE && !app->setup_typing &&
+           !strcmp(ask_question(app), "Overwrite users.ini? It is kept as users.ini.old"));
+    app->choices_of = GUI_CHOICES_ASK;
+    assert(ui_choices_rows_get_row_info(app, 1, 0, &over) && !strcmp(over.label, "Overwrite") &&
+           (over.attr & UI_ATTR_CAUTION));
+    key(app, SDLK_ESCAPE);
+    assert(!app->confirm.shown && !app->setup_typing && app->setup_on && page(app) == SNX_SETUP_USER);
+    key(app, SDLK_RETURN);
+    key(app, SDLK_RIGHT);
+    key(app, SDLK_RETURN);
+}
+/* a click on the setup page's row i (setup_order's order) */
+static void click_row(App* app, int i) {
+    GuiSetupBoxes b;
+    render(app);
+    setup_boxes(app, &b);
+    point(app, choice_box(app, &b.choices, i), true);
 }
 /* the Appearance's row i as drawn (ui.txt's scene Appearance): its box, past the cursor's margin, and its whole row */
 static GuiRect appearance_row_box(const App* app, const GuiAppearanceBoxes* a, int i) {
@@ -465,6 +572,11 @@ static void test_first(App* app) {
     assert(page(app) == SNX_SETUP_FOLDERS && snx_is_dir(portable) && same_path(app->home_dir, portable));
     key(app, SDLK_ESCAPE); /* back: it is portable now, the focus on Portable */
     assert(page(app) == SNX_SETUP_INSTALL && app->setup_choice.focus == 1);
+    { /* the steps' own choices have no icon: the notices' and the old files' alone do */
+        UiRowInfo info = {0};
+        app->choices_of = GUI_CHOICES_SETUP;
+        assert(ui_choices_rows_get_row_info(app, 0, 0, &info) && !info.icon);
+    }
     {
         char line[1100], expected[1100], shown[1024];
         snx_home_short(portable, shown, sizeof shown);
@@ -592,11 +704,19 @@ static void test_users(App* app) {
     app->setup_page = app->setup_count - 1;
     setup_enter(app);
     assert(page(app) == SNX_SETUP_USER && !app->setup_typing && app->setup_users == 1 && !app->setup_choice.focus);
+    { /* Overwrite wants care, users.ini kept as users.ini.old: the warning colour; Keep none */
+        UiRowInfo keep = {0}, over = {0};
+        app->choices_of = GUI_CHOICES_SETUP;
+        assert(ui_choices_rows_get_row_info(app, 0, 0, &keep) && !strcmp(keep.label, "Keep") &&
+               !(keep.attr & (UI_ATTR_CAUTION | UI_ATTR_DANGER)));
+        assert(ui_choices_rows_get_row_info(app, 1, 0, &over) && !strcmp(over.label, "Overwrite") &&
+               (over.attr & UI_ATTR_CAUTION));
+    }
     render(app);
     shows(app, "users.ini has 1 user", rgb(app->theme.page));
     shows(app, "Adam", rgb(app->theme.ink));
     key(app, SDLK_DOWN);
-    key(app, SDLK_RETURN);
+    overwrite_asked(app);
     assert(app->setup_typing);
     key(app, SDLK_ESCAPE);
     assert(!app->setup_typing && app->setup_on && app->setup_choice.count == 2 && app->setup_choice.focus == 1);
@@ -619,7 +739,7 @@ static void test_users(App* app) {
     setup_enter(app);
     assert(app->setup_saves == 1);
     key(app, SDLK_DOWN);
-    key(app, SDLK_RETURN);
+    overwrite_asked(app);
     assert(app->setup_typing && app->setup_saves == 1);
     render(app);
     shows(app, "of the saves of 1 game", rgb(app->theme.ink));
@@ -660,6 +780,480 @@ static void test_notice(App* app) {
     free(file);
     free(config);
     puts("PASS a notice alone after an update, and --debug");
+}
+
+/* the last notice asks Clean Old Settings while it has something to take: Clean Now in focus cleans there, the box
+   saying what it did and OK going on; Not Now goes on and cleans none, nor does Skip; with nothing to take, OK */
+static void test_clean_notice(App* app) {
+    char *config = config_of(app), *file = join(config, "setup.ini"), *game = join(app->games_dir, "0100000000ABC000");
+    char *ini = join(game, "0100000000ABC000.ini"), before[64], *text;
+    const char* labels[GUI_SETUP_CHOICES];
+    static const char deprecated[] = "[Display]\nfullscreen=1\n\n[Deprecated]\n; renderer: Vulkan is the only "
+                                     "renderer\nrenderer=opengl\n";
+    snprintf(before, sizeof before, "[setup]\nversion = 1\nnotices = %d\n", SNX_NOTICES - 2);
+    put(file, before);
+    put(ini, deprecated);
+    setup_start(app);
+    assert(app->setup_on && page(app) == SETUP_NOTICE && !strcmp(choice_label(app), "Next"));
+    assert(app->clean_inis_found < 0); /* looked for as the last comes, not before */
+    key(app, SDLK_RETURN);
+    assert(app->setup_top == 1 && app->clean_inis_found == 1 && app->setup_choice.count == 3);
+    assert(setup_labels(app, labels) == 4 && !strcmp(labels[0], "Back") && !strcmp(labels[1], "Clean Now") &&
+           !strcmp(labels[2], "Not Now") && !strcmp(labels[3], "Skip"));
+    assert(!strcmp(choice_label(app), "Clean Now"));
+    { /* two groups: Back, Not Now and Skip, which keep the files as they are, a row apart from Clean Now, in focus;
+         the keys go round them past that row, which takes no click */
+        static const char* const rows[] = {"Back", "Not Now", "Skip", "", "Clean Now"};
+        static const char* const icons[] = {ICON_ARROW_LEFT, ICON_X, ICON_SKIP_FORWARD, "", ICON_ERASER};
+        rows_show(app, rows, icons, 5, "Clean Now", NULL, "Clean Now");
+        key(app, SDLK_UP);
+        assert(!strcmp(choice_label(app), "Skip"));
+        key(app, SDLK_DOWN);
+        assert(!strcmp(choice_label(app), "Clean Now"));
+        key(app, SDLK_DOWN);
+        assert(!strcmp(choice_label(app), "Back"));
+        key(app, SDLK_UP);
+        click_row(app, 3);
+        assert(app->setup_top == 1 && !app->setup_cleaned && !strcmp(choice_label(app), "Clean Now"));
+        rows_show(app, rows, icons, 5, "Clean Now", NULL, "Clean Now");
+    }
+    render(app);
+    shows(app, "Clean Old Settings? [Deprecated] in 1 .ini", rgb(app->theme.ink));
+    key(app, SDLK_RETURN); /* Clean Now: done there, said in the box, OK in focus; nothing over the screen */
+    text = text_of(game, "0100000000ABC000.ini");
+    assert(text && !strcmp(text, "[Display]\nfullscreen=1\n"));
+    free(text);
+    assert(app->setup_on && app->setup_cleaned && !app->cleaned_shown && app->cleaned.count == 1);
+    assert(app->setup_choice.count == 2 && !strcmp(choice_label(app), "OK") && !strcmp(choice_before(app), "Back"));
+    render(app);
+    shows(app, "Cleaned: 1 done, 0 not", rgb(app->theme.ink));
+    shows(app, "[Deprecated] removed", rgb(app->theme.soft));
+    hides(app, "Clean Old Settings?", rgb(app->theme.ink));
+    key(app, SDLK_RETURN);
+    assert(!app->setup_on);
+    gui_cleaned_free(&app->cleaned);
+    /* Not Now: on, the file as it was; and Skip, which cleans none */
+    for (int skip = 0; skip < 2; ++skip) {
+        snprintf(before, sizeof before, "[setup]\nversion = 1\nnotices = %d\n", SNX_NOTICES - 1);
+        put(file, before);
+        put(ini, deprecated);
+        setup_start(app);
+        assert(app->setup_on && !app->setup_top && !strcmp(choice_label(app), "Clean Now") && !choice_before(app));
+        key(app, SDLK_DOWN);
+        if (skip) key(app, SDLK_DOWN);
+        assert(!strcmp(choice_label(app), skip ? "Skip" : "Not Now"));
+        key(app, SDLK_RETURN);
+        assert(!app->setup_on && !app->setup_cleaned && !app->cleaned.count);
+        text = text_of(game, "0100000000ABC000.ini");
+        assert(text && !strcmp(text, deprecated));
+        free(text);
+    }
+    /* nothing to take: OK, as the other notices */
+    put(file, before);
+    put(ini, "[Display]\nfullscreen=1\n");
+    setup_start(app);
+    assert(app->setup_on && !app->clean_inis_found && !strcmp(choice_label(app), "OK"));
+    key(app, SDLK_RETURN);
+    assert(!app->setup_on);
+    assert(!snx_remove_tree(game));
+    free(ini);
+    free(game);
+    free(file);
+    free(config);
+    puts("PASS the last notice's Clean Now, Not Now, and Skip cleaning none");
+}
+
+/* what an older version left: a setup page each folder (a game's save/ for each of its kinds), the last, after the
+   notices and the steps, alone when nothing else is due; its size, where it goes and what Move All and Delete All
+   would do; on the last Move All (asked), Delete All (asked, pressed twice) or Not Now, in focus; a save and keys never
+   deleted; F5 and the 5 s look again; the old files' pages alone write no setup.ini */
+static void test_old_files(App* app) {
+    char *config = config_of(app), *file = join(config, "setup.ini"), *user = snx_user_data_dir();
+    char *gui = join(user, "gui"), *settings = join(gui, "settings.ini"), *work = join(app->data_dir, "work");
+    char *object = join(work, "a.o"), *games = join(app->data_dir, "games"), *old_game = join(games, "x");
+    char *game = join(app->games_dir, "0100000000ABC000"), *saves = join(game, "0100000000ABC000_data/save");
+    char *device = join(saves, "device/d.bin"),
+         *moved = join(app->data_dir, "save/device/0100000000ABC000/" SNX_SAVE_COMMITTED "/d.bin");
+    char head[32], *text;
+    const char* labels[GUI_SETUP_CHOICES];
+    static const char mine[] = "; kept as it is\n[setup]\nversion = 1\nnotices = 99\n";
+    put(file, mine);
+    left_behind(app);
+    assert(!app->lefts);
+    put(settings, "[menu]\n");
+    put(object, "o");
+    put(old_game, "x");
+    put(device, "save");
+    {
+        char* account = join(saves, "user." FIRST "/u.bin");
+        put(account, "save");
+        free(account);
+    }
+    left_behind(app);
+    while (!__atomic_load_n(&app->left_space->done, __ATOMIC_ACQUIRE)) SDL_Delay(1);
+    assert(app->lefts == 5 && left_groups(app) == 4);
+    setup_start(app);
+    assert(app->setup_on && app->setup_count == 1 && page(app) == SETUP_LEFT && !setup_steps(app));
+    {
+        char tab[64];
+        tab_label(app, 0, tab, sizeof tab);
+        assert(!strcmp(tab, ICON_FOLDER_INPUT " Old Files"));
+    }
+    /* the first: gui/, Next alone, no Skip */
+    assert(setup_labels(app, labels) == 1 && !strcmp(labels[0], "Next"));
+    render(app);
+    shows(app, "Left by older versions", rgb(app->theme.page));
+    shows(app, "Old Files 1/4", rgb(head_ink(app)));
+    shows(app, "size        1 KB", rgb(app->theme.ink));
+    shows(app, "Move All    1 entry moves", rgb(app->theme.ink));
+    shows(app, "Delete All  Deletes it", rgb(app->theme.ink));
+    /* PgDn a page on, PgUp back; End the last, Home the first */
+    key(app, SDLK_PAGEDOWN);
+    assert(app->setup_top == 1 && setup_labels(app, labels) == 2 && !strcmp(choice_label(app), "Next"));
+    { /* none acts: one group, each with its icon */
+        static const char* const rows[] = {"Back", "Next"};
+        static const char* const icons[] = {ICON_ARROW_LEFT, ICON_CHECK};
+        rows_show(app, rows, icons, 2, "Next", NULL, NULL);
+    }
+    key(app, SDLK_PAGEUP);
+    key(app, SDLK_PAGEUP); /* none before the first */
+    assert(!app->setup_top);
+    key(app, SDLK_RETURN);
+    key(app, SDLK_RETURN);
+    assert(app->setup_top == 2); /* the game's save/, its two kinds one page */
+    render(app);
+    shows(app, "Old Files 3/4", rgb(head_ink(app)));
+    shows(app, "Move All    2 entries move", rgb(app->theme.ink));
+    shows(app, "Delete All  Stays: a save,", rgb(app->theme.ink));
+    {
+        SDL_Event end = {0};
+        end.type = SDL_EVENT_KEY_DOWN;
+        end.key.key = SDLK_END;
+        end.key.down = true;
+        event(app, &end);
+        assert(app->setup_top == 3);
+        end.key.key = SDLK_HOME;
+        event(app, &end);
+        assert(!app->setup_top);
+        end.key.key = SDLK_END;
+        event(app, &end);
+    }
+    /* the last: Back, Move All, Delete All and Not Now, in focus */
+    assert(setup_labels(app, labels) == 4 && !strcmp(labels[0], "Back") && !strcmp(labels[1], "Move All") &&
+           !strcmp(labels[2], "Delete All") && !strcmp(choice_label(app), "Not Now"));
+    snprintf(head, sizeof head, "Old Files %d/%d", 4, 4);
+    render(app);
+    shows(app, head, rgb(head_ink(app)));
+    { /* two groups: Back and Not Now, in focus, which keep them as they are, a row apart from Move All and Delete All;
+         Down from Not Now passes that row, which takes no click */
+        static const char* const rows[] = {"Back", "Not Now", "", "Move All", "Delete All"};
+        static const char* const icons[] = {ICON_ARROW_LEFT, ICON_X, "", ICON_FOLDER_INPUT, ICON_TRASH};
+        rows_show(app, rows, icons, 5, "Not Now", "Delete All", "Move All");
+        key(app, SDLK_DOWN);
+        assert(!strcmp(choice_label(app), "Move All"));
+        key(app, SDLK_UP);
+        click_row(app, 2);
+        assert(app->setup_top == 3 && !app->confirm.shown && !app->left_did && !strcmp(choice_label(app), "Not Now"));
+        { /* Delete All in the failure colour and Move All in the warning colour on every theme shipped, with and
+             without the focus: their words on them at WCAG's 3:1 for large text at least (the menu's letters have
+             two-pixel stems) */
+            const char* shipped[] = {SNX_GUI_THEMES_DIR};
+            GuiThemes themes = {0};
+            GuiTheme was = app->theme;
+            gui_themes_scan(&themes, shipped, 1);
+            assert(themes.count >= 7); /* default, yorha and the folders beside them */
+            for (size_t k = 0; k < themes.count; ++k) {
+                gui_theme_load(&app->theme, shipped, 1, themes.ids[k], NULL, 0);
+                assert(!strcmp(app->theme.id, themes.ids[k]) && contrast(app->theme.failure, app->theme.page) >= 3 &&
+                       contrast(app->theme.warning, app->theme.page) >= 3);
+                rows_show(app, rows, icons, 5, "Not Now", "Delete All", "Move All");
+                key(app, SDLK_DOWN);
+                key(app, SDLK_DOWN);
+                rows_show(app, rows, icons, 5, "Delete All", "Delete All", "Move All");
+                key(app, SDLK_UP);
+                key(app, SDLK_UP);
+            }
+            gui_themes_free(&themes);
+            app->theme = was;
+        }
+    }
+    /* Delete All asks, Delete pressed twice: what it deletes, a save staying; its Delete in the failure colour too */
+    key(app, SDLK_DOWN);
+    key(app, SDLK_DOWN);
+    key(app, SDLK_RETURN);
+    assert(app->confirm.shown && app->confirm.ask == GUI_ASK_DELETE_OLD && app->confirm.twice &&
+           !strcmp(app->ask_line, "Delete All? 3 deleted, 2 stay: a save and the console's keys are only moved"));
+    {
+        UiRowInfo keep = {0}, go = {0};
+        app->choices_of = GUI_CHOICES_ASK;
+        assert(ui_choices_rows_get_row_info(app, 0, 0, &keep) && !strcmp(keep.label, "Cancel") &&
+               !(keep.attr & UI_ATTR_DANGER));
+        assert(ui_choices_rows_get_row_info(app, 1, 0, &go) && !strcmp(go.label, "Delete") &&
+               (go.attr & UI_ATTR_DANGER));
+    }
+    key(app, SDLK_ESCAPE); /* Cancel: nothing deleted */
+    assert(!app->confirm.shown && snx_is_file(settings) && !app->left_did);
+    key(app, SDLK_RETURN);
+    key(app, SDLK_DOWN);
+    key(app, SDLK_RETURN);
+    assert(app->confirm.shown && app->confirm.armed && snx_is_file(settings)); /* armed, not yet */
+    render(app);
+    shows(app, "Delete: press again", rgb(app->theme.page));
+    key(app, SDLK_RETURN);
+    assert(!app->confirm.shown && app->left_did == 2 && !snx_path_exists(gui) && !snx_path_exists(work) &&
+           !snx_path_exists(games) && snx_is_file(device));
+    assert(app->moved.count == 4 && app->moved.done == 3 && app->report_delete && !app->cleaned_shown);
+    assert(setup_labels(app, labels) == 1 && !strcmp(labels[0], "OK"));
+    {
+        static const char* const rows[] = {"OK"};
+        static const char* const icons[] = {ICON_CHECK};
+        rows_show(app, rows, icons, 1, "OK", NULL, NULL);
+    }
+    shows(app, "Delete All: 3 done, 1 not", rgb(head_ink(app)));
+    key(app, SDLK_RETURN);
+    assert(!app->setup_on && app->lefts == 2);
+    text = text_of(config, "setup.ini");
+    assert(text && !strcmp(text, mine)); /* nothing else due: setup.ini as it was */
+    free(text);
+    /* the next start: the save alone; Delete All deletes none, said, nothing asked; Move All moves it */
+    left_behind(app);
+    setup_start(app);
+    assert(app->setup_on && page(app) == SETUP_LEFT && setup_labels(app, labels) == 3 &&
+           !strcmp(choice_label(app), "Not Now"));
+    {
+        static const char* const rows[] = {"Not Now", "", "Move All", "Delete All"};
+        static const char* const icons[] = {ICON_X, "", ICON_FOLDER_INPUT, ICON_TRASH};
+        rows_show(app, rows, icons, 4, "Not Now", "Delete All", "Move All");
+    }
+    key(app, SDLK_UP); /* round to the last, Delete All */
+    key(app, SDLK_RETURN);
+    assert(!app->confirm.shown && app->setup_failed && app->setup_on &&
+           !strcmp(app->message, "Delete All deletes none of these: a save and the console's keys are only moved"));
+    key(app, SDLK_UP);
+    move_all_asked(app, "Move Old Files? 2 move");
+    assert(app->left_did == 1 && snx_is_file(moved) && !snx_path_exists(device) && app->moved.count == 1);
+    render(app);
+    shows(app, "Move All: 1 done, 0 not", rgb(head_ink(app)));
+    key(app, SDLK_RETURN);
+    assert(!app->setup_on && !app->lefts); /* each save in its 0/ in the data folder's save/: none listed again */
+    left_behind(app);
+    setup_start(app);
+    assert(!app->setup_on); /* nothing left, nothing due */
+    /* Not Now keeps them; F5 and the 5 s look find them gone, and the setup goes on */
+    for (int how = 0; how < 3; ++how) {
+        put(settings, "[menu]\n");
+        left_behind(app);
+        setup_start(app);
+        assert(app->setup_on && page(app) == SETUP_LEFT && !strcmp(choice_label(app), "Not Now"));
+        if (!how) {
+            key(app, SDLK_RETURN);
+            assert(!app->setup_on && snx_is_file(settings) && app->lefts == 1);
+            continue;
+        }
+        assert(!snx_remove_tree(gui));
+        if (how == 1) {
+            SDL_Event f5 = {0};
+            f5.type = SDL_EVENT_KEY_DOWN;
+            f5.key.key = SDLK_F5;
+            f5.key.down = true;
+            event(app, &f5);
+        } else {
+            app->left_at = 0;
+            pump(app);
+        }
+        assert(!app->setup_on && !app->lefts);
+    }
+    /* after the notices: Skip goes through them with Not Now */
+    put(settings, "[menu]\n");
+    {
+        char seen[64];
+        snprintf(seen, sizeof seen, "[setup]\nversion = 1\nnotices = %d\n", SNX_NOTICES - 1);
+        put(file, seen);
+    }
+    left_behind(app);
+    setup_start(app);
+    assert(app->setup_on && app->setup_count == 2 && app->setup_pages[1] == SETUP_LEFT);
+    key(app, SDLK_DOWN); /* from OK to Skip */
+    assert(!strcmp(choice_label(app), "Skip"));
+    key(app, SDLK_RETURN);
+    assert(!app->setup_on && snx_is_file(settings) && !app->left_did);
+    assert(!snx_remove_tree(gui) && !snx_remove_tree(game));
+    text = join(app->data_dir, "save"); /* where Move All put the saves */
+    assert(!snx_remove_tree(text));
+    free(text);
+    left_behind(app);
+    assert(!app->lefts);
+    free(moved);
+    free(device);
+    free(saves);
+    free(game);
+    free(old_game);
+    free(games);
+    free(object);
+    free(work);
+    free(settings);
+    free(gui);
+    free(user);
+    free(file);
+    free(config);
+    puts("PASS the old files a page each, Move All, Delete All asked twice keeping saves, Not Now");
+}
+
+/* the games' own saves, however many games, one Old Files page: how many games and a line each, rolling under the
+   page's lines when they do not fit, how many more said; Delete All deletes none of them, Move All moves them all, its
+   page then a line a game */
+static void test_saves_one_page(App* app) {
+    char *config = config_of(app), *file = join(config, "setup.ini"), path[SNX_PATH_SIZE];
+    const char* labels[GUI_SETUP_CHOICES];
+    bool more = false;
+    int i, window_w, window_h;
+    put(file, "[setup]\nversion = 1\nnotices = 99\n");
+    assert(SDL_GetWindowSize(app->window, &window_w, &window_h));
+    assert(SDL_SetWindowSize(app->window, 800, 1)); /* the least a window takes: its rows too few for 14 */
+    SDL_SyncWindow(app->window);
+    for (i = 0; i < 14; ++i) {
+        assert(!snx_path_format(path, sizeof path, "%s/0100000000AB%X000/0100000000AB%X000_data/save/device/d.bin",
+                                app->games_dir, i, i));
+        put(path, "save");
+    }
+    left_behind(app);
+    while (!__atomic_load_n(&app->left_space->done, __ATOMIC_ACQUIRE)) SDL_Delay(1);
+    assert(app->lefts == 14 && left_groups(app) == 1);
+    setup_start(app);
+    assert(app->setup_on && page(app) == SETUP_LEFT && setup_labels(app, labels) == 3 &&
+           !strcmp(choice_label(app), "Not Now"));
+    render(app);
+    shows(app, "Old Files 1/1", rgb(head_ink(app)));
+    shows(app, "The games' own saves: 14 games", rgb(app->theme.ink));
+    shows(app, "Move All    14 entries move", rgb(app->theme.ink));
+    shows(app, "Delete All  Stays: a save,", rgb(app->theme.ink));
+    shows(app, "0100000000AB0000  1 KB", rgb(app->theme.ink)); /* the first game, a line */
+    for (i = 1; i < 14; ++i) {                                 /* the rest under it, said; they roll into view */
+        char said[64];
+        int x, y;
+        snprintf(said, sizeof said, "and %d more, which Share Log lists", i);
+        more = more || find_text(app, said, rgb(app->theme.soft), 1, &x, &y);
+    }
+    assert(more);
+    shows(app, "\x1f", rgb(app->theme.soft));
+    key(app, SDLK_UP); /* Delete All: none of them, said, nothing asked */
+    key(app, SDLK_RETURN);
+    assert(!app->confirm.shown && app->setup_failed &&
+           !strcmp(app->message, "Delete All deletes none of these: a save and the console's keys are only moved"));
+    key(app, SDLK_UP); /* Move All */
+    move_all_asked(app, "Move Old Files? 14 move");
+    assert(app->left_did == 1 && app->moved.count == 14 && app->moved.done == 14);
+    render(app); /* a line a game, rolling: none cut */
+    shows(app, "Move All: 14 done, 0 not", rgb(head_ink(app)));
+    shows(app, "\x1f", rgb(app->theme.soft));
+    for (i = 0; i < 14; ++i) {
+        assert(!snx_path_format(path, sizeof path, "%s/save/device/0100000000AB%X000/" SNX_SAVE_COMMITTED "/d.bin",
+                                app->data_dir, i));
+        assert(snx_is_file(path));
+    }
+    key(app, SDLK_RETURN);
+    assert(!app->setup_on && !app->lefts);
+    for (i = 0; i < 14; ++i) {
+        assert(!snx_path_format(path, sizeof path, "%s/0100000000AB%X000", app->games_dir, i));
+        assert(!snx_remove_tree(path));
+    }
+    assert(!snx_path_format(path, sizeof path, "%s/save", app->data_dir) && !snx_remove_tree(path));
+    left_behind(app);
+    assert(SDL_SetWindowSize(app->window, window_w, window_h));
+    SDL_SyncWindow(app->window);
+    layout(app);
+    free(file);
+    free(config);
+    puts("PASS the games' own saves one page, rolling, moved and never deleted");
+}
+
+/* a save as the versions before kept one in the data folder's save/, its files in the folder itself: on the games'
+   saves' page, a line by its path there; Delete All keeps it, said, nothing asked; Move All puts its files in its 0/ */
+static void test_data_saves(App* app) {
+    char *config = config_of(app), *file = join(config, "setup.ini"), path[SNX_PATH_SIZE];
+    const char* labels[GUI_SETUP_CHOICES];
+    put(file, "[setup]\nversion = 1\nnotices = 99\n");
+    assert(!snx_path_format(path, sizeof path, "%s/save/device/0100000000ABC000/d.bin", app->data_dir));
+    put(path, "save");
+    left_behind(app);
+    while (!__atomic_load_n(&app->left_space->done, __ATOMIC_ACQUIRE)) SDL_Delay(1);
+    assert(app->lefts == 1 && left_groups(app) == 1);
+    setup_start(app);
+    assert(app->setup_on && page(app) == SETUP_LEFT && setup_labels(app, labels) == 3 &&
+           !strcmp(choice_label(app), "Not Now"));
+    render(app);
+    shows(app, "The games' own saves: 1 game", rgb(app->theme.ink));
+    { /* by its path in save/, in the system's separators as the launcher shows a path */
+        char *in = snx_path_join("device", "0100000000ABC000"), line[64];
+        assert(in);
+        snprintf(line, sizeof line, "%s  1 KB", in);
+        shows(app, line, rgb(app->theme.ink));
+        free(in);
+    }
+    shows(app, "Delete All  Stays: a save,", rgb(app->theme.ink));
+    key(app, SDLK_UP); /* round to Delete All: it keeps the save, said, nothing asked */
+    key(app, SDLK_RETURN);
+    assert(!app->confirm.shown && app->setup_failed &&
+           !strcmp(app->message, "Delete All deletes none of these: a save and the console's keys are only moved"));
+    assert(snx_is_file(path));
+    key(app, SDLK_UP); /* Move All: into its last commit */
+    move_all_asked(app, "Move Old Files? 1 move");
+    assert(app->left_did == 1 && !snx_path_exists(path));
+    assert(!snx_path_format(path, sizeof path, "%s/save/device/0100000000ABC000/" SNX_SAVE_COMMITTED "/d.bin",
+                            app->data_dir) &&
+           snx_is_file(path));
+    key(app, SDLK_RETURN);
+    assert(!app->setup_on);
+    assert(!snx_path_format(path, sizeof path, "%s/save", app->data_dir) && !snx_remove_tree(path));
+    left_behind(app);
+    free(file);
+    free(config);
+    puts("PASS a save of the data folder's save/ on the saves' page, kept by Delete All, moved into its 0/");
+}
+
+/* each question's second choice in the colour of what it does: the failure colour for what has no way back, the
+   warning colour for what wants care, none for one that changes nothing kept; the first, which keeps things, none */
+static void test_ask_tones(App* app) {
+    static const struct {
+        GuiAsk ask;
+        unsigned tone;
+    } asks[] = {{GUI_ASK_ABORT, UI_ATTR_CAUTION},
+                {GUI_ASK_EXIT, 0},
+                {GUI_ASK_DEEP, 0},
+                {GUI_ASK_OUTSIDE, UI_ATTR_CAUTION},
+                {GUI_ASK_ROOM, UI_ATTR_CAUTION},
+                {GUI_ASK_CLEAN, UI_ATTR_CAUTION},
+                {GUI_ASK_RESET, UI_ATTR_CAUTION},
+                {GUI_ASK_PLACES, UI_ATTR_CAUTION},
+                {GUI_ASK_PLACE, UI_ATTR_CAUTION},
+                {GUI_ASK_FOLDER, UI_ATTR_CAUTION},
+                {GUI_ASK_MOVE, UI_ATTR_CAUTION},
+                {GUI_ASK_STATE, UI_ATTR_DANGER},
+                {GUI_ASK_CACHE, UI_ATTR_DANGER},
+                {GUI_ASK_CLOSE, UI_ATTR_CAUTION},
+                {GUI_ASK_MADE, 0},
+                {GUI_ASK_DRIVER, UI_ATTR_DANGER},
+                {GUI_ASK_CRASH, UI_ATTR_DANGER},
+                {GUI_ASK_ADDONS, 0},
+                {GUI_ASK_DELETE_OLD, UI_ATTR_DANGER},
+                {GUI_ASK_OVERWRITE, UI_ATTR_CAUTION},
+                {GUI_ASK_ERROR, 0}};
+    GuiConfirm was = app->confirm;
+    assert(SDL_arraysize(asks) == GUI_ASK_ERROR + 1);
+    app->choices_of = GUI_CHOICES_ASK;
+    for (size_t i = 0; i < SDL_arraysize(asks); ++i) {
+        UiRowInfo keep = {0}, act = {0};
+        app->confirm.ask = asks[i].ask;
+        assert(ui_choices_rows_get_row_info(app, 0, 0, &keep) && !(keep.attr & (UI_ATTR_DANGER | UI_ATTR_CAUTION)));
+        if (asks[i].ask == GUI_ASK_ERROR) {
+            assert(!ui_choices_rows_get_row_info(app, 1, 0, &act)); /* its OK alone */
+            continue;
+        }
+        assert(ui_choices_rows_get_row_info(app, 1, 0, &act) &&
+               (act.attr & (UI_ATTR_DANGER | UI_ATTR_CAUTION)) == asks[i].tone);
+    }
+    app->confirm = was;
+    puts("PASS each question's second choice in the colour of what it does");
 }
 
 /* in another language: the notices in its words (setup.c marks them), and the rows' labels padded to the columns their
@@ -807,7 +1401,7 @@ static void test_skip(App* app) {
     n = setup_labels(app, labels);
     assert(n == 2 && !strcmp(labels[0], "Next") && !strcmp(labels[1], "Skip"));
     render(app);
-    shows(app, "\xfe Skip", rgb(app->theme.ink));
+    shows(app, "\xfe " ICON_SKIP_FORWARD " Skip", rgb(app->theme.ink)); /* a notice's choice: with its icon */
     /* past the first page: none */
     for (i = setup_notices(app, list); i > 0; --i) key(app, SDLK_RETURN);
     assert(page(app) == SNX_SETUP_LANGUAGE && app->setup_page == 1 && setup_labels(app, labels) == 1);
@@ -823,7 +1417,7 @@ static void test_skip(App* app) {
     key(app, SDLK_UP); /* round from Next to Skip */
     assert(!strcmp(choice_label(app), "Skip"));
     render(app);
-    shows(app, "\xfe Skip", rgb(app->theme.page)); /* in focus, on YoRHa's band */
+    shows(app, "\xfe " ICON_SKIP_FORWARD " Skip", rgb(app->theme.page)); /* in focus, on YoRHa's band */
     keyboards = 0;
     key(app, SDLK_RETURN);
     pump(app);
@@ -923,6 +1517,174 @@ static void test_start_scale(App* app) {
 
 /* name set (NULL: unset) where getenv reads it as well as SDL: on Windows the C runtime keeps a copy of its own, which
    SDL_setenv_unsafe leaves naming the real user's folders */
+/* the F8's answer for its game's process on 2026-11-12, as MainActivity.exitFields writes it */
+#define F8_LOW_MEMORY                                                                                                  \
+    "reason=3\nsaid=low memory\nprocess=org.scarletnx:game\nstatus=0\nimportance=100 foreground\npss=5138022\n"        \
+    "rss=1992704\ndescription=\n"
+/* a run the menu started and did not see end, as it kept it beside its run log: program's (its state folder holding a
+   log written since, headed name, and with mark a start's mark no program holds), the probe's folder for Run
+   edenprobe. The record's path, owned */
+static char* stopped_run(App* app, const char* program, const char* name, const char* probe, bool mark) {
+    char *record = gui_last_run_path(app->run_log), *folder = snx_dirname(program), why[1024], text[256];
+    char *state = snx_user_path(folder, SNX_USER_STATE), *log = join(state, snx_path_leaf(folder)), *with;
+    GuiLastRun run = {0};
+    SDL_Time now = 0;
+    assert(record);
+    assert(SDL_GetCurrentTime(&now));
+    run.program = (char*)program;
+    run.name = (char*)snx_path_leaf(program);
+    run.probe = (char*)probe;
+    run.started = (long long)(now / SDL_NS_PER_SECOND) - 60;
+    run.cases = -1;
+    run.launch = 1;
+    assert(!gui_last_run_write(record, &run, why, sizeof why));
+    with = snx_format("%s.log", log);
+    snprintf(text, sizeof text, "[   0.00] log: written to the game's log\n[   0.00] ScarletNX - %s\n", name);
+    put(with, text);
+    if (mark) {
+        char* at = join(state, ".running-19590");
+        snprintf(text, sizeof text, "pid 19590, started 2026-11-12 20:18:25\n%lld\n", run.started + 1);
+        put(at, text);
+        free(at);
+    }
+    free(with);
+    free(log);
+    free(state);
+    free(folder);
+    return record;
+}
+/* the run the menu did not see end, Last Run: a game Android stopped for its memory, a page first that says what ran,
+   when it started, Android's reason, its process's PSS and RSS and its log, OK alone; Run edenprobe without its
+   summary, Continue (going on with it from its journal once the setup is done) and Not Now; one that reached its
+   summary, its counts in a box; a game that ended with an exit, or still runs, nothing but the log's line; with
+   --no-setup none, the record read all the same. setup.ini written by none */
+static void test_last_run(App* app) {
+    char *config = config_of(app), *file = join(config, "setup.ini"), *before;
+    char *folder = join(app->games_dir, "testgame"), *program = join(folder, "testgame");
+    char *probe = join(app->state_dir, "probe"), *game = join(probe, ".scarletnx/recompiled/edenprobe/edenprobe");
+    char *card = join(probe, ".scarletnx/recompiled/edenprobe/edenprobe_data/sdmc/edenprobe"), *record, *at, *state;
+    char *last = join(card, "last-run"), *report = join(card, "runs/abc1234/report.jsonl");
+    snx_setup_skip = 0;
+    before = text_of(config, "setup.ini");
+    app->system_said = F8_LOW_MEMORY;
+    /* a game: the page alone, OK; the record gone as it is read */
+    record = stopped_run(app, program, "A Test Game", NULL, true);
+    last_run_look(app);
+    assert(!snx_path_exists(record) && app->stopped_due && app->stopped_end.how == RUN_CUT);
+    assert(app->stopped_end.pid == 19590 && !strcmp(app->stopped_end.name, "A Test Game"));
+    setup_start(app);
+    assert(app->setup_on && app->setup_count == 1 && page(app) == SETUP_STOPPED && app->setup_choice.count == 1);
+    assert(!strcmp(choice_label(app), "OK") && !setup_skips(app));
+    render(app);
+    shows(app, "Android stopped A Test Game", rgb(app->theme.page));
+    shows(app, "Last Run", rgb(head_ink(app)));
+    shows(app, "A Test Game", rgb(app->theme.ink));
+    shows(app, "Android stopped it: low memory", rgb(app->theme.ink));
+    shows(app, "PSS 4.9 GB, RSS 1.9 GB", rgb(app->theme.ink));
+    shows(app, "testgame.log", rgb(app->theme.ink));
+    hides(app, "Continue", rgb(app->theme.ink));
+    {
+        static const char* const rows[] = {"OK"};
+        static const char* const icons[] = {ICON_CHECK};
+        rows_show(app, rows, icons, 1, "OK", NULL, NULL);
+    }
+    key(app, SDLK_RETURN);
+    assert(!app->setup_on && !app->stopped_due);
+    at = text_of(config, "setup.ini");
+    assert(before ? at && !strcmp(at, before) : !at); /* the page writes nothing */
+    free(at);
+    free(record);
+    /* the same game ended with an exit (its mark gone), or still running (its mark held): the log's line alone */
+    record = stopped_run(app, program, "A Test Game", NULL, false);
+    state = snx_user_path(folder, SNX_USER_STATE);
+    at = join(state, ".running-19590");
+    remove(at);
+    last_run_look(app);
+    assert(!snx_path_exists(record) && !app->stopped_due && app->stopped_end.how == RUN_ENDED);
+    free(record);
+    record = stopped_run(app, program, "A Test Game", NULL, false);
+    {
+        intptr_t lock;
+        put(at, "pid 19591, started 2026-11-12 20:30:00\n1762990200\n");
+        assert(!snx_lock_file(at, &lock));
+        last_run_look(app);
+        assert(!app->stopped_due && app->stopped_end.how == RUN_GOES);
+        snx_unlock_file(lock);
+    }
+    remove(at);
+    free(at);
+    free(state);
+    free(record);
+    /* Run edenprobe's launch Android stopped before its summary: Continue in focus, Not Now; the cases so far */
+    put(last, "runs/abc1234\n");
+    put(report, "{\"type\":\"note\",\"text\":\"edenprobe 0.9.0 (abc1234) starting\"}\n"
+                "{\"type\":\"case\",\"suite\":\"cpu\",\"name\":\"a\",\"result\":\"pass\"}\n"
+                "{\"type\":\"case\",\"suite\":\"cpu\",\"name\":\"b\",\"result\":\"pass\"}\n"
+                "{\"type\":\"case\",\"suite\":\"tex8k\",\"name\":\"c\",\"result\":\"pass\"}\n");
+    for (int go_on = 0; go_on < 2; ++go_on) {
+        record = stopped_run(app, game, "edenprobe", probe, true);
+        last_run_look(app);
+        setup_start(app);
+        assert(app->setup_on && page(app) == SETUP_STOPPED && app->setup_choice.count == 2);
+        assert(!strcmp(choice_label(app), "Continue") && !setup_skips(app));
+        render(app);
+        shows(app, "Android stopped edenprobe", rgb(app->theme.page));
+        shows(app, "Continue goes on from its journal: 3 cases so far", rgb(app->theme.ink));
+        {
+            static const char* const rows[] = {"Continue", "Not Now"};
+            static const char* const icons[] = {ICON_PLAY, ICON_X};
+            rows_show(app, rows, icons, 2, "Continue", NULL, NULL);
+        }
+        if (!go_on) key(app, SDLK_DOWN);
+        app->editor.note[0] = 0;
+        key(app, SDLK_RETURN);
+        assert(!app->setup_on && !app->stopped_go_on);
+        if (go_on) { /* probe_start's Continue: here the NRO it needs, as GPU Drivers' Continue says, over the menu */
+            char* nro = join(probe, "edenprobe.nro");
+            at = snx_format("Run edenprobe needs %s", nro);
+            free(nro);
+            assert(!strncmp(app->editor.note, at, strlen(at)) && app->confirm.shown &&
+                   app->confirm.ask == GUI_ASK_ERROR && !strcmp(app->error_line, app->editor.note));
+            app->confirm.shown = false;
+            free(at);
+        } else
+            assert(!app->editor.note[0] && !app->probe_launch);
+        free(record);
+    }
+    /* one that reached its summary: no page, its counts in a box, as its end would have shown them */
+    put(report, "{\"type\":\"note\",\"text\":\"edenprobe 0.9.0 (abc1234) starting\"}\n"
+                "{\"type\":\"case\",\"suite\":\"cpu\",\"name\":\"a\",\"result\":\"pass\"}\n"
+                "{\"type\":\"summary\",\"passed\":1,\"failed\":0,\"skipped\":0,\"crashed\":0}\n");
+    record = stopped_run(app, game, "edenprobe", probe, false);
+    last_run_look(app);
+    assert(!app->stopped_due && app->confirm.shown && app->confirm.ask == GUI_ASK_ERROR);
+    assert(!strncmp(app->error_line, "edenprobe 0.9.0 (abc1234): 1 passed, 0 failed, 0 skipped, 0 crashed. ", 69));
+    app->confirm.shown = false;
+    free(record);
+    /* --no-setup: no page; the record read and gone all the same, the log saying it */
+    record = stopped_run(app, program, "A Test Game", NULL, true);
+    snx_setup_skip = 1;
+    last_run_look(app);
+    setup_start(app);
+    assert(!app->setup_on && !snx_path_exists(record));
+    snx_setup_skip = 0;
+    app->stopped_due = false;
+    free(record);
+    app->system_said = NULL;
+    assert(!snx_remove_tree(probe) && !snx_remove_tree(folder));
+    free(before);
+    free(report);
+    free(last);
+    free(card);
+    free(game);
+    free(probe);
+    free(program);
+    free(folder);
+    free(file);
+    free(config);
+    puts("PASS Last Run: a game Android stopped, Run edenprobe's Continue and Not Now, its summary's box");
+}
+
 static void set_env(const char* name, const char* value) {
 #ifdef _WIN32
     assert(!_putenv_s(name, value ? value : ""));
@@ -962,6 +1724,12 @@ int main(void) {
     test_first(&app);
     test_users(&app);
     test_notice(&app);
+    test_clean_notice(&app);
+    test_last_run(&app);
+    test_old_files(&app);
+    test_saves_one_page(&app);
+    test_data_saves(&app);
+    test_ask_tones(&app);
     test_translated(&app);
     test_places(&app);
     test_skip(&app);

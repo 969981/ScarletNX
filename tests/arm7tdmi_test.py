@@ -29,13 +29,17 @@ ARM = {
     'stm_pc': (0xE8848000,),  # STMIA r4, {pc}
     'stm_base': (0xE8A40012,),  # STMIA r4!, {r1, r4}
     'ldm': (0xE8940005,),  # LDMIA r4, {r0, r2}
+    'stm_unaligned': (0xE8A40006,),  # STMIA r4!, {r1, r2}
     'io_load': (0xE5940000,),  # LDR r0, [r4]
     'io_store': (0xE1C410B0,),  # STRH r1, [r4]
+    'io_store_more': (0xE4841004, 0xE3A02001),  # STR r1, [r4], #4; MOV r2, #1
 }
 THUMB = {
     'pop_pc': (0xBD01,),  # POP {r0, pc}
+    'ldmia': (0xCC05,),  # LDMIA r4!, {r0, r2}
     # BL's second half alone (a GBA game's call through LR); with the halfword after it A57's STRB.W r0, [r0, r0]
     'bl_suffix': (0xF810, 0x0000),
+    'io_store_more': (0x8021, 0x2201),  # STRH r1, [r4]; MOVS r2, #1
 }
 
 
@@ -65,7 +69,7 @@ def put(memory, address, data):
 class Run:
     """one block on a fresh CPU and zeroed memory; the hook records what reaches it"""
 
-    def __init__(self, block, thumb=False, **registers):
+    def __init__(self, block, thumb=False, written=0, **registers):
         self.backing = mmap.mmap(-1, SIZE)
         self.memory = (C.c_uint8 * SIZE).from_buffer(self.backing)
         self.calls = []
@@ -79,10 +83,11 @@ class Run:
         self.cpu.mem_size = SIZE
         self.cpu.io = C.cast(self.hook, C.c_void_p)
         self.block = block
+        self.written = written
 
     def access(self, address, size_write, value):
         self.calls.append((address, size_write, value))
-        return 0xCAFE
+        return self.written if size_write & 0x100 else 0xCAFE
 
     def __call__(self):
         self.block(C.byref(self.cpu))
@@ -112,7 +117,24 @@ def check(arm, thumb, profile):
     assert cpu.exit == 0 and cpu.r[4] == 0x02008008 and word(run.memory, 0x02008000) == 7
     assert word(run.memory, 0x02008004) == (0x02008008 if seven else 0x02008000)  # the base after the first: written back
     run = Run(arm['ldm'], r4=0x02008002)
-    assert run().exit == (0 if seven else 7)  # A57: SNX_ARM_ALIGNMENT
+    put(run.memory, 0x02008000, bytes(range(0x11, 0xDD, 0x11)))
+    cpu = run()
+    assert cpu.exit == (0 if seven else 7)  # A57: SNX_ARM_ALIGNMENT
+    # the ARM7TDMI's list moves the words at the base with bits 1 and 0 clear, and writes the base back as it was plus
+    # the list; the save memory's 8 bit bus takes the address as it is
+    if seven:
+        assert (cpu.r[0], cpu.r[2]) == (0x44332211, 0x88776655), (hex(cpu.r[0]), hex(cpu.r[2]))
+        run = Run(thumb['ldmia'], thumb=True, r4=0x02008002)
+        put(run.memory, 0x02008000, bytes(range(0x11, 0xDD, 0x11)))
+        cpu = run()
+        assert (cpu.exit, cpu.r[0], cpu.r[2], cpu.r[4]) == (0, 0x44332211, 0x88776655, 0x0200800A), hex(cpu.r[0])
+        run = Run(arm['stm_unaligned'], r1=7, r2=9, r4=0x02008002)
+        cpu = run()
+        assert (cpu.exit, cpu.r[4]) == (0, 0x0200800A), hex(cpu.r[4])
+        assert (word(run.memory, 0x02008000), word(run.memory, 0x02008004)) == (7, 9), hex(word(run.memory, 0x02008000))
+        run = Run(arm['ldm'], r4=0x0E000001)
+        run.cpu.mem_size = 0x10000000  # the bounds the board's window has: the hook takes the save memory, past SIZE
+        assert run().exit == 0 and run.calls == [(0x0E000001, 4, 0), (0x0E000005, 4, 0)], run.calls
     # the I/O window goes through the hook, with the documented size_write; elsewhere memory is plain
     run = Run(arm['io_load'], r4=0x04000004)
     assert run().exit == 0 and run.cpu.r[0] == (0xCAFE if seven else 0)
@@ -120,9 +142,25 @@ def check(arm, thumb, profile):
     run = Run(arm['io_store'], r1=0x12345678, r4=0x04000006)
     assert run().exit == 0 and run.calls == ([(0x04000006, 0x102, 0x12345678)] if seven else [])
     assert word(run.memory, 0x04000004) == (0 if seven else 0x56780000)
+    # a write the hook answers nonzero ends the block once its instruction is done (the base written back), at the
+    # next one; zero goes on
+    for written in (0, 1):
+        run = Run(arm['io_store_more'], written=written, r1=7, r4=0x04000008)
+        cpu = run()
+        stopped = seven and written
+        assert (cpu.exit, cpu.r[2], cpu.r[4]) == (0, 0 if stopped else 1, 0x0400000C), (written, cpu.r[2], cpu.r[4])
+        assert cpu.r[15] == (PC + 4 if stopped else PC + 8), (written, hex(cpu.r[15]))
+        run = Run(thumb['io_store_more'], thumb=True, written=written, r1=7, r4=0x04000008)
+        cpu = run()
+        assert (cpu.exit, cpu.r[2], cpu.r[15]) == (0, 0 if stopped else 1, PC + 2 if stopped else PC + 4), written
     run = Run(arm['io_load'], r4=0x02000000)
     put(run.memory, 0x02000000, b'\x01\x02\x03\x04')
     assert run().r[0] == 0x04030201 and not run.calls
+    # past the console's 28 bits (but for the mirror at bit 31) nothing answers: the hook gives the open bus there
+    for address in (0x2E00A610, 0x10000000, 0xFFFFFFF0) if seven else ():
+        run = Run(arm['io_load'], r4=address)
+        run.cpu.mem_size = 1 << 32  # the board's window: the hook takes these, nothing past SIZE is touched
+        assert run().exit == 0 and run.calls == [(address, 4, 0)] and run.cpu.r[0] == 0xCAFE, (hex(address), run.calls)
     # the BIOS answers with the board's open bus, so its reads go through the hook too
     run = Run(arm['io_load'], r4=0x00000100)
     assert run().exit == 0 and run.calls == ([(0x00000100, 4, 0)] if seven else [])

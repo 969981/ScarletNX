@@ -11,10 +11,12 @@ What an older version used that this one replaced, how a run tells you, and how 
 - The old one becomes **deprecated**. A deprecated setting is not read (the new one is), but it is kept where it is,
   never dropped in silence; a deprecated option still works.
 - **Each run says so** where you read it: stderr for the drivers, the game's `.log` and stderr for the runtime, the
-  launcher's box for files an older version left. The line names what replaced it.
-- **You remove it**: a setting by hand or with the launcher's **Settings > App > Clean Old Settings**, which takes
-  the `[Deprecated]` section out of every game's `.ini` the launcher reaches (the games' config folder, `games/` and
-  the libraries of Settings > App > Folders); a file an older version left, by moving it where the line says.
+  launcher's setup for files an older version left (its Old Files pages). The line names what replaced it.
+- **You remove it**: a setting by hand or with the launcher's **Settings > App > Clean Old Settings** (or Clean Now
+  on the setup's last notice), which takes the `[Deprecated]` section out of every game's `.ini` the launcher reaches
+  (the games' config folder, `games/` and the libraries of Settings > App > Folders); a file an older version left, by
+  moving it where the line says, or with Move All or Delete All on the setup's Old Files pages (Delete All never
+  deletes a save or the console's keys).
 - **It is listed below** until the code that reads it goes, which is a change of its own named in the table.
 
 A game's `.ini` keeps its deprecated keys last, under what became of each:
@@ -44,6 +46,11 @@ renderer=opengl
 | `.ini` key `controls_skin` (the on-screen controls' look: a shipped skin, `line` or `yorha`, or a RetroArch overlay's `.cfg`) | [ui] Remove the on-screen controls' skins | nothing: the controls are white shapes | under `[Deprecated]`, named once a run |
 | `.ini` key `vk_descriptors` (graphics descriptors: `0` sets, its default until `3`, Automatic, was; `1` buffers; `2` heaps), and `--vk_descriptors=N` | [runtime] vk_descriptors_mode in place of vk_descriptors | `vk_descriptors_mode`, of the same values, `3` (Automatic) by default | read while `vk_descriptors_mode` has no value, the game's log and stderr saying once what it took: `1` and `2` as they are; `0` and `3`, the defaults every `.ini` had written, leave `vk_descriptors_mode` at its own (`3`); `--vk_descriptors=N` is still taken, as `--vk_descriptors_mode=N` for that run, said in the log |
 | `.ini` key `user` (the user's number in users.ini) and `--user=N` | [acc] the user plays by its uid: user_uid | `user_uid`, the uid of the user it named; `--user_uid=<uid>` | read while `user_uid` names none, the runtime's log and stderr saying once a run which uid replaces it; the launcher writes `user_uid` in its place once, said; under `[Deprecated]` |
+| `.ini` keys `nvn_verify`, `nvn_trace` (the game's NVN driver run on objects of its own beside the runtime's, the two compared; the NVN functions a game called, listed) | [gpu] Remove nvn_verify and nvn_trace | nothing: they went with the game's NVN driver on the emulated Maxwell GPU | under `[Deprecated]`, named once a run |
+| `.ini` keys `mme_hle`, `mme_jit`, `mme_verify` (the GPU macros run natively, compiled with LLVM, checked against the interpreter) | [gpu] Remove the emulated Maxwell GPU path | nothing: the macros went with it | the same |
+| `.ini` key `nvn_direct` (`0` the game's NVN driver, `1` the runtime, `2` the runtime where it knew the game's NVN API version) | [gpu] Make NVN the only GPU path and rename nvn_direct to the loader | nothing: the runtime always runs the game's NVN calls | the same |
+| `.ini` key `astc_background_threads` (the CPU threads that made the better ASTC textures) | [vk] Encode the background's ASTC levels on the GPU alone | nothing: the GPU makes them alone | the same |
+| `.ini` keys `press`, `press_at` (an unattended run's one press: its buttons in hex, at a time in ms) | #373 | `script`: `press_at:press` is the same press, held `press_len` ms | the same |
 | `--keep-c` | Replace Python pipeline with a C90 driver | `--keep-ir` | still taken, said on stderr each time |
 | `--recomp` | [cli] the options' names | `--recompile` | still taken, said on stderr once a run |
 | `--repo DIR` | [cli] the options' names | `--data DIR` | still taken, said on stderr once a run |
@@ -77,6 +84,7 @@ renderer=opengl
 | Environment variables `SNX_GNU_STRACE`, `SNX_GNU_SAMPLE`, `SNX_HOST_PAGE`, `SNX_LINUX_SYSROOT` of `scarletnx-gnuabi` | [gnuabi] Trace, sampling and the host page are options | `--strace`, `--sample-pc`, `--host-page=N`, `-L DIR` or `--sysroot=DIR` | still read where they did something, under the command line's own, said on stderr |
 | `fullscreen=.ini` or `controls=.ini` in `settings.ini` (Settings' **Fullscreen** or **Show controls** left to each game's `.ini`, which showed as *Off [default]*) | [gui] Fullscreen and Show controls are Off or On, no third value | the launcher's own choice, passed to every run: Off on a computer, On on a phone | the launcher as it opens: `settings.ini` is written again without it, said once |
 | In `settings.ini`, `<key>=.ini` for any other setting whose default is one of its values (shown *On [default]* beside a picked *On*), or that default picked (`docked=1`), which every run was given over the game's `.ini` | [gui] A setting's values are its own, [default] on the default's | the default, which no run is given: each game's `.ini` keeps it | the launcher as it opens: `settings.ini` is written again without it, said once |
+| A save's files in its folder itself, as every version before kept a save: `save/user.<uid>/<title ID>/<the game's files>`, and so for the Device, BCAT, cache and System saves | [fs] Commit a save as the console does | in the save's folder, `0/` holds its last commit, `1/` the copy the game works in, and the file `snx-journaled` says the folder is laid out so ([Filesystem](../platforms/nx/filesystem.md)) | played where it is and written in place, so a game killed while it saves there leaves part of a save; the game's log and stderr name the folder once a run for each save type, the launcher lists each as it opens, and Move Old Files moves the files into `0/` and writes `snx-journaled` (by hand: both, with the game closed). A save Move Old Files takes from a game's own folder to the data folder's goes into its `0/` there in the same move |
 
 Settings > App > Move Old Files in the launcher, or `scarletnx --migrate=yes`, moves the rest of these, an entry at a
 time, each to the folder its line names; `scarletnx --migrate` says first what would move ([Usage](usage.md#folders)).

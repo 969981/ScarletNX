@@ -2,6 +2,9 @@
    Copyright 2026 the mGBA contributors
    Copyright 2026 the ScarletNX contributors */
 #include "agb/board/board.h"
+#include "common/utilities/bits.h"
+#include "common/utilities/endian.h"
+#include <stdio.h>
 #include <string.h>
 
 void agb_board_init(AgbBoard* board) {
@@ -16,6 +19,11 @@ void agb_board_init(AgbBoard* board) {
     board->apu.soundbias = 0x200;
     board->ppu.bgpa[2] = board->ppu.bgpd[2] = board->ppu.bgpa[3] = board->ppu.bgpd[3] = 0x100;
     board->io[0x300 >> 1] = 1;
+    /* the BIOS's boot ends on line 126, 919 cycles into it, where mGBA's machine starts the cartridge when it skips the
+       BIOS (line 0x7E, its first horizontal blank at cycle 1008 of the line 120 cycles away, then 31 cycles of its reset
+       code): a game that turns its interrupts on as it boots meets the first vertical blank 34 lines later, not 160 */
+    board->ppu.vcount = AGB_BOOT_LINE;
+    board->ppu.dot = AGB_BOOT_DOT;
 }
 
 int agb_board_insert(AgbBoard* board, const void* image, size_t size, char* error, size_t error_size) {
@@ -26,6 +34,26 @@ int agb_board_insert(AgbBoard* board, const void* image, size_t size, char* erro
     board->has_cartridge = 1;
     agb_save_reset(board, agb_save_detect((const uint8_t*)image, size));
     return 0;
+}
+
+int agb_board_multiboot(AgbBoard* board, const void* image, size_t size, char* error, size_t error_size) {
+    if (!size || size > AGB_EWRAM_SIZE) {
+        snprintf(error, error_size,
+                 "the multiboot program is %zu bytes: EWRAM, where the BIOS receives one, holds 1 to %u", size,
+                 (unsigned)AGB_EWRAM_SIZE);
+        return -1;
+    }
+    memcpy(board->memory.ewram, image, size);
+    board->multiboot_size = (uint32_t)size;
+    board->multiboot_hash = snx_fnv1a(SNX_FNV_BASIS, image, size);
+    return 0;
+}
+
+uint32_t agb_board_entry(const AgbBoard* board) {
+    /* with no cartridge, mGBA's machine starts a program at 0x020000C0 when that word is not zero, else at EWRAM's
+       start, where a program whose header has no entry begins */
+    if (board->has_cartridge || !board->multiboot_size) return 0x08000000;
+    return snx_ld_le32(board->memory.ewram + 0xC0) ? 0x020000C0 : 0x02000000;
 }
 
 void agb_board_destroy(AgbBoard* board) {

@@ -636,8 +636,10 @@ An older version made its games in the data folder's `games/` (`recompiled/` now
 kept a game's files side by side in `games/` (`games/Game`, `Game_code.so`, `Game_data/`,
 `Game.ini`), the menu's in the data folder's `gui/`, outside Linux the rest in the data folder itself, a portable
 copy's in a `games/` beside the program, and a build tree's `games/`, `work/` and keys in its checkout. This one moves
-none of it by itself: as long as it is there, the menu lists each folder and where it goes now, the driver says so on
-each run, and an older game runs where it is, its run saying where its folder goes. Asked, it moves them:
+none of it by itself: as long as it is there, the launcher's setup shows each folder on a page of its own (Old Files,
+[GUI](gui.md#setup)) with where it goes now and asks on the last whether to move them all, delete them all (never a save
+nor the console's keys) or not now, the driver says so on each run, and an older game runs where it is, its run saying
+where its folder goes. Asked, it moves them:
 
 ```
 ./build/scarletnx --migrate       # each entry a line and where it would go; nothing is touched
@@ -689,7 +691,11 @@ there until Settings > App > Move Old Files moves it. Those an older version lef
 `0123456789abcdeffedcba9876543210`, are played there until you move them ([Deprecations](deprecations.md)). Beside
 an Account, Device or BCAT save's folder, `<its folder>.version` names the program and version that last committed it:
 when an older version of the game opens a save a newer one wrote, which a game may not read, the log says both, and so
-does the report if the game crashes or stops. The game's
+does the report if the game crashes or stops. In a save's folder, `0/` holds the save's last commit and `1/` the copy
+the running game works in, which becomes the save when the game commits: a game killed while it saves leaves the last
+commit whole. To copy a save, take its folder whole with the game closed; a save's files from elsewhere go in `0/`. A save an older version kept has the game's
+files in the folder itself, and is played so until Move Old Files moves them into `0/` ([Deprecations](deprecations.md)).
+The game's
 menu (Home, F2) shows the user playing in a box at its head's right, their nickname and picture, and the launcher the
 one its Settings' `user_uid` names, where a click picks another ([GUI](gui.md)); a users.ini that lists no users is said
 in the launcher's foot.
@@ -720,8 +726,11 @@ only said, nothing is moved), then asks:
    has one user, the nickname given (`Player` by default), its uid random, of a v4 UUID's form as Ryujinx's are; or
    `0123456789abcdeffedcba9876543210`, the uid user 1 has had, while a game in `recompiled/` has saves of it.
 
-In the launcher the first page also has Skip, which takes each step as its default, what Enter on each would take
-(the nickname `Player`), and writes `setup.ini`.
+In the launcher the last notice asks to take out the keys a game's `.ini` keeps under `[Deprecated]` (Clean Now, or
+Not Now), and after the steps a page for each folder an older version left asks, on the last, Move All, Delete All or
+Not Now ([GUI](gui.md#setup)); those pages come alone, with nothing written to `setup.ini`, at each start while the
+folders are there. The first page also has Skip, which takes each step as its default, what Enter on each would take
+(the nickname `Player`, Not Now on both questions), and writes `setup.ini`.
 
 `setup.ini`, in the config folder, keeps how far it went:
 
@@ -817,8 +826,10 @@ tear, and the game keeps the pace `fps_limit` sets.
 
 A save state is the whole game at one moment, kept in `states/` in the game's folder, one file a slot. F7 saves to
 the selected slot and F8 loads it, and F9 selects the next slot and says what it holds. The menu's **Save states**
-page lists the slots with the date, the play time and a picture of each, and saves, loads and deletes them. A load
-and a delete ask first. The game waits while the page is open. Before a load the game is saved to the auto slot,
+page lists the slots with the date, the play time and a picture of each, and saves, loads and deletes them. A load,
+a delete and a save over a state ask first (F7 does not: it saves at once, saying `Saved over slot 2` when the
+slot held one); Delete and that Save are in the failure colour, Load in the warning colour, and the menu's Exit,
+which ends the game, in the failure colour and asked first. The game waits while the page is open. Before a load the game is saved to the auto slot,
 listed first, so a load can be undone (`state_auto_backup`). The game's own save files are never part of a state,
 and loading one leaves them as they are. A state loads only into the game, update and mods it was saved with. A newer
 ScarletNX loads it too, unless it changed the recompiled code (`SNX_ABI`) or the layout of what a state holds, and
@@ -860,7 +871,7 @@ touch screen. By default (`controls=2`, Auto) they show on a touch screen while 
 The game's menu (Back on Android, Home on a gamepad, F2) has their page: show them, *Edit layout* (drag a control;
 tap one and size it with the bar on top; *Done* or Back ends it), snap to a grid, scale, the buttons
 shown, a stick's middle where the finger lands, a D-pad a finger slides on, a buzz on each press (Android), the touch
-screen, and *Reset layout*. Each control is a white shape drawn hard over the game, its edge and its label; a pressed
+screen, and *Reset layout*, in the warning colour and asked first. Each control is a white shape drawn hard over the game, its edge and its label; a pressed
 one is filled, its label cut out. The
 game's `.ini` keeps them: `controls`, `controls_scale`,
 `controls_snap`, `controls_rel_center`, `controls_dpad_slide`, `controls_haptics`, a control's place once it

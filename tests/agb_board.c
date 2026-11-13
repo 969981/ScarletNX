@@ -98,20 +98,63 @@ int main(void) {
     CHECK(strstr(error, "32 MiB"));
     make_rom(rom);
     rom[3] = 0x00;
+    rom[0xBD] ^= 0x40;
     CHECK(agb_board_insert(&board, rom, ROM_SIZE, error, sizeof error));
-    CHECK(strstr(error, "branch"));
+    CHECK(strstr(error, "ROM header starts with 0x0000002E, not an ARM branch"));
+    /* a whole header over no program, the data cartridge another console's game reads, and a flash memory's image,
+       erased where a header would be: each refused saying what it is */
+    make_rom(rom);
+    memset(rom, 0xFF, 4);
+    CHECK(agb_board_insert(&board, rom, ROM_SIZE, error, sizeof error));
+    CHECK(strstr(error, "ROM header (title \"TESTGAME\", code BZVE) is whole, but its first word is 0xFFFFFFFF, not an "
+                        "ARM branch: a data cartridge a game reads, not a GBA program"));
+    {
+        uint8_t* flash = (uint8_t*)malloc(0x20000);
+        CHECK(flash);
+        memset(flash, 0xFF, 0x20000);
+        flash[0x10000] = 0x12;
+        CHECK(agb_board_insert(&board, flash, 0x20000, error, sizeof error));
+        free(flash);
+        CHECK(strstr(error, "ROM image of 131072 bytes starts with 0xFFFFFFFF and its header is erased, all 0xFF: a "
+                            "flash memory's image"));
+    }
     make_rom(rom);
     rom[0xB2] = 0x00;
     fix_checksum(rom);
     CHECK(agb_board_insert(&board, rom, ROM_SIZE, error, sizeof error));
-    CHECK(strstr(error, "0x96"));
-    make_rom(rom);
-    rom[0xBD] ^= 0x40;
-    CHECK(agb_board_insert(&board, rom, ROM_SIZE, error, sizeof error));
-    CHECK(strstr(error, "checksum"));
+    CHECK(strstr(error, "ROM header's byte 0xB2 is 0x00, not the fixed 0x96"));
+
+    /* an immediate DMA with the repeat bit ends as any immediate one, its enable bit clear, so the next start runs: a
+       game that cleared OAM so and loaded its palettes after got none */
+    agb_write32(&board, 0x02000200, 0x11223344);
+    agb_write32(&board, 0x040000D4, 0x02000200);
+    agb_write32(&board, 0x040000D8, 0x02000300);
+    agb_write16(&board, 0x040000DC, 4);
+    agb_write16(&board, 0x040000DE, 0x8700); /* on, now, words, repeat, the source fixed */
+    CHECK(agb_read32(&board, 0x0200030C) == 0x11223344);
+    if (agb_read16(&board, 0x040000DE) != 0x0700) {
+        fprintf(stderr, "agb_board: an immediate repeat DMA left DMA3CNT_H at 0x%04X, not 0x0700\n",
+                agb_read16(&board, 0x040000DE));
+        return 1;
+    }
+    agb_write32(&board, 0x040000D4, 0x02000200);
+    agb_write32(&board, 0x040000D8, 0x05000000);
+    agb_write16(&board, 0x040000DC, 1);
+    agb_write16(&board, 0x040000DE, 0x8400);
+    CHECK(agb_read32(&board, 0x05000000) == 0x11223344);
 
     /* a rejected insert leaves the accepted cartridge in place */
     CHECK(board.has_cartridge && !strcmp(board.cartridge.title, "TEST"));
+
+    /* a header whose checksum is not its title block's runs, as mGBA runs it, where the console's BIOS stops: the
+       cartridge keeps both for the runner to say */
+    make_rom(rom);
+    {
+        uint8_t title = rom[0xBD];
+        rom[0xBD] ^= 0x40;
+        CHECK(!agb_board_insert(&board, rom, ROM_SIZE, error, sizeof error));
+        CHECK(board.cartridge.checksum == (uint8_t)(title ^ 0x40) && board.cartridge.checksum_title == title);
+    }
 
     /* the BIOS reads as the opcode it fetched last, at the read's lane, and ignores writes */
     CHECK(agb_read32(&board, 0x00000000) == AGB_BIOS_PREFETCH_BOOT);
@@ -120,6 +163,17 @@ int main(void) {
     agb_write32(&board, 0x00000000, 0);
     board.bios_prefetch = AGB_BIOS_PREFETCH_SWI;
     CHECK(agb_read32(&board, 0x00000000) == AGB_BIOS_PREFETCH_SWI);
+    /* past the 28 bits the console decodes (but for the mirror at bit 31) nothing answers: a read gives the open bus at
+       its lane and a write goes nowhere, as mGBA's GBALoadBad */
+    board.open_bus = 0x0A000005;
+    CHECK(agb_read32(&board, 0x2E00A610) == 0x0A000005 && agb_read16(&board, 0xFFFFFFFE) == 0x0A00 &&
+          agb_read8(&board, 0x10000001) == 0x00 && agb_read8(&board, 0x7FFFFFF3) == 0x0A);
+    agb_write32(&board, 0x2E00A610, 0x12345678);
+    agb_write8(&board, 0x9E000000, 0x77);
+    CHECK(agb_read32(&board, 0x2E00A610) == 0x0A000005);
+    agb_write32(&board, 0x02000040, 0x5A5A5A5A);
+    CHECK(agb_read32(&board, 0x82000040) == 0x5A5A5A5A);
+
     /* the cartridge windows hold the image once, and past it the bus still holds address / 2 */
     CHECK(agb_read32(&board, 0x08000000) == board.cartridge.entry);
     CHECK(agb_read16(&board, 0x08000000 + ROM_SIZE) == ROM_SIZE / 2);

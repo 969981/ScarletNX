@@ -181,7 +181,7 @@ static void thumb_ldmstm(ArmIR* a, const SnxThumb* t) {
     unsigned index = 0;
     if (t->op == 1) { /* LDMIA: snapshot before writeback */
         for (unsigned i = 0; i < 8; ++i)
-            if (list & (1u << i)) values[i] = readmem(a, add(a, base, c32(a, index++ * 4)), 4, 0);
+            if (list & (1u << i)) values[i] = readmem_list(a, add(a, base, c32(a, index++ * 4)), 4);
         for (unsigned i = 0; i < 8; ++i)
             if (list & (1u << i)) if (i != t->rn || !(t->flags & TH_WB)) setreg(a, i, values[i]);
     } else { /* STMIA: the ARM7TDMI stores the written back base when the base is not the first in the list */
@@ -475,7 +475,12 @@ LLVMValueRef snx_thumb_llvm_block_ex(LLVMModuleRef module, const char* name, con
     if (!options_valid(options) || !module || !name || !*name || !halfwords || !count || count > 65536 || (pc & 1) ||
         LLVMGetNamedFunction(module, name) || LLVMGetNamedGlobal(module, name))
         return NULL;
-    if (options) { a.profile = options->profile; a.memory = options->memory; }
+    if (options) {
+        a.profile = options->profile;
+        a.memory = options->memory;
+        a.bus_costs = options->bus_costs;
+        a.bus_cycles = options->bus_cycles;
+    }
     a.thumb = 1;
     block_begin(&a, module, name, pc);
     if (!hosted(&a)) {
@@ -539,6 +544,8 @@ LLVMValueRef snx_thumb_llvm_block_ex(LLVMModuleRef module, const char* name, con
             if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(a.b))) stop = 1; /* trapped */
             if (!stop) setreg(&a, 15, c32(&a, next_pc));
         }
+        if (!stop) yield_check(&a);
+        a.yields = 0;
         used += len;
         if (t.shape == TH_IT) itstate = t.imm & 0xFF;
         if (stop) break;

@@ -30,8 +30,11 @@ typedef struct {
     uint32_t offset; /* what a Thumb32 LDREX or STREX adds to its base (TH_A32's .rd); A32's add nothing */
     SnxArmProfile profile;
     SnxArmMemoryMode memory;
+    uint32_t bus_costs, bus_cycles; /* SnxArmCodegenOptions': 0 counts no bus cycles */
     LLVMValueRef transfer_base, transfer_buffer;
     unsigned transfer_bytes, transfer_operation;
+    LLVMValueRef yield; /* ARM7TDMI: what the bus hook's writes returned, ORed: nonzero ends the block (yield_check) */
+    int yields;         /* the instruction being emitted wrote through the bus hook */
 } ArmIR;
 
 static int options_valid(const SnxArmCodegenOptions* o) {
@@ -40,7 +43,9 @@ static int options_valid(const SnxArmCodegenOptions* o) {
                    o->profile == SNX_ARM_PROFILE_A9 ||
                    (o->profile == SNX_ARM_PROFILE_ARM7TDMI && o->memory == SNX_ARM_MEMORY_FLAT)) &&
                   (o->memory == SNX_ARM_MEMORY_FLAT || o->memory == SNX_ARM_MEMORY_CHECKED ||
-                   o->memory == SNX_ARM_MEMORY_HOSTED));
+                   o->memory == SNX_ARM_MEMORY_HOSTED) &&
+                  ((!o->bus_costs && !o->bus_cycles) || (o->profile == SNX_ARM_PROFILE_ARM7TDMI && o->bus_costs &&
+                                                         o->bus_cycles && o->bus_costs != o->bus_cycles)));
 }
 /* llvm.h: flat memory in a window of 2^32 guest addresses with a guard after it, the cpu private to the running block,
    and the entry state seen to by the dispatch loop */
@@ -338,9 +343,29 @@ static void instruction_fetch(ArmIR* a, uint32_t encoded, unsigned bytes) {
     value = host_order(a, value, bytes);
     require(a, cmp(a, LLVMIntEQ, value, LLVMConstInt(type, encoded, 0)), SNX_ARM_CODE_CHANGED, c32(a, a->pc));
 }
+/* the bus cycles of a load or store (SnxArmBusCosts), once for the instruction: its first access by addr's region and
+   its width, each next word of a multiple one a sequential word, a load's internal cycle and the region's adjustment,
+   never below none */
+static void bus_charge(ArmIR* a, LLVMValueRef addr, unsigned bytes, int write, int multi) {
+    unsigned words = multi ? (bytes / 4 ? bytes / 4 : 1) : 1, width = multi || bytes == 4 ? 2 : bytes == 2 ? 1 : 0;
+    LLVMValueRef costs = get(a, a->bus_costs, a->ptr), region = band(a, lsr(a, addr, 24), c32(a, 15)), raw, adjusted;
+    LLVMValueRef at[3] = {z64(a, add(a, c32(a, (uint32_t)offsetof(SnxArmBusCosts, nonseq) + width), shl(a, region, 2))),
+                          z64(a, add(a, c32(a, (uint32_t)offsetof(SnxArmBusCosts, seq)), region)),
+                          z64(a, add(a, c32(a, (uint32_t)offsetof(SnxArmBusCosts, adjust)), region))};
+    LLVMValueRef cost[3];
+    for (int i = 0; i < 3; ++i)
+        cost[i] = LLVMBuildLoad2(a->b, a->i8, LLVMBuildGEP2(a->b, a->i8, costs, &at[i], 1, ""), "");
+    raw = add(a, LLVMBuildZExt(a->b, cost[0], a->i32, ""), c32(a, !write));
+    if (words > 1)
+        raw = add(a, raw, LLVMBuildMul(a->b, LLVMBuildZExt(a->b, cost[1], a->i32, ""), c32(a, words - 1), ""));
+    adjusted = add(a, raw, LLVMBuildSExt(a->b, cost[2], a->i32, ""));
+    adjusted = LLVMBuildSelect(a->b, cmp(a, LLVMIntSLT, adjusted, c32(a, 0)), c32(a, 0), adjusted, "");
+    put(a, a->bus_cycles, add(a, get(a, a->bus_cycles, a->i32), adjusted));
+}
 static void transfer_begin(ArmIR* a, LLVMValueRef addr, unsigned bytes, unsigned alignment, int write, int multi) {
     if (a->memory != SNX_ARM_MEMORY_CHECKED) {
         bounds(a, addr, bytes, alignment);
+        if (a->bus_cycles) bus_charge(a, addr, bytes, write, multi);
         return;
     }
     if (alignment > 1)
@@ -369,11 +394,30 @@ static LLVMValueRef memptr(ArmIR* a, LLVMValueRef addr) {
    window and video memory, 0x0D the EEPROM a cartridge may have there, 0x0E and 0x0F the save memory. */
 #define SNX_ARM_IO_REGIONS                                                                                             \
     (1u << 0x00 | 1u << 0x01 | 1u << 0x04 | 1u << 0x05 | 1u << 0x06 | 1u << 0x07 | 1u << 0x0D | 1u << 0x0E | 1u << 0x0F)
+/* A write through the hook that returns nonzero ends the block once its instruction is done (yield_check), with R15
+   the next instruction's: the board has something to run first, a DMA holding the bus while the CPU waits */
+static void yield_after(ArmIR* a, LLVMValueRef result) {
+    LLVMBuildStore(a->b, bor(a, LLVMBuildLoad2(a->b, a->i32, a->yield, ""), result), a->yield);
+    a->yields = 1;
+}
+static void yield_check(ArmIR* a) {
+    if (!a->yields) return;
+    a->yields = 0;
+    LLVMBasicBlockRef go = block(a, "go"), stop = block(a, "yield");
+    LLVMBuildCondBr(a->b, cmp(a, LLVMIntEQ, LLVMBuildLoad2(a->b, a->i32, a->yield, ""), c32(a, 0)), go, stop);
+    LLVMPositionBuilderAtEnd(a->b, stop);
+    LLVMBuildRetVoid(a->b);
+    LLVMPositionBuilderAtEnd(a->b, go);
+}
+/* addresses past the console's 28 bits, but for the mirror at bit 31 the flat window keeps, go to the hook as well:
+   nothing answers them there, which the board gives as the open bus */
 static LLVMValueRef io_route(ArmIR* a, LLVMValueRef addr, LLVMValueRef fn) {
-    LLVMValueRef top = lsr(a, addr, 24);
+    LLVMValueRef top = lsr(a, addr, 24), high = lsr(a, addr, 28);
     LLVMValueRef route = band(a, LLVMBuildLShr(a->b, c32(a, SNX_ARM_IO_REGIONS), band(a, top, c32(a, 31)), ""),
                               z32(a, cmp(a, LLVMIntULT, top, c32(a, 32))));
-    route = band(a, route, c32(a, 1));
+    LLVMValueRef unused =
+        band(a, z32(a, cmp(a, LLVMIntNE, high, c32(a, 0))), z32(a, cmp(a, LLVMIntNE, high, c32(a, 8))));
+    route = bor(a, band(a, route, c32(a, 1)), unused);
     return band(a, route, z32(a, cmp(a, LLVMIntNE, fn, LLVMConstNull(a->ptr))));
 }
 static LLVMTypeRef io_type(ArmIR* a) {
@@ -500,15 +544,20 @@ static void writemem(ArmIR* a, LLVMValueRef addr, unsigned bytes, LLVMValueRef v
     {
         /* the hook sees the raw address: the save memory's 8 bit bus picks the lane from it */
         LLVMValueRef args[4] = {a->cpu, addr, c32(a, 0x100 | bytes), value};
-        LLVMBuildCall2(a->b, io_type(a), fn, args, 4, "");
+        yield_after(a, LLVMBuildCall2(a->b, io_type(a), fn, args, 4, ""));
     }
     LLVMBuildBr(a->b, done);
     LLVMPositionBuilderAtEnd(a->b, done);
 }
-/* LDM and STM move raw words at the exact addresses: the GBA's single transfer rotation and
-   alignment do not apply to the list transfers. The bus hook still sees them. */
+/* LDM and STM move whole words: the ARM7TDMI drives a word's address with bits 1 and 0 clear, below the save memory,
+   whose 8 bit bus takes the address as it is (mGBA's GBALoadMultiple), and a single transfer's rotation does not
+   apply. The bus hook still sees them */
+static LLVMValueRef list_address(ArmIR* a, LLVMValueRef addr) {
+    return LLVMBuildSelect(a->b, cmp(a, LLVMIntULT, addr, c32(a, 0x0E000000)), band(a, addr, c32(a, ~3u)), addr, "");
+}
 static LLVMValueRef readmem_list(ArmIR* a, LLVMValueRef addr, unsigned bytes) {
     if (!arm7tdmi(a)) return readmem(a, addr, bytes, 0);
+    addr = list_address(a, addr);
     LLVMTypeRef type = LLVMIntTypeInContext(a->ctx, bytes * 8);
     LLVMValueRef fn = get(a, offsetof(SnxArmCPU, io), a->ptr);
     LLVMBasicBlockRef io = block(a, "io"), mem = block(a, "mem"), done = block(a, "read");
@@ -540,6 +589,7 @@ static void writemem_list(ArmIR* a, LLVMValueRef addr, unsigned bytes, LLVMValue
         writemem(a, addr, bytes, value);
         return;
     }
+    addr = list_address(a, addr);
     LLVMTypeRef type = LLVMIntTypeInContext(a->ctx, bytes * 8);
     LLVMValueRef fn = get(a, offsetof(SnxArmCPU, io), a->ptr);
     LLVMBasicBlockRef io = block(a, "io"), mem = block(a, "mem"), done = block(a, "written");
@@ -554,7 +604,7 @@ static void writemem_list(ArmIR* a, LLVMValueRef addr, unsigned bytes, LLVMValue
     LLVMPositionBuilderAtEnd(a->b, io);
     {
         LLVMValueRef args[4] = {a->cpu, addr, c32(a, 0x100 | bytes), value};
-        LLVMBuildCall2(a->b, io_type(a), fn, args, 4, "");
+        yield_after(a, LLVMBuildCall2(a->b, io_type(a), fn, args, 4, ""));
     }
     LLVMBuildBr(a->b, done);
     LLVMPositionBuilderAtEnd(a->b, done);
@@ -1170,6 +1220,10 @@ static void block_begin(ArmIR* a, LLVMModuleRef module, const char* name, uint32
                                 LLVMCreateEnumAttribute(a->ctx, LLVMGetEnumAttributeKindForName("noalias", 7), 0));
     a->cpu = LLVMGetParam(a->fn, 0);
     LLVMPositionBuilderAtEnd(a->b, block(a, "entry"));
+    if (arm7tdmi(a)) {
+        a->yield = LLVMBuildAlloca(a->b, a->i32, "yield");
+        LLVMBuildStore(a->b, c32(a, 0), a->yield);
+    }
     if (hosted(a)) return; /* the dispatch loop saw to the entry state (llvm.h) */
     PUT(a, exit, c32(a, SNX_ARM_OK));
     PUT(a, syndrome, c32(a, 0));
@@ -1292,6 +1346,8 @@ LLVMValueRef snx_arm_llvm_block_ex(LLVMModuleRef module, const char* name, const
     if (options) {
         a.profile = options->profile;
         a.memory = options->memory;
+        a.bus_costs = options->bus_costs;
+        a.bus_cycles = options->bus_cycles;
     }
     block_begin(&a, module, name, pc);
     if (!hosted(&a)) {
@@ -1323,6 +1379,7 @@ LLVMValueRef snx_arm_llvm_block_ex(LLVMModuleRef module, const char* name, const
             ++i;
             break;
         }
+        yield_check(&a);
     }
     LLVMBuildRetVoid(a.b);
     LLVMDisposeBuilder(a.b);

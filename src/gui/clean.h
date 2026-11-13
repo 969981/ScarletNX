@@ -32,4 +32,44 @@ int gui_move_entries(GuiCleaned* done, const char* old, const char* now, const c
    folder the save moves to, as gui_move_entries moves an entry and says it: one at the new place stays, and the
    old one with it. 1 when it moves (or would, without apply) */
 int gui_move_save_note(GuiCleaned* done, const char* old, const char* now, bool apply);
+/* the folder save is a save as the versions before kept one, the game's own files in it and so without the file
+   that says it holds a last commit and a working copy (SNX_SAVE_JOURNALED, fs.c's "A save's commit"); or one whose
+   move below was cut short after its last file, the folder empty and its files in <save>.moving beside it */
+bool gui_save_old(const char* save);
+#define GUI_SAVE_MOVING ".moving" /* that folder's name: the save's and this */
+/* Move Old Files for such a save: its files into <save>/0, its last commit as this version keeps a save
+   (SNX_SAVE_COMMITTED), with the file that says so. They are moved, a file or folder at a time, into <save>.moving/0
+   beside the save, which then takes the save's place: a move cut short leaves that folder, and the next one goes on
+   from it. One that cannot move puts back the ones that did, the save as it was, and is the only entry. With apply
+   false nothing is touched and the entries say what would move. How many move */
+int gui_move_save_committed(GuiCleaned* done, const char* save, bool apply);
+/* Move Old Files for a game's own save old, its files in the folder itself as the versions before kept one, to the save
+   folder now as this version keeps one, at once: its files in now's 0/ (SNX_SAVE_COMMITTED), with the file that says
+   so. They go into <now>.moving/0 first, which then takes now's place, as gui_move_save_committed's do: one that
+   cannot move puts back the ones that did, old as it was, and is the only entry. A now already there takes them as
+   gui_move_entries moves entries, and is then put in its 0/ as gui_move_save_committed does when it is a save as the
+   versions before kept one. With apply false nothing is touched and the entries say where each would go. How many
+   move */
+int gui_move_save_into(GuiCleaned* done, const char* old, const char* now, bool apply);
+/* What Delete All of the old files leaves where it is, said on the page and in its entry: a save, never deleted, only
+   moved (a game's save folder, <name>_data/save/<kind>, or a game an older version laid out beside others, whose
+   <name>_data/ holds its saves); a folder holding saves (a <name>_data/ with a save/ or sdmc/ in it, however deep);
+   one it cannot read whole (a folder it cannot list, an entry it cannot look at, a link to a folder, which it does not
+   follow), as it cannot tell it holds no save; the console's keys (prod.keys or title.keys, or a folder holding
+   them). A game laid out beside others is read with its <name>_data/, which goes with it */
+typedef enum { GUI_KEEP_NONE, GUI_KEEP_SAVE, GUI_KEEP_SAVES, GUI_KEEP_KEYS, GUI_KEEP_UNREAD, GUI_KEEP_LINK } GuiKeep;
+typedef struct {
+    GuiKeep keep;
+    char where[4400]; /* the save, the folder not read whole, the link or the keys it found */
+    char why[256];    /* the system's reason a folder was not read */
+} GuiKept;
+/* what of path Delete All keeps, the weightiest (a save, then what it cannot read, then keys) in kept (NULL: none) */
+GuiKeep gui_old_keep(const char* path, GuiKept* kept);
+/* Delete All, an entry an older version left at old: deleted with apply (a file, or a folder and all in it; a game
+   laid out beside others with its <name>_data/), else the entry says it would be; what gui_old_keep keeps, and a folder another disk is mounted in, stay, said; one not there
+   says nothing. 1 when it is deleted, or would be */
+int gui_delete_old(GuiCleaned* done, const char* old, bool apply);
+/* Delete All, an entry the old files' list says is a save (one the versions before kept, its files in the folder
+   itself, wherever it is): it stays, said as gui_delete_old says a save */
+void gui_delete_keep_save(GuiCleaned* done, const char* old);
 #endif

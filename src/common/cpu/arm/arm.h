@@ -44,7 +44,8 @@ typedef struct SnxArmCPU {
     uint64_t mem_size; /* flat mapping, at most 2^32 bytes; no MMIO */
     /* An optional bus hook for the regions whose bus rules a plain access cannot follow: mirrors
        finer than a page, byte write widths. Reads return the value with size_write = the width;
-       writes pass size_write = 0x100 | width and value. Like the fetch callback, none is needed by
+       writes pass size_write = 0x100 | width and value, and return nonzero to end the block once the
+       instruction that wrote is done, R15 at the next one. Like the fetch callback, none is needed by
        default: without one every access goes straight to mem. */
     uint32_t (*io)(struct SnxArmCPU* cpu, uint32_t address, uint32_t size_write, uint32_t value);
     uint64_t exclusive_value;
@@ -79,6 +80,16 @@ void snx_arm_coproc(SnxArmCPU* cpu, uint32_t word);
 void snx_arm_coproc_user(SnxArmCPU* cpu, uint32_t word);
 
 typedef void (*SnxArmBlock)(SnxArmCPU* cpu);
+
+/* What an ARM7TDMI block's loads and stores cost on the bus, which the runtime knows (its wait states) and keeps in
+   this table: each load or store, a multiple one too, adds once max(0, nonseq + (words - 1) * seq + load + adjust),
+   by the region of its address (bits 24 to 27), to the runtime's counter (llvm.h's SnxArmCodegenOptions) */
+typedef struct {
+    uint8_t nonseq[16][4]; /* its first access, by region and width ([0] 8, [1] 16, [2] 32 bits) */
+    uint8_t seq[16];       /* each next word of a multiple one */
+    int8_t adjust[16];     /* once for the instruction, by its data's region: what the fetch after it adds, or (below 0)
+                              what the code region's prefetch buffer hides */
+} SnxArmBusCosts;
 
 typedef enum {
     SNX_A32_UNDEFINED,
@@ -136,8 +147,8 @@ SnxA32Kind snx_a32_decode(uint32_t word);
    A9 executes them (profile.c).
    ARM7TDMI is the AGB board's CPU on flat memory: misaligned loads rotate and stores align, stores of the PC write
    PC + 12, STM writes the written back base unless it comes first, Thumb's POP {pc} keeps the state, LDM and STM
-   take an unaligned base, and SnxArmCPU.io sees the board's I/O regions. It decodes as A57, but for an MSR that
-   writes the mode, which is UNDEFINED for the board's runtime to run */
+   take an unaligned base and move the aligned words below the save memory, and SnxArmCPU.io sees the board's I/O
+   regions. It decodes as A57, but for an MSR that writes the mode, which is UNDEFINED for the board's runtime to run */
 typedef enum { SNX_ARM_PROFILE_A57, SNX_ARM_PROFILE_ARM11, SNX_ARM_PROFILE_A9, SNX_ARM_PROFILE_ARM7TDMI } SnxArmProfile;
 SnxA32Kind snx_a32_decode_profile(SnxArmProfile profile, uint32_t word);
 

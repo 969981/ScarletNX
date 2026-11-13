@@ -23,6 +23,7 @@
 #include "common/utilities/run_mark.h"
 #include "gui/aot.h"
 #include "gui/browser.h"
+#include "gui/covers.h"
 #include "gui/editor.h"
 #include "common/utilities/font.h"
 #include "common/network/https.h"
@@ -38,6 +39,7 @@
 #include "gui/model.h"
 #include "gui/place.h"
 #include "gui/probe.h"
+#include "gui/last_run.h"
 #include "gui/queue.h"
 #include "gui/ui.h" /* generated from ui.txt by tools/uigen */
 #include "gui/gui_process.h"
@@ -278,6 +280,25 @@ typedef struct {
 } GuiFetchForm;
 /* the launcher's HTTPS GET (common/network/https.h), a test's own in its place */
 typedef int (*GuiHttpsGet)(const char* url, const SnxHttpsOptions* o, SnxHttpsResponse* out, char* why, size_t size);
+/* Settings > GBA > Covers' box art for a GBA game made from a ROM (cover_run): what the thread is given, and what it
+   found, which it hands back as its answer */
+typedef struct {
+    GuiHttpsGet get;
+    Uint32 event;
+    bool list_fetched; /* given: the list was fetched in this session already; back: this one fetched it */
+    bool failed;
+    char rom[SNX_PATH_SIZE], folder[SNX_PATH_SIZE]; /* the ROM, and its game's folder, where icon.png goes */
+    char list[SNX_PATH_SIZE];                       /* the list's copy in the cache */
+    char name[400];                                 /* the game's name in the list, "" while none */
+    char why[1000];                                 /* why no box came */
+    char kept[400];                                 /* why the list fetched could not be kept, "" when it was */
+} GuiCoverJob;
+/* a game whose box did not come, kept with why for the session, in memory alone: its row says why */
+typedef struct {
+    char* folder;
+    char why[1000];
+} GuiCoverFailure;
+#define GUI_COVERS_WAIT GUI_QUEUE_MAX /* the games waiting for theirs: each of the queue's at most */
 /* the head's measures: the row of tabs (its height and the tabs' width), the title's height and width (0: none), the
    user's box (0: none), a cell of the text */
 typedef struct {
@@ -321,6 +342,16 @@ typedef struct {
     } slot[GUI_GLYPH_SLOTS];
     uint16_t slot_of[]; /* each wide letter's slot plus one, 0 while it has none (gui_wide_letter) */
 } GuiFontSlots;
+/* how a run ended that the menu did not see end (Last Run, gui/last_run.h): RUN_ENDED with an exit, or before its game
+   wrote a log; RUN_GOES, its game still runs; RUN_CUT, its game did not end with an exit */
+enum { RUN_ENDED, RUN_GOES, RUN_CUT };
+typedef struct {
+    char* log; /* the game's log written since the run started; NULL for none */
+    int how;
+    long long pid, pid_started; /* RUN_CUT's: its process and that process's start, seconds since 1970 (0: unknown) */
+    GuiSystemEnd system;        /* RUN_CUT's: what the system says of that process's end */
+    char name[128];             /* the game as its log's head names it, else as the menu kept it */
+} RunEnd;
 typedef struct App {
     SDL_Window* window;
     SDL_Renderer* renderer;
@@ -350,12 +381,12 @@ typedef struct App {
     uint64_t free_bytes; /* on the data folder's disk, when the count started */
     char* left;          /* what older builds left where this one no longer looks, a line each, lefts of them */
     int lefts;
+    int left_pages;    /* the setup's Old Files pages they take: a folder each (left_folder) */
     int clean_found;   /* what Clean Old Settings would take out, as App last looked (clean_left); -1 before a look */
     /* UI scale's slider, in its dialog: its bar as last drawn, empty when none shows; a drag on it going on */
     GuiRect slider_bar;
     bool slider_drag;
-    bool left_shown;   /* in a box as the menu opens, until a key, a button or a finger closes it */
-    bool left_clear;   /* the menu's own files of menu_old among them: the box says how they go (SAY_LEFT_CLEAR) */
+    bool left_clear;   /* the menu's own files of menu_old among them: their page says how they go (SAY_LEFT_CLEAR) */
     char* menu_old;    /* Android: SDL's folder for the app, its own files, where an older version kept the menu's own
                           files (menu_files); NULL elsewhere */
     Uint64 left_at;    /* when they were looked for */
@@ -665,6 +696,14 @@ typedef struct App {
     char asset_labels[GUI_FETCH_ASSETS][240];
     const char* asset_picks[GUI_FETCH_ASSETS + 1];
     char download_name[160], download_said[400];
+    /* Settings > GBA > Covers: the box being fetched (covering), the games waiting for theirs, those whose box did not
+       come, and whether the No-Intro list was fetched in this session */
+    Uint32 cover_event;
+    bool covering, cover_list_fetched;
+    GuiCoverJob* cover_wait[GUI_COVERS_WAIT];
+    int cover_waiting;
+    GuiCoverFailure* cover_failed;
+    int cover_failed_count;
     char vk_gpu[256]; /* the system's GPU, as Vulkan names it (vk_system_ask): Download Driver's recommendation */
     char* run_driver; /* the run's --gpu_driver= and --freedreno_env= (gui_run_option), until the next run */
     char* run_freedreno;
@@ -676,9 +715,12 @@ typedef struct App {
     char* scale_gone;    /* [app] ui_scale = or text_size = Auto or a part of it, "ui_scale = auto": written again */
     char* background_key; /* [app] recompile_background = as app.ini had it: written again as background_recompile */
     bool scale_new;      /* no UI scale in app.ini as the start read it: the start's, written by setup_start */
-    GuiCleaned cleaned;  /* what it did, in a box over the screen while cleaned_shown, until a key closes it */
+    GuiCleaned cleaned;  /* what it did, a file an entry, in a box over the screen while cleaned_shown, until a key
+                            closes it; Share Log lists them */
+    GuiCleaned moved;    /* what Move Old Files or the old files' page did, a folder an entry: the box's, for them */
     bool cleaned_shown;
-    bool report_move; /* the box shows what Move Old Files did, not Clean Old Settings */
+    bool report_move;   /* the box shows what Move Old Files did, not Clean Old Settings */
+    bool report_delete; /* the old files' Delete All did it: Share Log names it so */
     /* app.ini's animations: a screen comes in from the page's colour and a box's shade comes and goes, GUI_FADE_MS
        each; with it off (0) each shows at once */
     bool animations_off;
@@ -786,9 +828,17 @@ typedef struct App {
        each step setup.ini has left */
     bool setup_on;
     SnxSetup setup; /* setup.ini as it was read, a newer one's numbers kept when it is written */
-    int setup_pages[SNX_SETUP_STEPS + 1], setup_count, setup_page;
+    int setup_pages[SNX_SETUP_STEPS + 3], setup_count, setup_page;
     GuiChoice setup_choice; /* the page's choices, the one in focus */
-    int setup_top;          /* the notice shown, one a page: the last one's OK goes on */
+    int setup_top;          /* the notice shown, one a page: the last one's OK goes on; the old files' folder */
+    /* what Clean Old Settings would take, as the last notice found it (-1 before), and its Clean Now done: its box
+       says what it did (cleaned) */
+    int clean_inis_found, clean_keys_found;
+    bool setup_cleaned;
+    /* the old files' last page: 0 asking, 1 after Move All, 2 after Delete All (moved says what); what each page says
+       its folder's Move All and Delete All would do, an entry a page */
+    int left_did;
+    GuiCleaned left_plan, left_drop;
     int setup_language;     /* Settings > App's Language as the setup found it, 0 Auto: kept Auto on the system's */
     int setup_row;          /* the Appearance page's focus, a GUI_APPEARANCE_* row or its Next */
     bool setup_typing;      /* the first user's nickname being typed, setup_name, to go with setup_uid */
@@ -802,6 +852,19 @@ typedef struct App {
     char setup_why[512];
     bool setup_save;  /* the Appearance changed, kept in app.ini once done (a portable copy's, when that is picked) */
     bool setup_moved; /* the data folder a portable copy's: what older versions left is looked for again */
+    /* Last Run (gui/last_run.h): the run going as the record beside the run log keeps it (written: the record is
+       there); and the run a start found the menu had not seen end, its page among the setup's while due, Continue
+       going on with Run edenprobe once the setup is done */
+    GuiLastRun run_kept, stopped;
+    bool run_kept_written;
+    RunEnd stopped_end;
+    int stopped_cases; /* Run edenprobe's report's cases so far */
+    bool stopped_due, stopped_go_on;
+    bool mark_unended;       /* the launcher's last start did not end with an exit (mark_start) */
+    const char* system_said; /* the tests': the system's answer to every end asked (exitFields' lines); NULL asks it */
+    long long oom_before;    /* the kernel's OOM kills as the run started (gui_oom_kills), -1 where none are kept */
+    char oom_file[1024];     /* where they are counted */
+    const char* oom_events;  /* the tests': a memory.events read in place of the menu's cgroup's; NULL reads it */
 #ifdef SDL_PLATFORM_ANDROID
     bool hidden;     /* behind other apps: nothing is drawn, a run is still read */
     bool play_later; /* a game made ready while hidden, which opens once the menu shows */
@@ -829,7 +892,7 @@ static char* game_ini_of(const char* program);
 typedef char gui_entries_in_order[GUI_ENTRY(GUI_LINUX) == UI_MENU_ENTRIES_LOAD_LINUX_ARM_ELF &&
                                           GUI_ENTRY(GUI_3DS) == UI_MENU_ENTRIES_LOAD_3DS_GAME &&
                                           GUI_ENTRY(GUI_VITA) == UI_MENU_ENTRIES_LOAD_VITA_VPK &&
-                                          GUI_ENTRY(GUI_GBA) == UI_MENU_ENTRIES_LOAD_GBA_ROM &&
+                                          GUI_ENTRY(GUI_GBA) == UI_MENU_ENTRIES_LOAD_GBA_MULTI_BOOT_ROM &&
                                           GUI_ENTRY(GUI_ANDROID) == UI_MENU_ENTRIES_LOAD_ANDROID_APK_XAPK &&
                                           GUI_ENTRY(GUI_KEYS) == UI_MENU_ENTRIES_INSTALL_KEYS &&
                                           GUI_ENTRY(GUI_SETTINGS) == UI_MENU_ENTRIES_SETTINGS &&
@@ -2385,7 +2448,7 @@ static void fades_mark(App* app) {
     unsigned mark = screen_mark(app);
     bool boxed = app->confirm.shown || app->sizes_shown || (app->editing && app->editor.typing) || app->users_shown ||
                  app->addons_shown || app->options_shown || app->states_shown || app->cleaned_shown ||
-                 app->left_shown || app->dests_shown || app->picks_shown || app->help_shown;
+                 app->dests_shown || app->picks_shown || app->help_shown;
     if (mark != app->screen_was && app->screen_was) app->switch_ms = SDL_max(now_ms(app), 1);
     if (boxed != app->boxed_was) app->box_ms = SDL_max(now_ms(app), 1);
     app->screen_was = mark;
@@ -2452,7 +2515,9 @@ static const char* ask_question(App* app) {
         case GUI_ASK_CACHE:
         case GUI_ASK_DRIVER:
         case GUI_ASK_CRASH:
-        case GUI_ASK_ADDONS: return app->ask_line;
+        case GUI_ASK_ADDONS:
+        case GUI_ASK_DELETE_OLD: return app->ask_line;
+        case GUI_ASK_OVERWRITE: return snx_tr("Overwrite users.ini? It is kept as users.ini.old");
         case GUI_ASK_ERROR: return app->error_line;
         case GUI_ASK_CLOSE:
             if (!app->menu.running && !app->finished) return job_leaving(app);
@@ -2468,6 +2533,9 @@ static const char* ask_question(App* app) {
 /* app->left's lines, Share Log's: English whatever the menu shows */
 #define SAY_LEFT_BY    " was left by an older version: this one keeps it in "
 #define SAY_LEFT_TITLE SNX_TR_NOOP("Left by older versions")
+/* the old files' page of every game's own saves: its key among the folders' (no path is it), and its name */
+#define LEFT_SAVES     "\x01saves"
+#define SAY_LEFT_SAVES SNX_TR_NOOP("The games' own saves")
 /* how the menu's own files an older Android version left go (left_clear): out of the player's reach, and the app in
    testing, its whole storage is cleared */
 #define SAY_LEFT_CLEAR                                                                                                 \
@@ -2599,71 +2667,59 @@ static int wrap_rows(const App* app, const char* s, int width, int path) {
         for (s += wrap_at(s, width, path); *s == ' ';) ++s;
     return SDL_max(rows, 1);
 }
-/* a box of files over the screen, two lines each, as many as fit from app->files_top, how many more, then OK,
-   focused: the folders and files an older version left (report 0), each where it is (-) and the space it takes; or
-   what Clean Old Settings did (1), each file and what was done to it or why not. Up/Down go over them, another key
-   closes it */
-/* the space the older version's i-th folder, old, takes, or that it is still counted */
-static void left_size(const App* app, int i, const char* old, char* out, size_t size) {
-    const GuiSpace* space = app->left_space;
-    if (space && i < __atomic_load_n(&space->counted, __ATOMIC_ACQUIRE) && !strcmp(space->dirs[i], old))
-        gui_size_text(out, size, space->bytes[i]);
-    else
-        snprintf(out, size, "%s", snx_tr("counting"));
-}
-/* the i-th file, at: its two lines, their colours, whether the second is a path; the next file, NULL after the last */
-static const char* files_entry(const App* app, int report, int i, const char* at, char* a, char* b, size_t size,
-                               SDL_Color* ca, SDL_Color* cb, int* path) {
-    SDL_Color failure = rgb(app->theme.failure), ink = rgb(app->theme.ink);
-    const char* next;
-    bool ok;
-    if (!report) {
-        left_paths(at, a, b, size);
-        left_size(app, i, a, b, size);
-        *ca = failure;
-        *cb = rgb(app->theme.soft);
-        *path = 0;
-        next = strchr(at, '\n') + 1;
-        return *next ? next : NULL;
-    }
-    next = gui_cleaned_entry(at, &ok, a, b, size);
-    *ca = ok ? ink : failure;
-    *cb = ok ? rgb(app->theme.soft) : failure;
-    *path = 0;
-    return next;
-}
+/* why the box of what Move Old Files did lists what it lists, over them */
+#define SAY_MOVED_WHY                                                                                                  \
+    SNX_TR_NOOP("An older version left these where this one no longer looks: each folder, what moved and where it is " \
+                "now")
+/* the box's entries: Move Old Files' a folder each (app->moved), Clean Old Settings' a file each (app->cleaned) */
+static const GuiCleaned* files_shown_of(const App* app) { return app->report_move ? &app->moved : &app->cleaned; }
+/* the more line under the entries: how many more, and how to get to them */
+#ifdef SNX_TOUCH_UI
+#define SAY_FILES_MORE SNX_TR_NOOP("and %d more, which Share Log lists")
+#else
+#define SAY_FILES_MORE SNX_TR_NOOP("and %d more: Up/Down, PgUp/PgDn and the wheel go over them")
+#endif
 static int rows_h(void (*layout)(GuiRect, int, GuiRect*), GuiRect (*row)(const GuiRect*, int, int, size_t),
                   GuiRect* rects, int item, int scale, int count);
-static void render_files(App* app, int report) {
-    char a[4400], b[4400], label[96];
-    const char *first = report ? app->cleaned.text : app->left, *at = first;
-    int width, height, cols, room, used = 0, shown, i, y, path, s = app->scale, ok_h, hint;
-    int count = report ? app->cleaned.count : app->lefts, done = app->cleaned.done, top;
-    SDL_Color ca, cb;
-    GuiRect r, text;
-    GuiRect ok[UI_FILES_ITEMS];
+static bool bar_place(const App* app, GuiRect area, long long total, long long view, long long at, GuiRect* track,
+                      GuiRect* thumb);
+static void bar_draw(App* app, GuiRect track, GuiRect thumb, bool held);
+/* a box of files over the screen, two lines each, as many as fit from app->files_top, how many more, then OK,
+   focused: what Move Old Files did, a folder an entry, under why they are there; or what Clean Old Settings did, a
+   file an entry. Each where it is (-) and what was done to it or why not. Up/Down go over them, an arrow at the
+   right of the first saying some are above it and one at the last's some are under it, a scroll bar beside them while
+   they do not all show; another key closes it */
+static void render_files(App* app) {
+    char a[4400], b[4400], label[128];
+    const GuiCleaned* list = files_shown_of(app);
+    const char *first, *at = list->text, *why = app->report_move ? snx_tr(SAY_MOVED_WHY) : NULL;
+    int width, height, cols, room, used = 0, shown, i, y, s = app->scale, ok_h, top, head_rows, last_y = 0;
+    int count = list->count, done = list->done;
+    bool ok;
+    GuiRect r, text, entries, track, thumb;
+    GuiRect oks_r[UI_FILES_ITEMS];
     UiList oks[UI_FILES_ITEMS] = {{0}}; /* OK in focus */
     area(app, &width, &height);
     cols = width / cell_w(app) - 6;
-    hint = !report && app->left_clear ? wrap_rows(app, snx_tr(SAY_LEFT_CLEAR), cols, 0) : 0; /* under them, before OK */
+    head_rows = why ? wrap_rows(app, why, cols, 0) + 1 : 0; /* the why, and a row under it */
     /* the first shown, kept among them when there are fewer since */
     top = app->files_top = SDL_clamp(app->files_top, 0, SDL_max(count - 1, 0));
-    for (i = 0; at && i < top; ++i) at = files_entry(app, report, i, at, a, b, sizeof a, &ca, &cb, &path);
+    for (i = 0; at && i < top; ++i) at = gui_cleaned_entry(at, &ok, a, b, sizeof a);
     first = at;
-    /* the files' rows, and one for how many more */
-    ok_h = rows_h(ui_files_layout, ui_files_row, ok, UI_FILES_OK, s, 1); /* ui.txt's scene Files: OK's row */
-    room = (height - head_h(app) - ok_h - 24 * s) / cell_h(app) - 2 - hint;
+    /* the files' rows, a letter's room at their right for the scroll bar, and one for how many more */
+    ok_h = rows_h(ui_files_layout, ui_files_row, oks_r, UI_FILES_OK, s, 1); /* ui.txt's scene Files: OK's row */
+    room = (height - head_h(app) - ok_h - 24 * s) / cell_h(app) - 2 - head_rows;
     for (shown = 0; at && top + shown < count; ++shown) {
         int need;
-        at = files_entry(app, report, top + shown, at, a, b, sizeof a, &ca, &cb, &path);
-        need = wrap_rows(app, a, cols - 2, 1) + wrap_rows(app, b, cols - 2, path);
+        at = gui_cleaned_entry(at, &ok, a, b, sizeof a);
+        need = wrap_rows(app, a, cols - 3, 1) + wrap_rows(app, b, cols - 3, 0);
         if (shown && used + need > room) break;
         used += need;
     }
     app->files_shown = shown;
-    r = over_rect(app, cols, head_h(app) + (used + (top + shown < count) + hint) * cell_h(app) + ok_h + 16 * s);
-    if (!report)
-        snprintf(label, sizeof label, "%s", snx_tr(SAY_LEFT_TITLE));
+    r = over_rect(app, cols, head_h(app) + (head_rows + used + (top + shown < count)) * cell_h(app) + ok_h + 16 * s);
+    if (app->report_delete)
+        snprintf(label, sizeof label, snx_tr("Delete All: %d done, %d not"), done, count - done);
     else if (app->report_move)
         snprintf(label, sizeof label, snx_tr("Move Old Files: %d done, %d not"), done, count - done);
     else if (count > done)
@@ -2672,21 +2728,33 @@ static void render_files(App* app, int report) {
         snprintf(label, sizeof label, snx_tr("Clean Old Settings: %d done"), done);
     y = over_box(app, r, label) + 2 * s;
     text = inner(app, r);
+    if (why) y += (wrap_in(app, text, text.x, y, why, 0, rgb(app->theme.soft)) + 1) * cell_h(app);
+    entries = gui_rect(text.x, y, text.w, used * cell_h(app));
+    text.w -= cell_w(app); /* the scroll bar's */
     for (i = 0, at = first; at && i < shown; ++i) {
-        at = files_entry(app, report, top + i, at, a, b, sizeof a, &ca, &cb, &path);
+        SDL_Color ca = rgb(app->theme.ink), cb = rgb(app->theme.soft);
+        at = gui_cleaned_entry(at, &ok, a, b, sizeof a);
+        if (!ok) ca = cb = rgb(app->theme.failure);
         text_in(app, text, text.x, y, "-", ca);
-        if (top && !i) text_in(app, r, text.x + text.w, y, "\x1e", rgb(app->theme.soft)); /* more above: its margin */
+        last_y = y;
         y += wrap_in(app, text, text.x + 2 * cell_w(app), y, a, 1, ca) * cell_h(app);
-        y += wrap_in(app, text, text.x + 2 * cell_w(app), y, b, path, cb) * cell_h(app);
+        y += wrap_in(app, text, text.x + 2 * cell_w(app), y, b, 0, cb) * cell_h(app);
     }
+    if (top) text_in(app, r, text.x + text.w, entries.y, "\x1e", rgb(app->theme.soft)); /* more above: its margin */
     if (top + shown < count) {
-        snprintf(label, sizeof label, snx_tr("and %d more, which Share Log lists"), count - top - shown);
+        text_in(app, r, text.x + text.w, last_y, "\x1f", rgb(app->theme.soft)); /* more under */
+        snprintf(label, sizeof label, snx_tr(SAY_FILES_MORE), count - top - shown);
         text_in(app, text, text.x, y, label, rgb(app->theme.soft));
-        y += cell_h(app);
     }
-    if (hint) wrap_in(app, text, text.x, y, snx_tr(SAY_LEFT_CLEAR), 0, rgb(app->theme.ink));
-    ui_files_layout(gui_rect(text.x, r.y + r.h - ok_h - 6 * s, SDL_min(text.w, 26 * cell_w(app)), ok_h), s, ok);
-    ui_files_draw(app, ok, s, oks);
+    if (bar_place(app, gui_rect(entries.x, entries.y, entries.w + cell_w(app) / 2, entries.h), count, shown, top,
+                  &track, &thumb)) {
+        track.x += cell_w(app) / 2; /* in the margin past the arrows' column */
+        thumb.x = track.x;
+        track.w = thumb.w = SDL_max(s, cell_w(app) / 4);
+        bar_draw(app, track, thumb, false);
+    }
+    ui_files_layout(gui_rect(text.x, r.y + r.h - ok_h - 6 * s, SDL_min(text.w, 26 * cell_w(app)), ok_h), s, oks_r);
+    ui_files_draw(app, oks_r, s, oks);
 }
 /* ---- a question and its choices, as the theme's options-dialog places them: in a box in the middle of their area, the
    question over the choices; or the question in a box at the area's foot, a tab with its label on the box's top edge,
@@ -2702,6 +2770,7 @@ typedef struct {
 } GuiChoices;
 /* choice i of whose choices (GuiChoicesOf) as its row reads, in out when it is made there; NULL past the last */
 static const char* choice_text(App* app, int of, int i, char* out, size_t size);
+static unsigned setup_icon(const App* app, int row);
 /* the height count rows of a scene's list take, from the first one's top to the last one's foot, as the scene lays
    them out: its layout and its row functions, rects room for its items, item the list's */
 static int rows_h(void (*layout)(GuiRect, int, GuiRect*), GuiRect (*row)(const GuiRect*, int, int, size_t),
@@ -2775,8 +2844,10 @@ static void choices_place(App* app, int of, GuiRect area, const char* question, 
     const char* label;
     memset(c, 0, sizeof *c);
     c->of = of;
-    for (; (label = choice_text(app, of, c->count, app->row_text, sizeof app->row_text)); ++c->count)
-        longest = SDL_max(longest, gui_text_cols(label) + marker + 2);
+    for (; (label = choice_text(app, of, c->count, app->row_text, sizeof app->row_text)); ++c->count) {
+        int icon = of == GUI_CHOICES_SETUP && setup_icon(app, c->count) ? 3 : 0; /* its columns and a space */
+        longest = SDL_max(longest, gui_text_cols(label) + marker + icon + 2);
+    }
     list_h = rows_h(ui_choices_layout, ui_choices_row, c->rects, UI_CHOICES_ROWS, s, c->count);
     if (app->theme.dialog == GUI_DIALOG_YORHA) {
         int margin = app->theme.cursor[0] ? gui_text_cols(app->theme.cursor) * cw : 0;
@@ -2881,9 +2952,36 @@ static const char* const ask_choices[][2] = {{SNX_TR_NOOP("Continue"), SNX_TR_NO
                                              {SNX_TR_NOOP("Cancel"), SNX_TR_NOOP("Remove")},
                                              {SNX_TR_NOOP("Cancel"), SNX_TR_NOOP("Clear")},
                                              {SNX_TR_NOOP("Yes"), SNX_TR_NOOP("No")},
+                                             {SNX_TR_NOOP("Cancel"), SNX_TR_NOOP("Delete")},
+                                             {SNX_TR_NOOP("Cancel"), SNX_TR_NOOP("Overwrite")},
                                              {SNX_TR_NOOP("OK"), NULL}};
 /* a question added to GuiAsk takes its choices here, in its place */
 typedef char snx_gui_ask_choices[SDL_arraysize(ask_choices) == GUI_ASK_ERROR + 1 ? 1 : -1];
+/* the look of each question's second choice, GuiAsk's order: the failure colour for what has no way back (a file
+   deleted, a list cleared), the warning colour for what wants care (a run ended, a warning answered Anyway, settings or
+   folders put back, files moved or cleaned, a folder off the Library); none for a choice that changes nothing kept */
+static const unsigned ask_tones[] = {UI_ATTR_CAUTION, /* Abort: the run ends */
+                                     0,               /* Exit */
+                                     0,               /* With Subfolders */
+                                     UI_ATTR_CAUTION, /* Use Anyway: a folder Android slows */
+                                     UI_ATTR_CAUTION, /* Run Anyway: an extraction that may not fit */
+                                     UI_ATTR_CAUTION, /* Clean: the old keys taken out */
+                                     UI_ATTR_CAUTION, /* Reset: every setting */
+                                     UI_ATTR_CAUTION, /* Reset: every folder picked */
+                                     UI_ATTR_CAUTION, /* Reset: a folder picked */
+                                     UI_ATTR_CAUTION, /* Remove: a folder off the Library, its games kept */
+                                     UI_ATTR_CAUTION, /* Move: what an older version left */
+                                     UI_ATTR_DANGER,  /* Delete: a save state */
+                                     UI_ATTR_DANGER,  /* Delete: a game's caches */
+                                     UI_ATTR_CAUTION, /* Exit: the run ends with the menu */
+                                     0,               /* Recompile */
+                                     UI_ATTR_DANGER,  /* Remove: a GPU driver package */
+                                     UI_ATTR_DANGER,  /* Clear: the crash list */
+                                     0,               /* No */
+                                     UI_ATTR_DANGER,  /* Delete: what an older version left */
+                                     UI_ATTR_CAUTION, /* Overwrite: users.ini, kept as users.ini.old */
+                                     0};
+typedef char snx_gui_ask_tones[SDL_arraysize(ask_tones) == GUI_ASK_ERROR + 1 ? 1 : -1];
 /* the question shown, over the whole screen in the middle or at its foot, a choice asked twice saying so once pressed:
    how many choices it has, one for a failure's OK */
 static int ask_place(App* app, GuiChoices* c) {
@@ -3056,6 +3154,7 @@ static unsigned key_icon(const char* key, const char* what) {
                  {"user", GUI_ICON_MOVE},
                  {"queue", GUI_ICON_MOVE},
                  {"scroll", GUI_ICON_MOVE},
+                 {"page", GUI_ICON_MOVE},
                  {"move, change", GUI_ICON_MOVE},
                  {"key, change", GUI_ICON_MOVE},
                  {"row, change", GUI_ICON_MOVE},
@@ -3277,7 +3376,9 @@ static GuiRect ui_row_box(const App* app, GuiRect r) {
    other blink_ms with UI_ATTR_BLINK, steady with 0), the active colour writes the one activated last, and an open one
    (UI_ATTR_OPEN) has the focus's look without the cursor; a title (UI_ATTR_TITLE) is on a band of ink in a theme of
    filled boxes, else over a rule. One with nothing to do now (UI_ATTR_OFF) is greyed, still there: written in the soft
-   colour, or inverted on it where the focus inverts */
+   colour, or inverted on it where the focus inverts. An action with no way back (UI_ATTR_DANGER) is on the page framed
+   and written in the failure colour, and filled with it, written in the page's, in focus, whatever the theme's focus;
+   one to take with care (UI_ATTR_CAUTION) so in the warning colour */
 /* a row's text's top: as item_text_y has it in a row a cell and a pixel high, in the middle of a taller one */
 static int ui_text_y(const App* app, GuiRect b) { return b.y + (b.h - cell_h(app) + app->scale) / 2; }
 static int user_side(const App* app, int h);
@@ -3357,7 +3458,9 @@ void ui_draw_row(App* app, GuiRect r, const char* text, unsigned icon, const voi
     int look = focused || (attr & UI_ATTR_OPEN), filled = t->panels == GUI_PANELS_FILL, inverted = look && t->focus_bar;
     int failing =
         (attr & UI_ATTR_FAILURE) && !((attr & UI_ATTR_BLINK) && t->blink_ms && (now_ms(app) / t->blink_ms) % 2);
-    int off = (attr & UI_ATTR_OFF) != 0;
+    int off = (attr & UI_ATTR_OFF) != 0, toned = (attr & (UI_ATTR_DANGER | UI_ATTR_CAUTION)) && !failing && !off;
+    int solid = failing || inverted || (toned && look); /* filled, written in the page colour */
+    GuiRgb tone = attr & UI_ATTR_DANGER ? t->failure : t->warning;
     GuiRect b = ui_row_box(app, r);
     char label[400];
     if (attr & UI_ATTR_LABEL) { /* between rows, as "Recent Games": no box, no marker */
@@ -3374,13 +3477,14 @@ void ui_draw_row(App* app, GuiRect r, const char* text, unsigned icon, const voi
         return;
     }
     snprintf(label, sizeof label, "%s%s%s%s", t->marker, gui_icon_utf8(icon, glyph), icon ? " " : "", text);
-    if (failing || inverted)
-        fill_rect(app, b, failing ? t->failure : off ? t->soft : t->focus);
-    else if (filled)
-        fill_rect(app, b, t->dim);
-    if (!failing && !inverted && (!filled || look)) outline(app, b, look ? t->focus : t->dim);
+    if (solid)
+        fill_rect(app, b, failing ? t->failure : toned ? tone : off ? t->soft : t->focus);
+    else if (toned || filled)
+        fill_rect(app, b, toned ? t->page : t->dim);
+    if (!solid && (!filled || look || toned)) outline(app, b, toned ? tone : look ? t->focus : t->dim);
     {
-        SDL_Color ink = rgb(failing || inverted      ? t->page
+        SDL_Color ink = rgb(solid                    ? t->page
+                            : toned                  ? tone
                             : off                    ? t->soft
                             : attr & UI_ATTR_WARNING ? t->warning
                             : attr & UI_ATTR_ACTIVE  ? t->active
@@ -3398,7 +3502,7 @@ void ui_draw_row(App* app, GuiRect r, const char* text, unsigned icon, const voi
             row_text_in(app, inner(app, b), x, ui_text_y(app, b), label, focused, ink);
     }
     if (focused && t->cursor[0]) text_in(app, r, r.x, ui_text_y(app, b), t->cursor, rgb(t->focus));
-    row_arrows(app, b, ui_text_y(app, b), attr, rgb(failing || inverted ? t->page : t->soft));
+    row_arrows(app, b, ui_text_y(app, b), attr, rgb(solid ? t->page : t->soft));
 }
 /* a label of a scene of ui.txt, in the soft colour unless it names one */
 void ui_draw_label(App* app, GuiRect r, const char* text, unsigned color) {
@@ -4322,18 +4426,35 @@ static SDL_Texture* icon_none(App* app) {
     free(pixels);
     return app->icon_none;
 }
-/* a PNG icon as its rows show it: GUI_ICON_SIDE pixels square, the alpha premultiplied; NULL when it does not read */
+/* argb, an ARGB8888 surface, as an icon's rows show it, GUI_ICON_SIDE pixels square: scaled, and one that is not square
+   (a GBA game's box) keeping its shape, centred, the rest clear. Takes argb; NULL when SDL could not */
+static SDL_Surface* icon_square(SDL_Surface* argb) {
+    SDL_Surface *scaled, *square;
+    int w, h;
+    if (!argb || (argb->w == GUI_ICON_SIDE && argb->h == GUI_ICON_SIDE)) return argb;
+    w = argb->w >= argb->h ? GUI_ICON_SIDE : SDL_max(1, argb->w * GUI_ICON_SIDE / argb->h);
+    h = argb->h >= argb->w ? GUI_ICON_SIDE : SDL_max(1, argb->h * GUI_ICON_SIDE / argb->w);
+    scaled = SDL_ScaleSurface(argb, w, h, SDL_SCALEMODE_LINEAR);
+    SDL_DestroySurface(argb);
+    if (!scaled || (w == GUI_ICON_SIDE && h == GUI_ICON_SIDE)) return scaled;
+    square = SDL_CreateSurface(GUI_ICON_SIDE, GUI_ICON_SIDE, SDL_PIXELFORMAT_ARGB8888);
+    { /* its pixels copied as they are onto clear ones */
+        SDL_Rect at = {(GUI_ICON_SIDE - w) / 2, (GUI_ICON_SIDE - h) / 2, w, h};
+        if (square && (!SDL_FillSurfaceRect(square, NULL, 0) || !SDL_SetSurfaceBlendMode(scaled, SDL_BLENDMODE_NONE) ||
+                       !SDL_BlitSurface(scaled, NULL, square, &at))) {
+            SDL_DestroySurface(square);
+            square = NULL;
+        }
+    }
+    SDL_DestroySurface(scaled);
+    return square;
+}
+/* a PNG icon as its rows show it (icon_square), the alpha premultiplied; NULL when it does not read */
 static SDL_Texture* png_icon(App* app, const char* file) {
     SDL_Surface* png = SDL_LoadPNG(file);
-    SDL_Surface* argb = png ? SDL_ConvertSurface(png, SDL_PIXELFORMAT_ARGB8888) : NULL;
-    SDL_Surface* scaled = NULL;
+    SDL_Surface* argb = icon_square(png ? SDL_ConvertSurface(png, SDL_PIXELFORMAT_ARGB8888) : NULL);
     SDL_Texture* texture = NULL;
     SDL_DestroySurface(png);
-    if (argb && (argb->w != GUI_ICON_SIDE || argb->h != GUI_ICON_SIDE)) {
-        scaled = SDL_ScaleSurface(argb, GUI_ICON_SIDE, GUI_ICON_SIDE, SDL_SCALEMODE_LINEAR);
-        SDL_DestroySurface(argb);
-        argb = scaled;
-    }
     if (argb && SDL_PremultiplySurfaceAlpha(argb, false)) {
         texture = SDL_CreateTextureFromSurface(app->renderer, argb);
         if (texture && !SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND_PREMULTIPLIED)) {
@@ -5167,7 +5288,10 @@ bool ui_addons_rows_get_row_info(App* app, size_t row, int width, UiRowInfo* inf
         why[0] = (addons_row(app, (int)row) == ROW_CLEAN_CACHE && !caches_there(app)) ||
                  (addons_row(app, (int)row) == ROW_STATES && !states_kept(app->addons_game)) ||
                  (addons_row(app, (int)row) == ROW_GPU_DRIVER && app->addons_driver_off);
-    if (why[0]) info->attr |= UI_ATTR_OFF;
+    if (why[0])
+        info->attr |= UI_ATTR_OFF;
+    else if (!app->addons_folders_shown && addons_row(app, (int)row) == ROW_CLEAN_CACHE)
+        info->attr |= UI_ATTR_DANGER; /* the caches deleted */
     return true;
 }
 static void render_addons(App* app) {
@@ -6219,22 +6343,27 @@ static int recompile_tab(const App* app, char* out, size_t size) {
     snprintf(out, size, "%s", failed ? snx_tr("Compile FAILED") : ok ? snx_tr("Compile OK") : snx_tr("Compile"));
     return failed ? GUI_TAB_FAILED : ok ? GUI_TAB_OK : GUI_TAB_GOES;
 }
-/* the tabs while the setup shows: its pages, the notices' then each step's, numbered */
-enum { SETUP_NOTICE = SNX_SETUP_STEPS }; /* a page's: a step's, or the notices' */
+/* the tabs while the setup shows: its pages, the notices' then each step's, numbered, then what older versions left.
+   A page's kind: a step's, the notices', the old files' or the Last Run's */
+enum { SETUP_NOTICE = SNX_SETUP_STEPS, SETUP_LEFT, SETUP_STOPPED };
 static const char* const setup_step_names[SNX_SETUP_STEPS] = {SNX_TR_NOOP("Appearance"), SNX_TR_NOOP("Install"),
                                                               SNX_TR_NOOP("Folders"), SNX_TR_NOOP("Keys"),
                                                               SNX_TR_NOOP("User")};
 /* each step's icon in its tab, before its name where its number was (the page's head says it, 1/5): the tabs keep
-   the width they had; the notices' after them */
-static const unsigned setup_step_icons[SNX_SETUP_STEPS + 1] = {
-    GUI_ICON_PALETTE, GUI_ICON_HARD_DRIVE_DOWNLOAD, GUI_ICON_FOLDER, GUI_ICON_KEY_ROUND, GUI_ICON_USER, GUI_ICON_INFO};
+   the width they had; the notices', the old files' (Move Old Files') and the Last Run's after them */
+static const unsigned setup_step_icons[SNX_SETUP_STEPS + 3] = {
+    GUI_ICON_PALETTE, GUI_ICON_HARD_DRIVE_DOWNLOAD, GUI_ICON_FOLDER,  GUI_ICON_KEY_ROUND, GUI_ICON_USER,
+    GUI_ICON_INFO,    GUI_ICON_FOLDER_INPUT,        GUI_ICON_ACTIVITY};
 static int tab_count(const App* app) {
     if (app->setup_on && !app->editing) return app->setup_count;
     return app->queue.count ? GUI_TABS : GUI_TAB_RECOMPILE;
 }
-/* page i's number among the steps, from 1; 0 for the notices' */
+/* page i's number among the steps, from 1; 0 for the notices', the old files' and the Last Run's */
 static int setup_number(const App* app, int i) {
-    return app->setup_pages[i] == SETUP_NOTICE ? 0 : i + (app->setup_pages[0] != SETUP_NOTICE);
+    int k, n = 0;
+    if (app->setup_pages[i] >= SETUP_NOTICE) return 0;
+    for (k = 0; k <= i; ++k) n += app->setup_pages[k] < SETUP_NOTICE;
+    return n;
 }
 static void tab_label(const App* app, int i, char* out, size_t size) {
     if ((!app->setup_on || app->editing) && i == GUI_TAB_RECOMPILE)
@@ -6245,8 +6374,10 @@ static void tab_label(const App* app, int i, char* out, size_t size) {
         char icon[4];
         gui_icon_utf8(setup_step_icons[app->setup_pages[i]], icon);
         snprintf(out, size, "%s %s", icon,
-                 app->setup_pages[i] == SETUP_NOTICE ? snx_tr("Notice")
-                                                     : snx_tr(setup_step_names[app->setup_pages[i]]));
+                 app->setup_pages[i] == SETUP_NOTICE    ? snx_tr("Notice")
+                 : app->setup_pages[i] == SETUP_LEFT    ? snx_tr("Old Files")
+                 : app->setup_pages[i] == SETUP_STOPPED ? snx_tr("Last Run")
+                                                        : snx_tr(setup_step_names[app->setup_pages[i]]));
     }
 }
 /* the columns tab i's name takes: the Compile tab's as many as its longest, so the head stays put as it changes */
@@ -6594,7 +6725,7 @@ static const char* item_about(const App* app, int item) {
                                         SNX_TR_NOOP("Runs a Linux ARM program, 64 or 32-bit"),
                                         SNX_TR_NOOP("Recompiles a 3DS game, then runs it"),
                                         SNX_TR_NOOP("Recompiles a PS Vita homebrew .vpk, then runs it"),
-                                        SNX_TR_NOOP("Runs a GBA ROM on the emulated AGB board"),
+                                        SNX_TR_NOOP("Runs a GBA ROM or MultiBoot ROM on the emulated AGB board"),
                                         SNX_TR_NOOP("Runs an Android app's .apk, .xapk or .apks")};
     if (item >= GUI_SWITCH && item <= GUI_ANDROID) return snx_tr(loads[item - GUI_SWITCH]);
     if (item == GUI_KEYS) return snx_tr("Installs prod.keys, which games are extracted with");
@@ -7038,6 +7169,7 @@ void ui_games_grid_tiles_row_action_cb(App* app, size_t row, uint32_t hit) {
 /* the focused row of Games: what it is, about it, and a line more for a recent game's or a game's kind */
 static bool game_was_old(const App* app, const char* path);
 static int row_driver(const GuiGames* games, size_t i);
+static const char* cover_why(const App* app, const char* path);
 /* a 3DS game, a Vita VPK, a GBA ROM or an Android app: a package its driver makes a game of, or runs as it is */
 static bool package(const char* name) {
     return gui_is_cia(name) || gui_is_vpk(name) || gui_is_gba(name) || gui_is_apk(name);
@@ -7102,16 +7234,21 @@ static void game_kind(const App* app, const GuiGames* games, size_t i, char* kin
                  games->addons[i]);
     else
         snprintf(kind, size, "%s",
-                 gui_is_cia(name)    ? snx_tr("3DS game, opened with scarletnx-3ds")
-                 : gui_is_vpk(name)  ? snx_tr("Vita VPK, opened with scarletnx-vita")
-                 : gui_is_gba(name)  ? snx_tr("GBA ROM, played with scarletnx-agb")
-                 : gui_is_apk(name)  ? snx_tr("Android app, run with scarletnx-android")
+                 gui_is_cia(name)         ? snx_tr("3DS game, opened with scarletnx-3ds")
+                 : gui_is_vpk(name)       ? snx_tr("Vita VPK, opened with scarletnx-vita")
+                 : gui_is_multiboot(name) ? snx_tr("GBA MultiBoot ROM, played with scarletnx-agb")
+                 : gui_is_gba(name)       ? snx_tr("GBA ROM, played with scarletnx-agb")
+                 : gui_is_apk(name)       ? snx_tr("Android app, run with scarletnx-android")
                  : gui_is_dump(name) ? snx_tr("A dump, prepared when it runs")
                                      /* Games' own rows by what list_games read, another list's from its folder */
                                      : ready_kind(games == &app->games ? app->games_drivers[i] : row_driver(games, i)));
     n = strlen(kind);
     if (!games->addons[i] && (gui_is_dump(name) || gui_is_cia(name)) && games->paths[i])
         n += icon_why_said(app, games->paths[i], kind + n, size - n);
+    else if (games->paths[i] && cover_why(app, games->paths[i]) && n < size) { /* Covers' box, not come */
+        snprintf(kind + n, size - n, snx_tr(". No box art: %s"), cover_why(app, games->paths[i]));
+        n += strlen(kind + n);
+    }
     if (game_was_old(app, games->paths[i]))
         snprintf(kind + n, size - n, "%s",
                  snx_tr(", in the games/ an older version made: new games go to recompiled/"));
@@ -7644,7 +7781,6 @@ static void draw_screen(App* app) {
     if (idle && app->addons_shown && !app->confirm.shown) render_addons(app);
     if (idle && app->options_shown && !app->confirm.shown) render_view(app);
     if (idle && app->states_shown && !app->confirm.shown) render_states(app);
-    if (idle && app->left_shown && app->lefts) render_files(app, 0);
     overlay(app);
 }
 int (*snx_menu_has_driver)(const char* name) = NULL;
@@ -7985,8 +8121,8 @@ static const GuiThemeKey app_keys[] = {
      0, NULL},
     {"", SNX_TR_NOOP("GPU Drivers"), GUI_KEY_ACTION, offsetof(GuiAppForm, drivers), sizeof(((GuiAppForm*)0)->drivers),
      NULL, 0,
-     SNX_TR_NOOP("Vulkan drivers for Adreno and Xclipse GPUs on Android (Turnip, RADV): add, remove, and the one games "
-                 "use"),
+     SNX_TR_NOOP("Vulkan drivers for Adreno, Mali and Xclipse GPUs on Android (Turnip, PanVK, RADV): add, remove, and "
+                 "the one games use"),
      0, 0, 0, 0, NULL},
     {"", SNX_TR_NOOP("Freedreno Settings"), GUI_KEY_ACTION, offsetof(GuiAppForm, freedreno),
      sizeof(((GuiAppForm*)0)->freedreno), NULL, 0,
@@ -8035,6 +8171,7 @@ static void size_shown(const App* app, char* out, size_t n) {
         size_name(app->menu.text_size, out, n);
 }
 static bool on_battery(App* app);
+static int left_groups(const App* app);
 static void app_values(App* app) {
     GuiAppForm* f = &app->app_form;
     char games[4200], work[4200];
@@ -8072,8 +8209,8 @@ static void app_values(App* app) {
         else
             snprintf(f->freedreno, sizeof f->freedreno, "%s", snx_tr("None"));
     }
-    if (app->lefts) /* as the menu last looked: when it opened, or App did */
-        snprintf(f->moves, sizeof f->moves, snx_tr("%d left"), app->lefts);
+    if (app->lefts) /* as the menu last looked: when it opened, or App did; a folder each, as the setup's pages */
+        snprintf(f->moves, sizeof f->moves, snx_tr("%d left"), left_groups(app));
     else
         snprintf(f->moves, sizeof f->moves, "%s", snx_tr("Nothing left"));
     /* the three folders under the rows, as Folders' value has no room for them; one in the data folder from it */
@@ -8378,17 +8515,19 @@ static void group_add(App* app, const char* name, int first, const char* about) 
 static const char* group_title(const char* section) {
     return strcmp(section, "On-screen controls") ? section : SNX_TR_NOOP("Overlay");
 }
-/* the icon of a group by its name (group_title's English), and of a group's row that opens a page by the page's: none
-   for one these do not name, which gui_sdl's test refuses for every section and page of settings.txt */
+/* the icon of a group by its name (group_title's English), another for each group, and of a group's row that opens a
+   page by the page's: none for one these do not name. gui_sdl's test refuses a section or a page of settings.txt
+   without one, and two groups with the same */
 static unsigned group_icon(const char* name) {
     static const struct {
         const char* name;
         unsigned icon;
-    } icons[] = {{"App", GUI_ICON_APP_WINDOW},     {"Launch", GUI_ICON_ROCKET},   {"Game", GUI_ICON_JOYSTICK},
-                 {"Display", GUI_ICON_MONITOR},    {"Graphics", GUI_ICON_IMAGE},  {"3DS", GUI_ICON_MONITOR},
-                 {"Performance", GUI_ICON_GAUGE},  {"Overlay", GUI_ICON_POINTER}, {"Controllers", GUI_ICON_GAMEPAD_2},
-                 {"Shortcuts", GUI_ICON_KEYBOARD}, {"Network", GUI_ICON_WIFI},    {"User", GUI_ICON_USER},
-                 {"Debug", GUI_ICON_BUG}};
+    } icons[] = {
+        {"App", GUI_ICON_APP_WINDOW},     {"Launch", GUI_ICON_ROCKET},   {"Game", GUI_ICON_JOYSTICK},
+        {"Display", GUI_ICON_MONITOR},    {"Graphics", GUI_ICON_IMAGE},  {"3DS", GUI_ICON_SQUARE_SPLIT_VERTICAL},
+        {"Performance", GUI_ICON_GAUGE},  {"Overlay", GUI_ICON_POINTER}, {"Controllers", GUI_ICON_GAMEPAD_2},
+        {"Shortcuts", GUI_ICON_KEYBOARD}, {"Network", GUI_ICON_WIFI},    {"User", GUI_ICON_USER},
+        {"Debug", GUI_ICON_BUG},          {"GBA", GUI_ICON_GAMEPAD}}; /* the menu's Load GBA ROM's */
     for (size_t i = 0; i < SDL_arraysize(icons); ++i)
         if (!strcmp(icons[i].name, name)) return icons[i].icon;
     return GUI_ICON_NONE;
@@ -8795,7 +8934,7 @@ static void mark_said(void* data, const SnxRunMark* mark) {
 }
 /* this launcher's start's mark (run_mark.h) in its log's folder, after each start that left its own there unended is
    said; moving it, from the folder Logs was before */
-static void mark_start(const App* app, bool moving) {
+static void mark_start(App* app, bool moving) {
     char *folder = log_folder(app), why[1024];
     bool any = false;
     snx_run_mark_end();
@@ -8803,6 +8942,7 @@ static void mark_start(const App* app, bool moving) {
         gui_log("start mark: %s: the next start cannot tell whether this one ended with an exit",
                 folder ? why : "no log folder");
     if (!any && !moving) gui_log("last start: ended with an exit, or none before");
+    if (!moving) app->mark_unended = any;
     free(folder);
 }
 #define GUI_RUN_LOGS 8 /* launchers open at once on one Logs folder, each with run logs of its own */
@@ -9654,8 +9794,8 @@ static int drivers_fill(App* app) {
         snx_gpu_driver_loads(drivers_host(app), app->drivers_about[r], sizeof app->drivers_about[r]);
     else
         snprintf(app->drivers_about[r], sizeof app->drivers_about[r], "%s",
-                 snx_tr("A driver package's zip, a meta.json and the driver's libraries at its top as Turnip's "
-                        "releases are: unpacked into gpu_drivers/ of the user's data folder"));
+                 snx_tr("A driver package's zip, a meta.json and the driver's libraries at its top as Turnip's and "
+                        "PanVK's releases are: unpacked into gpu_drivers/ of the user's data folder"));
     snprintf(f->value[r], sizeof f->value[r], "%s", lack ? lack : "");
     app->drivers_keys[r] = page_row(app->drivers_label[r], offsetof(GuiDriversForm, value) + r * sizeof f->value[0],
                                     sizeof f->value[0], app->drivers_about[r]);
@@ -9917,7 +10057,7 @@ static void picks_key(App* app, GuiKey key);
 static void open_fetch(App* app);
 static void probe_start(App* app, bool continuing);
 static void probe_clear(App* app);
-static void probe_after(App* app);
+static void probe_after(App* app, const RunEnd* end);
 static void probe_back(App* app);
 static void driver_select(App* app, int r) {
     /* Download Driver or Add Driver greyed: why, its help's words; a greyed package's box opens, for its Remove */
@@ -10304,6 +10444,236 @@ static void fetch_answer(App* app, int code, void* data) {
         free(a->r.body);
     }
     free(data);
+}
+
+/* ---- Settings > GBA > Covers: a GBA game made from a ROM, with Box art picked, gets its box from libretro-thumbnails
+   (gui/covers.h) as it is made: the ROM's CRC-32 names it in libretro-database's No-Intro list, whose copy the cache
+   keeps, and the box under that name goes in its folder as icon.png, which its rows show (gui_game_icon). One game at
+   a time on a thread, the others waiting; a game whose box did not come is kept with why for the session ---- */
+#define GUI_COVERS_LIST_MAX (16ull << 20) /* the list's most bytes: about 1 MB now */
+#define GUI_COVERS_BOX_MAX  (16ull << 20) /* a box's */
+/* body (n bytes) put at path, through a copy beside it: 0, else -1 with why */
+static int cover_keep(const char* path, const char* body, size_t n, char* why, size_t size) {
+    char *folder = snx_dirname(path), *staged = snx_format("%s.new", path), os[256];
+    int failed =
+        !folder || !staged || snx_mkdirs(folder) || snx_write_file(staged, body, n) || plat_replace_file(staged, path);
+    if (failed) {
+        snprintf(why, size, snx_tr("cannot write %s: %s"), path, snx_os_error(os, sizeof os));
+        if (staged) remove(staged);
+    }
+    free(staged);
+    free(folder);
+    return failed ? -1 : 0;
+}
+/* the game's name in the list, by crc, into job->name: the cache's copy, fetched first when there is none or when it
+   lacks crc and this session fetched none yet. 0 with the name, 1 when the list has none, -1 when it could not be had,
+   job->why saying why */
+static int cover_name(GuiCoverJob* job, uint32_t crc) {
+    size_t n = 0;
+    char* text = (char*)snx_read_file(job->list, &n);
+    SnxHttpsOptions o = {NULL, 60, GUI_COVERS_LIST_MAX, 0, NULL, NULL};
+    SnxHttpsResponse r;
+    int found = text && gui_cover_name(text, n, crc, job->name, sizeof job->name);
+    if (!found && !job->list_fetched) {
+        if (job->get(GUI_COVERS_LIST_URL, &o, &r, job->why, sizeof job->why)) {
+            free(text);
+            return -1;
+        }
+        if (r.status != 200) {
+            snprintf(job->why, sizeof job->why, snx_tr("GET %s: HTTP %d"), GUI_COVERS_LIST_URL, r.status);
+            free(r.body);
+            free(text);
+            return -1;
+        }
+        job->list_fetched = true;
+        cover_keep(job->list, r.body, r.size, job->kept, sizeof job->kept);
+        free(text);
+        text = r.body;
+        n = r.size;
+        found = gui_cover_name(text, n, crc, job->name, sizeof job->name);
+    }
+    free(text);
+    return found ? 0 : 1;
+}
+static int SDLCALL cover_run(void* data) {
+    GuiCoverJob* job = (GuiCoverJob*)data;
+    SnxHttpsOptions o = {"image/png", 60, GUI_COVERS_BOX_MAX, 0, NULL, NULL};
+    SnxHttpsResponse r = {0};
+    size_t size = 0;
+    unsigned char* rom = (unsigned char*)snx_read_file(job->rom, &size);
+    char url[1600], os[256], *icon = snx_path_join(job->folder, "icon.png");
+    uint32_t crc;
+    int named;
+    job->failed = true;
+    if (!rom) {
+        snprintf(job->why, sizeof job->why, snx_tr("cannot read %s: %s"), job->rom, snx_os_error(os, sizeof os));
+        goto said;
+    }
+    crc = gui_cover_crc(rom, size);
+    free(rom);
+    named = cover_name(job, crc);
+    if (named > 0)
+        snprintf(job->why, sizeof job->why, snx_tr("%s, CRC-32 %08X, is no game of libretro-database's No-Intro list"),
+                 snx_path_leaf(job->rom), (unsigned)crc);
+    if (named) goto said;
+    if (!gui_cover_url(job->name, url, sizeof url)) {
+        snprintf(job->why, sizeof job->why, snx_tr("the name %s makes a link past %zu bytes"), job->name, sizeof url);
+        goto said;
+    }
+    if (job->get(url, &o, &r, job->why, sizeof job->why)) goto said;
+    if (r.status == 404)
+        snprintf(job->why, sizeof job->why, snx_tr("libretro-thumbnails has no box of %s"), job->name);
+    else if (r.status != 200)
+        snprintf(job->why, sizeof job->why, snx_tr("GET %s: HTTP %d"), url, r.status);
+    else if (!gui_cover_png(r.body, r.size))
+        snprintf(job->why, sizeof job->why, snx_tr("GET %s: %zu bytes that are no PNG"), url, r.size);
+    else if (!icon)
+        snprintf(job->why, sizeof job->why, snx_tr("no room for the path of %s's icon.png"), job->folder);
+    else
+        job->failed = cover_keep(icon, r.body, r.size, job->why, sizeof job->why) != 0;
+said:
+    free(r.body);
+    free(icon);
+    fetch_push(job->event, 0, job);
+    return 0;
+}
+/* the next game waiting for its box, on a thread, while none is being fetched */
+static void cover_next(App* app) {
+    GuiCoverJob* job;
+    SDL_Thread* t;
+    if (app->covering || !app->cover_waiting) return;
+    job = app->cover_wait[0];
+    memmove(app->cover_wait, app->cover_wait + 1, (size_t)--app->cover_waiting * sizeof *app->cover_wait);
+    if (!app->cover_event) app->cover_event = SDL_RegisterEvents(1);
+    job->event = app->cover_event;
+    job->list_fetched = app->cover_list_fetched;
+    t = app->cover_event ? SDL_CreateThread(cover_run, "box art", job) : NULL;
+    if (!t) {
+        snprintf(app->message, sizeof app->message, snx_tr("%s: no box art: no thread: %s"), snx_path_leaf(job->folder),
+                 SDL_GetError());
+        free(job);
+        cover_next(app);
+        return;
+    }
+    SDL_DetachThread(t);
+    app->covering = true;
+}
+/* the failure kept for the game in folder: its index, cover_failed_count for none */
+static int cover_failure(const App* app, const char* folder) {
+    int i;
+    for (i = 0; i < app->cover_failed_count && !snx_same_file(app->cover_failed[i].folder, folder); ++i) {}
+    return i;
+}
+/* folder's game's box not come, for why: kept for its row, said and logged; why NULL: come, what was kept forgotten */
+static void cover_said(App* app, const char* folder, const char* why) {
+    int i = cover_failure(app, folder);
+    if (i < app->cover_failed_count && !why) {
+        free(app->cover_failed[i].folder);
+        app->cover_failed[i] = app->cover_failed[--app->cover_failed_count];
+    } else if (why) {
+        if (i == app->cover_failed_count) {
+            app->cover_failed =
+                (GuiCoverFailure*)snx_realloc(app->cover_failed, (size_t)(i + 1) * sizeof *app->cover_failed);
+            app->cover_failed[app->cover_failed_count++].folder = snx_strdup(folder);
+        }
+        snprintf(app->cover_failed[i].why, sizeof app->cover_failed[i].why, "%s", why);
+        snprintf(app->message, sizeof app->message, snx_tr("%s: no box art: %s"), snx_path_leaf(folder), why);
+        gui_log("Covers: %s: %s", folder, why);
+    }
+}
+/* why the game whose program is at path shows no box, as its row says it; NULL when none was asked or it came */
+static const char* cover_why(const App* app, const char* path) {
+    char* folder = path && app->cover_failed_count ? snx_dirname(path) : NULL;
+    int i = folder ? cover_failure(app, folder) : app->cover_failed_count;
+    free(folder);
+    return i < app->cover_failed_count ? app->cover_failed[i].why : NULL;
+}
+/* the thread's answer: its game's icon drawn again from its new file, or why none came kept; then the next */
+static void cover_answer(App* app, GuiCoverJob* job) {
+    app->covering = false;
+    app->cover_list_fetched = app->cover_list_fetched || job->list_fetched;
+    if (job->failed)
+        cover_said(app, job->folder, job->why);
+    else {
+        cover_said(app, job->folder, NULL);
+        icons_free(app);
+        snprintf(app->message, sizeof app->message, snx_tr("%s: box art of %s, from libretro-thumbnails"),
+                 snx_path_leaf(job->folder), job->name);
+    }
+    if (job->kept[0]) { /* the next start fetches it again */
+        size_t n = strlen(app->message);
+        snprintf(app->message + n, sizeof app->message - n, snx_tr("; the No-Intro list is not kept: %s"), job->kept);
+        gui_log("Covers: the No-Intro list is not kept: %s", job->kept);
+    }
+    free(job);
+    cover_next(app);
+}
+/* job i, a GBA game's make that ended well (of a ROM, or of a game made already): with Covers on Box art, the box of
+   the game, from the ROM its folder's .ini names, unless its folder has an icon.png already */
+static void cover_made(App* app, int i) {
+    const char* value = gui_settings_value(&app->settings, "gba_covers");
+    const char* file = gui_queue_file(&app->queue, i);
+    char *folder = NULL, *rom = NULL, *icon = NULL, *list, *cache;
+    GuiCoverJob* job;
+    if (!value || strcmp(value, "boxart")) return;
+    if (gui_game_program(file)) { /* a made game's own make (R on its row): its program, in its folder */
+        char* name = snx_strdup(snx_path_leaf(file));
+        int recorded = 0;
+#ifdef _WIN32
+        if (name && strlen(name) > 4 && !SDL_strcasecmp(name + strlen(name) - 4, ".exe")) name[strlen(name) - 4] = 0;
+#endif
+        folder = snx_dirname(file);
+        rom = folder && name ? snx_game_source(folder, name, &recorded) : NULL;
+        if (!recorded) { /* its .ini names no ROM */
+            free(rom);
+            rom = NULL;
+        }
+        free(name);
+    } else { /* a ROM: the game made of it */
+        MadeGames made;
+        const char* program;
+        made_read(app, &made);
+        program = made_program(&made, file);
+        folder = program ? snx_dirname(program) : NULL;
+        rom = snx_strdup(file);
+        made_free(&made);
+    }
+    cache = folder && rom ? menu_folder(app, SNX_USER_CACHE, false) : NULL;
+    list = cache ? snx_path_join(cache, "covers/gba-no-intro.dat") : NULL;
+    if (!folder || !rom) {
+        snprintf(app->message, sizeof app->message, snx_tr("%s: no box art: no game of %s names it as its source"),
+                 gui_queue_name(&app->queue, i), app->games_dir ? app->games_dir : "recompiled/");
+        gui_log("Covers: %s: no game names it as its source", file);
+    } else if ((icon = snx_path_join(folder, "icon.png")) != NULL && snx_is_file(icon))
+        cover_said(app, folder, NULL); /* its box came already */
+    else if (!app->https_get)
+        cover_said(app, folder, snx_tr("this build of the launcher has no HTTPS client"));
+    else if (!list)
+        cover_said(app, folder, snx_tr("no cache folder to keep the No-Intro list in"));
+    else if (app->cover_waiting == GUI_COVERS_WAIT)
+        cover_said(app, folder, snx_tr("too many games wait for theirs: make it again once they are done"));
+    else if ((job = (GuiCoverJob*)calloc(1, sizeof *job)) != NULL) {
+        job->get = app->https_get;
+        snprintf(job->rom, sizeof job->rom, "%s", rom);
+        snprintf(job->folder, sizeof job->folder, "%s", folder);
+        snprintf(job->list, sizeof job->list, "%s", list);
+        app->cover_wait[app->cover_waiting++] = job;
+        cover_next(app);
+    } else
+        cover_said(app, folder, snx_tr("no memory to ask for it"));
+    free(cache);
+    free(list);
+    free(icon);
+    free(rom);
+    free(folder);
+}
+/* what was kept for Covers, freed as the launcher ends */
+static void covers_free(App* app) {
+    for (int i = 0; i < app->cover_waiting; ++i) free(app->cover_wait[i]);
+    for (int i = 0; i < app->cover_failed_count; ++i) free(app->cover_failed[i].folder);
+    free(app->cover_failed);
+    app->cover_failed = NULL;
+    app->cover_waiting = app->cover_failed_count = 0;
 }
 
 /* Freedreno Settings' rows: Eden's presets, a row a variable set (a press removes it, as Eden's delete does),
@@ -11863,6 +12233,16 @@ static unsigned form_icon(const App* app, const GuiEditor* e, int r) {
         return page_icon(k->key);
     return GUI_ICON_NONE;
 }
+/* the look of row r of e: Settings > App's Clean Old Settings, Move Old Files and Reset to Defaults, Folders' Reset to
+   Defaults and Freedreno Settings' Clear All want care; GPU Drivers' Clear Crash List has no way back */
+static unsigned form_tone(const App* app, const GuiEditor* e, int r) {
+    const GuiThemeKey* k = gui_editor_key_of(e, r);
+    if (e->keys == app_keys) return r == GUI_APP_CLEAN || r == GUI_APP_MOVE || r == GUI_APP_RESET ? UI_ATTR_CAUTION : 0;
+    if (e->keys == app->drivers_keys) return r == app->drivers_clear ? UI_ATTR_DANGER : 0;
+    if (e->keys == app->folder_keys) return !k ? UI_ATTR_CAUTION : 0; /* Reset to Defaults */
+    if (e->keys == app->fd_keys) return k && !strcmp(k->key, "Clear All") ? UI_ATTR_CAUTION : 0;
+    return 0;
+}
 /* row r of e as a list of ui.txt asks for it, in a row width pixels wide: false past its last. In a form with icons a
    row without one starts where their text does, its values in their column; but for Folders', whose rows hold paths
    that need the room (a long one would lose what it is, default, beside it) */
@@ -11881,7 +12261,10 @@ static bool form_row_info(App* app, const GuiEditor* e, size_t r, int labels, in
         memset(line + n, ' ', 3);
     }
     info->label = line + strlen(app->theme.marker); /* ui_draw_row puts the marker */
-    if (form_row_off(app, e, (int)r)) info->attr |= UI_ATTR_OFF;
+    if (form_row_off(app, e, (int)r))
+        info->attr |= UI_ATTR_OFF;
+    else
+        info->attr |= form_tone(app, e, (int)r);
     if (app->warn_until && now_ms(app) < app->warn_until && app->warn_key[0] &&
         e->object == (char*)app->settings.values) {
         int row = setting_of(app, (int)r);
@@ -12328,6 +12711,274 @@ static void form_pointer(App* app, float x, float y) {
     }
     form_rows_pointer(app, &f, x, y, UI_HIT_CLICK);
 }
+/* ---- Last Run (gui/last_run.h): the run going kept beside its run log until the menu sees it end; a start that finds
+   one did not, and says how that run ended on the setup's Last Run page ---- */
+static bool game_run_log(const char* name, const char* file);
+#if !defined(SDL_PLATFORM_ANDROID) && !defined(SDL_PLATFORM_IOS)
+static char* run_named_log(const char* run_log, bool* ran);
+#endif
+static void probe_start(App* app, bool continuing);
+/* the run that starts kept: program the game's it plays where the menu starts that itself (a phone; NULL where the
+   run's output names its log), name what the menu calls it; Run edenprobe's folder, cases and launch with it. Written
+   beside the run log; a failure said in the launcher log, as a start after this one cannot say how the run ended */
+static void run_keep(App* app, const char* program, const char* name) {
+    char *path = gui_last_run_path(app->run_log), why[1200];
+    SDL_Time now = 0;
+    gui_last_run_free(&app->run_kept);
+    SDL_GetCurrentTime(&now);
+    app->run_kept.started = (long long)(now / SDL_NS_PER_SECOND);
+    app->run_kept.program = program ? snx_strdup(program) : NULL;
+    app->run_kept.name = snx_strdup(name ? name : "");
+    app->run_kept.probe = app->probe_launch && app->probe_folder ? snx_strdup(app->probe_folder) : NULL;
+    app->run_kept.cases = app->run_kept.probe ? app->probe_cases : -1;
+    app->run_kept.launch = app->run_kept.probe ? app->probe_launch : 0;
+    app->run_kept_written = path && !gui_last_run_write(path, &app->run_kept, why, sizeof why);
+    if (path && !app->run_kept_written) gui_log("last run: %s: the next start cannot say how this run ended", why);
+    free(path);
+}
+/* the run's end seen: its record deleted */
+static void run_forget(App* app) {
+    char *path = app->run_kept_written ? gui_last_run_path(app->run_log) : NULL, reason[256];
+    if (path && snx_path_exists(path) && remove(path))
+        gui_log("last run: %s cannot be deleted (%s): the next start says this run again", path,
+                snx_os_error(reason, sizeof reason));
+    app->run_kept_written = false;
+    free(path);
+}
+/* a computer's run that ended by SIGKILL (status 128 + 9) while the kernel's OOM kills of the menu's memory cgroup
+   (or the system's) went up since it started: the out-of-memory killer ended it, said with the counts and where they
+   are, and the memory the run held at the last look, into out. False where none are kept, or for another end */
+static bool oom_said(const App* app, int status, char* out, size_t size) {
+    char file[sizeof app->oom_file], held[32] = "?";
+    long long after;
+    if (status != 128 + 9 || app->oom_before < 0) return false;
+    after = gui_oom_kills(app->oom_events, file, sizeof file);
+    if (after <= app->oom_before || strcmp(file, app->oom_file)) return false;
+    if (app->usage.available) gui_size_text(held, sizeof held, app->usage.memory_bytes);
+    snprintf(out, size,
+             snx_tr("the kernel's out-of-memory killer ended it (oom_kill %lld to %lld in %s), and it held %s"),
+             app->oom_before, after, file, held);
+    return true;
+}
+/* the newest log of the game named name in its state folder (game_run_log), owned; NULL for none */
+static char* game_log_in(const char* folder, const char* name) {
+    char **files = NULL, *newest = NULL;
+    size_t count = 0, i;
+    SDL_Time time = 0;
+    if (!folder || snx_list_dir(folder, &files, &count)) return NULL;
+    for (i = 0; i < count; ++i) {
+        SDL_PathInfo info;
+        char* path = game_run_log(name, files[i]) ? snx_path_join(folder, files[i]) : NULL;
+        if (path && SDL_GetPathInfo(path, &info) && info.type == SDL_PATHTYPE_FILE &&
+            (!newest || info.modify_time > time)) {
+            free(newest);
+            newest = path;
+            path = NULL;
+            time = info.modify_time;
+        }
+        free(path);
+    }
+    snx_free_strings(files, count);
+    return newest;
+}
+/* the state folder of the game whose program is program, as its runtime takes it (nx/runtime/main.c's game_dirs): the
+   one <program>.folders records when it is there, else its folder's (snx_user_path); owned */
+static char* game_state_of(const char* program) {
+    char *record = snx_format("%s.folders", program), *text, *key, *value, *state = NULL, *folder;
+    size_t size = 0;
+    SnxIni ini;
+    text = (char*)snx_read_file(record, &size);
+    if (text) snx_ini_start(&ini, text);
+    while (text && !state && snx_ini_next(&ini, &key, &value))
+        if (!strcmp(key, "state") && snx_is_dir(value)) state = snx_strdup(value);
+    free(text);
+    free(record);
+    if (state) return state;
+    folder = snx_dirname(program);
+    state = folder ? snx_user_path(folder, SNX_USER_STATE) : NULL;
+    free(folder);
+    return state;
+}
+/* the game's log of run, written since it started: the one its output named (a computer's run, in the run log), else
+   the newest of its program's in the program's state folder, where the runtime writes it; owned, NULL for none */
+static char* run_game_log(const App* app, const GuiLastRun* run) {
+    char* log = NULL;
+    SDL_PathInfo info;
+#if !defined(SDL_PLATFORM_ANDROID) && !defined(SDL_PLATFORM_IOS)
+    bool ran;
+    if (!run->program && app->run_log) log = run_named_log(app->run_log, &ran);
+#else
+    (void)app;
+#endif
+    if (!log && run->program) {
+        char *folder = snx_dirname(run->program), *state = game_state_of(run->program);
+        log = folder ? game_log_in(state, snx_path_leaf(folder)) : NULL;
+        free(state);
+        free(folder);
+    }
+    if (log && (!SDL_GetPathInfo(log, &info) || info.modify_time < (SDL_Time)run->started * SDL_NS_PER_SECOND)) {
+        free(log);
+        log = NULL;
+    }
+    return log;
+}
+/* the game as its log's head names it ("ScarletNX - <name>", the runtime's first lines), into out: false for none */
+static bool log_named(const char* log, char* out, size_t size) {
+    static const char head[] = "] ScarletNX - ";
+    char line[512];
+    FILE* f = snx_fopen(log, "rb");
+    for (int i = 0; f && i < 16 && fgets(line, sizeof line, f); ++i) {
+        char* at = strstr(line, head);
+        if (!at) continue;
+        at += sizeof head - 1;
+        at[strcspn(at, "\r\n")] = 0;
+        snprintf(out, size, "%s", at);
+        fclose(f);
+        return out[0] != 0;
+    }
+    if (f) fclose(f);
+    return false;
+}
+#ifndef SDL_PLATFORM_IOS /* there the game runs under the launcher's mark */
+/* a mark beside the game's log (run_mark.h): one held is a start of the game still going; one that no program holds
+   and that started since the run did is the run's game, which did not end with an exit (the newest of them) */
+typedef struct {
+    long long since;
+    RunEnd* end;
+} RunMarks;
+static void run_mark_seen(void* data, const SnxRunMark* mark) {
+    RunMarks* m = (RunMarks*)data;
+    if (mark->held) {
+        if (m->end->how == RUN_ENDED) m->end->how = RUN_GOES;
+        return;
+    }
+    if (!mark->text || (mark->started && mark->started < m->since)) return; /* another run's, before this one */
+    if (m->end->how == RUN_CUT && mark->started <= m->end->pid_started) return;
+    m->end->how = RUN_CUT;
+    m->end->pid = mark->pid;
+    m->end->pid_started = mark->started;
+}
+#endif
+/* how run ended, which the menu did not see, into end (run_end_free): its game's log since it started, the mark of
+   that start beside it, and what the system says of that process's end */
+static void run_end_of(App* app, const GuiLastRun* run, RunEnd* end) {
+    char* system = NULL;
+    memset(end, 0, sizeof *end);
+    end->how = RUN_ENDED;
+    snprintf(end->name, sizeof end->name, "%s", run->name ? run->name : "");
+    end->log = run_game_log(app, run);
+    if (end->log) log_named(end->log, end->name, sizeof end->name);
+#ifdef SDL_PLATFORM_IOS /* the game ran in the launcher's process, under its mark */
+    end->how = app->mark_unended ? RUN_CUT : RUN_ENDED;
+#else
+    if (end->log) {
+        char *folder = snx_dirname(end->log), why[1100];
+        RunMarks marks = {run->started, end};
+        if (!folder || snx_run_mark_look(folder, run_mark_seen, &marks, why, sizeof why))
+            gui_log("last run: %s: whether its game ended with an exit is unknown", folder ? why : end->log);
+        free(folder);
+    }
+#endif
+    if (end->how != RUN_CUT) return;
+    if (app->system_said) system = snx_strdup(app->system_said);
+#ifdef SDL_PLATFORM_ANDROID
+    else
+        system = gui_android_exit_fields(end->pid, end->pid_started);
+#endif
+    gui_system_end_read(system, &end->system);
+    free(system);
+    if (!end->system.known && !app->system_said) /* what this system's ends may be, as the launcher log's mark says */
+        snprintf(end->system.none, sizeof end->system.none, "%s",
+#ifdef SDL_PLATFORM_IOS
+                 snx_tr("the system ended it: a crash, its memory limit (jetsam), or a close from the app switcher")
+#elif defined(SDL_PLATFORM_ANDROID)
+                 end->system.none
+#else
+                 snx_tr("a crash (whose report ends its log), a kill (by the system for its memory, or by the user) or "
+                        "a power loss, which the system does not name")
+#endif
+        );
+}
+static void run_end_free(RunEnd* end) {
+    free(end->log);
+    end->log = NULL;
+}
+/* how a run that did not end with an exit ended, in a line: what the system says (Android stopped it: low memory,
+   and the process's details), else what it may have been where the system names none */
+static void end_words(const RunEnd* end, char* out, size_t size) {
+    const GuiSystemEnd* s = &end->system;
+    char details[512];
+    if (!s->known) {
+        snprintf(out, size, "%s", s->none);
+        return;
+    }
+    snprintf(details, sizeof details, snx_tr("%s, status %d, importance %s"), s->process, s->status, s->importance);
+    snprintf(out, size,
+             gui_system_stopped(s->reason) ? snx_tr("Android stopped it: %s (%s%s%s)")
+                                           : snx_tr("Android says %s (%s%s%s)"),
+             s->said, details, s->description[0] ? ": " : "", s->description);
+}
+/* the memory its process held as it ended, as the system says it: ? for what it does not */
+static void end_memory(const RunEnd* end, char* out, size_t size) {
+    char pss[32] = "?", rss[32] = "?";
+    if (end->system.pss >= 0) gui_size_text(pss, sizeof pss, (uint64_t)end->system.pss << 10);
+    if (end->system.rss >= 0) gui_size_text(rss, sizeof rss, (uint64_t)end->system.rss << 10);
+    snprintf(out, size, snx_tr("PSS %s, RSS %s"), pss, rss);
+}
+/* a run's start, seconds since 1970, as local time into out ("2026-11-12 20:18:25"); ? when the system cannot say */
+static void run_when(long long started, char* out, size_t size) {
+    SDL_DateTime dt;
+    if (SDL_TimeToDateTime((SDL_Time)started * SDL_NS_PER_SECOND, &dt, true))
+        snprintf(out, size, "%04d-%02d-%02d %02d:%02d:%02d", dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second);
+    else
+        snprintf(out, size, "?");
+}
+/* the start's look at the run the menu started last and did not see end: said in the launcher log; a game that did not
+   end with an exit, or Run edenprobe left without its summary, the Last Run page (setup_start); Run edenprobe that
+   reached its summary, its counts in a box, as its end would have shown them */
+static void last_run_look(App* app) {
+    char *path = gui_last_run_path(app->run_log), why[1200], words[1100], when[32] = "?", launch[96] = "";
+    GuiLastRun run;
+    GuiProbeReport r;
+    int taken = path ? gui_last_run_take(path, &run, why, sizeof why) : 0;
+    free(path);
+    if (taken < 0) gui_log("last run: %s", why);
+    if (taken < 0 && !run.started) {
+        gui_last_run_free(&run);
+        return;
+    }
+    if (!taken) return;
+    app->stopped_due = false;
+    run_when(run.started, when, sizeof when);
+    gui_last_run_free(&app->stopped);
+    run_end_free(&app->stopped_end);
+    run_end_of(app, &run, &app->stopped_end);
+    end_words(&app->stopped_end, words, sizeof words);
+    if (run.probe) /* the probe's launch, and its cases before it */
+        snprintf(launch, sizeof launch, " (launch %d, %d cases before it)", run.launch, SDL_max(run.cases, 0));
+    gui_log("last run: %s%s, started %s, whose end this launcher did not see: %s%s%s", app->stopped_end.name, launch,
+            when,
+            app->stopped_end.how == RUN_CUT    ? "it did not end with an exit: "
+            : app->stopped_end.how == RUN_GOES ? "it still runs"
+                                               : "it ended with an exit, or before its game wrote a log",
+            app->stopped_end.how == RUN_CUT ? words : "",
+            app->stopped_end.log ? ""
+            : run.program        ? ", no log of it since it started"
+                                 : "");
+    app->stopped = run;
+    app->stopped_cases = run.probe && gui_probe_read(run.probe, &r) ? r.cases : 0;
+    if (run.probe && gui_probe_read(run.probe, &r) && r.summary) { /* its end's box, which no one showed */
+        char said[700], *report = gui_probe_report(run.probe);
+        gui_probe_said(&r, said, sizeof said);
+        snprintf(app->error_line, sizeof app->error_line, snx_tr("%s. The report: %s"), said, report ? report : "?");
+        gui_log("%s", app->error_line);
+        gui_confirm_open(&app->confirm, GUI_ASK_ERROR, false);
+        free(report);
+    } else if (run.probe) /* without its summary, the relaunch that went on after it gone with the menu: Continue */
+        app->stopped_due = app->stopped_end.how != RUN_GOES;
+    else
+        app->stopped_due = app->stopped_end.how == RUN_CUT;
+}
 /* ---- the setup a first start goes through (common/utilities/setup.h), in place of the menu: a page at a time, the
    notices of what older versions did, then each step setup.ini has left. Its boxes say what the page is about, its
    question and choices come as the theme's options-dialog places them, its tip in the foot. What a step does is done
@@ -12345,11 +12996,13 @@ static void form_pointer(App* app, float x, float y) {
 #define SAY_SETUP_TYPING SNX_TR_KEYS("Type the nickname.")
 #endif
 #define SAY_SETUP_NOTICE SAY_SETUP
+#define SAY_SETUP_LEFT   SAY_SETUP
 #else
 #define SAY_SETUP        SNX_TR_KEYS("Up/Down: choose. Enter: next. ESC: back.")
 #define SAY_SETUP_FIRST  SNX_TR_KEYS("Up/Down: choose. Enter: next. ESC: exit.")
 #define SAY_SETUP_TYPING SNX_TR_KEYS("Type the nickname. Enter: done. ESC: back.")
 #define SAY_SETUP_NOTICE SNX_TR_KEYS("Left/Right: choose. Enter: OK. ESC: exit.")
+#define SAY_SETUP_LEFT   SNX_TR_KEYS("Left/Right: choose. Enter: OK. PgUp/PgDn: page. ESC: exit.")
 #endif
 #ifdef SNX_TOUCH_UI
 #define SAY_SETUP_LOOK       SAY_SETUP
@@ -12368,6 +13021,7 @@ static void form_pointer(App* app, float x, float y) {
 #define SAY_SETUP_ON_FIRST   SNX_TR_KEYS("Up/Down: row. Enter: next. ESC: exit.")
 #endif
 #define GUI_SETUP_CHOICES 4 /* a page's, at most: Folders' and Keys' three, and Skip on the first page */
+#define GUI_SETUP_ROWS         (GUI_SETUP_CHOICES + 1) /* and the row between its two groups (setup_order) */
 /* a page's boxes above YoRHa's choices at least, else beside them: a notice's, its head and four lines, and a row */
 #define GUI_SETUP_CONTENT_ROWS 6
 #define GUI_SETUP_CONTENT_COLS 24 /* and the columns beside them it takes */
@@ -12386,10 +13040,20 @@ static void closing_start(App* app) {
 #endif
 }
 static int setup_page_of(const App* app) { return app->setup_pages[app->setup_page]; }
-static int setup_steps(const App* app) { return app->setup_count - (app->setup_pages[0] == SETUP_NOTICE); }
-/* the first page shows Skip after its own choices (setup_choice.count of them): every page left taken as its defaults
-   have it (setup_skip) */
-static int setup_skips(const App* app) { return app->setup_page == 0; }
+static int setup_steps(const App* app) {
+    int k, n = 0;
+    for (k = 0; k < app->setup_count; ++k) n += app->setup_pages[k] < SETUP_NOTICE;
+    return n;
+}
+/* the first page past the Last Run's shows Skip after its own choices (setup_choice.count of them): every page left
+   taken as its defaults have it (setup_skip); the old files' alone have their own Not Now, and the Last Run's comes
+   before any it would take */
+static int setup_skips(const App* app) {
+    return app->setup_page == (app->setup_pages[0] == SETUP_STOPPED) && setup_page_of(app) != SETUP_LEFT &&
+           setup_page_of(app) != SETUP_STOPPED;
+}
+/* the old files' pages show */
+static bool left_page(const App* app) { return app->setup_on && setup_page_of(app) == SETUP_LEFT; }
 /* a portable copy's folder beside the program (snx_portable_dir), and whether it is there: owned */
 static char* setup_portable(const App* app, bool* there) {
     char* portable = snx_portable_dir(app->drivers);
@@ -12427,11 +13091,187 @@ static void setup_type(App* app) {
 static void setup_keyboard(App* app) {
     if (app->setup_on && app->setup_typing && !SDL_TextInputActive(app->window)) SDL_StartTextInput(app->window);
 }
-/* the notices' choices: Next (OK on the last), Back before it past the first; the focus on Back while back says so and
-   there is one, else on Next */
+static int setup_notices(const App* app, int* list);
+static int clean_count(App* app, int* inis, int* keys);
+static void clean_old(App* app);
+static int left_groups(const App* app);
+static int left_pages_of(const App* app);
+static int left_group_first(const App* app, int page);
+static const char* left_nth(const App* app, int i);
+static void left_folder(const char* old, char* out, size_t size);
+static void left_page_key(const char* old, const char* now, char* out, size_t size);
+static void left_plans(App* app);
+static int move_old(App* app, GuiCleaned* done, GuiCleaned* folders, bool apply, bool pages);
+static int delete_old(App* app, GuiCleaned* done, GuiCleaned* folders, bool apply, bool pages);
+static void refresh(App* app);
+/* the last notice, while Clean Old Settings has something to take and its Clean Now was not taken: it asks */
+static bool notice_cleans(const App* app) {
+    int list[SNX_NOTICES];
+    return setup_page_of(app) == SETUP_NOTICE && app->setup_top == setup_notices(app, list) - 1 &&
+           !app->setup_cleaned && app->clean_inis_found + app->clean_keys_found > 0;
+}
+/* the notices' choices: Next (OK on the last), Back before it past the first; on the last, while it asks
+   (notice_cleans, looked for once as it comes), Clean Now and Not Now in its place, Clean Now in focus. The focus on
+   Back while back says so and there is one, else on Next, OK or Clean Now */
 static void notice_choices(App* app, bool back) {
-    app->setup_choice.count = app->setup_top > 0 ? 2 : 1;
-    app->setup_choice.focus = back && app->setup_top > 0 ? 0 : app->setup_choice.count - 1;
+    int list[SNX_NOTICES], backs = app->setup_top > 0;
+    if (app->setup_top == setup_notices(app, list) - 1 && app->clean_inis_found < 0)
+        clean_count(app, &app->clean_inis_found, &app->clean_keys_found);
+    app->setup_choice.count = backs + (notice_cleans(app) ? 2 : 1);
+    app->setup_choice.focus = back && backs ? 0 : backs;
+}
+/* the last notice's Clean Now: Clean Old Settings, as App's, said in the notice's box rather than over the screen */
+static void clean_now(App* app) {
+    clean_old(app);
+    app->cleaned_shown = false;
+    app->setup_cleaned = true;
+    app->clean_found = -1; /* App looks again */
+}
+/* the old files' choices: Next, Back before it past the first page; on the last Move All, Delete All and Not Now, Not
+   Now in focus; OK alone once one of the first two is done. The focus on Back while back says so */
+static void left_choices(App* app, bool back) {
+    int n = left_groups(app), backs = app->setup_top > 0 && !app->left_did;
+    app->setup_choice.count = app->left_did ? 1 : backs + (app->setup_top >= n - 1 ? 3 : 1);
+    app->setup_choice.focus = back && backs ? 0 : app->setup_choice.count - 1;
+}
+/* what choice i of the notices' and the old files' pages does (Skip's place is setup_choice.count), as setup_take reads
+   its place; another page's choices are SETUP_DOES_OTHER. Those from SETUP_DOES_CLEAN on act on the player's files */
+typedef enum {
+    SETUP_DOES_OTHER,
+    SETUP_DOES_BACK,
+    SETUP_DOES_NEXT,
+    SETUP_DOES_OK,
+    SETUP_DOES_NOT_NOW,
+    SETUP_DOES_SKIP,
+    SETUP_DOES_CONTINUE,
+    SETUP_DOES_CLEAN,
+    SETUP_DOES_MOVE,
+    SETUP_DOES_DELETE
+} SetupDoes;
+static SetupDoes setup_does(const App* app, int i) {
+    int page = setup_page_of(app), list[SNX_NOTICES], backs = app->setup_top > 0;
+    if (page == SETUP_STOPPED) /* Run edenprobe's Continue and Not Now, a game's OK */
+        return app->stopped.probe ? (i == 0 ? SETUP_DOES_CONTINUE : SETUP_DOES_NOT_NOW) : SETUP_DOES_OK;
+    if (page != SETUP_NOTICE && page != SETUP_LEFT) return SETUP_DOES_OTHER;
+    if (setup_skips(app) && i == app->setup_choice.count) return SETUP_DOES_SKIP;
+    if (page == SETUP_LEFT && app->left_did) return SETUP_DOES_OK;
+    if (i < backs) return SETUP_DOES_BACK;
+    if (notice_cleans(app)) return i == backs ? SETUP_DOES_CLEAN : SETUP_DOES_NOT_NOW;
+    if (page == SETUP_LEFT && app->setup_top >= left_groups(app) - 1)
+        return i == backs ? SETUP_DOES_MOVE : i == backs + 1 ? SETUP_DOES_DELETE : SETUP_DOES_NOT_NOW;
+    return app->setup_top < (page == SETUP_LEFT ? left_groups(app) : setup_notices(app, list)) - 1 ? SETUP_DOES_NEXT
+                                                                                                   : SETUP_DOES_OK;
+}
+/* the page's choices top to bottom, each its place among them (Skip's setup_choice.count): those that keep the files as
+   they are, then those that act on them (setup_does), the empty row -1 between the two groups; a page whose choices
+   all keep them, or all act, in their order. How many rows */
+static int setup_order(const App* app, int* rows) {
+    int i, n = 0, all = app->setup_choice.count + setup_skips(app), acts = 0;
+    for (i = 0; i < all; ++i)
+        if (setup_does(app, i) < SETUP_DOES_CLEAN) rows[n++] = i;
+    for (i = 0; i < all; ++i) acts += setup_does(app, i) >= SETUP_DOES_CLEAN;
+    if (acts && n) rows[n++] = -1;
+    for (i = 0; i < all; ++i)
+        if (setup_does(app, i) >= SETUP_DOES_CLEAN) rows[n++] = i;
+    return n;
+}
+/* the row choice shows on (setup_order), -1 for none */
+static int setup_order_row(const App* app, int choice) {
+    int rows[GUI_SETUP_ROWS], i, n = setup_order(app, rows);
+    for (i = 0; i < n; ++i)
+        if (rows[i] == choice) return i;
+    return -1;
+}
+/* the icon before a choice by what it does (SetupDoes' order): the verb's in F1's box (key_icon), and that of Settings >
+   App's row that does the same (Clean Old Settings, Move Old Files); none for another page's */
+static const unsigned setup_icons[] = {
+    GUI_ICON_NONE,         GUI_ICON_ARROW_LEFT, GUI_ICON_CHECK,  GUI_ICON_CHECK,        GUI_ICON_X,
+    GUI_ICON_SKIP_FORWARD, GUI_ICON_PLAY,       GUI_ICON_ERASER, GUI_ICON_FOLDER_INPUT, GUI_ICON_TRASH};
+/* a SetupDoes added takes its icon here, in its place */
+typedef char snx_setup_icons[SDL_arraysize(setup_icons) == SETUP_DOES_DELETE + 1 ? 1 : -1];
+/* what the choice on row i (setup_order) does; SETUP_DOES_OTHER between the groups */
+static SetupDoes setup_row_does(const App* app, int row) {
+    int rows[GUI_SETUP_ROWS], n = setup_order(app, rows);
+    return row >= 0 && row < n && rows[row] >= 0 ? setup_does(app, rows[row]) : SETUP_DOES_OTHER;
+}
+/* the icon before the choice on row i; none between the groups */
+static unsigned setup_icon(const App* app, int row) { return setup_icons[setup_row_does(app, row)]; }
+/* the look of the choice on row i: Delete All has no way back; Move All, Clean Now and the user's page's Overwrite
+   (users.ini kept as users.ini.old) want care */
+static unsigned setup_tone(const App* app, int row) {
+    SetupDoes does = setup_row_does(app, row);
+    if (does == SETUP_DOES_DELETE) return UI_ATTR_DANGER;
+    if (does == SETUP_DOES_MOVE || does == SETUP_DOES_CLEAN) return UI_ATTR_CAUTION;
+    return setup_page_of(app) == SNX_SETUP_USER && !app->setup_typing && row == 1 ? UI_ATTR_CAUTION : 0;
+}
+/* the old files' page to: a step on or back, the first or the last; none past them, nor once one was done */
+static void left_turn(App* app, int to) {
+    int n = left_groups(app);
+    to = SDL_clamp(to, 0, SDL_max(n - 1, 0));
+    if (app->left_did || to == app->setup_top) return;
+    app->setup_top = to;
+    left_choices(app, false);
+}
+/* the old files looked for again (the player may have moved some, F5 asked): the pages as they are now, what Move All
+   and Delete All would do looked again when they changed or plans says so, the page shown and the choice in focus
+   kept as far as they can be; none left, the setup goes on */
+static void setup_next(App* app);
+static void left_again(App* app, bool plans) {
+    int focus = app->setup_choice.focus, count = app->setup_choice.count, n;
+    char* was = app->left ? snx_strdup(app->left) : NULL;
+    left_behind(app);
+    n = left_groups(app);
+    if (!n) {
+        free(was);
+        setup_next(app);
+        return;
+    }
+    if (plans || !was || !app->left || strcmp(was, app->left)) left_plans(app);
+    free(was);
+    app->setup_top = SDL_min(app->setup_top, n - 1);
+    left_choices(app, false);
+    if (app->setup_choice.count == count) app->setup_choice.focus = focus;
+}
+/* Move All or Delete All done (did: 1 or 2), app->moved saying what to each folder: the page says it, OK goes on */
+static void left_done(App* app, int did) {
+    app->report_move = true; /* Share Log's name for what app->cleaned lists */
+    app->report_delete = did == 2;
+    app->left_did = did;
+    left_behind(app);     /* App's Move Old Files counts what is left */
+    app->games_stamp = 0; /* Games lists them again where they are */
+    left_choices(app, false);
+}
+/* Move All: each folder's entries where this version keeps them, as Move Old Files moves them */
+static void left_move(App* app) {
+    gui_cleaned_free(&app->cleaned);
+    gui_cleaned_free(&app->moved);
+    move_old(app, &app->cleaned, &app->moved, true, false); /* what it did, a folder a line: a game's saves each */
+    left_done(app, 1);
+}
+static void left_move_ask(App* app);
+/* Delete All asked first, Delete pressed twice (GUI_ASK_DELETE_OLD): how many paths go and how many stay, a save and
+   the console's keys always; with none it can delete, the foot says so and nothing is asked */
+static void setup_fail(App* app, const char* text);
+static void left_delete_ask(App* app) {
+    GuiCleaned files = {0};
+    int deleted = delete_old(app, &files, NULL, false, false), paths = files.count;
+    gui_cleaned_free(&files);
+    if (!deleted) {
+        setup_fail(app, snx_tr("Delete All deletes none of these: a save and the console's keys are only moved"));
+        return;
+    }
+    snprintf(app->ask_line, sizeof app->ask_line,
+             paths > deleted ? snx_tr("Delete All? %d deleted, %d stay: a save and the console's keys are only moved")
+                             : snx_tr("Delete All? %d deleted"),
+             deleted, paths - deleted);
+    gui_confirm_open(&app->confirm, GUI_ASK_DELETE_OLD, true);
+}
+/* its Delete pressed the second time */
+static void left_delete(App* app) {
+    gui_cleaned_free(&app->cleaned);
+    gui_cleaned_free(&app->moved);
+    delete_old(app, &app->cleaned, &app->moved, true, false);
+    left_done(app, 2);
 }
 /* the page shown from its start: its choices, the one in focus the one in use */
 static void setup_enter(App* app) {
@@ -12467,6 +13307,19 @@ static void setup_enter(App* app) {
             app->setup_choice.count = 2; /* Keep, Overwrite */
             if (!app->setup_written) setup_type(app);
             break;
+        case SETUP_STOPPED: /* Continue, in focus, and Not Now for Run edenprobe; OK for a game */
+            app->setup_choice.count = app->stopped.probe ? 2 : 1;
+            break;
+        case SETUP_LEFT: /* what an older version left, a folder a page, looked for now */
+            app->left_did = 0;
+            left_behind(app);
+            if (!left_groups(app)) { /* moved meanwhile */
+                setup_next(app);
+                return;
+            }
+            left_plans(app);
+            left_choices(app, false);
+            break;
         default: notice_choices(app, false); break; /* the notices' Next or OK, Back past the first */
     }
 }
@@ -12485,8 +13338,14 @@ static void setup_start(App* app) {
     int i;
     app->setup_on = false;
     app->setup_count = app->setup_page = 0;
+    app->clean_inis_found = app->clean_keys_found = -1;
+    app->setup_cleaned = false;
+    app->left_did = 0;
+    if (!snx_setup_skip && app->stopped_due) app->setup_pages[app->setup_count++] = SETUP_STOPPED; /* first */
     if (snx_setup_skip || !file) {
         free(file);
+        app->setup_on = app->setup_count > 0;
+        if (app->setup_on) setup_enter(app);
         scale_keep(app);
         return;
     }
@@ -12497,15 +13356,18 @@ static void setup_start(App* app) {
     if (i < SNX_NOTICES) app->setup_pages[app->setup_count++] = SETUP_NOTICE;
     for (i = 0; i < SNX_SETUP_STEPS; ++i)
         if (snx_setup_asks(&app->setup, i) && snx_setup_here(i)) app->setup_pages[app->setup_count++] = i;
+    if (app->lefts > 0) app->setup_pages[app->setup_count++] = SETUP_LEFT; /* what an older version left, last */
     app->setup_on = app->setup_count > 0;
     app->setup_save = app->setup_moved = false;
     app->setup_language = app->language;
     if (app->setup_on) setup_enter(app);
     scale_keep(app);
 }
-/* the last page done: setup.ini says so, the language picked kept in app.ini, the menu with the user its head shows */
+/* the last page done: setup.ini says so (the old files' pages alone write nothing), the language picked kept in
+   app.ini, the menu with the user its head shows */
 static void setup_finish(App* app) {
     char why[512], *file = snx_setup_file(app->home_dir ? app->home_dir : app->data_dir);
+    bool due = snx_setup_due(&app->setup);
     app->setup_on = false;
     app->setup_typing = false;
     SDL_StopTextInput(app->window);
@@ -12513,17 +13375,42 @@ static void setup_finish(App* app) {
     app->message[0] = 0;
     users_read(app);
     if (app->setup_save) app_save(app);
-    if (!file || snx_setup_done(file, &app->setup, why, sizeof why)) {
+    if (due && (!file || snx_setup_done(file, &app->setup, why, sizeof why))) {
         snprintf(app->message, sizeof app->message, snx_tr("The setup was not kept, so it asks again: %s"),
                  file ? why : snx_tr("no folder for setup.ini"));
         say_failure(app, app->message);
+    } else if (due) { /* done, as setup.ini says now */
+        app->setup.version = SDL_max(app->setup.version, SNX_SETUP_VERSION);
+        app->setup.notices = SDL_max(app->setup.notices, SNX_NOTICES);
     }
     app->setup_failed = false;
-    if (app->setup_moved) { /* in the folders it has now */
+    if (app->setup_moved) { /* in the folders it has now: what an older version left there, its pages */
+        app->setup_moved = false;
         left_behind(app);
-        app->left_shown = app->lefts > 0;
+        if (app->lefts > 0) {
+            app->setup_count = app->setup_page = 0;
+            app->setup_pages[app->setup_count++] = SETUP_LEFT;
+            app->setup_on = true;
+            setup_enter(app);
+        }
     }
     free(file);
+    app->stopped_due = false;
+    if (app->stopped_go_on) { /* the Last Run's Continue, the setup done; what stops it said over the menu, where GPU
+                                 Drivers' note is not */
+        app->stopped_go_on = false;
+        app->editor.note[0] = 0;
+        probe_start(app, true);
+        if (!app->probe_launch && !app->confirm.shown) {
+            char said[sizeof app->editor.note + 64];
+            if (app->editor.note[0])
+                snprintf(said, sizeof said, "%s", app->editor.note);
+            else
+                snprintf(said, sizeof said, snx_tr("Continue: %s holds no run of edenprobe left before its summary"),
+                         app->stopped.probe ? app->stopped.probe : "?");
+            say_failure(app, said);
+        }
+    }
     layout(app);
 }
 static void setup_next(App* app) {
@@ -12669,23 +13556,53 @@ static void setup_take(App* app) {
         case SNX_SETUP_USER:
             if (app->setup_typing)
                 setup_user_done(app);
-            else if (choice)
-                setup_type(app);
+            else if (choice) /* Overwrite, asked first */
+                gui_confirm_open(&app->confirm, GUI_ASK_OVERWRITE, false);
             else
                 setup_next(app);
             return;
-        case SETUP_NOTICE: { /* each notice read before the setup goes on, as terms are; Back the one before */
-            int list[SNX_NOTICES];
-            bool back = app->setup_choice.count == 2 && !app->setup_choice.focus;
+        case SETUP_NOTICE: { /* each notice read before the setup goes on, as terms are; Back the one before; the
+                                last one's Clean Now cleans, its box saying what it did, and Not Now goes on */
+            int list[SNX_NOTICES], backs = app->setup_top > 0;
+            bool back = backs && !choice;
             if (back)
                 --app->setup_top;
             else if (app->setup_top < setup_notices(app, list) - 1)
                 ++app->setup_top;
+            else if (notice_cleans(app) && choice == backs)
+                clean_now(app);
             else {
                 setup_next(app);
                 return;
             }
             notice_choices(app, back);
+            return;
+        }
+        case SETUP_STOPPED: /* Continue goes on with Run edenprobe once the setup is done; Not Now leaves it to GPU
+                               Drivers' Continue */
+            app->stopped_go_on = setup_does(app, choice) == SETUP_DOES_CONTINUE;
+            if (app->stopped.probe)
+                gui_log("last run: %s", app->stopped_go_on ? "Continue: edenprobe goes on from its journal"
+                                                           : "Not Now: Settings > App > GPU Drivers' Continue goes on "
+                                                             "with it later");
+            setup_next(app);
+            return;
+        case SETUP_LEFT: { /* a folder a page; on the last Move All (asked), Delete All (asked, pressed twice) or Not Now,
+                              which keeps them for Settings > App > Move Old Files; OK after either */
+            int backs = app->setup_top > 0 && !app->left_did;
+            if (app->left_did)
+                setup_next(app);
+            else if (backs && !choice) {
+                left_turn(app, app->setup_top - 1);
+                left_choices(app, true);
+            } else if (app->setup_top < left_groups(app) - 1)
+                left_turn(app, app->setup_top + 1);
+            else if (choice - backs == 0)
+                left_move_ask(app);
+            else if (choice - backs == 1)
+                left_delete_ask(app);
+            else
+                setup_next(app);
             return;
         }
         default: setup_next(app); return;
@@ -12699,6 +13616,7 @@ static void setup_skip(App* app) {
     for (;;) {
         int page = app->setup_page, top = app->setup_top;
         bool typing = app->setup_typing;
+        if (notice_cleans(app)) app->setup_choice.focus = app->setup_choice.count - 1; /* Not Now: Skip cleans none */
         setup_take(app);
         if (!app->setup_on || app->setup_failed || app->confirm.shown) return; /* done, or its failure said */
         if (page == app->setup_page && top == app->setup_top && typing == app->setup_typing) {
@@ -12787,8 +13705,21 @@ static void setup_key(App* app, GuiKey key) {
             app->setup_choice.focus = key == GUI_UP ? all.count - 1 : 0;
         return;
     }
-    did = gui_choice_key(&all, key);
-    app->setup_choice.focus = all.focus;
+    if (setup_page_of(app) == SETUP_LEFT && (key == GUI_PAGE_UP || key == GUI_PAGE_DOWN)) { /* a page back or on */
+        left_turn(app, app->setup_top + (key == GUI_PAGE_DOWN ? 1 : -1));
+        return;
+    }
+    { /* round the choices in the order their rows show them, the row between the groups passed */
+        int rows[GUI_SETUP_ROWS], shown[GUI_SETUP_ROWS], i, n = setup_order(app, rows);
+        all.count = 0;
+        for (i = 0; i < n; ++i)
+            if (rows[i] >= 0) {
+                if (rows[i] == app->setup_choice.focus) all.focus = all.count;
+                shown[all.count++] = rows[i];
+            }
+        did = gui_choice_key(&all, key);
+        app->setup_choice.focus = shown[all.focus];
+    }
     switch (did) {
         case GUI_CHOICE_TAKE: setup_take(app); break;
         case GUI_CHOICE_BACK: setup_back(app); break;
@@ -12831,6 +13762,14 @@ static bool setup_event(App* app, const SDL_Event* e) {
     }
     if (app->setup_typing && (e->key.key == SDLK_SPACE || (e->key.key >= SDLK_A && e->key.key <= SDLK_Z)))
         return true; /* letters come as text */
+    if (left_page(app) && (e->key.key == SDLK_HOME || e->key.key == SDLK_END)) { /* the old files' first or last page */
+        left_turn(app, e->key.key == SDLK_HOME ? 0 : left_groups(app) - 1);
+        return true;
+    }
+    if (left_page(app) && e->key.key == SDLK_F5) { /* looked for again now */
+        if (!e->key.repeat) refresh(app);
+        return true;
+    }
     if (menu_key_of(&e->key, &key)) setup_key(app, key);
     return true;
 }
@@ -12842,16 +13781,27 @@ static int setup_labels(const App* app, const char** labels) {
                                           SNX_TR_NOOP("Add a folder")};
     static const char* const keys[] = {SNX_TR_NOOP("Use These"), SNX_TR_NOOP("Browse..."), SNX_TR_NOOP("Later")};
     static const char* const user[] = {SNX_TR_NOOP("Keep"), SNX_TR_NOOP("Overwrite")};
-    int i, page = setup_page_of(app), count = app->setup_choice.count, list[SNX_NOTICES];
+    static const char* const clean[] = {SNX_TR_NOOP("Clean Now"), SNX_TR_NOOP("Not Now")};
+    static const char* const left[] = {SNX_TR_NOOP("Move All"), SNX_TR_NOOP("Delete All")};
+    /* the notices' and the old files' by what each does (setup_does), from SETUP_DOES_BACK on */
+    const char* const does[] = {SNX_TR_NOOP("Back"),
+                                SNX_TR_NOOP("Next"),
+                                SNX_TR_NOOP("OK"),
+                                clean[1],
+                                SNX_TR_NOOP("Skip"),
+                                SNX_TR_NOOP("Continue"),
+                                clean[0],
+                                left[0],
+                                left[1]};
+    int i, page = setup_page_of(app), count = app->setup_choice.count;
     for (i = 0; i < count; ++i)
-        labels[i] = page == SNX_SETUP_LANGUAGE                     ? snx_tr("Next")
+        labels[i] = setup_does(app, i)                             ? snx_tr(does[setup_does(app, i) - SETUP_DOES_BACK])
+                    : page == SNX_SETUP_LANGUAGE                   ? snx_tr("Next")
                     : page == SNX_SETUP_INSTALL                    ? snx_tr(install[i])
                     : page == SNX_SETUP_FOLDERS                    ? snx_tr(folders[i])
                     : page == SNX_SETUP_KEYS                       ? snx_tr(keys[i + 3 - count])
                     : page == SNX_SETUP_USER && !app->setup_typing ? snx_tr(user[i])
-                    : page == SETUP_NOTICE && i < count - 1        ? snx_tr("Back")
-                    : page == SETUP_NOTICE && app->setup_top < setup_notices(app, list) - 1 ? snx_tr("Next")
-                                                                                            : snx_tr("OK");
+                                                                   : snx_tr("OK"); /* the nickname's */
     if (setup_skips(app)) labels[count++] = snx_tr("Skip");
     return count;
 }
@@ -12859,6 +13809,16 @@ static const char* setup_question(const App* app, char* out, size_t size) {
     switch (setup_page_of(app)) {
         case SETUP_NOTICE:
             return app->setup.version ? snx_tr("Changed since the last version") : snx_tr("Changed in older versions");
+        case SETUP_LEFT: return snx_tr(SAY_LEFT_TITLE);
+        case SETUP_STOPPED:
+            snprintf(out, size,
+                     app->stopped_end.how == RUN_CUT && app->stopped_end.system.known &&
+                             gui_system_stopped(app->stopped_end.system.reason)
+                         ? snx_tr("Android stopped %s")
+                     : app->stopped.probe ? snx_tr("%s stopped before its summary")
+                                          : snx_tr("%s stopped"),
+                     app->stopped_end.name);
+            return out;
         case SNX_SETUP_LANGUAGE: return snx_tr("Appearance");
         case SNX_SETUP_INSTALL: return snx_tr("Install Type");
         case SNX_SETUP_FOLDERS: return snx_tr("Folders");
@@ -12878,6 +13838,10 @@ static const char* setup_question(const App* app, char* out, size_t size) {
 static const char* setup_tip(const App* app) {
     switch (setup_page_of(app)) {
         case SETUP_NOTICE: return snx_tr("Tip: --no-setup skips the setup");
+        case SETUP_LEFT: return snx_tr("Tip: Settings > App > Move Old Files moves them later");
+        case SETUP_STOPPED:
+            return app->stopped.probe ? snx_tr("Tip: Settings > App > GPU Drivers' Continue goes on with it later")
+                                      : snx_tr("Tip: Share Log sends the game's log");
         case SNX_SETUP_LANGUAGE: return snx_tr("Tip: games keep their own language: Settings > Display > Language");
         case SNX_SETUP_INSTALL: return snx_tr("Tip: a portable copy is a folder you can copy");
         case SNX_SETUP_FOLDERS: return snx_tr("Tip: Settings > App > Folders changes them");
@@ -12891,17 +13855,18 @@ static const char* setup_keys_said(const App* app) {
     if (setup_page_of(app) == SNX_SETUP_LANGUAGE && app->setup_row == GUI_APPEARANCE_NEXT)
         return app->setup_page ? SAY_SETUP_ON : SAY_SETUP_ON_FIRST;
     if (setup_page_of(app) == SNX_SETUP_LANGUAGE) return app->setup_page ? SAY_SETUP_LOOK : SAY_SETUP_LOOK_FIRST;
-    return app->setup_typing                    ? SAY_SETUP_TYPING
-           : setup_page_of(app) == SETUP_NOTICE ? SAY_SETUP_NOTICE
-           : app->setup_page                    ? SAY_SETUP
-                                                : SAY_SETUP_FIRST;
+    return app->setup_typing                     ? SAY_SETUP_TYPING
+           : setup_page_of(app) == SETUP_NOTICE  ? SAY_SETUP_NOTICE
+           : setup_page_of(app) == SETUP_STOPPED ? SAY_SETUP_NOTICE
+           : setup_page_of(app) == SETUP_LEFT    ? SAY_SETUP_LEFT
+           : app->setup_page                     ? SAY_SETUP
+                                                 : SAY_SETUP_FIRST;
 }
-/* the page's choice drawn in focus: the Appearance's choices only while the focus is on them, not on a row; -1 for
-   none */
+/* the row of the page's choice drawn in focus (setup_order): the Appearance's choices only while the focus is on them,
+   not on a row; -1 for none */
 static int setup_focus(const App* app) {
-    if (setup_page_of(app) == SNX_SETUP_LANGUAGE)
-        return app->setup_row == GUI_APPEARANCE_NEXT ? app->setup_choice.focus : -1;
-    return app->setup_choice.focus;
+    if (setup_page_of(app) == SNX_SETUP_LANGUAGE && app->setup_row != GUI_APPEARANCE_NEXT) return -1;
+    return setup_order_row(app, app->setup_choice.focus);
 }
 /* ---- the Appearance page's box: at the top of r, as high as its rows; under its head the rows, ui.txt's scene
    Appearance ---- */
@@ -12996,14 +13961,42 @@ static void setup_boxes(App* app, GuiSetupBoxes* b) {
             b->content = gui_rect(b->content.x, b->content.y, beside, SDL_max(0, foot - b->content.y));
     }
 }
-/* a box of lines under its label, each wrapped from a row of its own (at its slashes, as paths); the rows they took */
+#define GUI_SETUP_ROWS_MS 600 /* a box's rows too many for it roll a row this often, resting at each end */
+/* lines in text from its top, each wrapped from a row of its own (at its slashes, as paths), all when they fit; else
+   they roll up a row every GUI_SETUP_ROWS_MS to the last and back, an arrow at text's right while some are above or
+   under them and a scroll bar between the arrows, so none is cut; each in its colour of colors (NULL: color). The rows
+   they take */
+static int setup_rows(App* app, GuiRect text, const char* const* lines, int n, SDL_Color color,
+                      const SDL_Color* colors) {
+    int cw = cell_w(app), ch = cell_h(app), room = text.h / ch, total = 0, top = 0, rows = 0, i, s = app->scale;
+    GuiRect area = text, all, track, thumb;
+    for (i = 0; i < n; ++i) total += wrap_rows(app, lines[i], area.w / cw, 1);
+    if (total > room && room > 0) { /* a column for the arrows and the bar, the rows wrapped again without it */
+        area.w -= cw;
+        for (total = 0, i = 0; i < n; ++i) total += wrap_rows(app, lines[i], area.w / cw, 1);
+        top = gui_slide(total - room, now_ms(app), GUI_SETUP_ROWS_MS);
+        ui_clip(app, &text);
+    }
+    all = gui_rect(area.x, area.y - top * ch, area.w, (total + 1) * ch); /* every row, so wrap_in cuts none */
+    for (i = 0; i < n; ++i)
+        rows += wrap_in(app, all, area.x, all.y + rows * ch, lines[i], 1, colors ? colors[i] : color);
+    if (total <= room || room <= 0) return rows;
+    ui_clip(app, NULL);
+    if (top) text_in(app, text, area.x + area.w, text.y, "\x1e", rgb(app->theme.soft));
+    if (top < total - room) text_in(app, text, area.x + area.w, text.y + (room - 1) * ch, "\x1f", rgb(app->theme.soft));
+    if (room > 2 &&
+        bar_place(app, gui_rect(area.x + area.w, text.y + ch, cw, (room - 2) * ch), total, room, top, &track, &thumb)) {
+        track.x = thumb.x = area.x + area.w + cw / 2 - SDL_max(s, cw / 4) / 2;
+        track.w = thumb.w = SDL_max(s, cw / 4);
+        bar_draw(app, track, thumb, false);
+    }
+    return room;
+}
+/* a box of lines under its label (setup_rows: none cut); the rows they take */
 static int setup_box(App* app, GuiRect r, const char* label, const char* const* lines, int n) {
     GuiRect text = inner(app, r);
-    int y = pane(app, r, label), i, rows = 0;
-    text = gui_rect(text.x, y, text.w, r.y + r.h - y);
-    for (i = 0; i < n; ++i)
-        rows += wrap_in(app, text, text.x, y + rows * cell_h(app), lines[i], 1, rgb(app->theme.ink));
-    return rows;
+    int y = pane(app, r, label);
+    return setup_rows(app, gui_rect(text.x, y, text.w, r.y + r.h - y), lines, n, rgb(app->theme.ink), NULL);
 }
 /* two boxes side by side, the first of fifths of r: their rectangles */
 static void setup_split(const App* app, GuiRect r, int fifths, GuiRect* a, GuiRect* b) {
@@ -13022,11 +14015,63 @@ static const char* setup_pad(char* out, size_t size, const char* label, int cols
     snprintf(out, size, "%s%*s", snx_tr(label), SDL_max(0, cols - gui_text_cols(snx_tr(label))), "");
     return out;
 }
+/* entry k of c: its fields, false past its last */
+static bool entry_nth(const GuiCleaned* c, int k, bool* ok, char* file, char* what, size_t size) {
+    const char* at = c->text && *c->text ? c->text : NULL;
+    for (int i = 0; at; ++i) {
+        const char* next = gui_cleaned_entry(at, ok, file, what, size);
+        if (i == k) return true;
+        at = next;
+    }
+    return false;
+}
+static void clean_said(char* line, size_t size, int inis, int keys);
+/* a box of entries (GuiCleaned's) under its label, after lines: each where it is (-, its path short) and under it what
+   was done to it or why not, the failure colour on one not done; rolling as setup_rows' rows when they do not fit */
+static void setup_entries_box(App* app, GuiRect r, const char* label, const char* const* lines, int n,
+                              const GuiCleaned* entries) {
+    char file[4400], what[4400], shown[1024];
+    GuiRect text = inner(app, r);
+    int y = pane(app, r, label), i, count = n + 2 * entries->count, k = 0;
+    char* said = (char*)malloc((size_t)(2 * entries->count + 1) * 4400); /* each entry's two lines */
+    const char** all = (const char**)malloc((size_t)(count + 1) * sizeof *all);
+    SDL_Color* colors = (SDL_Color*)malloc((size_t)(count + 1) * sizeof *colors);
+    bool ok;
+    if (!said || !all || !colors) { /* no memory for their lines: the lines, then how many Share Log lists */
+        char more[96];
+        int rows = setup_rows(app, gui_rect(text.x, y, text.w, r.y + r.h - y), lines, n, rgb(app->theme.ink), NULL);
+        snprintf(more, sizeof more, snx_tr("and %d more, which Share Log lists"), entries->count);
+        text_in(app, text, text.x, y + rows * cell_h(app), more, rgb(app->theme.failure));
+        free(colors);
+        free(all);
+        free(said);
+        return;
+    }
+    for (i = 0; i < n; ++i, ++k) {
+        all[k] = lines[i];
+        colors[k] = rgb(app->theme.ink);
+    }
+    for (i = 0; entry_nth(entries, i, &ok, file, what, sizeof file); ++i) {
+        char *a = said + (size_t)(2 * i) * 4400, *b = a + 4400;
+        snx_home_short(file, shown, sizeof shown);
+        snprintf(a, 4400, "- %s", shown);
+        snprintf(b, 4400, "  %s", what);
+        all[k] = a;
+        colors[k++] = rgb(ok ? app->theme.ink : app->theme.failure);
+        all[k] = b;
+        colors[k++] = rgb(ok ? app->theme.soft : app->theme.failure);
+    }
+    setup_rows(app, gui_rect(text.x, y, text.w, r.y + r.h - y), all, k, rgb(app->theme.ink), colors);
+    free(colors);
+    free(all);
+    free(said);
+}
 static void setup_notices_box(App* app, GuiRect r) {
     static const char* const said[] = {SNX_TR_NOOP("before"), SNX_TR_NOOP("now")};
-    char text[4][320], head[64], pad[64];
-    const char* lines[4];
+    char text[6][1100], head[64], pad[64];
+    const char* lines[6];
     int list[SNX_NOTICES], n = setup_notices(app, list), k = 0, cols = setup_cols(said, 2, 2);
+    bool cleaned = app->setup_cleaned && app->setup_top == n - 1;
     if (n) { /* in the launcher's language: setup.c marks them for scripts/build-languages.py */
         const SnxNotice* notice = &snx_notices[list[SDL_min(app->setup_top, n - 1)]];
         snprintf(text[k], sizeof text[k], "%s%s", app->theme.marker, snx_tr(notice->what));
@@ -13043,7 +14088,272 @@ static void setup_notices_box(App* app, GuiRect r) {
     snprintf(text[k], sizeof text[k], "  %s", snx_tr("Not moved. See docs/user/deprecations.md"));
     lines[k] = text[k];
     ++k;
+    if (notice_cleans(app) || cleaned) { /* the last one: what Clean Now takes, or took, a row under it */
+        lines[k++] = " ";
+        if (cleaned)
+            snprintf(text[k], sizeof text[k], snx_tr("Cleaned: %d done, %d not"), app->cleaned.done,
+                     app->cleaned.count - app->cleaned.done);
+        else
+            clean_said(text[k], sizeof text[k], app->clean_inis_found, app->clean_keys_found);
+        lines[k] = text[k];
+        ++k;
+    }
     snprintf(head, sizeof head, snx_tr("Changed %d/%d"), SDL_min(app->setup_top, n - 1) + 1, n);
+    if (cleaned)
+        setup_entries_box(app, r, head, lines, k, &app->cleaned);
+    else
+        setup_box(app, r, head, lines, k);
+}
+/* the Last Run page's box: the run, when it started, how it ended and the memory its process held as the system says
+   them, its game's log; for Run edenprobe the cases so far, which Continue goes on after */
+static void setup_stopped_box(App* app, GuiRect r) {
+    static const char* const said[] = {SNX_TR_NOOP("started"), SNX_TR_NOOP("end"), SNX_TR_NOOP("memory"),
+                                       SNX_TR_NOOP("log")};
+    const RunEnd* end = &app->stopped_end;
+    char text[6][1300], pad[64], value[1100], shown[1024];
+    const char* lines[6];
+    int k = 0, cols = setup_cols(said, 4, 2);
+#define STOPPED_LINE(...) (snprintf(text[k], sizeof text[k], __VA_ARGS__), lines[k] = text[k], ++k)
+    STOPPED_LINE("%s%s", app->theme.marker, end->name);
+    run_when(app->stopped.started, value, sizeof value);
+    STOPPED_LINE("    %s%s", setup_pad(pad, sizeof pad, said[0], cols), value);
+    if (end->how == RUN_CUT)
+        end_words(end, value, sizeof value);
+    else
+        snprintf(value, sizeof value, "%s", snx_tr("it ended with an exit, or before its game wrote a log"));
+    STOPPED_LINE("    %s%s", setup_pad(pad, sizeof pad, said[1], cols), value);
+    if (end->how == RUN_CUT) {
+        end_memory(end, value, sizeof value);
+        STOPPED_LINE("    %s%s", setup_pad(pad, sizeof pad, said[2], cols), value);
+    }
+    snx_home_short(end->log ? end->log : "", shown, sizeof shown);
+    STOPPED_LINE("    %s%s", setup_pad(pad, sizeof pad, said[3], cols),
+                 end->log ? shown : snx_tr("none since it started"));
+    if (app->stopped.probe) {
+        snprintf(value, sizeof value,
+                 app->stopped_cases == 1 ? snx_tr("Continue goes on from its journal: %d case so far")
+                                         : snx_tr("Continue goes on from its journal: %d cases so far"),
+                 app->stopped_cases);
+        STOPPED_LINE("  %s", value);
+    }
+#undef STOPPED_LINE
+    setup_box(app, r, snx_tr("Last Run"), lines, k);
+}
+/* lines a row each in text from its top, all when they fit; else as many as fit but one roll a line every
+   GUI_SETUP_ROWS_MS to the last and back, an arrow at text's right while some are above or under them and a scroll bar
+   between the arrows, and the last row says how many are under them */
+static void setup_list(App* app, GuiRect text, const char* const* lines, int n) {
+    int cw = cell_w(app), ch = cell_h(app), room = text.h / ch, shown, top, more, i, s = app->scale;
+    SDL_Color ink = rgb(app->theme.ink), soft = rgb(app->theme.soft);
+    GuiRect area = text, track, thumb;
+    char said[96];
+    if (n <= room) {
+        for (i = 0; i < n; ++i) text_in(app, text, text.x, text.y + i * ch, lines[i], ink);
+        return;
+    }
+    if (room < 2) return; /* no row for one and the more line: the box is a row high */
+    shown = room - 1;
+    area.w -= cw; /* a column for the arrows and the bar */
+    top = gui_slide(n - shown, now_ms(app), GUI_SETUP_ROWS_MS);
+    more = n - top - shown;
+    for (i = 0; i < shown; ++i) text_in(app, area, area.x, area.y + i * ch, lines[top + i], ink);
+    if (top) text_in(app, text, area.x + area.w, text.y, "\x1e", soft);
+    if (more) text_in(app, text, area.x + area.w, text.y + (shown - 1) * ch, "\x1f", soft);
+    if (shown > 2 &&
+        bar_place(app, gui_rect(area.x + area.w, text.y + ch, cw, (shown - 2) * ch), n, shown, top, &track, &thumb)) {
+        track.x = thumb.x = area.x + area.w + cw / 2 - SDL_max(s, cw / 4) / 2;
+        track.w = thumb.w = SDL_max(s, cw / 4);
+        bar_draw(app, track, thumb, false);
+    }
+    if (more) {
+        snprintf(said, sizeof said, snx_tr("and %d more, which Share Log lists"), more);
+        text_in(app, text, text.x, text.y + shown * ch, said, soft);
+    }
+}
+/* row appended to rows, used bytes of room, ended by a 0; false when memory runs out */
+static bool rows_add(char** rows, size_t* used, size_t* room, const char* row) {
+    size_t n = strlen(row) + 1;
+    if (*used + n > *room) {
+        size_t want = (*used + n) * 2;
+        char* grown = (char*)realloc(*rows, want);
+        if (!grown) return false;
+        *rows = grown;
+        *room = want;
+    }
+    memcpy(*rows + *used, row, n);
+    *used += n;
+    return true;
+}
+/* the old files' page of the games' own saves, every game's on it: how many games, the space they take, where they
+   go now, what Move All does and that Delete All never deletes a save; then a line a game, its folder's name and the
+   space its saves take, rolling as setup_list's when they do not fit */
+static void setup_saves_box(App* app, GuiRect r, int page, int first) {
+    static const char* const said[] = {SNX_TR_NOOP("size"), SNX_TR_NOOP("now"), SNX_TR_NOOP("Move All"),
+                                       SNX_TR_NOOP("Delete All")};
+    char head[96], pad[64], old[4400], now[4400], key[4400], folder[4400], last[4400] = "", game[4400] = "";
+    char said_lines[5][1100], size[64], file[4400], what[4400], *rows = NULL, *save;
+    const char* lines[5];
+    const char** list = NULL;
+    const GuiSpace* space = app->left_space;
+    const char* at;
+    int cols = setup_cols(said, 4, 2), counted = space ? __atomic_load_n(&space->counted, __ATOMIC_ACQUIRE) : 0;
+    int games = 0, i, k = 0, head_rows = 0, ch = cell_h(app);
+    uint64_t all = 0, one = 0;
+    bool ok, counting = false, game_counting = false;
+    size_t used = 0, room = 0;
+    GuiRect text = inner(app, r);
+    /* each game a row: its folder's name (the one over its <id>_data/) and its saves' space */
+    for (i = first;; ++i) {
+        at = i < app->lefts ? left_nth(app, i) : NULL;
+        if (at) {
+            left_paths(at, old, now, sizeof old);
+            left_page_key(old, now, key, sizeof key);
+            left_folder(old, folder, sizeof folder);
+        }
+        if (last[0] && (!at || strcmp(key, LEFT_SAVES) || strcmp(folder, last))) { /* the game before, whole */
+            gui_size_text(size, sizeof size, one);
+            snprintf(file, sizeof file, "%s  %s", game, game_counting ? snx_tr("counting") : size);
+            if (!rows_add(&rows, &used, &room, file)) break;
+            ++games;
+        }
+        if (!at || strcmp(key, LEFT_SAVES)) break;
+        if (strcmp(folder, last)) { /* a game: <games>/<id>/<id>_data/save; or a save of the data folder's save/, by
+                                       its path there (device/<id>) */
+            char *data = snx_dirname(folder), *dir = data ? snx_dirname(data) : NULL;
+            const char* name = dir ? dir + strlen(dir) : NULL;
+            while (name && name > dir && name[-1] != '/' && name[-1] != '\\') --name;
+            if (!strcmp(folder, old)) { /* left_is_save's, not in a game's <id>_data/save: what follows its save/ */
+                const char* in = old + strlen(old);
+                while (in - old >= 6 && !((in[-6] == '/' || in[-6] == '\\') && !strncmp(in - 5, "save", 4) &&
+                                          (in[-1] == '/' || in[-1] == '\\')))
+                    --in;
+                name = in - old >= 6 ? in : old;
+            }
+            snprintf(game, sizeof game, "%s", name ? name : folder);
+            snprintf(last, sizeof last, "%s", folder);
+            free(dir);
+            free(data);
+            one = 0;
+            game_counting = false;
+        }
+        if (space && i < counted && !strcmp(space->dirs[i], old)) {
+            one += space->bytes[i];
+            all += space->bytes[i];
+        } else
+            counting = game_counting = true;
+    }
+    list = games ? (const char**)malloc((size_t)games * sizeof *list) : NULL;
+    for (i = 0, save = rows; list && i < games; ++i, save += strlen(save) + 1) list[i] = save;
+#define SAVES_LINE(...) (snprintf(said_lines[k], sizeof said_lines[k], __VA_ARGS__), lines[k] = said_lines[k], ++k)
+    snprintf(what, sizeof what, games == 1 ? snx_tr("%d game") : snx_tr("%d games"), games);
+    SAVES_LINE("%s%s: %s", app->theme.marker, snx_tr(SAY_LEFT_SAVES), what);
+    if (counting)
+        snprintf(size, sizeof size, "%s", snx_tr("counting"));
+    else
+        gui_size_text(size, sizeof size, all);
+    SAVES_LINE("    %s%s", setup_pad(pad, sizeof pad, said[0], cols), size);
+    save = app->data_dir ? snx_path_join(app->data_dir, "save") : NULL;
+    snx_home_short(save ? save : "save/", what, sizeof what);
+    free(save);
+    SAVES_LINE("    %s%s", setup_pad(pad, sizeof pad, said[1], cols), what);
+    if (entry_nth(&app->left_plan, page, &ok, file, what, sizeof file))
+        SAVES_LINE("    %s%s", setup_pad(pad, sizeof pad, said[2], cols), what);
+    if (entry_nth(&app->left_drop, page, &ok, file, what, sizeof file))
+        SAVES_LINE("    %s%s", setup_pad(pad, sizeof pad, said[3], cols), what);
+#undef SAVES_LINE
+    snprintf(head, sizeof head, snx_tr("Old Files %d/%d"), page + 1, left_groups(app));
+    text = gui_rect(text.x, pane(app, r, head), text.w, 0);
+    text.h = r.y + r.h - text.y;
+    for (i = 0; i < k; ++i) head_rows += wrap_rows(app, lines[i], text.w / cell_w(app), 1);
+    if (text.h / ch >= head_rows + 3) { /* the lines, then the games, rolling under them */
+        setup_rows(app, gui_rect(text.x, text.y, text.w, head_rows * ch), lines, k, rgb(app->theme.ink), NULL);
+        if (list)
+            setup_list(app,
+                       gui_rect(text.x + 2 * cell_w(app), text.y + (head_rows + 1) * ch, text.w - 2 * cell_w(app),
+                                text.h - (head_rows + 1) * ch),
+                       list, games);
+    } else /* a box too short for both: the lines alone, rolling */
+        setup_rows(app, text, lines, k, rgb(app->theme.ink), NULL);
+    free(list);
+    free(rows);
+}
+/* the old files' page: the folder an older version left (a game's save/ for each of its kinds), the space it takes,
+   where its entries go now, and what Move All and Delete All would do to it, with the menu's own files an older
+   Android version kept out of reach how they go; once one of them was done, what it did to each folder */
+static void setup_left_box(App* app, GuiRect r) {
+    static const char* const said[] = {SNX_TR_NOOP("size"), SNX_TR_NOOP("now"), SNX_TR_NOOP("Move All"),
+                                       SNX_TR_NOOP("Delete All")};
+    enum { LINES = 40 }; /* setup_rows rolls them when the box is short */
+    char text[LINES][1100], head[96], pad[64], old[4400], now[4400], folder[4400], here[4400], last[4400] = "";
+    char shown[1024], file[4400], what[4400];
+    const char* lines[LINES];
+    const char* at;
+    const GuiSpace* space = app->left_space;
+    int n = left_groups(app), page = SDL_min(app->setup_top, n - 1), first, k = 0, i, pass, unlisted = 0;
+    int cols = setup_cols(said, 4, 2), counted = space ? __atomic_load_n(&space->counted, __ATOMIC_ACQUIRE) : 0;
+    uint64_t bytes = 0;
+    bool ok, counting = false, out_of_reach = false;
+    if (app->left_did) {
+        snprintf(head, sizeof head,
+                 app->left_did == 2 ? snx_tr("Delete All: %d done, %d not") : snx_tr("Move All: %d done, %d not"),
+                 app->moved.done, app->moved.count - app->moved.done);
+        setup_entries_box(app, r, head, NULL, 0, &app->moved);
+        return;
+    }
+    first = left_group_first(app, page);
+    if (first < 0) return; /* none left: the setup goes on at the next look */
+    left_paths(left_nth(app, first), old, now, sizeof old);
+    left_page_key(old, now, folder, sizeof folder);
+    if (!strcmp(folder, LEFT_SAVES)) {
+        setup_saves_box(app, r, page, first);
+        return;
+    }
+#define LEFT_LINE(...) (snprintf(text[k], sizeof text[k], __VA_ARGS__), lines[k] = text[k], ++k)
+    snx_home_short(folder, shown, sizeof shown);
+    LEFT_LINE("%s%s", app->theme.marker, shown);
+    for (pass = 0; pass < 2; ++pass) { /* the space its paths take, each once; then where each goes */
+        last[0] = 0;
+        if (pass) {
+            if (counting)
+                snprintf(what, sizeof what, "%s", snx_tr("counting"));
+            else
+                gui_size_text(what, sizeof what, bytes);
+            LEFT_LINE("    %s%s", setup_pad(pad, sizeof pad, said[0], cols), what);
+        }
+        for (i = first; (at = left_nth(app, i)) != NULL && i < app->lefts; ++i) {
+            left_paths(at, old, now, sizeof old);
+            left_page_key(old, now, here, sizeof here);
+            if (strcmp(here, folder)) break;
+            if (!pass && strcmp(old, last)) {
+                if (space && i < counted && !strcmp(space->dirs[i], old))
+                    bytes += space->bytes[i];
+                else
+                    counting = true;
+                out_of_reach = out_of_reach || (app->menu_old && snx_path_within(old, app->menu_old));
+            }
+            snprintf(last, sizeof last, "%s", old);
+            if (pass && k >= LINES - 5) /* the lines after them kept: how many more, said */
+                ++unlisted;
+            else if (pass) { /* the label on the first, the others under its value */
+                snx_home_short(now, shown, sizeof shown);
+                if (i == first)
+                    LEFT_LINE("    %s%s", setup_pad(pad, sizeof pad, said[1], cols), shown);
+                else
+                    LEFT_LINE("    %*s%s", cols, "", shown);
+            }
+        }
+    }
+    if (unlisted) {
+        snprintf(what, sizeof what, snx_tr("and %d more, which Share Log lists"), unlisted);
+        LEFT_LINE("    %*s%s", cols, "", what);
+    }
+    if (entry_nth(&app->left_plan, page, &ok, file, what, sizeof file))
+        LEFT_LINE("    %s%s", setup_pad(pad, sizeof pad, said[2], cols), what);
+    if (entry_nth(&app->left_drop, page, &ok, file, what, sizeof file))
+        LEFT_LINE("    %s%s", setup_pad(pad, sizeof pad, said[3], cols), what);
+    if (out_of_reach) LEFT_LINE("  %s", snx_tr(SAY_LEFT_CLEAR));
+#undef LEFT_LINE
+    snprintf(head, sizeof head, snx_tr("Old Files %d/%d"), page + 1, n);
     setup_box(app, r, head, lines, k);
 }
 /* users.ini's users, a row each: the picture, the nickname, the uid */
@@ -13135,6 +14445,8 @@ static void setup_panes(App* app, GuiRect r) {
 #define SETUP_LINE(...) (snprintf(text[n], sizeof text[n], __VA_ARGS__), lines[n] = text[n], ++n)
     switch (setup_page_of(app)) {
         case SETUP_NOTICE: setup_notices_box(app, r); break;
+        case SETUP_LEFT: setup_left_box(app, r); break;
+        case SETUP_STOPPED: setup_stopped_box(app, r); break;
         case SNX_SETUP_LANGUAGE: {
             GuiAppearanceBoxes a;
             appearance_boxes(app, r, &a);
@@ -13477,7 +14789,7 @@ static void render(App* app) {
             render_users(app); /* opened from the form's head, as from the menu's */
     } else
         draw_screen(app);
-    if (app->cleaned_shown) render_files(app, 1); /* over the menu, or the App's rows it was started from */
+    if (app->cleaned_shown) render_files(app); /* over the menu, or the App's rows it was started from */
     if (app->help_shown) render_help(app);
     fades_draw(app);
     SDL_RenderPresent(app->renderer);
@@ -13574,6 +14886,7 @@ static int play_as(App* app, const char* asked, bool next) {
     SDL_GetCurrentTime(&app->played_at);
     ok = gui_android_play(argv, app->message, sizeof(app->message));
     if (ok) app->playing = true; /* the queue's recompile goes gently until the menu shows again */
+    if (ok) run_keep(app, game, snx_path_leaf(game));
     app->run_started_ms = SDL_max(now_ms(app), 1);
     if (debug_log(app))
         run_said(app, "run", ok ? "starts in the game's activity, a process of its own" : app->message, 0);
@@ -13632,9 +14945,10 @@ static bool next_program(App* app) {
     return ok;
 }
 static char* newest_log(const App* app);
-/* the game activity has ended: a failure its log shows (a crash, an error) stays on the run's screen, as a game that
-   fails on a computer does, with Share Log blinking. The game's own error screen shows no crash */
-static void game_end(App* app) {
+/* the game activity has ended: a failure its log shows (a crash, an error), or an end its log cannot show (ended:
+   Android's kill of a game that did not end with an exit), stays on the run's screen, as a game that fails on a
+   computer does, with Share Log blinking. The game's own error screen shows no crash */
+static void game_end(App* app, const RunEnd* ended) {
     char *log = newest_log(app), what[1024], lines[4096];
     SDL_PathInfo info;
     int end = -1;
@@ -13649,13 +14963,18 @@ static void game_end(App* app) {
         snprintf(said, sizeof said, "ended, %s: %s", end >= 0 ? "its log says" : "its log unread", what);
         run_said(app, "run", said, app->run_started_ms);
     }
-    if (end == SNX_LOG_NONE) {
+    if (end == SNX_LOG_NONE && ended->how == RUN_CUT) { /* its log says nothing of it: Android's kill, a signal */
+        char memory[64];
+        end_words(ended, what, sizeof what);
+        end_memory(ended, memory, sizeof memory);
+        snprintf(what + strlen(what), sizeof what - strlen(what), "; %s", memory);
+    } else if (end == SNX_LOG_NONE) {
         free(log);
         return;
     }
     gui_steps_reset(&app->steps); /* the steps that made it ready ended well: under the failure they read as its end */
     gui_console_init(&app->console, app->cols - 2, app->rows - 8);
-    if (end > 0) gui_console_feed(&app->console, lines, strlen(lines));
+    if (end >= 0 && lines[0]) gui_console_feed(&app->console, lines, strlen(lines));
     snprintf(app->message, sizeof app->message, snx_tr("The game stopped: %s"), what);
     gui_log("%s", app->message);
     app->finished = app->abnormal_exit = app->log_due = true;
@@ -13734,6 +15053,7 @@ static int play(App* app, const char* asked) {
     if (freedreno) argv[n++] = freedreno;
     argv[n] = NULL;
     if (debug_log(app)) run_said(app, "run", "starts in this process once the menu closes", 0);
+    run_keep(app, game, snx_path_leaf(game));
     gui_apple_play(argv);
     free(driver);
     free(freedreno);
@@ -13816,28 +15136,47 @@ static bool saves_global(const App* app) {
     free(text);
     return global;
 }
-/* save_layout=global: the saves the games of folder keep in their own folders, <id>/<id>_data/save/<kind>, each now in
-   the data folder's save/ as fs.c's save_global has them: an Account save in user.<uid>/<id>, Device's and BCAT's in
-   device/<id> and bcat/<id>, cache storage in cache/<id>/0 (a game's own folder held its indices as one). A System
-   save stays, its folder there named by a save ID the game's own did not keep, which the game's run says; a game with
-   no title ID of its own keeps its saves */
-static void left_saves(App* app, const char* folder) {
+/* a save as the versions before kept one, the game's own files in the folder save itself: this one keeps a save's last
+   commit in its 0/ (fs.c's "A save's commit"), where Move Old Files puts them */
+static void left_save(App* app, const char* save) {
+    char now[SNX_PATH_SIZE];
+    if (gui_save_old(save) && !snx_path_format(now, sizeof now, "%s/" SNX_SAVE_COMMITTED, save))
+        left_line(app, save, now, true);
+}
+/* whether old and now are such a save's line: the folder, and its 0/ */
+static bool left_is_save(const char* old, const char* now) {
+    size_t n = strlen(old);
+    return strlen(now) == n + 1 + strlen(SNX_SAVE_COMMITTED) && !strncmp(now, old, n) &&
+           (now[n] == '/' || now[n] == '\\') && !strcmp(now + n + 1, SNX_SAVE_COMMITTED);
+}
+/* The saves the games of folder keep in their own folders, <id>/<id>_data/save/<kind>. With global (save_layout=global)
+   each is now in the data folder's save/ as fs.c's save_global has them: an Account save in user.<uid>/<id>, Device's
+   and BCAT's in device/<id> and bcat/<id>, cache storage in cache/<id>/0 (a game's own folder held its indices as
+   one), its files in that folder's 0/ at once (gui_move_save_into). A System save stays, its folder there named by a
+   save ID the game's own did not keep, which the game's run says. A game with no title ID of its own keeps its saves,
+   and so does every game with save_layout=game: those are listed while they are as the versions before kept a save
+   (left_save) */
+static void left_saves(App* app, const char* folder, bool global) {
     char **names = NULL, **kinds = NULL;
     size_t count = 0, kinds_count = 0, i, k;
     if (!folder || !app->data_dir || snx_list_dir(folder, &names, &count)) return;
     for (i = 0; i < count; ++i) {
         char save[SNX_PATH_SIZE], old[SNX_PATH_SIZE], now[SNX_PATH_SIZE];
         SnxU64 id;
-        if (!snx_title_parse(names[i], &id) ||
-            snx_path_format(save, sizeof save, "%s/%s/%s_data/save", folder, names[i], names[i]) ||
+        bool moves = global && snx_title_parse(names[i], &id);
+        if (snx_path_format(save, sizeof save, "%s/%s/%s_data/save", folder, names[i], names[i]) ||
             snx_list_dir(save, &kinds, &kinds_count))
             continue;
         for (k = 0; k < kinds_count; ++k) {
             const char* kind = kinds[k];
             bool user = !strncmp(kind, "user.", 5) && strlen(kind) == 37, cache = !strcmp(kind, "cache");
-            if ((user || cache || !strcmp(kind, "device") || !strcmp(kind, "bcat")) &&
-                !snx_path_format(old, sizeof old, "%s/%s", save, kind) &&
-                !snx_path_format(now, sizeof now, "%s/save/%s/%s%s", app->data_dir, kind, names[i], cache ? "/0" : ""))
+            if ((!user && !cache && strcmp(kind, "device") && strcmp(kind, "bcat")) ||
+                snx_path_format(old, sizeof old, "%s/%s", save, kind))
+                continue;
+            if (!moves)
+                left_save(app, old);
+            else if (!snx_path_format(now, sizeof now, "%s/save/%s/%s%s", app->data_dir, kind, names[i],
+                                      cache ? "/0" : ""))
                 left_line(app, old, now, has_files(old));
         }
         snx_free_strings(kinds, kinds_count);
@@ -13845,6 +15184,42 @@ static void left_saves(App* app, const char* folder) {
         kinds_count = 0;
     }
     snx_free_strings(names, count);
+}
+/* the saves in folder, a folder each, deep folders down: save/device/<title ID> is 1 down from save/device, cache
+   storage's save/cache/<title ID>/<index> 2 */
+static void left_saves_in(App* app, const char* folder, int deep) {
+    char **names = NULL, path[SNX_PATH_SIZE];
+    size_t count = 0, i;
+    if (snx_list_dir(folder, &names, &count)) return;
+    for (i = 0; i < count; ++i) {
+        size_t n = strlen(names[i]), tail = sizeof GUI_SAVE_MOVING - 1;
+        /* a move of the save beside it that was cut short, which that save's line goes on from */
+        if ((n > tail && !strcmp(names[i] + n - tail, GUI_SAVE_MOVING)) ||
+            snx_path_format(path, sizeof path, "%s/%s", folder, names[i]) || !snx_is_dir(path))
+            continue;
+        if (deep > 1)
+            left_saves_in(app, path, deep - 1);
+        else
+            left_save(app, path);
+    }
+    snx_free_strings(names, count);
+}
+/* the data folder's save/ (save_layout=global's): each save there that is as the versions before kept one */
+static void left_saves_global(App* app) {
+    char **kinds = NULL, path[SNX_PATH_SIZE];
+    size_t count = 0, i;
+    if (!app->data_dir || snx_path_format(path, sizeof path, "%s/save", app->data_dir) ||
+        snx_list_dir(path, &kinds, &count))
+        return;
+    for (i = 0; i < count; ++i) {
+        const char* kind = kinds[i];
+        bool user = !strncmp(kind, "user.", 5) && strlen(kind) == 37, cache = !strcmp(kind, "cache");
+        if ((user || cache || !strcmp(kind, "device") || !strcmp(kind, "bcat") || !strcmp(kind, "system") ||
+             !strcmp(kind, "sysbcat")) &&
+            !snx_path_format(path, sizeof path, "%s/save/%s", app->data_dir, kind))
+            left_saves_in(app, path, cache ? 2 : 1);
+    }
+    snx_free_strings(kinds, count);
 }
 /* the data folder's games/, where an older version made its games, while it is not the folder games go to: its games
    are still listed until the player moves them to recompiled/. NULL when there is none */
@@ -13952,10 +15327,9 @@ static void left_behind(App* app) {
 #endif
     left_games(app, app->games_dir);
     for (i = 0; i < app->folder_count; ++i) left_games(app, app->folders[i]);
-    if (saves_global(app)) {
-        left_saves(app, app->games_dir);
-        for (i = 0; i < app->folder_count; ++i) left_saves(app, app->folders[i]);
-    }
+    left_saves(app, app->games_dir, saves_global(app));
+    for (i = 0; i < app->folder_count; ++i) left_saves(app, app->folders[i], saves_global(app));
+    left_saves_global(app);
     /* the data folder's games/, recompiled/ now */
     old = games_old(app);
     if (old && app->games_dir) left_line(app, old, app->games_dir, has_files(old));
@@ -13979,6 +15353,7 @@ static void left_behind(App* app) {
         free(now);
     }
     left_count(app);
+    app->left_pages = left_pages_of(app);
     free(kept);
     free(moved);
     free(work);
@@ -14035,7 +15410,7 @@ static void clean_keys(App* app, const char* file, const char* unread, int faile
 static void clean_old(App* app) {
     char unread[1024];
     gui_cleaned_free(&app->cleaned);
-    app->report_move = false;
+    app->report_move = app->report_delete = false;
     clean_inis(app, &app->cleaned);
     if (settings_unread(app, unread, sizeof unread))
         clean_keys(app, app->settings_file, unread, gui_settings_save(&app->settings, app->settings_file));
@@ -14044,23 +15419,129 @@ static void clean_old(App* app) {
     app->cleaned_shown = app->cleaned.count > 0;
     app->files_top = 0;
 }
-/* the moves of Move Old Files, made with apply, else what they would be, an entry each in done: each folder app->left
-   names, entry by entry, into the one this version keeps it in; the menu's gui/ split by its files between the config
-   and state folders; with the data folder's games/, its games' settings and caches in the config, state and cache
-   folders. A game laid out beside others is not moved: its run from its dump makes its folder (docs/user/deprecations.md).
-   How many entries move */
+/* the i-th line of app->left, NULL past its last */
+static const char* left_nth(const App* app, int i) {
+    const char* at = app->left;
+    for (; at && *at && i > 0; --i) at = strchr(at, '\n') ? strchr(at, '\n') + 1 : NULL;
+    return at && *at ? at : NULL;
+}
+/* the folder of the old files' page an old path is on: a game's save/ for each of its kinds (<id>_data/save/<kind>),
+   else the path itself (gui/'s two lines, one for the config folder and one for the state folder, are one page) */
+static void left_folder(const char* old, char* out, size_t size) {
+    const char *name = old + strlen(old), *parent, *grand;
+    while (name > old && name[-1] != '/' && name[-1] != '\\') --name;
+    parent = name > old ? name - 1 : old; /* the separator before it: save/ is what ends there */
+    for (grand = parent; grand > old && grand[-1] != '/' && grand[-1] != '\\';) --grand;
+    if (parent - grand == 4 && !strncmp(grand, "save", 4) && grand - old > 6 && !strncmp(grand - 6, "_data", 5))
+        snprintf(out, size, "%.*s", (int)(parent - old), old);
+    else
+        snprintf(out, size, "%s", old);
+}
+/* the page an old path going to now is on: one for every game's own saves and every save the versions before kept
+   (left_is_save), LEFT_SAVES, else its folder's (left_folder) */
+static void left_page_key(const char* old, const char* now, char* out, size_t size) {
+    left_folder(old, out, size);
+    if (strcmp(out, old) || left_is_save(old, now)) snprintf(out, size, "%s", LEFT_SAVES);
+}
+/* the old files' pages: app->left's lines a folder each, the games' saves one (left_page_key), as left_behind
+   counted them */
+static int left_groups(const App* app) { return app->left_pages; }
+static int left_pages_of(const App* app) {
+    char old[4400], now[4400], folder[4400], last[4400] = "";
+    const char* at;
+    int i, n = 0;
+    for (i = 0; (at = left_nth(app, i)) != NULL && i < app->lefts; ++i) {
+        left_paths(at, old, now, sizeof old);
+        left_page_key(old, now, folder, sizeof folder);
+        if (i && !strcmp(folder, last)) continue;
+        snprintf(last, sizeof last, "%s", folder);
+        ++n;
+    }
+    return n;
+}
+/* the line of app->left where the old files' page-th folder starts, -1 past the last */
+static int left_group_first(const App* app, int page) {
+    char old[4400], now[4400], folder[4400], last[4400] = "";
+    const char* at;
+    int i, n = 0;
+    for (i = 0; (at = left_nth(app, i)) != NULL && i < app->lefts; ++i) {
+        left_paths(at, old, now, sizeof old);
+        left_page_key(old, now, folder, sizeof folder);
+        if (i && !strcmp(folder, last)) continue;
+        snprintf(last, sizeof last, "%s", folder);
+        if (n++ == page) return i;
+    }
+    return -1;
+}
+/* done's entries from its from-th, a folder's, summed up as one entry of folders for it, the folder of an old files'
+   page: how many of its entries moved (or would, without apply) and where, how many did not and the first one's why;
+   the folder itself taken away once empty is no entry of its. A game laid out beside others (beside), which no move
+   takes, says so without its path, which its page shows */
+static void folder_moves(GuiCleaned* folders, const GuiCleaned* done, int from, const char* folder, const char* dests,
+                         bool apply, bool beside) {
+    char shown[4400], file[4400], what[4400], why[4400], said[9000];
+    const char* at = done->text;
+    bool ok;
+    int i, n = 0, moved = 0;
+    why[0] = 0;
+    for (i = 0; at; ++i) {
+        at = gui_cleaned_entry(at, &ok, file, what, sizeof file);
+        if (i < from || (ok && !strcmp(what, snx_tr("Removed: it was empty")))) continue; /* an old folder, gone */
+        ++n;
+        moved += ok;
+        if (!ok && !why[0]) snprintf(why, sizeof why, "%s", what);
+    }
+    if (!n)
+        snprintf(said, sizeof said, "%s", snx_tr("Nothing in it to move"));
+    else if (moved == n && apply)
+        snprintf(said, sizeof said, snx_tr("%d moved to %s"), moved, dests);
+    else if (moved == n) /* its page says where, above */
+        snprintf(said, sizeof said, n == 1 ? snx_tr("1 entry moves") : snx_tr("%d entries move"), n);
+    else if (beside && !moved)
+        snprintf(said, sizeof said, "%s",
+                 snx_tr("Not moved: run it from its dump once, then move its saves (docs/user/deprecations.md)"));
+    else if (moved && apply)
+        snprintf(said, sizeof said, snx_tr("%d moved to %s, %d not: %s"), moved, dests, n - moved, why);
+    else if (moved)
+        snprintf(said, sizeof said, snx_tr("%d entries move, %d stay: %s"), moved, n - moved, why);
+    else if (n == 1)
+        snprintf(said, sizeof said, "%s", why);
+    else
+        snprintf(said, sizeof said, apply ? snx_tr("%d not moved: %s") : snx_tr("%d stay: %s"), n, why);
+    if (!strcmp(folder, LEFT_SAVES))
+        snprintf(shown, sizeof shown, "%s", snx_tr(SAY_LEFT_SAVES));
+    else
+        snx_home_short(folder, shown, sizeof shown);
+    gui_cleaned_add(folders, moved == n, shown, said);
+}
+/* whether item is one of list's, a comma and a space between them */
+static bool listed(const char* list, const char* item) {
+    size_t n = strlen(item);
+    for (const char* at = list; (at = strstr(at, item)) != NULL; at += n)
+        if ((at == list || (at - list >= 2 && !strncmp(at - 2, ", ", 2))) && (!at[n] || !strncmp(at + n, ", ", 2)))
+            return true;
+    return false;
+}
+/* the moves of Move Old Files and the old files' Move All, made with apply, else what they would be, a file an entry
+   in done and, with folders, a page's folder an entry there (folder_moves): each folder app->left names, entry by
+   entry, into the one this version keeps it in; the menu's gui/ split by its files between the config and state
+   folders; with the data folder's games/, its games' settings and caches in the config, state and cache folders. A
+   game laid out beside others is not moved: its run from its dump makes its folder (docs/user/deprecations.md). How
+   many entries move */
 static const char* last_part(const char* path) {
     const char* end = path + strlen(path);
     while (end > path && end[-1] != '/' && end[-1] != '\\') --end;
     return end;
 }
-static int move_old(App* app, GuiCleaned* done, bool apply) {
-    char old[4400], now[4400], what[4500];
+static int move_old(App* app, GuiCleaned* done, GuiCleaned* folders, bool apply, bool pages) {
+    char old[4400], now[4400], what[4500], folder[4400], group[4400] = "", dests[4400] = "", shown[4400];
+    char save_of[4400];
     char *config = menu_folder(app, SNX_USER_CONFIG, false), *state = menu_folder(app, SNX_USER_STATE, false);
     char* games = games_old(app);
     const char* only[2][5];
     const char* at = app->left;
-    int i, k, moves = 0;
+    int i, k, moves = 0, from = 0;
+    bool beside = false;
     for (i = 0; i < 2; ++i) { /* menu_files, as gui_move_entries takes them */
         for (k = 0; k < 4 && menu_files[i][k][0]; ++k) only[i][k] = menu_files[i][k];
         only[i][k] = NULL;
@@ -14069,6 +15550,19 @@ static int move_old(App* app, GuiCleaned* done, bool apply) {
         const char* const* files = NULL;
         char* data;
         left_paths(at, old, now, sizeof old);
+        if (pages)
+            left_page_key(old, now, folder, sizeof folder);
+        else
+            left_folder(old, folder, sizeof folder);
+        snx_home_short(now, shown, sizeof shown);
+        if (folders && strcmp(folder, group)) { /* a page's folder: the one before summed up */
+            if (group[0]) folder_moves(folders, done, from, group, dests, apply, beside);
+            snprintf(group, sizeof group, "%s", folder);
+            snprintf(dests, sizeof dests, "%s", shown);
+            from = done->count;
+            beside = false;
+        } else if (folders && !listed(dests, shown) && strlen(dests) + strlen(shown) + 3 < sizeof dests)
+            snprintf(dests + strlen(dests), sizeof dests - strlen(dests), ", %s", shown);
         data = snx_format("%s_data", old);
         if (!snx_is_dir(old) && data && snx_is_dir(data)) { /* a game laid out beside others */
             snprintf(what, sizeof what,
@@ -14077,47 +15571,131 @@ static int move_old(App* app, GuiCleaned* done, bool apply) {
                      now);
             gui_cleaned_add(done, false, old, what);
             free(data);
+            beside = true;
             continue;
         }
         free(data);
+        if (left_is_save(old, now)) { /* a save's own files into its last commit (left_save) */
+            moves += gui_move_save_committed(done, old, apply);
+            continue;
+        }
         if (!strcmp(last_part(old), "gui") && snx_is_dir(old))
             files = config && !strcmp(now, config) ? only[0] : state && !strcmp(now, state) ? only[1] : NULL;
-        moves += gui_move_entries(done, old, now, files, apply);
+        left_folder(old, save_of, sizeof save_of);
+        if (strcmp(save_of, old)) /* a game's own save (left_saves): its files in its last commit at once */
+            moves += gui_move_save_into(done, old, now, apply);
+        else
+            moves += gui_move_entries(done, old, now, files, apply);
         moves += gui_move_save_note(done, old, now, apply); /* a save's folder (left_saves) brings its note */
         for (k = SNX_USER_CONFIG; games && !strcmp(old, games) && k <= SNX_USER_CACHE; ++k) {
-            char *from = snx_user_path(old, k), *to = snx_user_path(now, k);
-            if (from && to && strcmp(from, old) && strcmp(to, now))
-                moves += gui_move_entries(done, from, to, NULL, apply);
-            else if (from && strcmp(from, old) && snx_path_exists(from)) { /* recompiled/ is not in the data folder */
+            char *from_dir = snx_user_path(old, k), *to = snx_user_path(now, k);
+            if (from_dir && to && strcmp(from_dir, old) && strcmp(to, now))
+                moves += gui_move_entries(done, from_dir, to, NULL, apply);
+            else if (from_dir && strcmp(from_dir, old) && snx_path_exists(from_dir)) { /* recompiled/ is not in the
+                                                                                          data folder */
                 snprintf(what, sizeof what,
                          snx_tr("Not moved: %s is not in the data folder, which these settings go by"), now);
-                gui_cleaned_add(done, false, from, what);
+                gui_cleaned_add(done, false, from_dir, what);
             }
-            free(from);
+            free(from_dir);
             free(to);
         }
     }
+    if (folders && group[0]) folder_moves(folders, done, from, group, dests, apply, beside);
     free(games);
     free(config);
     free(state);
     return moves;
 }
+/* the old files' Delete All, made with apply, else what it would be: each path app->left names once
+   (gui_delete_old), a file or folder an entry in done, and a page's folder an entry in folders: what was done to its
+   paths, the first one's word when it is every one's, else how many were deleted and why the first of the rest was
+   not. How many paths are deleted, or would be */
+static int delete_old(App* app, GuiCleaned* done, GuiCleaned* folders, bool apply, bool pages) {
+    char old[4400], now[4400], folder[4400], last[4400] = "", file[4400], what[4400], why[4400], shown[4400];
+    char said[9000];
+    const char* at;
+    int i = 0, deleted = 0;
+    while ((at = left_nth(app, i)) != NULL && i < app->lefts) {
+        GuiCleaned one = {0};
+        int paths = 0, gone = 0, same = 1;
+        bool ok;
+        left_paths(at, old, now, sizeof old);
+        if (pages)
+            left_page_key(old, now, folder, sizeof folder);
+        else
+            left_folder(old, folder, sizeof folder);
+        what[0] = why[0] = 0;
+        for (; (at = left_nth(app, i)) != NULL && i < app->lefts; ++i) { /* the page's paths, each once */
+            char this_folder[4400];
+            left_paths(at, old, now, sizeof old);
+            if (pages)
+                left_page_key(old, now, this_folder, sizeof this_folder);
+            else
+                left_folder(old, this_folder, sizeof this_folder);
+            if (strcmp(this_folder, folder)) break;
+            if (!strcmp(old, last)) continue;
+            snprintf(last, sizeof last, "%s", old);
+            gui_cleaned_free(&one);
+            if (left_is_save(old, now)) /* a save the versions before kept, wherever it is */
+                gui_delete_keep_save(&one, old);
+            else
+                gone += gui_delete_old(&one, old, apply);
+            if (!one.text) continue; /* not there now */
+            gui_cleaned_entry(one.text, &ok, file, said, sizeof file);
+            gui_cleaned_add(done, ok, file, said);
+            same = same && (!paths || !strcmp(what, said));
+            if (!paths) snprintf(what, sizeof what, "%s", said);
+            if (!ok && !why[0]) snprintf(why, sizeof why, "%s", said);
+            ++paths;
+        }
+        gui_cleaned_free(&one);
+        deleted += gone;
+        if (!strcmp(folder, LEFT_SAVES))
+            snprintf(shown, sizeof shown, "%s", snx_tr(SAY_LEFT_SAVES));
+        else
+            snx_home_short(folder, shown, sizeof shown);
+        if (!paths)
+            snprintf(said, sizeof said, "%s", snx_tr("Not there any more"));
+        else if (same)
+            snprintf(said, sizeof said, "%s", what);
+        else
+            snprintf(said, sizeof said, apply ? snx_tr("%d deleted, %d not: %s") : snx_tr("Deletes %d, %d stay: %s"),
+                     gone, paths - gone, why);
+        if (folders) gui_cleaned_add(folders, paths && gone == paths, shown, said);
+    }
+    return deleted;
+}
+/* what each old files' page says Move All and Delete All would do to its folder, looked for now */
+static void left_plans(App* app) {
+    GuiCleaned files = {0};
+    gui_cleaned_free(&app->left_plan);
+    gui_cleaned_free(&app->left_drop);
+    move_old(app, &files, &app->left_plan, false, true); /* a page an entry */
+    gui_cleaned_free(&files);
+    delete_old(app, &files, &app->left_drop, false, true);
+    gui_cleaned_free(&files);
+}
 /* App's Move Old Files: what it would move, in a box (GUI_ASK_MOVE); nothing left, said; nothing that can move, the
    box of entries saying why */
 static void move_row(App* app) {
-    GuiCleaned plan = {0};
+    GuiCleaned plan = {0}, folders = {0};
     int moves;
     left_behind(app);
     app_values(app);
-    moves = move_old(app, &plan, false);
+    moves = move_old(app, &plan, &folders, false, false);
     if (!plan.count) {
+        gui_cleaned_free(&folders);
         snprintf(app->editor.note, sizeof app->editor.note, "%s", snx_tr("Nothing left by an older version"));
         return;
     }
     if (!moves) {
         gui_cleaned_free(&app->cleaned);
+        gui_cleaned_free(&app->moved);
         app->cleaned = plan;
+        app->moved = folders;
         app->report_move = true;
+        app->report_delete = false;
         app->cleaned_shown = true;
         app->files_top = 0;
         snprintf(app->editor.note, sizeof app->editor.note, snx_tr("None of the %d can move: the box says why"),
@@ -14129,19 +15707,36 @@ static void move_row(App* app) {
                                 : snx_tr("Move Old Files? %d move"),
              moves, plan.count - moves);
     gui_cleaned_free(&plan);
+    gui_cleaned_free(&folders);
     gui_confirm_open(&app->confirm, GUI_ASK_MOVE, false);
 }
-/* App's row: what it would take out, in a box (GUI_ASK_CLEAN), else that there is nothing */
-static void clean_row(App* app) {
-    char unread[16], *line = app->ask_line;
-    size_t size = sizeof app->ask_line;
-    int inis = clean_inis(app, NULL);
-    int keys = settings_unread(app, unread, sizeof unread) + app_read(app, false, unread, sizeof unread, NULL, 0);
-    if (!inis && !keys) {
-        snprintf(app->editor.note, sizeof app->editor.note, "%s",
-                 snx_tr("Nothing to clean: no [Deprecated] in a game's .ini, no old keys"));
+/* Move All asked first, as Settings > App's Move Old Files asks (GUI_ASK_MOVE): how many entries move and how many
+   stay; with none that can move it goes on, the page saying why of each */
+static void left_move_ask(App* app) {
+    GuiCleaned plan = {0};
+    int moves = move_old(app, &plan, NULL, false, false);
+    if (!moves) {
+        gui_cleaned_free(&plan);
+        left_move(app);
         return;
     }
+    snprintf(app->ask_line, sizeof app->ask_line,
+             plan.count > moves ? snx_tr("Move Old Files? %d move, %d stay where they are")
+                                : snx_tr("Move Old Files? %d move"),
+             moves, plan.count - moves);
+    gui_cleaned_free(&plan);
+    gui_confirm_open(&app->confirm, GUI_ASK_MOVE, false);
+}
+/* what Clean Old Settings would take out: the .ini files with a [Deprecated] section in inis, the keys of the menu's
+   own files nothing reads in keys; both */
+static int clean_count(App* app, int* inis, int* keys) {
+    char unread[16];
+    *inis = clean_inis(app, NULL);
+    *keys = settings_unread(app, unread, sizeof unread) + app_read(app, false, unread, sizeof unread, NULL, 0);
+    return *inis + *keys;
+}
+/* the question of Clean Old Settings that takes them, into line */
+static void clean_said(char* line, size_t size, int inis, int keys) {
     if (inis && keys)
         snprintf(line, size,
                  keys > 1 ? snx_tr("Clean Old Settings? [Deprecated] in %d .ini, %d old keys")
@@ -14152,6 +15747,16 @@ static void clean_row(App* app) {
     else
         snprintf(line, size,
                  keys > 1 ? snx_tr("Clean Old Settings? %d old keys") : snx_tr("Clean Old Settings? %d old key"), keys);
+}
+/* App's row: what it would take out, in a box (GUI_ASK_CLEAN), else that there is nothing */
+static void clean_row(App* app) {
+    int inis, keys;
+    if (!clean_count(app, &inis, &keys)) {
+        snprintf(app->editor.note, sizeof app->editor.note, "%s",
+                 snx_tr("Nothing to clean: no [Deprecated] in a game's .ini, no old keys"));
+        return;
+    }
+    clean_said(app->ask_line, sizeof app->ask_line, inis, keys);
     gui_confirm_open(&app->confirm, GUI_ASK_CLEAN, false);
 }
 /* Settings > App's Reset to Defaults: how many settings it changes, in a box (GUI_ASK_RESET), else that none */
@@ -14183,11 +15788,15 @@ static void change_answer(App* app, GuiAsk ask, bool taken) {
                  changed > 1 ? snx_tr("%d settings back to their defaults") : snx_tr("%d setting back to its default"),
                  changed);
         write_settings(app);          /* a save that fails says so over the count */
-    } else if (ask == GUI_ASK_MOVE) { /* done: what it did over the screen, and the menu as the files are now */
+    } else if (ask == GUI_ASK_MOVE && left_page(app)) /* the setup's Move All: its page says what it did */
+        left_move(app);
+    else if (ask == GUI_ASK_MOVE) { /* done: what it did over the screen, and the menu as the files are now */
         int moved;
         gui_cleaned_free(&app->cleaned);
-        moved = move_old(app, &app->cleaned, true);
+        gui_cleaned_free(&app->moved);
+        moved = move_old(app, &app->cleaned, &app->moved, true, false);
         app->report_move = true;
+        app->report_delete = false;
         app->cleaned_shown = app->cleaned.count > 0;
         app->files_top = 0;
         snprintf(app->editor.note, sizeof app->editor.note, snx_tr("%d moved, %d not"), moved,
@@ -14286,7 +15895,9 @@ static void pump(App* app) {
         recent_name(app, "LAUNCH");
         int status;
         if (gui_process_finished(app->process, &status)) {
+            char oom[512];
             app->menu.running = false;
+            run_forget(app);
             if (debug_log(app)) {
                 char what[64];
                 run_said(app, "run", run_ended(what, sizeof what, app->aborting, status), app->run_started_ms);
@@ -14309,6 +15920,9 @@ static void pump(App* app) {
             app->menu.view = GUI_LOAD_NONE;
             if (app->aborting)
                 snprintf(app->message, sizeof(app->message), "%s", snx_tr("Aborted with ESC."));
+            else if (app->abnormal_exit && oom_said(app, status, oom, sizeof oom))
+                snprintf(app->message, sizeof(app->message), snx_tr("Program ended abnormally (status %d): %s."),
+                         status, oom);
             else if (app->abnormal_exit)
                 snprintf(app->message, sizeof(app->message), snx_tr("Program ended abnormally (status %d)."), status);
             else
@@ -14324,7 +15938,7 @@ static void pump(App* app) {
                 probe_back(app);
             }
 #if !defined(SDL_PLATFORM_ANDROID) && !defined(SDL_PLATFORM_IOS)
-            if (app->probe_launch) probe_after(app);
+            if (app->probe_launch) probe_after(app, NULL);
 #else
             if (app->probe_launch && app->abnormal_exit) { /* its screen says why, the menu after it */
                 app->probe_launch = 0;
@@ -14372,11 +15986,15 @@ static void pump(App* app) {
         if (ready(app)) leave_run(app);
     }
     if (app->played && !app->hidden) {
+        RunEnd end;
         app->played = false;
+        run_end_of(app, &app->run_kept, &end); /* its game's mark and what Android says, before the next one starts */
+        run_forget(app);
         if (app->probe_launch)
-            probe_after(app);
+            probe_after(app, &end);
         else if (!next_program(app))
-            game_end(app); /* a collection's program starting another ended well */
+            game_end(app, &end); /* a collection's program starting another ended well */
+        run_end_free(&end);
     }
 #endif
 #ifdef SDL_PLATFORM_ANDROID
@@ -14389,10 +16007,8 @@ static void pump(App* app) {
         app->job_usage = gui_process_usage_of(app->job_process);
         app->sampled = now;
     }
-    if (app->left_shown && (!app->left_at || now - app->left_at >= 5000)) { /* the player may have moved them */
-        left_behind(app);
-        app->left_shown = app->lefts > 0;
-    }
+    if (left_page(app) && !app->left_did && !app->confirm.shown && (!app->left_at || now - app->left_at >= 5000))
+        left_again(app, false); /* the player may have moved them */
     if (app->leaving_ms && now_ms(app) - app->leaving_ms >= app->theme.fade_out_ms) leave_run(app);
     if (app->closing_ms && now_ms(app) - app->closing_ms >= GUI_CLOSING_MS) app->menu.quit = true;
     if (app->dump_icons.lock) { /* a dump's icon the driver answered: its row looks again */
@@ -14576,6 +16192,18 @@ static const char* pick_label(App* app, int i) {
             : "( )",
         snx_tr(SAY_SUBFOLDERS));
     return app->pick_text;
+}
+/* the look of the picks box's choice i: a GPU driver's Remove has no way back; a Folders row's Reset to Default and
+   Remove from Library want care */
+static unsigned pick_tone(const App* app, int i) {
+    const char* const* picks = picks_list(app);
+    int n = 0;
+    while (picks[n]) ++n;
+    if (i < 0 || i >= n || app->picks_of == GUI_PICKS_ASSET || app->picks_of == GUI_PICKS_THEME ||
+        app->picks_of == GUI_PICKS_GAME)
+        return 0;
+    if (app->picks_of == GUI_PICKS_DRIVER) return !strcmp(picks[i], "Remove") ? UI_ATTR_DANGER : 0;
+    return !strcmp(picks[i], "Reset to Default") || !strcmp(picks[i], "Remove from Library") ? UI_ATTR_CAUTION : 0;
 }
 static void picks_open(App* app, GuiPicksOf of) {
     app->picks_of = of;
@@ -15079,6 +16707,10 @@ static bool run_start(App* app, const char* const* argv, char* file, bool native
     bool started = gui_process_start(app->process, argv, app->message, sizeof(app->message));
     app->run_started_ms = SDL_max(now_ms(app), 1);
     if (debug_log(app)) run_said(app, "run", started ? "starts" : app->message, 0);
+    if (started) { /* its record, and the kernel's OOM kills so far */
+        run_keep(app, NULL, app->probe_launch ? "edenprobe" : file ? snx_path_leaf(file) : "");
+        app->oom_before = gui_oom_kills(app->oom_events, app->oom_file, sizeof app->oom_file);
+    }
     if (started && app->run_log) {
         size_t k;
         if (app->run_out) fclose(app->run_out);
@@ -15367,6 +16999,7 @@ static void launch(App* app, char* absolute, bool prepared) {
                                 : GUI_JOB_RECOMPILE);
         addons_forget(app); /* the queue keeps what argv held */
         free(argv);
+        free(game_option);
         free(run);
         free(out);
         free(app->dest_out); /* the run's, which argv held until here: a next one asks again */
@@ -15496,12 +17129,12 @@ static void probe_clear(App* app) {
     free(folder);
     drivers_show(app, app->editor.row);
 }
-/* a launch of the probe ended (its game's process, or on Android its game's activity): launched again while it adds
-   cases and has no summary, GUI_PROBE_RELAUNCHES times at most, as edenprobe's journal goes on after the case it ended
-   inside; else its counts in a box, over the menu */
-static void probe_after(App* app) {
+/* a launch of the probe ended (its game's process, or on Android its game's activity, end saying how where the menu
+   looked: NULL elsewhere): launched again while it adds cases and has no summary, GUI_PROBE_RELAUNCHES times at most,
+   as edenprobe's journal goes on after the case it ended inside; else its counts in a box, over the menu */
+static void probe_after(App* app, const RunEnd* end) {
     GuiProbeReport r;
-    char said[700], *report;
+    char said[700], *report, words[1100] = "";
     if (!gui_probe_read(app->probe_folder, &r)) { /* the run's lines say why, on its screen or in the log */
         app->probe_launch = 0;
         app->probe_row = -1; /* its screen stays, the menu after it */
@@ -15509,9 +17142,15 @@ static void probe_after(App* app) {
         say_failure(app, app->message);
         return;
     }
+    if (end && end->how == RUN_CUT) {
+        words[0] = ' ';
+        words[1] = '(';
+        end_words(end, words + 2, sizeof words - 3);
+        snprintf(words + strlen(words), sizeof words - strlen(words), ")");
+    }
     if (!r.summary && r.cases > app->probe_cases && app->probe_launch <= GUI_PROBE_RELAUNCHES) {
-        gui_log("edenprobe: launch %d ended before the summary, cases so far %d; launching again", app->probe_launch,
-                r.cases);
+        gui_log("edenprobe: launch %d ended before the summary%s, cases so far %d; launching again", app->probe_launch,
+                words, r.cases);
         app->probe_cases = r.cases;
         app->probe_launch++;
         probe_launch(app);
@@ -15844,6 +17483,7 @@ static void job_ended(App* app, int i, int status) {
     app->ended_serial = job->serial;
     if (failed) app->log_due = true; /* Share Log blinks, its log holding this one's output */
     snprintf(app->message, sizeof app->message, "%s: %s", name, job->said);
+    if (!failed && job->console == GUI_GBA && job->kind != GUI_JOB_AOT) cover_made(app, i);
 #ifdef SDL_PLATFORM_ANDROID
     app->told_result = failed                         ? SNX_TR_NOOP("Failed")
                        : job->kind == GUI_JOB_AOT     ? SNX_TR_NOOP("AOT pack built")
@@ -16922,9 +18562,13 @@ static void share_log(App* app, bool zip) {
         "%s\nMessage: %s\n%s%s%s%s\n%s== the last run: %s ==\n%s\n\n== the last recompile of the queue: %s "
         "==\n%s\n\n== the launcher's log: %s ==\n%s\n\n== fatal errors: %s ==\n%s\n\n== %s ==\n%s\n",
         snx_build_log_line(), app->message, app->left ? app->left : "", app->left_clear ? SAY_LEFT_CLEAR "\n" : "",
-        app->cleaned.count ? "Clean Old Settings:\n" : "", app->cleaned.text ? app->cleaned.text : "", summary,
-        app->run_log ? app->run_log : "", run, app->job_log ? app->job_log : "", recompiled,
-        console[0] ? console : "none", said, errors[0] ? errors : "none", fatal, game ? game : "no game log", played);
+        !app->cleaned.count  ? ""
+        : app->report_delete ? "Delete All of the old files:\n"
+        : app->report_move   ? "Move Old Files:\n"
+                             : "Clean Old Settings:\n",
+        app->cleaned.text ? app->cleaned.text : "", summary, app->run_log ? app->run_log : "", run,
+        app->job_log ? app->job_log : "", recompiled, console[0] ? console : "none", said, errors[0] ? errors : "none",
+        fatal, game ? game : "no game log", played);
     logs = logs_folder(app);
     share = logs ? snx_path_join(logs, "share") : NULL;
     if (!share) snprintf(app->message, sizeof(app->message), snx_tr("The logs could not be saved: %s"), logs_none());
@@ -17425,7 +19069,7 @@ static void menu_key(App* app, GuiKey key) {
         case GUI_MENU_SETTINGS: open_settings(app); break;
         case GUI_MENU_LOG: picks_open(app, GUI_PICKS_SHARE); break;
         case GUI_MENU_STAY:
-            if (app->menu.quit && jobs_live(app)) { /* Exit: the queue's recompiles go with the menu, asked first */
+            if (app->menu.quit) { /* Exit, asked first; the queue's recompiles would go with the menu */
                 app->menu.quit = false;
                 gui_confirm_open(&app->confirm, GUI_ASK_EXIT, false);
             }
@@ -17495,6 +19139,10 @@ static void ask_key(App* app, GuiKey key) {
         closing_start(app);
     } else if (ask == GUI_ASK_EXIT && second)
         closing_start(app);
+    else if (ask == GUI_ASK_DELETE_OLD && second)
+        left_delete(app);
+    else if (ask == GUI_ASK_OVERWRITE && second)
+        setup_type(app);
     else if (ask == GUI_ASK_ABORT && second)
         abort_run(app);
 }
@@ -17521,14 +19169,28 @@ static const char* choice_text(App* app, int of, int i, char* out, size_t size) 
         case GUI_CHOICES_DESTS: return dest_label(app, i, out, size);
         case GUI_CHOICES_PICKS: return pick_label(app, i);
         case GUI_CHOICES_TYPED: return i < 2 ? snx_tr(typed_choices[i]) : NULL;
-        default: return i < setup_labels(app, labels) ? labels[i] : NULL;
+        default: { /* the setup's in its rows' order (setup_order), the row between its two groups "" */
+            int rows[GUI_SETUP_ROWS], n = setup_order(app, rows);
+            setup_labels(app, labels);
+            return i >= n ? NULL : rows[i] < 0 ? "" : labels[rows[i]];
+        }
     }
 }
-/* Choices' row: the choice's text, drawn with the theme's marker */
+/* Choices' row: the choice's text, drawn with the theme's marker, a setup's notice's or old files' choice with its
+   icon; the row between the setup's two groups a label, no box. Delete All and its question's Delete, which have no
+   way back, in the failure colour */
 bool ui_choices_rows_get_row_info(App* app, size_t row, int width, UiRowInfo* info) {
     (void)width; /* a choice too long for its row is cut, or slides while focused, as the menu's rows (row_text_in) */
     info->label = row < 64 ? choice_text(app, app->choices_of, (int)row, app->row_text, sizeof app->row_text) : NULL;
     if (app->choices_of == GUI_CHOICES_SIZES && !row && size_why(app, NULL, 0)) info->attr |= UI_ATTR_OFF; /* OK */
+    if (app->choices_of == GUI_CHOICES_SETUP && info->label) {
+        info->icon = setup_icon(app, (int)row);
+        if (!info->label[0]) info->attr |= UI_ATTR_LABEL;
+        info->attr |= setup_tone(app, (int)row);
+    }
+    if (app->choices_of == GUI_CHOICES_ASK && row == (size_t)GUI_CONFIRM_ABORT)
+        info->attr |= ask_tones[app->confirm.ask];
+    if (app->choices_of == GUI_CHOICES_PICKS && info->label) info->attr |= pick_tone(app, (int)row);
     return info->label != NULL;
 }
 /* a choice under the pointer takes the focus, and a click takes it: the question's pressed, UI scale's size or the
@@ -17555,11 +19217,14 @@ void ui_choices_rows_row_action_cb(App* app, size_t row, uint32_t hit) {
         case GUI_CHOICES_TYPED:
             if (hit & UI_HIT_CLICK) typed_choice(app, i);
             break;
-        default:
-            app->setup_choice.focus = i;
+        default: { /* the setup's choice on row i (setup_order); none on the row between its groups */
+            int rows[GUI_SETUP_ROWS];
+            if (i >= setup_order(app, rows) || rows[i] < 0) break;
+            app->setup_choice.focus = rows[i];
             app->setup_row = GUI_APPEARANCE_NEXT;
             if (hit & UI_HIT_CLICK) setup_take(app);
             break;
+        }
     }
 }
 /* whether pixel x, y is on the head's user */
@@ -17643,7 +19308,7 @@ void ui_menu_entries_load_switch_nsp_xci_nro_action_cb(App* app, uint32_t hit) {
 void ui_menu_entries_load_linux_arm_elf_action_cb(App* app, uint32_t hit) { menu_entry(app, GUI_LINUX, hit); }
 void ui_menu_entries_load_3ds_game_action_cb(App* app, uint32_t hit) { menu_entry(app, GUI_3DS, hit); }
 void ui_menu_entries_load_vita_vpk_action_cb(App* app, uint32_t hit) { menu_entry(app, GUI_VITA, hit); }
-void ui_menu_entries_load_gba_rom_action_cb(App* app, uint32_t hit) { menu_entry(app, GUI_GBA, hit); }
+void ui_menu_entries_load_gba_multi_boot_rom_action_cb(App* app, uint32_t hit) { menu_entry(app, GUI_GBA, hit); }
 void ui_menu_entries_load_android_apk_xapk_action_cb(App* app, uint32_t hit) { menu_entry(app, GUI_ANDROID, hit); }
 void ui_menu_entries_install_keys_action_cb(App* app, uint32_t hit) { menu_entry(app, GUI_KEYS, hit); }
 void ui_menu_entries_settings_action_cb(App* app, uint32_t hit) { menu_entry(app, GUI_SETTINGS, hit); }
@@ -18171,7 +19836,7 @@ static bool menu_key_of(const SDL_KeyboardEvent* k, GuiKey* key) {
 }
 /* the box of files over the screen step files on (back for a negative one), down only while some are under them */
 static void files_step(App* app, int step) {
-    int count = app->cleaned_shown ? app->cleaned.count : app->lefts;
+    int count = files_shown_of(app)->count;
     if (step > 0 && app->files_top + app->files_shown >= count) return; /* the last one shows already */
     app->files_top = SDL_max(0, app->files_top + step);
 }
@@ -18181,10 +19846,9 @@ static void files_step(App* app, int step) {
 static void refresh(App* app) {
     app->clean_found = -1; /* Clean Old Settings looks again */
     app->loads_at = 0;     /* the loads' drivers looked for again */
-    if (app->left_shown) {
-        left_behind(app);
-        app->left_shown = app->lefts > 0;
-    } else if (app->editing && app->form == GUI_FORM_FOLDERS) {
+    if (left_page(app) && !app->left_did)
+        left_again(app, true);
+    else if (app->editing && app->form == GUI_FORM_FOLDERS) {
         /* the places, a default made when a run needs it and a picked one not; then the libraries' folders */
         char gone[sizeof app->editor.note];
         size_t n = 0;
@@ -18353,25 +20017,16 @@ static void event_take(App* app, const SDL_Event* e) {
     }
     /* the setup, while it shows, takes the keys and the typing; the pointer goes to it through pointer() */
     if (app->setup_on && !app->splash && setup_event(app, e)) return;
-    /* what Clean Old Settings did, and the box of an older version's files: Up/Down and the wheel go over their files,
-       the first other key, button or finger closes it */
-    if (!app->setup_on && (app->cleaned_shown || (app->left_shown && !app->splash)) &&
+    /* what Clean Old Settings or Move Old Files did: Up/Down and the wheel go over their files, the first other key,
+       button or finger closes it */
+    if (!app->setup_on && app->cleaned_shown &&
         ((e->type == SDL_EVENT_KEY_DOWN && files_key(app, e->key.key)) || e->type == SDL_EVENT_MOUSE_WHEEL)) {
         if (e->type == SDL_EVENT_MOUSE_WHEEL) files_step(app, -e->wheel.integer_y); /* a notch a file, as a row */
-        return;
-    }
-    if (app->left_shown && !app->splash && !app->setup_on && e->type == SDL_EVENT_KEY_DOWN && e->key.key == SDLK_F5) {
-        if (!e->key.repeat) refresh(app);
         return;
     }
     if (app->cleaned_shown &&
         (e->type == SDL_EVENT_KEY_DOWN || e->type == SDL_EVENT_MOUSE_BUTTON_DOWN || e->type == SDL_EVENT_FINGER_DOWN)) {
         app->cleaned_shown = false;
-        return;
-    }
-    if (app->left_shown && !app->splash && !app->setup_on &&
-        (e->type == SDL_EVENT_KEY_DOWN || e->type == SDL_EVENT_MOUSE_BUTTON_DOWN || e->type == SDL_EVENT_FINGER_DOWN)) {
-        app->left_shown = false;
         return;
     }
     /* the splash takes the input it gets: a key, a button or a finger ends it, and does nothing else */
@@ -18486,6 +20141,11 @@ static void event_take(App* app, const SDL_Event* e) {
         addons_picked(app, (const char*)e->user.data1, (const char*)e->user.data2, e->user.code != 0);
         SDL_free(e->user.data1);
         SDL_free(e->user.data2);
+        return;
+    }
+    /* Covers' thread: a GBA game's box come, or why not */
+    if (app->cover_event && e->type == app->cover_event) {
+        cover_answer(app, (GuiCoverJob*)e->user.data1);
         return;
     }
     /* Download Driver's threads: a repository's releases, a download's progress and its end */
@@ -18635,7 +20295,7 @@ static void event_take(App* app, const SDL_Event* e) {
         int rows = e->wheel.integer_y;
         for (; app->setup_on && !app->splash && !app->confirm.shown && rows; rows += rows > 0 ? -1 : 1)
             setup_key(app, rows > 0 ? GUI_UP : GUI_DOWN);
-        if (app->splash || app->menu.running || app->finished || app->confirm.shown || app->left_shown ||
+        if (app->splash || app->menu.running || app->finished || app->confirm.shown ||
             (app->editing && app->editor.picking))
             return;
         if (app->help_shown) { /* F1's box's rows, a notch a row, and nothing under it */
@@ -18891,6 +20551,12 @@ static void forget(App* app) {
     gui_android_ran(NULL); /* the run goes with the menu */
 #endif
     gui_process_destroy(app->process);
+#if !defined(SDL_PLATFORM_ANDROID) && !defined(SDL_PLATFORM_IOS) /* a phone's game plays on past the menu */
+    run_forget(app);                                             /* the run, if any, ended with the menu */
+#endif
+    gui_last_run_free(&app->run_kept);
+    gui_last_run_free(&app->stopped);
+    run_end_free(&app->stopped_end);
     watch_stop(app);
     dump_icons_stop(app);
     SDL_DestroyTexture(app->icon_loading);
@@ -18913,6 +20579,9 @@ static void forget(App* app) {
     free(app->folders_file);
     free(app->app_file);
     gui_cleaned_free(&app->cleaned);
+    gui_cleaned_free(&app->moved);
+    gui_cleaned_free(&app->left_plan);
+    gui_cleaned_free(&app->left_drop);
     free(app->left);
     if (app->run_locked) snx_unlock_file(app->run_lock);
     app->run_locked = false;
@@ -18959,6 +20628,7 @@ static void forget(App* app) {
     snx_splash_close(app->splash_drawing);
     SDL_DestroyTexture(app->user_picture);
     icons_free(app);
+    covers_free(app);
     users_close(app);
     free(app->user_jpeg);
     free(app->users_dir);
@@ -19058,7 +20728,7 @@ static int migrate(const char* self, bool apply, FILE* out) {
     }
     open_files(&app); /* the folders the menu picked, which tell where things go */
     left_behind(&app);
-    moves = move_old(&app, &app.cleaned, apply);
+    moves = move_old(&app, &app.cleaned, NULL, apply, false);
     for (at = app.cleaned.text; at;) {
         at = gui_cleaned_entry(at, &ok, file, what, sizeof file);
         fprintf(out, "%s: %s\n", file, what);
@@ -19116,13 +20786,13 @@ int snx_gui_main(const char* self) {
     }
     open_files(&app); /* here, not in initialize(), so the tests keep their own */
     mark_start(&app, false);
+    last_run_look(&app); /* a run whose end the last start did not see: the setup's first page, Last Run */
+    left_behind(&app);   /* what an older version left: the setup's last pages, Old Files */
     setup_start(&app);
     app.games_fresh = true;
     watch_start(&app);
     app.dump_icons.live = true; /* the dumps' icons asked on a thread of their own */
     space_start(&app);          /* the footer's disk */
-    left_behind(&app);
-    app.left_shown = app.lefts > 0;
     splash_start(&app);
     while (!app.menu.quit) {
         SDL_Event e;

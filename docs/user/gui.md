@@ -20,9 +20,15 @@ embedded public-domain 8x16 VGA BIOS font, with GNU Unifont's 8x16 glyphs fitted
 lacks and its 16x16 ones, two columns each, for the letters game titles are written in (Chinese, Japanese and Korean)
 and the wide letters a language shows, and nearest-neighbor
 integer scaling; its words are English or a language compiled into it ([Languages](#languages)). An item of a menu
-has an icon beside its name, 16x16 in the font's stroke (`src/gui/icons.hex`): the menu's, the groups of the Settings and
-their rows that open a screen or do something (the others keep its columns), a game's box's actions, the setup's pages,
-the game's menu's and the keys of F1's box. No font files or localization packages are needed.
+has an icon beside its name, 16x16 in the font's stroke (`src/gui/icons.hex`): the menu's, the groups of the Settings
+(each its own) and their rows that open a screen or do something (the others keep its columns), a game's box's actions,
+the setup's pages, the game's menu's and the keys of F1's box. A choice with no way back is framed and written in the
+theme's `failure` colour, and filled with it in focus: Delete All, a game's Clean Cache, a GPU driver's Remove, Clear
+Crash List, and the Delete, Remove or Clear of the question each asks first. One that wants care is so in its `warning`
+colour: Settings > App's Clean Old Settings, Move Old Files and Reset to Defaults, Folders' Reset to Defaults and a
+row's Reset to Default and Remove from Library, Freedreno Settings' Clear All, the setup's Move All, Clean Now and
+Overwrite (users.ini kept as `users.ini.old`), and the questions' Abort, Exit with a run going, Use Anyway, Run Anyway,
+Reset, Clean and Move. No font files or localization packages are needed.
 
 ```sh
 ./build/scarletnx
@@ -79,7 +85,7 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   focus again. A tap on a finished run returns to the menu, and one on a
   running run's ESC line aborts it. Android's back button is ESC. On a screen packed with
   pixels (a phone) the text takes the display's own scale, as far as the menu still fits.
-- **Load Switch NSP/XCI/NRO**, **Load Linux ARM ELF**, **Load 3DS game**, **Load Vita VPK**, **Load GBA ROM** and
+- **Load Switch NSP/XCI/NRO**, **Load Linux ARM ELF**, **Load 3DS game**, **Load Vita VPK**, **Load GBA/MultiBoot ROM** and
   **Load Android APK/XAPK** open a screen as the keys': a click on its blinking **[ Pick or drop a file ]**, or Enter, opens the system's file
   picker (on Linux the desktop's, else zenity's). Dropping a file on the window and Ctrl+V with
   a path work too. On the Switch's, **P** (on a phone a tap on *Folder* at the foot, on a pad Y) opens the system's
@@ -105,9 +111,12 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   into its game's folder of `recompiled/` (named after its title ID), compiles its code ahead of time and plays it,
   compiling at run time what it missed. A VPK extracted and compiled before plays at once. See
   [Vita driver](../platforms/vita/README.md) for limits.
-- **Load GBA ROM** uses `scarletnx-agb`, the AGB board runtime, with the menu's data folder as its `--data`: it makes
-  the game's folder of `recompiled/` (named after the ROM's file), its module and its copy of the runtime, and plays
-  it in a window. See [AGB board](../platforms/agb/README.md).
+- **Load GBA/MultiBoot ROM** uses `scarletnx-agb`, the AGB board runtime, with the menu's data folder as its
+  `--data`, on a `.gba` or a `.mb` (a program the console receives through the link cable): it makes the game's folder
+  of `recompiled/` (named after the ROM's file), its module and its copy of the runtime, and plays it in a window. With
+  Settings > GBA > **Covers** on *Box art (libretro-thumbnails)* (`gba_covers=boxart`, off by default), each make that
+  ends well downloads the game's box into its folder (`icon.png`), which its rows show; a ROM with no box there keeps
+  Wimsy, and its row says why ([Settings](settings.md#gba)). See [AGB board](../platforms/agb/README.md).
 - **Load Android APK/XAPK** uses `scarletnx-android` on an `.apk`, `.xapk` or `.apks` file, with no other argument.
   The driver installs a bundle of split APKs itself. The app runs as it is, as a Linux program does: nothing is
   compiled first, and its recent row shows at once. An APK in a games or dumps folder shows in Games, and Enter runs
@@ -176,11 +185,12 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   - **Reset to Defaults**, last, which asks first.
 
   **GPU Drivers** lists the Vulkan driver packages added (a zip of a `meta.json` and the driver's libraries, as
-  Turnip's releases are, in libadrenotools' format) and picks the one every game runs with: **System driver**, the
-  system's own, its GPU, Vulkan version and driver version said, then a row a package, then **Add Driver**, the
-  system's file picker. A package is checked whole before anything is written (its `meta.json`, its files at the
-  zip's top, its library an arm64 one, its `minApi` at most the device's API level) and unpacked into a folder of
-  `gpu_drivers/` of the user's data folder named after the zip; a refusal says what is wrong, with the value. A
+  Turnip's and PanVK's releases are, in libadrenotools' format) and picks the one every game runs with: **System
+  driver**, the system's own, its GPU, Vulkan version and driver version said, then a row a package, then **Add
+  Driver**, the system's file picker. A package is checked whole before anything is written (its `meta.json`, its
+  files at the zip's top, its library an arm64 one, its `minApi` at most the device's API level) and unpacked into
+  a folder of `gpu_drivers/` of the user's data folder named after the zip; a refusal says what is wrong, with the
+  value. A
   package's box has **Use** and **Remove** (Del removes too), which asks first; one added is picked where packages
   load. **Download Driver** lists, from GitHub, the releases of the driver repositories Eden's driver fetcher lists
   (Mr. Purple Turnip, GameHub Adreno 8xx, KIMCHI Turnip, Weab-Chan Freedreno, Whitebelyash Turnip), fetched as it
@@ -188,23 +198,29 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   those Vulkan 1.0); a repository that failed says why, and Enter fetches the
   lists again. A release's box lists its downloads with their sizes, a GPU maker's own drivers (every GameHub one, and
   one named Qualcomm) marked *proprietary, no license*; the one picked is downloaded, its progress in the note, and
-  added as Add Driver adds a zip. They load on Android 9 or newer, arm64, with an Adreno GPU (`/dev/kgsl-3d0`) or an
-  Xclipse GPU (a render node of the `amdgpu` kernel driver in `/dev/dri`, for [RADV's port to
+  added as Add Driver adds a zip. They load on Android 9 or newer, arm64, with an Adreno GPU (`/dev/kgsl-3d0`), a Mali
+  GPU (`/dev/mali0`) or an Xclipse GPU (a render node of the `amdgpu` kernel driver in `/dev/dri`, for [RADV's port to
   it](https://github.com/JimVulkan/radv-xclipse), whose package asks Android 14): the page's first line says what this
   device is and, anywhere else, why games there use the system driver. There the packages, Download Driver and Add
   Driver are greyed, each row saying what the device lacks (*Android only*, *Unsupported GPU*...) and Enter
-  the whole line; a package's box still opens for its Remove, its Use refused with that line. On an Xclipse GPU
-  Download Driver alone is greyed, as those repositories hold Adreno's drivers: its package is added from its zip. A
+  the whole line; a package's box still opens for its Remove, its Use refused with that line. On an Xclipse or a
+  Mali GPU Download Driver alone is greyed, as those repositories hold Adreno's drivers: its package is added
+  from its zip. A
   game whose package does not load stops, saying why, and so does one whose package lists no Vulkan device, a driver
   for another GPU. Under them, **edenprobe Mode** (Quick, the default:
-  `quick notime cpu graphics`; Full adds `fs video audio kernel display`) and **Run edenprobe**, which plays
+  `notime cpu graphics`; Full adds `fs video audio kernel display`) and **Run edenprobe**, which plays
   [edenprobe](../dev/edenprobe.md)'s probes as a game with the GPU driver picked here, from `probe/edenprobe.nro` of the
   Logs folder, in a data folder of its own there (`probe/.scarletnx`: none of your settings, saves or users) with the
   default settings, and the build as edenprobe's machine (`machine=scarletnx@<commit>`), whose ban list then skips the
-  cases that end ScarletNX every time. A launch that ends before the report's summary is followed by another, up to
-  16, which goes on after the case it ended inside, while each adds cases; ESC ends it. At the end a box says the
+  cases that end ScarletNX every time. Its window shows edenprobe's own screens: the start screen with those families
+  chosen, which begins by itself after ten seconds, the running screen, then the results, which leave by themselves
+  after ten seconds with nothing pressed (+ or - leaves them). A launch that ends before the report's summary is
+  followed by another, up to 16, which goes on after the case it ended inside (edenprobe's screen that asks first goes
+  on by itself after ten seconds), while each adds cases; ESC ends it. At the end a box says the
   counts and the suites that failed or crashed, and where the report is. A next press after a whole run starts it
-  over; after one that stopped inside a case (an iOS app ends with its game), it goes on. **Freedreno Settings** sets
+  over; after one that stopped inside a case (an iOS app ends with its game), it goes on. A run whose launches ended
+  with the menu (Android's low memory killer ends the menu first, then the game) is offered again at the next start,
+  on the setup's Last Run page ([Setup](#setup)). **Freedreno Settings** sets
   Mesa's Freedreno and Turnip
   variables (`TU_DEBUG`, `FD_MESA_DEBUG`, `IR3_SHADER_DEBUG`, `FD_RD_DUMP`...) every game starts with: Eden's presets
   first (Debug - CPU Memory, `TU_DEBUG=sysmem`, and the others), a row a variable set (a press, or Del, takes it out),
@@ -242,10 +258,13 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   (only while the runtime lists its settings) and those of `app.ini` the menu does not know. A box
   over the screen then lists each file and what was done to it, or why not, Up/Down and the wheel going over those
   that do not fit, until another key closes it;
-  Share Log lists them too. **Move Old Files** (its value how many folders an older version left) asks first, with
-  how many entries would move and how many stay, then moves what *Left by older versions* lists an entry at a time
-  (`scarletnx --migrate=yes` without the menu, [Usage](usage.md#folders)), the same box saying what moved and why the
-  rest did not: one already there, one on another disk, a game laid out beside others, which moves from its dump.
+  Share Log lists them too. **Move Old Files** (its value how many folders an older version left, the setup's Old Files
+  pages) asks first, with how many entries would move and how many stay, then moves them an entry at a time
+  (`scarletnx --migrate=yes` without the menu, [Usage](usage.md#folders)). The box then says, over them, why they are
+  there, and a folder a line what moved and where it is now, or why not: one already there, one on another disk, a game
+  laid out beside others, which moves from its dump; an arrow at the right of the first and of the last while some are
+  above or under them, a scroll bar beside them, and how many more, Up/Down, PgUp/PgDn and the wheel going over them;
+  Share Log lists each entry.
   **Reset to Defaults**, the last row, puts every setting of the groups after App back to its default, asking first with how
   many change. A group of settings shows
   a row each, its help above, Left/Right going round its values, Enter typing one. A value typed (a number, a text, a
@@ -395,7 +414,14 @@ two; left out, none), `probe_mode` (edenprobe Mode's `quick`, the default, or `f
   system says of it (on Android 11 and later the reason it keeps for that process, [Android host](../hosts/android-app.md); elsewhere
   the system names none). The mark is `.running-<pid>` beside the log, made at the start, held while the launcher
   runs and deleted at its exit, Logs moving it; a game keeps its own beside its log, which the game's next start says
-  the same way. The start also gives the data folder's disk, `disk: 51200 MiB free of 953344 MiB` (on iOS the
+  the same way. The run going is kept beside its run log too, `last-run.ini` beside `last-run.log`, from its start
+  until the menu sees it end: a start that finds one did not see it end, says so (`last run: edenprobe, started
+  2026-11-12 20:18:25, whose end this launcher did not see: it did not end with an exit: Android stopped it: low memory
+  (...)`) and shows the setup's Last Run page ([Setup](#setup)) for a game that did not end with an exit. On Linux a
+  run the kernel's out-of-memory killer ends (SIGKILL, while the OOM kills of the launcher's memory cgroup, its
+  `memory.events`, or else of the system, `/proc/vmstat`, went up) says it on its screen: `Program ended abnormally
+  (status 137): the kernel's out-of-memory killer ended it (oom_kill 3 to 4 in /sys/fs/cgroup/.../memory.events), and
+  it held 14.2 GB`, the memory at the Status box's last look. The start also gives the data folder's disk, `disk: 51200 MiB free of 953344 MiB` (on iOS the
   banner's, [macOS and iOS](../hosts/apple.md)). Debug's Log level at 2 adds a line at each start and end of a run and of a recompile,
   with its status, its time and the disk then (`run: ended, status 7, after 12.3 s; disk: ...`); and on Android and
   the Apple apps each change of the thermal state and of the low power mode (Android's Battery Saver), `state: thermal
@@ -407,19 +433,16 @@ two; left out, none), `probe_mode` (edenprobe Mode's `quick`, the default, or `f
   files it keeps for the next start (Settings, the picks of Settings > App, the libraries' folders, the recent games), a second
   close skipping it. Closing its window during a run asks first: Exit terminates the entire owned process tree (a
   recompile's work lost), so let the game exit normally to preserve its saves.
-- As it opens, the menu shows in a box what an older version left where this one no longer looks, a
-  folder at a time: where it is (`- `, in the failure colour, a path too long for a row going on in the next) and
-  under it the space it takes, counted as the box shows (*counting* until then). They are the menu's `gui/`, `work/`, each game laid out
-  beside the others in `games/` or a library's Extra (`games/<id>/` now), the data folder's `games/` (`recompiled/` now,
-  its games still listed, each row marked `(games/)`, until they are moved), a portable copy's `games/`
-  beside the program, and a build tree's `games/`, `work/` and keys in its checkout
-  ([Usage](usage.md#folders)). Up/Down, PgUp/PgDn and the wheel go over those that do not fit (an arrow at the
-  right of the first says some are above it, *and N more* the ones under), any other key, click or tap closes it;
-  nothing is moved, and it shows again at the next start for as long as they are there.
-  **Share Log** lists them all, each with where it goes now. On Android the menu's own files an older version kept
-  in the app's own files, out of the Files app's reach, are listed a file at a time, and under them the box says how
-  they go while the app is in testing: Android's Settings > Apps > ScarletNX > Storage > Clear storage, which takes
-  every game, save and key in the app with them. The menu never reads them: it starts from its defaults.
+- As it opens, the menu shows what an older version left where this one no longer looks on the setup's **Old Files**
+  pages ([Setup](#setup)), alone when nothing else of the setup is due: the menu's `gui/`, `work/`, each game laid out
+  beside the others in `games/` or a library's Extra (`games/<id>/` now), a game's own saves (`save/` of the data
+  folder now, with `save_layout=global`), the data folder's `games/` (`recompiled/` now, its games still listed, each
+  row marked `(games/)`, until they are moved), a portable copy's `games/` beside the program, and a build tree's
+  `games/`, `work/` and keys in its checkout ([Usage](usage.md#folders)). They show at each start for as long as they
+  are there. **Share Log** lists them all, each with where it goes now. On Android the menu's own files an older
+  version kept in the app's own files, out of the Files app's reach, are a page each, which says how they also go while
+  the app is in testing: Android's Settings > Apps > ScarletNX > Storage > Clear storage, which takes every game, save
+  and key in the app with them. The menu never reads them: it starts from its defaults.
 - **Recent Games**, at the top of Games, lists the last games run, newest first, three and a row that
   shows the rest, by the name their run gave (the runner's `ScarletNX - <name>` line), else their file's. A dump not
   made into a game yet stays in the list but has no row, as opening it would compile it; once made, by any run, its
@@ -447,15 +470,47 @@ Status box. See [GNU ABI](../platforms/gnuabi/README.md) for supported Linux ELF
 The first start opens on the setup, not the menu, a page at a time, each a tab at the top under its number: the
 notices of what older versions did that this one does otherwise (only said, nothing moves:
 [Deprecations](deprecations.md)), then **Appearance**, **Install**, **Folders**, **Keys** and **User**
-([Usage](usage.md#setup) has what each asks, the terminal's setup too). Its boxes say what the page is about; its
+([Usage](usage.md#setup) has what each asks, the terminal's setup too). Its boxes say what the page is about, a box
+with more rows than it holds rolling them up a row every 0.6 s and back, an arrow at its right while some are above or
+under them and a scroll bar between the arrows, so none is cut; its
 question and choices come as the theme's `[body] options-dialog` places a question ([Themes](#themes)), over the boxes
 without darkening them; its tip, and what a choice did or why it did not, are in the foot. Up/Down (or the mouse)
 move between the choices, Enter takes one and ESC goes back a page, on the first page asking whether to exit. The
 notices come one a page, numbered (Changed 1/8), each read before the setup goes on: Next the next one, Back (from the
-second) the one before, and OK on the last. The first page has **Skip** after its choices: it takes every page left as
-its defaults have it, what Next, OK or Enter on each would take (the notices read, the appearance and the install as
-they are, Keep, Later, the nickname `Player`), writes `setup.ini` and opens the menu; a page whose default fails (a
-`users.ini` that cannot be written) stays, saying why.
+second) the one before, and OK on the last. While a game's `.ini` keeps keys under `[Deprecated]` (or the menu's own
+files keys nothing reads), the last asks what Settings > App's Clean Old Settings would take out (`Clean Old Settings?
+[Deprecated] in 2 .ini`): **Clean Now**, in focus, takes them out there, the box then saying each file and what was
+done to it, and OK goes on; **Not Now** goes on, App's row still there. Clean Now comes under Back, Not Now and Skip, a
+row apart: the choices that act on the player's files in a group of their own, as on Old Files' last page, Up/Down
+going round them all past that row. On the notices' and Old Files' pages each choice has the icon of what it does, as
+F1's box and Settings > App draw it: Back an arrow left, Next and OK a check, Not Now an x, Skip skip-forward, Clean Now
+the eraser, Move All the folder with an arrow in it, Delete All the trash can. The first page has **Skip** after its
+choices: it
+takes every page left as its defaults have it, what Next, OK or Enter on each would take (the notices read, the
+appearance and the install as they are, Keep, Later, the nickname `Player`, and Not Now on both questions: Skip cleans,
+moves and deletes nothing), writes `setup.ini` and opens the menu; a page whose default fails (a `users.ini` that
+cannot be written) stays, saying why.
+
+**Old Files**, after the steps, is a page for each folder an older version left (Old Files 1/4): where it is, the space
+it takes (*counting* until it is counted), where its entries go now, and what **Move All** and **Delete All** would do
+to it (`2 entries move`, `Deletes it`). The games' own saves are one page, whatever the games: how many games, the
+space their saves take, the data folder's `save/` they go to, Move All's entries and Delete All's `Stays: a save, which
+Delete All never deletes: Move All moves it`, then a line a game, its folder's name and its saves' space, rolling up a
+line every 0.6 s and back when they do not all fit, arrows and a scroll bar beside them and the last row saying how
+many are under them. Next goes on, Back back, PgUp/PgDn a page either way and Home/End to the first or the
+last; the last asks Back, **Not Now**, in focus, and a row under them Move All and Delete All. Delete All, and its
+question's Delete, have no way back: framed and written in the theme's `failure` colour, filled with it in focus, on
+every theme. Move All asks first as Move Old Files does, how many move and how many stay, and moves them as it
+does; Delete
+All asks first how many go and how many stay, its Delete pressed twice, and deletes each folder but a save, a folder
+holding saves (a game's `<name>_data/` with a `save/` or `sdmc/`, however deep), a folder it cannot read whole (one it
+cannot list, an entry it cannot look at, a link to a folder, which it does not follow), as it cannot tell it holds no
+save, and the console's keys, the page naming the path that keeps each; only Move All moves those. A game laid out
+beside the others goes with its `<name>_data/`. The page then says a folder
+a line what was done, and OK goes on. Not Now moves and deletes nothing: the pages come again at the next start, and
+Settings > App > Move Old Files moves them meanwhile. F5 looks again at once, and the page looks every 5 s: a folder
+moved away goes, and with none left the setup goes on. With nothing else due they come alone and write nothing to
+`setup.ini`.
 
 - **Appearance**: a box of Settings > App's Language, Theme, UI scale and Side panel, and Games' View and Icon size
   as its View box has them (Icon size greyed in the list), a row each, and Next (with Skip, on the first page) under
@@ -475,9 +530,24 @@ they are, Keep, Later, the nickname `Player`), writes `setup.ini` and opens the 
 - **Keys**: `prod.keys` and `title.keys` where the Switch driver reads them, and `aes_keys.txt` in `~/.3ds`, for the
   encrypted 3DS games; Use these, Choose folder (a folder with `prod.keys`, `title.keys` if it has one, and
   `aes_keys.txt` if it has one, installed where Install Keys installs them) or Later.
-- **User**: with `users/users.ini` there, its users with their pictures and uids, then Keep or Overwrite; without one,
-  or to overwrite it, the nickname typed (`Player` to start with; Backspace takes a letter out) and Enter. A nickname
+- **User**: with `users/users.ini` there, its users with their pictures and uids, then Keep or Overwrite, which asks
+  first (the file is kept as `users.ini.old`); without one, or to overwrite it, the nickname typed (`Player` to start with; Backspace takes a letter out) and Enter. A nickname
   the rooms' rule refuses is said, and the page stays.
+
+**Last Run** comes first when the menu did not see the last run end: on Android the low memory killer ends the menu,
+cached behind the game, and then the game, and the app comes back with neither (on iOS the system ends the app the
+game runs in). Its box says what ran and when it started, how it ended as the system says it (on Android 11 and later
+the reason Android keeps for the game's process, `Android stopped it: low memory (org.scarletnx:game, status 0,
+importance 100 foreground)`, the question then `Android stopped <game>`; elsewhere what it may have been), the memory
+that process held (`PSS 4.9 GB, RSS 1.9 GB`, `?` for what the system does not say) and the game's log. Run edenprobe
+left before its summary has **Continue**, in focus, which goes on with it from its journal once the setup is done, as
+GPU Drivers' Continue does, and **Not Now**, which leaves it to that row; one that reached its summary shows its counts
+in a box instead. A game has OK alone, and the page comes only for one that did not end with an exit, its own mark left
+beside its log: one that ended with an exit, or that still runs, is said in the launcher log alone. The page writes
+nothing to `setup.ini`, the setup's Skip comes on the page after it, and `--no-setup` leaves it out. When the menu
+stays and only the game's process is ended, the run's screen says it as it says a crash, `The game stopped: Android
+stopped it: low memory (...); PSS 4.9 GB, RSS 1.9 GB` with Share Log blinking, and Run edenprobe's next launch goes on
+as after any launch that ends before the summary, the launcher log saying how the last one ended.
 
 Once the last page is done the menu opens, `setup.ini` written. After an update that brings a notice, the setup
 shows that notice alone (1/1), with OK, before the menu. `scarletnx --no-setup` opens the menu with no
@@ -689,7 +759,7 @@ foot's ESC. A failure of the system's (a file not written, a folder not made, a 
 not found, the log not saved) shows whole in a box over the screen until OK, once in a session; the tips or the
 note go on saying it after. F5, or the foot's (Refresh on a phone), looks at the disk again at once rather than at the next look:
 Games lists its folders again, Folders says which of its folders are there, the menu counts the disk
-again, and the box of what an older version left looks again. The theme editor lists its keys, the preview beside them. The list's column is two fifths of
+again, and the Old Files pages look again. The theme editor lists its keys, the preview beside them. The list's column is two fifths of
 every screen, 20 columns at the least, and a window under 45 columns shows the list alone, or with app.ini's
 `side_box = on` (F2) the side box under it; a run's output and the theme editor's keys take three fifths, the side box
 24 columns at the least, under them on a window under 45 columns. The screens are laid out by `src/gui/ui.txt`'s
@@ -715,8 +785,8 @@ its rows, its last sliding what is left, or takes one that slides with `[body] t
 beside it what runs and how it ended over the status, the file in the tips and the ESC line where the keys
 go, which a tap aborts. The button map draws the pad in the box between the head and the foot. A question comes
 over the screen darkened, in a box in its middle, or with `[body] options-dialog = yorha` (YoRHa's) in a box at its
-foot, a tab with its label on the box's edge, the choices at its right above it, as the game's dialogs. The files an
-older version left come in a box over the screen darkened.
+foot, a tab with its label on the box's edge, the choices at its right above it, as the game's dialogs. What Clean Old
+Settings and Move Old Files did comes in a box over the screen darkened.
 
 The built-ins are `default`, the look above, and `yorha`: paper and ink, a title twice the text's size where it fits whole, a faint
 grid on the page, square markers, the focused box inverted, the tips in a box under the head, the keys in one on a

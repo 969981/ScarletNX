@@ -13,16 +13,16 @@ typedef struct AgbBoard AgbBoard;
 typedef struct {
     SnxArmCPU arm;
     AgbBoard* board; /* the machine the bus hook serves */
+    /* the bus cycles of the recompiled blocks' loads and stores (arm.h's SnxArmBusCosts): the table of the running
+       block's code region, which the block reads, and the cycles it adds up, which the machine loop takes after it */
+    const SnxArmBusCosts* bus_costs;
+    uint32_t bus_cycles;
+    /* each code region's table, made for the WAITCNT costs_waitcnt says (0x10000 before any) */
+    uint32_t costs_waitcnt;
+    SnxArmBusCosts costs[16];
     /* the banked registers of the ARM7TDMI's modes: usr and sys share one bank */
     uint32_t banked_r13[6], banked_r14[6], spsr[6];
     uint32_t fiq_r8[5], usr_r8[5]; /* the ARM7TDMI banks r8 to r12 in FIQ mode */
-    /* IntrWait's interrupts while it waits: the machine halts until the game's handler flags one of them in the BIOS's
-       flags (0x03007FF8), as the BIOS does; 0 when it waits for none */
-    uint16_t wait;
-    /* the interrupts entered and not yet returned from through the BIOS, and that count when IntrWait was called: the
-       BIOS checks its flags where the call was made, once every handler it ran returned, whichever mode a handler
-       switched to (a nested one runs in system mode) */
-    uint16_t irq_depth, wait_depth;
     /* the cycles the last run went past its budget, which the next run's takes back: a run of a frame's cycles then
        ends where the machine's frame does, not later at each frame */
     uint32_t over;

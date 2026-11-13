@@ -57,19 +57,11 @@ void vk_pipeline_save(int at_exit) {
         pm_unlock(&g_pipeline.psave);
         return;
     }
-    size_t n = 0;
-    void* d = NULL;
-    if (vkGetPipelineCacheData(g_vk.dev, g_pipeline.pcache, &n, NULL) == VK_SUCCESS && n) d = malloc(n);
-    if (d && vkGetPipelineCacheData(g_vk.dev, g_pipeline.pcache, &n, d) == VK_SUCCESS) {
-        FILE* f = fopen(g_pipeline.pcache_tmp, "wb");
-        if (f) {
-            int ok = fwrite(d, 1, n, f) == n;
-            if (fclose(f)) ok = 0;
-            if (!ok || plat_replace_file(g_pipeline.pcache_tmp,
-                                         g_pipeline.pcache_path)) /* the old cache stays whole until this */
-                remove(g_pipeline.pcache_tmp);
-        }
+    size_t saved;
+    char why[512];
+    if (snx_vk_pipeline_cache_save(g_vk.dev, g_pipeline.pcache, g_pipeline.pcache_path, &saved, why, sizeof why)) {
+        WARN("vulkan: the pipeline cache could not be written to %s: %s\n", g_pipeline.pcache_path, why);
+        pcache_note(); /* written again after another quiet time, or at exit */
     }
-    free(d);
     pm_unlock(&g_pipeline.psave);
 }

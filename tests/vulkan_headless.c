@@ -5901,6 +5901,7 @@ static int check_video_decode_gate(void) {
 #include "vulkan_compute_depth.inc"
 #include "vulkan_owned_readback.inc"
 #include "vulkan_lock_waits.inc"
+#include "vulkan_release_slot.inc"
 #include "vulkan_guest_staging.inc"
 #include "vulkan_storage_suffix.inc"
 #include "vulkan_storage_logged.inc"
@@ -6622,11 +6623,12 @@ static int run_headless(int argc, char** argv) {
         if (!strcmp(name, "placed") && ++ran) CHECK(!check_uma_placed());
         if (!strcmp(name, "placed_view") && ++ran) CHECK(!check_uma_placed_view());
         if (!strcmp(name, "logged_back") && ++ran) CHECK(!check_uma_logged_back());
+        if (!strcmp(name, "trapped_window") && ++ran) CHECK(!check_uma_trapped_window());
         if (!ran) {
             fprintf(stderr,
                     "SNX_TEST_UMA_ONLY=%s names no check: 1, runtime_write, constants, migrate, way, region_writes, "
                     "region_merge, writes, feedback, publish, dispatch, texture_pending, dispatch_constants, "
-                    "dispatch_table, header_words, placed, placed_view or logged_back\n",
+                    "dispatch_table, header_words, placed, placed_view, logged_back or trapped_window\n",
                     name);
             return 2;
         }
@@ -6637,6 +6639,7 @@ static int run_headless(int argc, char** argv) {
     if (getenv("SNX_TEST_UMA_ONLY")) { /* the checks of guest memory read in place alone, for a quick run on a GPU */
         CHECK(!check_uma_in_flight());
         CHECK(!check_uma_trap_ranges());
+        CHECK(!check_uma_trapped_window());
         CHECK(!check_uma_lookup_then_submit());
         CHECK(!check_uma_runtime_write());
         CHECK(!check_uma_constants());
@@ -6689,6 +6692,14 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_mapping_lock());
     CHECK(!check_landing_wait());
     CHECK(!check_frame_ready());
+    CHECK(!check_release_in_use());
+    CHECK(!check_release_recording());
+    CHECK(!check_release_fresh());
+    CHECK(!check_release_bytes());
+    CHECK(!check_release_present_landing());
+    CHECK(!check_release_recycle_landing());
+    CHECK(!check_release_landing_fresh());
+    CHECK(!check_landing_records_fresh());
     CHECK(!check_mapping_landing());
     CHECK(!check_guest_staging());
     CHECK(!check_owned_writable());
@@ -6833,6 +6844,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_targets_kept());
     CHECK(!check_uma_in_flight());
     CHECK(!check_uma_trap_ranges());
+    CHECK(!check_uma_trapped_window());
     CHECK(!check_uma_lookup_then_submit());
     CHECK(!check_uma_runtime_write());
     CHECK(!check_uma_constants());

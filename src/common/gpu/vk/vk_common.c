@@ -1,8 +1,20 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L /* getpid in strict C99 */
+#endif
 #include "common/gpu/vk/vk_common.h"
+#include "common/platform/file.h"
+#include "common/utilities/common.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h> /* GetCurrentProcessId */
+#else
+#include <unistd.h> /* getpid */
+#endif
 
 const char* snx_vk_result_str(VkResult r) {
     switch (r) {
@@ -287,6 +299,98 @@ int snx_vk_pipeline_workers(int setting, int cpus) {
    in a burst, where the frame waits and the game idles, and what the system gives after the game's threads while it
    plays */
 int snx_vk_pipeline_low_workers(int workers) { return workers > 2 ? workers - 2 : 0; }
+
+VkPipelineCache snx_vk_pipeline_cache_new(VkDevice dev, const VkPhysicalDeviceProperties* props, const void* data,
+                                          size_t size, size_t* taken, char* why, size_t n) {
+    VkPipelineCacheCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    char found[256];
+    *taken = 0;
+    if (n) *why = 0;
+    if (data && snx_vk_pipeline_cache_check(data, size, props, found, sizeof found))
+        snprintf(why, n, "it %s, so the pipeline cache starts empty", found);
+    else if (data) {
+        ci.initialDataSize = size;
+        ci.pInitialData = data;
+    }
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    VkResult r = vkCreatePipelineCache(dev, &ci, NULL, &cache);
+    if (r != VK_SUCCESS && ci.initialDataSize) {
+        snprintf(why, n, "the driver refused its %zu bytes (%s), so the pipeline cache starts empty", size,
+                 snx_vk_result_str(r));
+        ci.initialDataSize = 0;
+        ci.pInitialData = NULL;
+        r = vkCreatePipelineCache(dev, &ci, NULL, &cache);
+    }
+    if (r != VK_SUCCESS) {
+        size_t at = n ? strlen(why) : 0;
+        snprintf(why + at, n - at,
+                 "%sthe device refuses even an empty pipeline cache (%s): pipelines are made without one",
+                 at ? "; " : "", snx_vk_result_str(r));
+        return VK_NULL_HANDLE;
+    }
+    *taken = ci.initialDataSize;
+    return cache;
+}
+VkPipelineCache snx_vk_pipeline_cache_load(VkDevice dev, const VkPhysicalDeviceProperties* props, const char* path,
+                                           size_t* loaded, char* why, size_t n) {
+    PFileMap data = {0};
+    char os[256] = "";
+    int there = path && snx_path_exists(path);
+    if (there && plat_file_map(&data, path)) snx_os_error(os, sizeof os);
+    /* an empty file is checked too: what a run cut short leaves on a file system that lost the data */
+    const void* bytes = !there || os[0] ? NULL : data.data ? (const void*)data.data : "";
+    VkPipelineCache cache = snx_vk_pipeline_cache_new(dev, props, bytes, (size_t)data.size, loaded, why, n);
+    if (os[0] && cache) snprintf(why, n, "it cannot be read (%s), so the pipeline cache starts empty", os);
+    plat_file_unmap(&data); /* the cache copied it, and a mapped file can't be replaced on Windows */
+    return cache;
+}
+int snx_vk_pipeline_cache_save(VkDevice dev, VkPipelineCache cache, const char* path, size_t* saved, char* why,
+                               size_t n) {
+    *saved = 0;
+    if (n) *why = 0;
+    size_t size = 0;
+    if (!cache) {
+        snprintf(why, n, "there is no pipeline cache to write");
+        return -1;
+    }
+    VkResult r = vkGetPipelineCacheData(dev, cache, &size, NULL);
+    if (r != VK_SUCCESS || !size) {
+        snprintf(why, n, "the driver gave %zu bytes for the cache's data (%s)", size, snx_vk_result_str(r));
+        return -1;
+    }
+    void* data = malloc(size);
+    if (!data) {
+        snprintf(why, n, "%zu bytes for the cache's data cannot be allocated", size);
+        return -1;
+    }
+    /* VK_INCOMPLETE when a pipeline made since the size was asked grew the cache: what fits is no whole cache */
+    if ((r = vkGetPipelineCacheData(dev, cache, &size, data)) != VK_SUCCESS) {
+        snprintf(why, n, "the driver did not give the cache's data (%s)", snx_vk_result_str(r));
+        free(data);
+        return -1;
+    }
+#if defined(_WIN32)
+    unsigned long pid = (unsigned long)GetCurrentProcessId();
+#else
+    unsigned long pid = (unsigned long)getpid();
+#endif
+    char* tmp = snx_format("%s.%lu.tmp", path, pid);
+    char os[256];
+    FILE* f = fopen(tmp, "wb");
+    int failed = !f || fwrite(data, 1, size, f) != size;
+    if (f && fclose(f)) failed = 1;
+    if (failed)
+        snprintf(why, n, "%s cannot be written (%s)", tmp, snx_os_error(os, sizeof os));
+    else if (plat_replace_file(tmp, path)) { /* the old file stays whole until this */
+        failed = 1;
+        snprintf(why, n, "%s cannot be moved over it (%s)", tmp, snx_os_error(os, sizeof os));
+    }
+    if (failed && f) remove(tmp);
+    if (!failed) *saved = size;
+    free(tmp);
+    free(data);
+    return failed ? -1 : 0;
+}
 
 VkResult snx_vk_shader_module(VkDevice dev, const uint32_t* words, size_t size, VkShaderModule* out) {
     VkShaderModuleCreateInfo info = {

@@ -377,6 +377,14 @@ if(TARGET snx_ctr_board)
     target_link_libraries(snx-test-3ds-vk-y2r PRIVATE snx_ctr_gpu)
     add_test(NAME 3ds_vk_y2r COMMAND snx-test-3ds-vk-y2r)
     set_tests_properties(3ds_vk_y2r PROPERTIES SKIP_RETURN_CODE 77)
+    # the pipeline cache kept between runs: an empty one without a file, a written one read back whole, a cut file,
+    # no temporary file left, and the renderer's file in the folder's shader_cache
+    add_executable(snx-test-3ds-vk-pipeline-cache 3ds_vk_pipeline_cache.c)
+    snx_test_target(snx-test-3ds-vk-pipeline-cache 11)
+    target_link_libraries(snx-test-3ds-vk-pipeline-cache PRIVATE snx_ctr_gpu)
+    add_test(NAME 3ds_vk_pipeline_cache COMMAND snx-test-3ds-vk-pipeline-cache
+                                                "${CMAKE_CURRENT_BINARY_DIR}/pipeline-cache")
+    set_tests_properties(3ds_vk_pipeline_cache PROPERTIES SKIP_RETURN_CODE 77)
     # the GPU's draws against the software renderer, the CPU reference they replaced, scene by scene
     add_executable(snx-test-3ds-vk-draw 3ds_vk_draw.c)
     snx_test_target(snx-test-3ds-vk-draw 11)
@@ -384,7 +392,9 @@ if(TARGET snx_ctr_board)
     add_test(NAME 3ds_vk_draw COMMAND snx-test-3ds-vk-draw)
     # async_pipelines: the draw skipped while its pipeline is made on a worker, then drawn
     add_test(NAME 3ds_vk_draw_async COMMAND snx-test-3ds-vk-draw --async)
-    set_tests_properties(3ds_vk_draw 3ds_vk_draw_async PROPERTIES SKIP_RETURN_CODE 77)
+    # the pipeline cache kept between runs: the file named for the driver, and a failed write made again by the next
+    add_test(NAME 3ds_vk_draw_pipeline_cache COMMAND snx-test-3ds-vk-draw --pipeline-cache)
+    set_tests_properties(3ds_vk_draw 3ds_vk_draw_async 3ds_vk_draw_pipeline_cache PROPERTIES SKIP_RETURN_CODE 77)
     # the GPU's copy of the RAM, page by page: what is copied in and back, and when, and every byte where it belongs
     add_executable(snx-test-3ds-vk-copies 3ds_vk_copies.c)
     snx_test_target(snx-test-3ds-vk-copies 11)
@@ -606,6 +616,11 @@ add_executable(snx-test-gui-probe gui_probe.c "${PROJECT_SOURCE_DIR}/src/gui/pro
 snx_test_target(snx-test-gui-probe 99)
 target_link_libraries(snx-test-gui-probe PRIVATE snx_test_common snx_yyjson)
 add_test(NAME gui_probe COMMAND snx-test-gui-probe)
+# the menu's Last Run record, what the system says of a process's end and the kernel's OOM kills (gui/last_run.c)
+add_executable(snx-test-gui-last-run gui_last_run.c "${PROJECT_SOURCE_DIR}/src/gui/last_run.c")
+snx_test_target(snx-test-gui-last-run 99)
+target_link_libraries(snx-test-gui-last-run PRIVATE snx_test_common)
+add_test(NAME gui_last_run COMMAND snx-test-gui-last-run)
 # a mod's IPS, IPS32 and IPSwitch patches: their formats, which module takes one, the played mods' in their order
 add_executable(snx-test-patches patches.c)
 snx_test_target(snx-test-patches 99)
@@ -651,6 +666,8 @@ if(TARGET hactool_internals)
     add_test(NAME filesystem_raw COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> raw)
     add_test(NAME filesystem_addon_overlay COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> addon-overlay)
     add_test(NAME filesystem_mods COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> mods)
+    # a game killed while it saves, at each step of a save's commit and open: its last commit or the new one, whole
+    add_test(NAME filesystem_save_kill COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> save-kill)
     add_test(NAME filesystem_mods_stale COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> mods-stale)
     add_test(NAME filesystem_folder_source
              COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> folder-source)
@@ -1130,6 +1147,14 @@ target_include_directories(snx-test-hook-address PRIVATE "${PROJECT_SOURCE_DIR}/
 snx_hookgen(snx-test-hook-address SPEC "${CMAKE_CURRENT_SOURCE_DIR}/hook/address_first.hook"
             "${CMAKE_CURRENT_SOURCE_DIR}/hook/address.hook")
 add_test(NAME hook_address COMMAND snx-test-hook-address)
+# hook_install on a 64-bit game (src/nx/hle/hook/hook.c) over tests/hook/install.hook, with the runtime stubbed: the
+# hooks' slots, and what is left of them once a save state's g_hle took the running one's place
+add_executable(snx-test-hook-install hook_install.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/version.c")
+snx_test_target(snx-test-hook-install 23)
+target_include_directories(snx-test-hook-install PRIVATE "${PROJECT_SOURCE_DIR}/src")
+snx_service_swipc(snx-test-hook-install)
+snx_hookgen(snx-test-hook-install SPEC "${CMAKE_CURRENT_SOURCE_DIR}/hook/install.hook")
+add_test(NAME hook_install COMMAND snx-test-hook-install)
 # the route list (src/nx/loader/hook_routes.c): hookgen --routes over three specs (tests/hook/routes.hook,
 # versions.hook and address.hook), the runtime's own list, its lookup and the hashes a module carries, and the build
 # IDs an address hook's key names
@@ -1722,6 +1747,12 @@ if(Python3_Interpreter_FOUND)
     # then the checks on checkouts made to fail them
     add_test(NAME docs_check COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/check-docs.py")
     add_test(NAME docs_check_script COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/docs_test.py")
+    # every key settings.txt dropped in main's history named by INI_DEPRECATED and docs/user/deprecations.md, the two
+    # alike (scripts/check-deprecations.py); then the checks on histories made to fail them. Skipped (77) without git
+    # or a checkout; a shallow clone's states are the ones it has
+    add_test(NAME deprecations_check COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/check-deprecations.py")
+    add_test(NAME deprecations_check_script COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/deprecations_test.py")
+    set_tests_properties(deprecations_check PROPERTIES SKIP_RETURN_CODE 77)
     # which GitHub Actions caches the cleanup workflow deletes (scripts/trim-caches.py)
     add_test(NAME trim_caches COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/trim_caches_test.py")
     # build.yml's LLVM builds, each saved by the step right after it: a later failure or a cancelled run keeps it;
@@ -1869,7 +1900,8 @@ snx_test_target(snx-test-collection-programs 99)
 target_link_libraries(snx-test-collection-programs PRIVATE scarletnx-common)
 add_test(NAME collection_programs COMMAND snx-test-collection-programs)
 
-# a start's mark (common/utilities/run_mark.c): made, ended, said by the next start, a held one left, a long folder
+# a start's mark (common/utilities/run_mark.c): made, ended, said by the next start, a held one left, a long folder,
+# a look that deletes none
 add_executable(snx-test-run-mark run_mark.c)
 snx_test_target(snx-test-run-mark 99)
 target_link_libraries(snx-test-run-mark PRIVATE scarletnx-common)
@@ -2179,7 +2211,7 @@ if(NOT SNX_TOOLS_ONLY)
     # read through its mapping
     add_executable(snx-test-pipeline-file pipeline_file.c tracy_stubs.c)
     snx_test_target(snx-test-pipeline-file 23)
-    target_link_libraries(snx-test-pipeline-file PRIVATE snx_nx_flags snx_zstd scarletnx-common)
+    target_link_libraries(snx-test-pipeline-file PRIVATE snx_nx_flags snx_zstd scarletnx-common snx_vk_common)
     add_test(NAME pipeline_file COMMAND snx-test-pipeline-file)
     add_executable(snx-test-vk-pipeline-probe-flags vk_pipeline_probe_flags.c)
     snx_test_target(snx-test-vk-pipeline-probe-flags 23)
@@ -2198,10 +2230,15 @@ if(NOT SNX_TOOLS_ONLY)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         # The real cache saver with a fake driver: compilation defers periodic snapshots without losing dirty work.
         # Include only its implementation; sanitizer-retained callback tables make whole-file linker GC unsuitable.
-        add_executable(snx-test-vk-pipeline-save vk_pipeline_save.c)
-        snx_test_target(snx-test-vk-pipeline-save 23)
-        target_link_libraries(snx-test-vk-pipeline-save PRIVATE snx_nx_flags)
-        add_test(NAME vk_pipeline_save COMMAND snx-test-vk-pipeline-save)
+        # It writes through the common writer (common/gpu/vk/vk_common.c), which calls volk's pointers
+        if(TARGET snx_vk_common)
+            add_executable(snx-test-vk-pipeline-save vk_pipeline_save.c "${volk_SOURCE_DIR}/volk.c")
+            set_source_files_properties("${volk_SOURCE_DIR}/volk.c" PROPERTIES COMPILE_OPTIONS
+                                        "${snx_third_party_flags}")
+            snx_test_target(snx-test-vk-pipeline-save 23)
+            target_link_libraries(snx-test-vk-pipeline-save PRIVATE snx_nx_flags snx_vk_common)
+            add_test(NAME vk_pipeline_save COMMAND snx-test-vk-pipeline-save)
+        endif()
     endif()
     # graphics storage images' write-backs (gpu/vk/image_out.c) against a stand-in GPU: a draw over one whose copy is
     # recorded goes on from it with no read or wait, and they land in order, each over the bytes the last one left
@@ -3468,6 +3505,11 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
         snx_test_target(snx-test-vk-pipeline-workers 11)
         target_link_libraries(snx-test-vk-pipeline-workers PRIVATE snx_vk_common)
         add_test(NAME vk_pipeline_workers COMMAND snx-test-vk-pipeline-workers)
+        # which pipeline cache files go to the driver: its own data, whole, of this device and driver build
+        add_executable(snx-test-vk-pipeline-cache-check vk_pipeline_cache_check.c)
+        snx_test_target(snx-test-vk-pipeline-cache-check 11)
+        target_link_libraries(snx-test-vk-pipeline-cache-check PRIVATE snx_vk_common)
+        add_test(NAME vk_pipeline_cache_check COMMAND snx-test-vk-pipeline-cache-check)
         # the subgroups a compute pipeline asks for: their size, and whole ones
         add_executable(snx-test-vk-compute-subgroups vk_compute_subgroups.c "${volk_SOURCE_DIR}/volk.c")
         snx_test_target(snx-test-vk-compute-subgroups 11)

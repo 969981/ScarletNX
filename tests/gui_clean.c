@@ -1,14 +1,15 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 /* Clean Old Settings (src/gui/clean.c): a game's .ini without its [Deprecated] section and nothing else changed, the
-   .ini files of a folder, and an entry for each file, done or not */
+   .ini files of a folder, and an entry for each file, done or not; Move Old Files' moves, and Delete All, which never
+   deletes a save or the console's keys */
 #include "gui/clean.h"
 #include "common/utilities/common.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef SNX_XDG
+#ifndef _WIN32 /* chmod and symlink */
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -278,6 +279,148 @@ int main(void) {
             free(saves);
             free(note);
         }
+        /* a save an older version kept, the game's own files in its folder, two of them folders named 0 and 1 (a game's
+           slots): each into the save's 0/, its last commit as this version keeps a save, with the file that says so.
+           Nothing touched without apply; then the save is not one of those any more, and nothing is left beside it */
+        {
+            char *save = snx_path_join(root, "title"), *zero = snx_path_join(save, "0/slot.bin"),
+                 *one = snx_path_join(save, "1/slot.bin"), *top = snx_path_join(save, "system.bin"),
+                 *staged = snx_path_join(root, "title.moving"), *mark = snx_path_join(save, SNX_SAVE_JOURNALED),
+                 *moved = snx_path_join(save, SNX_SAVE_COMMITTED "/1/slot.bin"), *dir, *said;
+            assert(!gui_save_old(save) && !snx_mkdirs(save)); /* not there */
+            assert(!gui_save_old(save));                      /* a folder with nothing in it */
+            dir = snx_dirname(zero);
+            assert(!snx_mkdirs(dir));
+            free(dir);
+            dir = snx_dirname(one);
+            assert(!snx_mkdirs(dir));
+            free(dir);
+            write_text(zero, "zero");
+            write_text(one, "one");
+            write_text(top, "top");
+            assert(gui_save_old(save));
+            assert(gui_move_save_committed(&done, save, false) == 3);
+            said = native(snx_format("+title/0|Moves to %s/title/0/0\n+title/1|Moves to %s/title/0/1\n"
+                                     "+title/system.bin|Moves to %s/title/0/system.bin\n",
+                                     root, root, root));
+            assert(!strcmp(entries(&done, base), said) && snx_is_file(top) && !snx_path_exists(staged));
+            free(said);
+            gui_cleaned_free(&done);
+            assert(gui_move_save_committed(&done, save, true) == 3 && done.count == 3 && done.done == 3);
+            gui_cleaned_free(&done);
+            assert(snx_is_file(mark) && snx_is_file(moved) && !snx_path_exists(top) && !snx_path_exists(staged));
+            {
+                char* text = read_text(moved);
+                assert(text && !strcmp(text, "one"));
+                free(text);
+            }
+            free(moved);
+            moved = snx_path_join(save, SNX_SAVE_COMMITTED "/0/slot.bin");
+            assert(snx_is_file(moved) && !snx_path_exists(one));
+            /* laid out now: not one of those, and a second move does nothing */
+            assert(!gui_save_old(save) && !gui_move_save_committed(&done, save, true) && !done.count);
+            /* a move cut short after its last file: the save's folder empty, its files beside it. The next one puts
+               the folder in place */
+            assert(!rename(save, staged) && !snx_mkdirs(save) && gui_save_old(save));
+            assert(gui_move_save_committed(&done, save, true) == 1 && done.count == 1 && done.done == 1);
+            gui_cleaned_free(&done);
+            assert(snx_is_file(mark) && snx_is_file(moved) && !snx_path_exists(staged) && !gui_save_old(save));
+            /* one of its files cannot move, its name there already from a move cut short: the save is as it was, the
+               ones that moved back in it, and that file is the only entry */
+            assert(!snx_remove_tree(save) && !snx_mkdirs(save));
+            write_text(top, "top");
+            free(moved);
+            moved = snx_path_join(save, "a.bin");
+            write_text(moved, "a");
+            dir = snx_path_join(staged, SNX_SAVE_COMMITTED "/system.bin");
+            free(zero);
+            zero = snx_dirname(dir);
+            assert(!snx_mkdirs(zero));
+            write_text(dir, "an older move's");
+            assert(!gui_move_save_committed(&done, save, true) && done.count == 1 && done.done == 0);
+            said = native(snx_format("!title/system.bin|Stays: %s/title.moving/0/system.bin is there\n", root));
+            assert(!strcmp(entries(&done, base), said));
+            free(said);
+            gui_cleaned_free(&done);
+            assert(snx_is_file(moved) && snx_is_file(top) && snx_is_file(dir) && !snx_path_exists(mark));
+            assert(!snx_remove_tree(save) && !snx_remove_tree(staged));
+            free(dir);
+            free(moved);
+            free(mark);
+            free(staged);
+            free(top);
+            free(one);
+            free(zero);
+            free(save);
+        }
+        /* a game's own save as an older version kept it, its files in its folder, to the data folder's save/ at once:
+           each into the new folder's 0/ with the file that says so, the old folder gone; nothing touched without
+           apply. One that cannot move, its name there already from a move cut short, puts back those that did */
+        {
+            char *old = snx_path_join(root, "game/save/device"), *now = snx_path_join(root, "data/save/device/title"),
+                 *a = snx_path_join(old, "a.bin"), *slot = snx_path_join(old, "1/slot.bin"),
+                 *staged = snx_path_join(root, "data/save/device/title.moving"),
+                 *mark = snx_path_join(now, SNX_SAVE_JOURNALED),
+                 *moved = snx_path_join(now, SNX_SAVE_COMMITTED "/1/slot.bin"), *dir = snx_dirname(slot), *said, *b,
+                 *left;
+            assert(dir && !snx_mkdirs(dir));
+            write_text(a, "a");
+            write_text(slot, "slot");
+            assert(gui_move_save_into(&done, old, now, false) == 2);
+            said = native(snx_format("+game/save/device/1|Moves to %s/data/save/device/title/0/1\n"
+                                     "+game/save/device/a.bin|Moves to %s/data/save/device/title/0/a.bin\n",
+                                     root, root));
+            assert(!strcmp(entries(&done, base), said) && snx_is_file(a) && !snx_path_exists(now) &&
+                   !snx_path_exists(staged));
+            free(said);
+            gui_cleaned_free(&done);
+            assert(gui_move_save_into(&done, old, now, true) == 2 && done.count == 3 && done.done == 3);
+            said = native(snx_format("+game/save/device/1|Moved to %s/data/save/device/title/0/1\n"
+                                     "+game/save/device/a.bin|Moved to %s/data/save/device/title/0/a.bin\n"
+                                     "+game/save/device|Removed: it was empty\n",
+                                     root, root));
+            assert(!strcmp(entries(&done, base), said));
+            free(said);
+            gui_cleaned_free(&done);
+            assert(snx_is_file(mark) && snx_is_file(moved) && !snx_path_exists(old) && !snx_path_exists(staged) &&
+                   !gui_save_old(now));
+            /* b.bin's name in the folder an earlier move left: a.bin goes back, b.bin stays, the only entry */
+            assert(!snx_remove_tree(now) && !snx_mkdirs(old));
+            write_text(a, "a");
+            b = snx_path_join(old, "b.bin");
+            write_text(b, "b");
+            left = snx_path_join(staged, SNX_SAVE_COMMITTED "/b.bin");
+            free(dir);
+            dir = snx_dirname(left);
+            assert(dir && !snx_mkdirs(dir));
+            write_text(left, "an older move's");
+            assert(!gui_move_save_into(&done, old, now, true) && done.count == 1 && done.done == 0);
+            said = native(
+                snx_format("!game/save/device/b.bin|Stays: %s/data/save/device/title.moving/0/b.bin is there\n", root));
+            assert(!strcmp(entries(&done, base), said));
+            free(said);
+            gui_cleaned_free(&done);
+            assert(snx_is_file(a) && snx_is_file(b) && snx_is_file(left) && !snx_path_exists(now));
+            said = snx_path_join(staged, SNX_SAVE_COMMITTED "/a.bin");
+            assert(!snx_path_exists(said));
+            free(said);
+            said = snx_path_join(root, "game");
+            assert(!snx_remove_tree(said));
+            free(said);
+            said = snx_path_join(root, "data");
+            assert(!snx_remove_tree(said));
+            free(said);
+            free(left);
+            free(b);
+            free(dir);
+            free(moved);
+            free(mark);
+            free(staged);
+            free(slot);
+            free(a);
+            free(now);
+            free(old);
+        }
 #ifdef SNX_XDG
         { /* another disk: the entry not moved, the folder on the other named */
             char* shm = snx_is_dir("/dev/shm") ? snx_temp_dir("/dev/shm") : NULL;
@@ -303,6 +446,129 @@ int main(void) {
         free(base);
         free(now);
         free(old);
+    }
+    /* Delete All: a save is never deleted, nor a game laid out beside others whose <name>_data/ holds its saves, a
+       folder holding saves however deep, one it cannot read whole or the console's keys, each said with its path; the
+       rest is, only with apply, said either way */
+    {
+        static const char* const files[] = {"gui/settings.ini",
+                                            "work/tmp/a.o",
+                                            "games/0100000000ABC000/0100000000ABC000_data/save/user.x/s",
+                                            "games/0100000000ABC000/0100000000ABC000_data/exefs/main",
+                                            "code/0100000000ABC000/0100000000ABC000_data/exefs/main",
+                                            "beside/Game",
+                                            "beside/Game_data/sdmc/notes.txt",
+                                            "deep/a/b/c/d/e/x_data/save/s",
+                                            "checkout/prod.keys",
+                                            "keys/sub/title.keys",
+                                            "laid/Old",
+                                            "laid/Old_data/exefs/main"};
+        static const char* const olds[] = {
+            "gui", "work", "code", "laid/Old", "games", "beside/Game", "deep", "checkout/prod.keys", "keys"};
+        char *base = snx_path_join(root, ""), *path, *said;
+        size_t i;
+        GuiKept kept;
+        for (i = 0; i < sizeof files / sizeof files[0]; ++i) {
+            char* dir;
+            path = snx_path_join(root, files[i]);
+            dir = snx_dirname(path);
+            assert(dir && !snx_mkdirs(dir));
+            write_text(path, "x");
+            free(dir);
+            free(path);
+        }
+#define KEEP(at) (path = snx_path_join(root, at), gui_old_keep(path, &kept), free(path), kept.keep)
+#define WHERE(at)                                                                                                      \
+    (path = native(snx_format("%s/%s", root, at)), strcmp(kept.where, path) ? (free(path), 0) : (free(path), 1))
+        assert(KEEP("gui") == GUI_KEEP_NONE && KEEP("work") == GUI_KEEP_NONE && KEEP("code") == GUI_KEEP_NONE);
+        assert(KEEP("games/0100000000ABC000/0100000000ABC000_data/save/user.x") == GUI_KEEP_SAVE);
+        assert(KEEP("beside/Game") == GUI_KEEP_SAVE && WHERE("beside/Game_data"));
+        assert(KEEP("games") == GUI_KEEP_SAVES && WHERE("games/0100000000ABC000/0100000000ABC000_data"));
+        assert(KEEP("deep") == GUI_KEEP_SAVES && WHERE("deep/a/b/c/d/e/x_data")); /* six folders down */
+        assert(KEEP("checkout/prod.keys") == GUI_KEEP_KEYS && KEEP("checkout") == GUI_KEEP_KEYS);
+        assert(KEEP("keys") == GUI_KEEP_KEYS && WHERE("keys/sub/title.keys"));
+        assert(gui_old_keep(base, NULL) == GUI_KEEP_SAVES); /* all of it: a save first */
+        for (i = 0; i < sizeof olds / sizeof olds[0]; ++i) {
+            path = snx_path_join(root, olds[i]);
+            gui_delete_old(&done, path, false);
+            free(path);
+        }
+        said = native(snx_format(
+            "+gui|Deletes it\n+work|Deletes it\n+code|Deletes it\n+laid/Old|Deletes it, with Old_data\n"
+            "!games|Stays: it holds saves (%s/games/0100000000ABC000/0100000000ABC000_data), which Delete All never "
+            "deletes: Move All moves it\n"
+            "!beside/Game|Stays: a save, which Delete All never deletes: Move All moves it\n"
+            "!deep|Stays: it holds saves (%s/deep/a/b/c/d/e/x_data), which Delete All never deletes: Move All moves it\n"
+            "!checkout/prod.keys|Stays: the console's keys, which Delete All never deletes: Move All moves them\n"
+            "!keys|Stays: it holds the console's keys (%s/keys/sub/title.keys), which Delete All never deletes: Move "
+            "All moves them\n",
+            root, root, root));
+        assert(!strcmp(entries(&done, base), said) && done.count == 9 && done.done == 4);
+        free(said);
+        path = snx_path_join(root, "gui/settings.ini");
+        assert(snx_is_file(path)); /* nothing deleted without apply */
+        free(path);
+        gui_cleaned_free(&done);
+        for (i = 0; i < sizeof olds / sizeof olds[0]; ++i) {
+            path = snx_path_join(root, olds[i]);
+            assert(gui_delete_old(&done, path, true) == (i < 4));
+            assert(!snx_path_exists(path) == (i < 4));
+            free(path);
+        }
+        path = snx_path_join(root, "laid/Old_data");
+        assert(!snx_path_exists(path)); /* with its game */
+        free(path);
+        path = snx_path_join(root, "deep/a/b/c/d/e/x_data/save/s");
+        assert(snx_is_file(path)); /* the deep save, there */
+        free(path);
+        said = native(snx_format("+gui|Deleted\n+work|Deleted\n+code|Deleted\n+laid/Old|Deleted, with Old_data\n"));
+        assert(done.count == 9 && done.done == 4 && !strncmp(entries(&done, base), said, strlen(said)));
+        free(said);
+        gui_cleaned_free(&done);
+        path = snx_path_join(root, "gone");
+        assert(!gui_delete_old(&done, path, true) && !done.count); /* not there: nothing said */
+        free(path);
+#ifndef _WIN32
+        /* a folder it cannot list and a link to a folder, which it does not follow: it cannot tell they hold no save,
+           so they stay, the page naming them; root reads what its mode forbids, so that one is not tried as root */
+        {
+            char *locked = snx_path_join(root, "locked"), *sub = snx_path_join(root, "locked/sub"),
+                 *linked = snx_path_join(root, "linked"), *out = snx_path_join(root, "linked/out"),
+                 *target = snx_path_join(root, "target"), **names = NULL;
+            size_t count = 0;
+            assert(!snx_mkdirs(sub) && !snx_mkdirs(linked) && !snx_mkdirs(target) && !symlink(target, out));
+            assert(KEEP("linked") == GUI_KEEP_LINK && !strcmp(kept.where, out));
+            assert(!gui_delete_old(&done, linked, true) && snx_is_dir(linked) && snx_is_dir(target));
+            said =
+                snx_format("!%s|Stays: %s is a link to a folder, which Delete All does not follow, so it cannot tell "
+                           "it holds no save\n",
+                           linked, out);
+            assert(!strcmp(entries(&done, ""), said));
+            free(said);
+            gui_cleaned_free(&done);
+            assert(!chmod(sub, 0));
+            if (snx_list_dir(sub, &names, &count)) {
+                assert(KEEP("locked") == GUI_KEEP_UNREAD && !strcmp(kept.where, sub) && kept.why[0]);
+                assert(!gui_delete_old(&done, locked, true) && snx_is_dir(sub));
+                said = snx_format("!%s|Stays: %s cannot be read (%s), so Delete All cannot tell it holds no save\n",
+                                  locked, sub, kept.why);
+                assert(!strcmp(entries(&done, ""), said));
+                free(said);
+                gui_cleaned_free(&done);
+            } else
+                puts("gui_clean: the mode does not keep this user out (root): a folder not read is not tried");
+            snx_free_strings(names, count);
+            assert(!chmod(sub, 0755));
+            free(target);
+            free(out);
+            free(linked);
+            free(sub);
+            free(locked);
+        }
+#endif
+#undef WHERE
+#undef KEEP
+        free(base);
     }
     assert(!snx_remove_tree(root));
     free(games);
