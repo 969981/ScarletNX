@@ -56,7 +56,7 @@ if(SNX_TEST_SANITIZERS)
         snx_driver snx_nx_module snx_driver_llvm hactool_lib snx_setup snx_settings snx_settings_runtime snx_build_info
         snx-test-build-info
         # the Switch runtime: its components, the shader translator and the Vulkan backend
-        scarletnx snx_core snx_kernel snx_hle snx_video snx_gpu snx_platform snx_shader snx_vk
+        scarletnx snx_core snx_kernel snx_hle snx_video snx_gpu snx_platform snx_shader snx_vk snx_fsr2
         # the GNU ABI runtime and its kernel
         scarletnx-gnuabi scarletnx-gnuabi-kernel
         # the Android app driver: its DEX translator, its program and the native bridge
@@ -1664,7 +1664,7 @@ target_link_libraries(snx-test-am-service PRIVATE snx_test_common) # snx_nacp_ao
 add_test(NAME am_service COMMAND snx-test-am-service)
 
 # gsv.c's display session: what a game is told of the display's HDR (GetHdrStatus, GetHdrPaperWhite, the HDR status
-# event), with the renderer stood in for
+# event) and of its largest picture (GetBufferMaxResolution), with the renderer stood in for
 add_executable(snx-test-gsv-hdr gsv_hdr.c)
 snx_test_target(snx-test-gsv-hdr 23)
 snx_service_swipc(snx-test-gsv-hdr hle/services/native_video.swipc hle/services/gsv.swipc hle/services/nvdrv.swipc)
@@ -3770,6 +3770,17 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
         snx_test_target(snx-test-vk-compute-subgroups 11)
         target_link_libraries(snx-test-vk-compute-subgroups PRIVATE snx_vk_common)
         add_test(NAME vk_compute_subgroups COMMAND snx-test-vk-compute-subgroups)
+        if(snx_fsr2_api_dir AND SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY) # snx_fsr2 is src/nx's, added after the tests
+            # FSR 2.2.1 (gpu/vk/fsr2) on a real device, with no renderer: a jittered still scene upscaled over 40
+            # frames comes out nearer the scene than a bilinear upscale. Skipped (77) without a Vulkan device
+            add_executable(snx-test-vk-fsr2 vk_fsr2.c "${volk_SOURCE_DIR}/volk.c")
+            snx_test_target(snx-test-vk-fsr2 11)
+            target_include_directories(snx-test-vk-fsr2 PRIVATE "${PROJECT_SOURCE_DIR}/src")
+            target_link_libraries(snx-test-vk-fsr2 PRIVATE snx_fsr2 snx_vk_common)
+            set_target_properties(snx-test-vk-fsr2 PROPERTIES LINKER_LANGUAGE CXX)
+            add_test(NAME vk_fsr2 COMMAND snx-test-vk-fsr2)
+            set_tests_properties(vk_fsr2 PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
         # a compute program's layouts and what its descriptor set is written with, for every frontend's dispatches
         add_executable(snx-test-vk-compute-program vk_compute_program.c "${volk_SOURCE_DIR}/volk.c")
         snx_test_target(snx-test-vk-compute-program 11)

@@ -49,7 +49,7 @@ typedef struct {
     u32 shared, shared_ptr, shared_words;
     u32 local, local_ptr, local_words; /* LDL and STL's memory: a Function array, made at the start */
     u32 in_attr[32], out_attr[32], position, point_size, fragcoord, color[8], depth;
-    u32 vertex_index, instance_index, local_id, group_id, lane_id;
+    u32 vertex_index, instance_index, base_instance, local_id, group_id, lane_id;
     u32 num_groups, hmma_count;  /* NumWorkgroups and the HMMAs so far, for hmma_zero */
     int coop;                    /* HMMA takes hmma_coop (coop_wanted), and the module the Vulkan memory model */
     u32 coop_slots, subgroup_id; /* hmma_coop's slots (Workgroup) and SubgroupId */
@@ -57,7 +57,7 @@ typedef struct {
     u32 push, push_ptr; /* a vertex program's push constant vec4: the base instance, the depth fix (vk/render.c) */
     u32 centroid_mask;  /* the inputs decorated Centroid */
     u32 legacy_fs;      /* a fragment program's legacy varying groups (shader_legacy_group), read as generics 17-31 */
-    u32 point_coord, front_facing;
+    u32 point_coord, front_facing, primitive_id;
     /* a fragment program at a resolution scale: SNX_VKB_RS's vec4 (scale_component) and the fragment stage's push
        constants, whose uvec4s mark the textures bound to scaled render targets (scaled_slot) */
     u32 scale, scale_ptr, scaled_push;
@@ -365,11 +365,15 @@ static u32 carry_in(Ctx* c, u32 field_lo, const Sm86Insn* in, int uniform) {
     u32 p = prd(c, sm86_field(in, field_lo, 3), sm86_field(in, field_lo + 3, 1), uniform);
     return spv_emit_ternary(&c->e, SPV_OP_SELECT, u64_type(c), p, c64(c, 1), c64(c, 0));
 }
-/* a source of a 64-bit sum: its two's complement as NAK's fold reads it, ~x + 1 in 33 bits */
-static u32 term64(Ctx* c, const Sm86Src* s) {
+/* a source of a 64-bit sum: its two's complement as NAK's fold reads it, ~x + 1 in 33 bits. With the carries in
+   (.X) the modifier is the complement alone, ~x (NAK's OpIAdd3X folds get_u32_bnot_src, and nvdisasm writes
+   IADD3.X R17, ~R17, ...): the low word's sum gave the + 1 as a carry. One game's 64-bit subtractions are
+   IADD3 a, b, -c then IADD3.X a', b', ~c', and with ~c' + 1 their high word was one too many */
+static u32 term64(Ctx* c, const Sm86Src* s, int x) {
     u32 v = src_bits(c, s);
     if (!s->neg || s->kind == SM86_SRC_IMM) return to64(c, v);
-    return op2(c, SPV_OP_I_ADD, u64_type(c), to64(c, spv_emit_unary(&c->e, SPV_OP_NOT, c->t_u32, v)), c64(c, 1));
+    v = to64(c, spv_emit_unary(&c->e, SPV_OP_NOT, c->t_u32, v));
+    return x ? v : op2(c, SPV_OP_I_ADD, u64_type(c), v, c64(c, 1));
 }
 
 /* ---- FTZ and the rounding modes ---- */
@@ -738,10 +742,22 @@ static u32 frag_coord(Ctx* c, u32 k) {
 /* ALD's attribute at byte address addr, as bits */
 static u32 attr_load(Ctx* c, u32 addr) {
     if (addr >= 0x80 && addr < 0x280) return input_load(c, (addr - 0x80) >> 4, (addr >> 2) & 3);
-    if (c->stage == ST_VS && addr == 0x2f8) /* InstanceIndex counts from the base instance, the push constant's x */
+    if (c->stage == ST_VS && addr == 0x2f8) {
+        /* The instance ID counts from 0 whatever the draw's base instance (the game's driver gives the program the
+           base instance apart, in c[0]), and Vulkan's InstanceIndex counts from firstInstance. Without draw
+           parameters the push constant's x is the base instance. With them it is what the draw's first instance adds
+           to the base instance (render.c), and BaseInstance gives the rest, an indirect draw's too, as the Maxwell
+           translator has it (emit_io.c). Less the push constant alone, a direct draw's instances counted from its
+           base instance there: one game's instanced buildings and trees took other instances' transforms */
+        u32 base = to_u(c, push_component(c, 0));
+        if (g_shader_draw_parameters) {
+            spv_emit_draw_parameters_capability(&c->e);
+            base = spv_emit_binary(&c->e, SPV_OP_I_SUB, c->t_u32,
+                                   builtin_u32(c, &c->base_instance, SPV_BUILT_IN_BASE_INSTANCE), base);
+        }
         return spv_emit_binary(&c->e, SPV_OP_I_SUB, c->t_u32,
-                               builtin_u32(c, &c->instance_index, SPV_BUILT_IN_INSTANCE_INDEX),
-                               to_u(c, push_component(c, 0)));
+                               builtin_u32(c, &c->instance_index, SPV_BUILT_IN_INSTANCE_INDEX), base);
+    }
     if (c->stage == ST_VS && addr == 0x2fc) return builtin_u32(c, &c->vertex_index, SPV_BUILT_IN_VERTEX_INDEX);
     if (c->stage == ST_FS && addr >= 0x70 && addr < 0x80) return to_u(c, frag_coord(c, (addr >> 2) & 3));
     fail(c, "attribute load 0x%x", addr);
@@ -2551,16 +2567,20 @@ static void texture_query(Ctx* c, const Sm86Insn* in) {
         return;
     }
     u32 handle = sm86_field(in, 40, 19), bank = (handle >> 14) & 31, off = handle & 0x3fff;
-    int slot = in->op == SM86_TXQ_U ? (int)c->handle[c->cur].slot - 1 : -1; /* memory_handles' */
-    for (int i = 0; i < c->si->ntex && slot < 0 && in->op != SM86_TXQ_U; i++)
+    int mem = in->op == SM86_TXQ_U || in->op == SM86_TXQ_B;
+    int slot = mem ? (int)c->handle[c->cur].slot - 1 : -1; /* memory_handles' */
+    /* the level: a TXQ.B's is in the register after its handle's */
+    u32 level = sm86_field(in, 24, 8);
+    if (in->op == SM86_TXQ_B) level = level + 1 < SM86_RZ ? level + 1 : SM86_RZ;
+    for (int i = 0; i < c->si->ntex && slot < 0 && !mem; i++)
         if (c->si->tex[i].bl_cbuf == bank && c->si->tex[i].cbuf_off == off &&
             !(c->si->tex[i].flags & (SNX_TEX_INDEXED | SNX_TEX_MEMORY)))
             slot = i;
     /* a TLD of a multisampled 2D texture with the handle, anywhere in the program, names its view */
     u32 ms = 0;
-    for (u32 k = 0; k < c->n && slot < 0 && !ms && in->op != SM86_TXQ_U; k++)
+    for (u32 k = 0; k < c->n && slot < 0 && !ms && !mem; k++)
         ms = c->in[k].op == SM86_TLD && sm86_field(&c->in[k], 78, 1) && sm86_field(&c->in[k], 40, 19) == handle;
-    if (slot < 0 && in->op != SM86_TXQ_U) slot = tex_slot(c, bank, off * 4, 1, 0, 0, ms);
+    if (slot < 0 && !mem) slot = tex_slot(c, bank, off * 4, 1, 0, 0, ms);
     if (slot < 0) return;
     const ShTex* t = &c->si->tex[slot];
     ms = t->flags & 2;
@@ -2570,7 +2590,7 @@ static void texture_query(Ctx* c, const Sm86Insn* in) {
     /* a multisampled texture has one level, and its size takes none */
     u32 size = spv_emit_image_query_size_lod(
         &c->e, spv_emit_type_vector(&c->e, c->t_u32, dims), c->tex_sampled[slot], c->tex[slot],
-        ms ? 0 : spv_emit_unary(&c->e, SPV_OP_BITCAST, c->t_i32, rd(c, sm86_field(in, 24, 8))));
+        ms ? 0 : spv_emit_unary(&c->e, SPV_OP_BITCAST, c->t_i32, rd(c, level)));
     u32 v[4];
     for (u32 k = 0; k < 3; k++) v[k] = k < dims ? SPV(&c->e, SPV_OP_COMPOSITE_EXTRACT, c->t_u32, size, k) : cu(c, 1);
     if (t->type == 0) v[1] = cu(c, 1);
@@ -3489,8 +3509,8 @@ static void emit_insn_iadd3(Ctx* c, const Sm86Insn* in, int uniform, u32 p, u32 
         return;
     }
     /* the sum in 64 bits: its carries, and .X's two carries in */
-    u32 sum = op2(c, SPV_OP_I_ADD, u64_type(c), term64(c, &in->a), term64(c, &in->b));
-    sum = op2(c, SPV_OP_I_ADD, u64_type(c), sum, term64(c, &in->c));
+    u32 sum = op2(c, SPV_OP_I_ADD, u64_type(c), term64(c, &in->a, x), term64(c, &in->b, x));
+    sum = op2(c, SPV_OP_I_ADD, u64_type(c), sum, term64(c, &in->c, x));
     if (x) {
         sum = op2(c, SPV_OP_I_ADD, u64_type(c), sum, carry_in(c, 87, in, uniform));
         sum = op2(c, SPV_OP_I_ADD, u64_type(c), sum, carry_in(c, 77, in, uniform));
@@ -3719,6 +3739,63 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
             dwr(c, in, pack_half(c, spv_emit_vec2_construct(&c->e, c->t_v2f, src_f(c, &in->b), cf(c, 0.0f))));
             return;
         }
+        case SM86_F2I64: {
+            /* F2I's fields (NAK), to a 64-bit integer: the register pair dst, dst + 1. One game's compute programs
+               have F2I.U64.F32.TRUNC, the only form here: the hardware saturates, and a NaN gives 0 */
+            u32 dsize = sm86_field(in, 75, 2), ssize = sm86_field(in, 84, 2);
+            if (dsize != 3 || ssize != 2 || sm86_field(in, 72, 1)) {
+                fail(c, "F2I.64 of sizes %u, %u, signed %u", ssize, dsize, sm86_field(in, 72, 1));
+                return;
+            }
+            static const u16 rounding[4] = {SPV_GLSL_ROUND_EVEN, SPV_GLSL_FLOOR, SPV_GLSL_CEIL, SPV_GLSL_TRUNC};
+            u32 x = spv_emit_glsl_unary(&c->e, c->t_f32, c->glsl, rounding[sm86_field(in, 78, 2)], src_f(c, &in->b));
+            u32 nan = spv_emit_unary(&c->e, SPV_OP_IS_NAN, c->t_bool, x), t64 = u64_type(c);
+            u32 high = spv_emit_fcompare(&c->e, c->t_bool, 6, x, cf(c, 18446744073709551616.0f));
+            /* the largest float under 2^64 keeps the conversion in range where the result is not taken */
+            u32 clamped = spv_emit_glsl_binary(
+                &c->e, c->t_f32, c->glsl, SPV_GLSL_N_MIN,
+                spv_emit_glsl_binary(&c->e, c->t_f32, c->glsl, SPV_GLSL_N_MAX, x, cf(c, 0.0f)),
+                cf(c, 18446742974197923840.0f));
+            u32 v = spv_emit_unary(&c->e, SPV_OP_CONVERT_F_TO_U, t64, clamped);
+            v = spv_emit_ternary(&c->e, SPV_OP_SELECT, t64, high, c64(c, ~0ull), v);
+            v = spv_emit_ternary(&c->e, SPV_OP_SELECT, t64, nan, c64(c, 0), v);
+            wr(c, in->dst, lo32(c, v));
+            if (in->dst < SM86_RZ) wr(c, in->dst + 1, hi32(c, v));
+            return;
+        }
+        case SM86_I2F64: {
+            /* I2F's fields, from a 64-bit integer in the register pair b, b + 1: the same programs' I2F.F32.U64,
+               to the nearest and upward. The conversion rounds as the device does, so for a direction the result
+               is stepped to the float on the asked side of the integer when it is on the other */
+            u32 dsize = sm86_field(in, 75, 2), ssize = sm86_field(in, 84, 2), mode = sm86_field(in, 78, 2);
+            if (dsize != 2 || ssize != 3 || sm86_field(in, 74, 1) || in->b.kind != SM86_SRC_REG) {
+                fail(c, "I2F.64 of sizes %u, %u, signed %u", ssize, dsize, sm86_field(in, 74, 1));
+                return;
+            }
+            u32 t64 = u64_type(c), hi_reg = in->b.reg + 1 < SM86_RZ ? in->b.reg + 1 : SM86_RZ;
+            u32 x = pair64(c, rd(c, in->b.reg), rd(c, hi_reg));
+            u32 r = spv_emit_unary(&c->e, SPV_OP_CONVERT_U_TO_F, c->t_f32, x);
+            if (mode) {
+                u32 big = spv_emit_fcompare(&c->e, c->t_bool, 6, r, cf(c, 18446744073709551616.0f));
+                u32 back = spv_emit_unary(&c->e, SPV_OP_CONVERT_F_TO_U, t64,
+                                          spv_emit_glsl_binary(&c->e, c->t_f32, c->glsl, SPV_GLSL_N_MIN, r,
+                                                               cf(c, 18446742974197923840.0f)));
+                u32 bits = to_u(c, r), step;
+                if (mode == 2) { /* up: under the integer, and not 2^64 itself */
+                    u32 under = spv_emit_binary(&c->e, SPV_OP_U_LESS_THAN, c->t_bool, back, x);
+                    step = spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_u32, under, cu(c, 1), c->zero);
+                    step = spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_u32, big, c->zero, step);
+                    r = to_f(c, spv_emit_iadd_u32(&c->e, c->t_u32, bits, step));
+                } else { /* down, toward zero: over the integer, as 2^64 is */
+                    u32 over = spv_emit_binary(&c->e, SPV_OP_U_LESS_THAN, c->t_bool, x, back);
+                    step = spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_u32, over, cu(c, 1), c->zero);
+                    step = spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_u32, big, cu(c, 1), step);
+                    r = to_f(c, spv_emit_binary(&c->e, SPV_OP_I_SUB, c->t_u32, bits, step));
+                }
+            }
+            dwr(c, in, to_u(c, r));
+            return;
+        }
         case SM86_F2I: {
             u32 dsize = sm86_field(in, 75, 2); /* NAK: log2 of the destination's bytes */
             u32 ssize = sm86_field(in, 84, 2);
@@ -3854,9 +3931,13 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
         }
         case SM86_UIMAD:
         case SM86_IMAD: {
-            /* .X (bit 74) adds the carry predicate at 87-90, as IADD3.X does */
+            /* .X (bit 74) adds the carry predicate at 87-90, as IADD3.X does, and as there a negated addend is then
+               its complement, ~c: one game's 64-bit division negates a high word with IMAD.X RZ, RZ, ~c, P */
             u32 v = spv_emit_binary(&c->e, SPV_OP_I_MUL, c->t_u32, src_int(c, &in->a), src_int(c, &in->b));
-            v = spv_emit_iadd_u32(&c->e, c->t_u32, v, src_int(c, &in->c));
+            u32 addend = sm86_field(in, 74, 1) && in->c.neg && in->c.kind != SM86_SRC_IMM
+                             ? spv_emit_unary(&c->e, SPV_OP_NOT, c->t_u32, src_bits(c, &in->c))
+                             : src_int(c, &in->c);
+            v = spv_emit_iadd_u32(&c->e, c->t_u32, v, addend);
             if (sm86_field(in, 74, 1))
                 v = spv_emit_iadd_u32(&c->e, c->t_u32, v,
                                       spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_u32,
@@ -4277,9 +4358,20 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
             }
             chi = in->c.kind == SM86_SRC_UREG ? urd(c, creg >= SM86_URZ ? creg : creg + 1)
                                               : rd(c, creg >= SM86_RZ ? creg : creg + 1);
-            u32 sum =
-                op2(c, SPV_OP_I_ADD, t64, op2(c, SPV_OP_I_MUL, t64, a64, b64), pair64(c, src_bits(c, &in->c), chi));
+            u32 product = op2(c, SPV_OP_I_MUL, t64, a64, b64);
+            u32 sum = op2(c, SPV_OP_I_ADD, t64, product, pair64(c, src_bits(c, &in->c), chi));
             u32 d = in->dst;
+            /* the carry out of the 64-bit sum, in the predicate at 81-83 as IADD3's first (nvdisasm: IMAD.WIDE.U32
+               R14, P0, R10, R19, R14): one game's 64-bit division chains IMAD.WIDE ..., P0 into IMAD.X. With .X
+               (bit 74; nvdisasm: IMAD.WIDE.U32.X R6, RZ, R5, R6, P1) the carry predicate at 87-90 joins the sum */
+            u32 carry = op2(c, SPV_OP_U_LESS_THAN, c->t_bool, sum, product);
+            if (sm86_field(in, 74, 1)) {
+                u32 more = op2(c, SPV_OP_I_ADD, t64, sum, carry_in(c, 87, in, uniform));
+                carry = spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_bool, carry, c->true_v,
+                                         op2(c, SPV_OP_U_LESS_THAN, c->t_bool, more, sum));
+                sum = more;
+            }
+            pwr(c, sm86_field(in, 81, 3), carry, uniform);
             dwr(c, in, lo32(c, sum));
             if (uniform && d < SM86_URZ)
                 uwr(c, d + 1, hi32(c, sum));
@@ -4288,9 +4380,13 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
             return;
         }
         case SM86_IMAD_HI: {
-            /* the high word of a * b (bit 73 signed), plus c */
+            /* The high word of a * b + c (bit 73 signed): the addend goes into the 64-bit product, below the word
+               that is kept, and with .X the carry predicate at 87-90 with it; the carry out of the 64 bits goes to
+               the predicate at 81-83. One game's 64-bit division is written that way (IMAD.HI R8, R7, R11, R8 adds
+               the middle column's low word and hands its carry to P1): with the addend added to the high word
+               instead, 4239360 / 20480 came out 728513, and with this 207 (tools/div_model.py) */
             int is_signed = (int)sm86_field(in, 73, 1);
-            u32 t64 = u64_type(c), a32 = src_int(c, &in->a), b32 = src_int(c, &in->b), product;
+            u32 t64 = u64_type(c), a32 = src_int(c, &in->a), b32 = src_int(c, &in->b), product, addend;
             if (is_signed) {
                 u32 i64 = spv_emit_type_int64(&c->e, 1);
                 product = op2(c, SPV_OP_I_MUL, t64,
@@ -4300,15 +4396,23 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
                               spv_emit_unary(&c->e, SPV_OP_BITCAST, t64,
                                              SPV(&c->e, SPV_OP_S_CONVERT, i64,
                                                  spv_emit_unary(&c->e, SPV_OP_BITCAST, c->t_i32, b32))));
-            } else
+                addend = spv_emit_unary(&c->e, SPV_OP_BITCAST, t64,
+                                        SPV(&c->e, SPV_OP_S_CONVERT, i64,
+                                            spv_emit_unary(&c->e, SPV_OP_BITCAST, c->t_i32, src_int(c, &in->c))));
+            } else {
                 product = op2(c, SPV_OP_I_MUL, t64, to64(c, a32), to64(c, b32));
-            u32 v = spv_emit_iadd_u32(&c->e, c->t_u32, hi32(c, product), src_int(c, &in->c));
-            if (sm86_field(in, 74, 1))
-                v = spv_emit_iadd_u32(&c->e, c->t_u32, v,
-                                      spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_u32,
-                                                       prd(c, sm86_field(in, 87, 3), sm86_field(in, 90, 1), 0),
-                                                       cu(c, 1), c->zero));
-            dwr(c, in, v);
+                addend = to64(c, src_int(c, &in->c));
+            }
+            u32 sum = op2(c, SPV_OP_I_ADD, t64, product, addend);
+            u32 carry = op2(c, SPV_OP_U_LESS_THAN, c->t_bool, sum, product);
+            if (sm86_field(in, 74, 1)) {
+                u32 more = op2(c, SPV_OP_I_ADD, t64, sum, carry_in(c, 87, in, uniform));
+                carry = spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_bool, carry, c->true_v,
+                                         op2(c, SPV_OP_U_LESS_THAN, c->t_bool, more, sum));
+                sum = more;
+            }
+            if (!is_signed) pwr(c, sm86_field(in, 81, 3), carry, uniform);
+            dwr(c, in, hi32(c, sum));
             return;
         }
         case SM86_SGXT:
@@ -4671,6 +4775,19 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
                 }
                 v = spv_emit_vec4_extract(&c->e, c->t_f32, spv_emit_load(&c->e, c->t_v2f, c->point_coord),
                                           (addr >> 2) & 1);
+            } else if (addr == 0x60 && c->stage == ST_FS && g_shader_geometry) {
+                /* NAK's NAK_ATTR_PRIMITIVE_ID: the primitive's number, an integer, its bits as they are. The
+                   builtin needs the Geometry capability in a fragment program */
+                if (!c->primitive_id) {
+                    /* the primitive's number with no geometry stage, or after the varying pass's (which writes it);
+                       a mesh program writes none, so a mesh draw with this program is refused at its link */
+                    c->si->reads_primitive_id = 1;
+                    c->primitive_id = spv_emit_builtin_input_u32(&c->e, c->t_u32, SPV_BUILT_IN_PRIMITIVE_ID);
+                    spv_emit_flat(&c->e, c->primitive_id);
+                    spv_emit_capability(&c->e, SPV_CAPABILITY_GEOMETRY);
+                    add_interface(c, c->primitive_id);
+                }
+                v = to_f(c, spv_emit_load(&c->e, c->t_u32, c->primitive_id));
             } else {
                 fail(c, "IPA of attribute 0x%x", addr);
                 return;
@@ -4722,6 +4839,14 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
         case SM86_TXD: texture_grad(c, in); return;
         case SM86_TLD: texel_fetch(c, in); return;
         case SM86_TXQ: texture_query(c, in); return;
+        case SM86_TXQ_B:
+            /* the handle from memory, as a TEX.B's (memory_handles) */
+            if (!c->handle || !c->handle[c->cur].slot) {
+                fail(c, "TXQ.B whose handle is not memory's");
+                return;
+            }
+            texture_query(c, in);
+            return;
         case SM86_SULD_P:
         case SM86_SUST_P:
         case SM86_SURED:
@@ -5324,6 +5449,9 @@ static int mh_may_write(const Sm86Insn* in, int file, u32 r) {
             case SM86_UPLOP3: return u && (p81 || p84);
             case SM86_LEA:
             case SM86_ULEA:
+            case SM86_IMAD_WIDE: /* their carry out */
+            case SM86_UIMAD_WIDE:
+            case SM86_IMAD_HI:
             case SM86_LOP3:
             case SM86_ULOP3: return uk == u && p81;
             case SM86_UVOTE: return u && p81;
@@ -5467,6 +5595,7 @@ static int mh_add(Ctx* c, u32 k, u32 reader) {
         case SM86_IMAD_WIDE:
         case SM86_UIMAD_WIDE:
             if (!mh_src(c, k, &in->a) || !mh_src(c, k, &in->b) || !mh_src(c, k, &in->c)) return 0;
+            if (sm86_field(in, 74, 1) && !mh_pred(c, k, u, 87)) return 0; /* .X: the carry predicate joins the sum */
             if (in->c.kind == SM86_SRC_REG) return mh_need(c, k, MH_R, in->c.reg >= SM86_RZ ? SM86_RZ : in->c.reg + 1);
             if (in->c.kind == SM86_SRC_UREG)
                 return mh_need(c, k, MH_UR, in->c.reg >= SM86_URZ ? SM86_URZ : in->c.reg + 1);
@@ -5588,6 +5717,11 @@ static u32 tex_b_handle_reg(const Sm86Insn* in) {
     u32 n0 = array + coords, n1 = 1 + (lod == 2 || lod == 3) + sm86_field(in, 76, 1) + sm86_field(in, 78, 1);
     return tex_operands(in, n0, n1, regs) ? regs[n0] : SM86_RZ;
 }
+/* the handle register of a TEX.B, or of a TXQ.B: its first source, the level in the register after it (NAK's OpTxq
+   with TexRef::Bindless) */
+static u32 handle_b_reg(const Sm86Insn* in) {
+    return in->op == SM86_TXQ_B ? sm86_field(in, 24, 8) : tex_b_handle_reg(in);
+}
 /* whether a TEX.B's handle is a constant buffer word's, which prepare_handles binds: a MOV of one, or an LDC. A handle
    with no one writer is memory_handles' too (one game's lights take theirs from memory in a loop, as a TEX.B's
    handle from an LDG was before), which then samples it as no texture */
@@ -5597,6 +5731,9 @@ static int tex_b_cbuf_handle(Ctx* c, u32 i, u32 reg) {
         k = reaching_write(c, (u32)k, c->in[k].b.reg);
     if (k < 0) return 0;
     const Sm86Insn* w = &c->in[k];
+    /* a compute program has no texture arrays, so a table's LDC (its address has a register) is tried as a handle
+       from memory: where every lane picks the same element, the dispatch's own, it is that texture; else none */
+    if (c->stage == ST_CS && w->op == SM86_LDC && sm86_field(w, 24, 8) < SM86_RZ) return 0;
     return (w->op == SM86_MOV && w->b.kind == SM86_SRC_CBUF && !w->b.bindless) || w->op == SM86_LDC;
 }
 /* The handles from memory: TEX, TLD, TLD4 and TXQ with the handle in a uniform register pair (URn the texture's word,
@@ -5607,8 +5744,8 @@ static void memory_handles(Ctx* c) {
     for (u32 i = 0; i < n; i++) {
         int op = c->in[i].op;
         any |= op == SM86_TEX_U || op == SM86_TLD_U || op == SM86_TLD4_U || op == SM86_TXQ_U ||
-               (op == SM86_TEX_B && tex_b_handle_reg(&c->in[i]) < SM86_RZ &&
-                !tex_b_cbuf_handle(c, i, tex_b_handle_reg(&c->in[i])));
+               ((op == SM86_TEX_B || op == SM86_TXQ_B) && handle_b_reg(&c->in[i]) < SM86_RZ &&
+                !tex_b_cbuf_handle(c, i, handle_b_reg(&c->in[i])));
     }
     if (!any) return;
     c->mh_mark = calloc((size_t)n + 1, 1);
@@ -5628,8 +5765,9 @@ static void memory_handles(Ctx* c) {
     for (u32 i = 0; i < n && !c->failed; i++) {
         const Sm86Insn* in = &c->in[i];
         int op = in->op, u = op == SM86_TEX_U || op == SM86_TLD_U || op == SM86_TLD4_U || op == SM86_TXQ_U;
-        u32 reg = op == SM86_TEX_B ? tex_b_handle_reg(in) : SM86_RZ;
-        if (!u && !(op == SM86_TEX_B && reg < SM86_RZ && !tex_b_cbuf_handle(c, i, reg))) continue;
+        int b = op == SM86_TEX_B || op == SM86_TXQ_B;
+        u32 reg = b ? handle_b_reg(in) : SM86_RZ;
+        if (!u && !(b && reg < SM86_RZ && !tex_b_cbuf_handle(c, i, reg))) continue;
         u32 ur = sm86_field(in, 40, 6), nmh = c->nmh, ndep = c->nmh_dep;
         if (u && ur + 1 >= SM86_URZ) {
             fail(c, "%s of UR%u", sm86_ops[op].name, ur);
@@ -5656,12 +5794,12 @@ static void memory_handles(Ctx* c) {
         for (u32 i = 0; i < n && !c->failed; i++) {
             const Sm86Insn* in = &c->in[i];
             int op = in->op, slot = -1;
-            if (probe[i][0] == ~0u || (op == SM86_TXQ_U) != (pass == 1)) continue;
-            if (op != SM86_TEX_U && op != SM86_TLD_U && op != SM86_TLD4_U && op != SM86_TXQ_U && op != SM86_TEX_B)
-                continue;
+            int query = op == SM86_TXQ_U || op == SM86_TXQ_B;
+            if (probe[i][0] == ~0u || query != (pass == 1)) continue;
+            if (op != SM86_TEX_U && op != SM86_TLD_U && op != SM86_TLD4_U && !query && op != SM86_TEX_B) continue;
             u32 tex = mh_final(c, probe[i][0]), smp = probe[i][1] == ~0u ? 0 : mh_final(c, probe[i][1]);
             int has_smp = probe[i][1] != ~0u;
-            if (op == SM86_TXQ_U) {
+            if (query) {
                 for (int k = 0; k < c->si->ntex && slot < 0; k++) {
                     const ShTex* t = &c->si->tex[k];
                     if ((t->flags & SNX_TEX_MEMORY) && t->cbuf_off == tex && t->bl2 == has_smp && t->bl2_off == smp)
@@ -5684,6 +5822,34 @@ static void memory_handles(Ctx* c) {
    buffer, and a program finds the lights of a pixel with FLO on a mask, then an IMAD of that index by the record's
    size makes the LDC's address, c[bank][x * stride + base + offset]. So the texture is chosen for each pixel, from
    an array, and the table's elements are stride bytes apart, whatever the stride (they aren't a power of two) */
+/* The instruction that makes the address register of a table's LDC, x * stride + base by constants: an IMAD without
+   .X; the low word of a left SHF by a constant (x << s: stride 1 << s, base 0), as another game's material and light
+   tables are indexed, 4, 8 and 16 bytes apart; or a LEA of the low word, without the negation or the carry in
+   ((x << s) + base, its b a constant). 0 where it is none of them */
+static int handle_table_index(Ctx* c, int m, u32* stride, u32* base) {
+    if (m < 0) return 0;
+    const Sm86Insn* w = &c->in[m];
+    u32 s = 0;
+    *stride = 0, *base = 0;
+    if (w->op == SM86_IMAD) {
+        if (sm86_field(w, 74, 1) || !src_const(c, (u32)m, &w->b, stride) || !src_const(c, (u32)m, &w->c, base))
+            return 0;
+    } else if (w->op == SM86_SHF || w->op == SM86_USHF) {
+        /* bit 76: right; bit 80: the high word. Under 32, the low word is the same for a 64-bit shift */
+        if (sm86_field(w, 76, 1) || sm86_field(w, 80, 1) || !src_const(c, (u32)m, &w->b, &s) || s < 2 || s > 15)
+            return 0;
+        *stride = 1u << s;
+    } else if (w->op == SM86_LEA) {
+        /* bit 72: the negation; bit 74: .X; bit 80: .HI. A carry out predicate changes nothing of the sum */
+        s = sm86_field(w, 75, 5);
+        if (sm86_field(w, 72, 1) || sm86_field(w, 74, 1) || sm86_field(w, 80, 1) || s < 2 || s > 15 ||
+            !src_const(c, (u32)m, &w->b, base))
+            return 0;
+        *stride = 1u << s;
+    } else
+        return 0;
+    return *stride && *stride <= 0xffff;
+}
 static void prepare_handles(Ctx* c) {
     memory_handles(c);
     for (u32 i = 0; i < c->n && !c->failed; i++) {
@@ -5723,10 +5889,10 @@ static void prepare_handles(Ctx* c) {
                 const Sm86Insn* mul = m >= 0 ? &c->in[m] : NULL;
                 u32 stride = 0, base = 0, count = SNX_TEX_ARRAY;
                 if (!g_shader_texture_arrays || c->stage == ST_CS) {
+                    /* a compute program's table doesn't come here: tex_b_cbuf_handle leaves its TEX.B to
+                       memory_handles, which gives it a slot (the dispatch's element, or none) or fails the program */
                     fail(c, "TEX.B of a table of handles, without texture arrays");
-                } else if (!mul || mul->op != SM86_IMAD || sm86_field(mul, 74, 1) ||
-                           !src_const(c, (u32)m, &mul->b, &stride) || !src_const(c, (u32)m, &mul->c, &base) ||
-                           !stride || stride > 0xffff) {
+                } else if (!handle_table_index(c, m, &stride, &base)) {
                     fail(c, "TEX.B of a table of handles, indexed by %s",
                          mul ? sm86_ops[mul->op].name : "several writes");
                 } else {

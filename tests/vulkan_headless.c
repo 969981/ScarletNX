@@ -567,6 +567,52 @@ static int check_rings_budget_share(void) {
     return 0;
 }
 
+/* The stream's chunks are memory the caches budget too (cmd.c's vk_stream_upload): where the GPU shares the system's
+   memory, what was recorded goes to the GPU once the stream wrote an eighth of the budget, not VK_FRAME_RING_CAPS
+   allocations. With allocations of 1 MiB and a budget of 16 MiB that is every 2 MiB rather than every 4: 64 draws of a
+   megabyte each, all of it through the stream, send 31 submissions (15 by the allocations alone), and the copies still
+   read their uploads */
+static int check_stream_budget_share(void) {
+    const u32 draws = 64;
+    u64 saved_cap = g_vk.alloc_cap, saved_budget;
+    VkBuffer rb;
+    u8* result;
+    if (g_vk.mem_model != VK_MEM_UMA || !g_settings.stream_ring) {
+        printf("skip: the stream's share of the budget holds on a GPU that shares the system's memory, with "
+               "vk_stream_ring=1\n");
+        return 0;
+    }
+    vk_finish();
+    vk_frame_next();
+    g_vk.alloc_cap = 1u << 20;
+    saved_budget = vk_mem_budget_cap(16u << 20);
+    const u64 went0 = vk_submits(VK_SUB_PERIODIC), first = vk_frame_id();
+    result = vk_readback_buffer(draws * 16, &rb);
+    CHECK(result);
+    for (u32 i = 0; i < draws; i++) {
+        VkBuffer buffer;
+        u64 offset;
+        vk_frame_check(); /* a draw's start */
+        u8* data = vk_stream_upload(g_vk.alloc_cap, 16, &buffer, &offset);
+        CHECK(data);
+        memset(data, (int)(i + 1), 16);
+        VkBufferCopy copy = {offset, i * 16ull, 16};
+        rec_CmdCopyBuffer(vk_cmd(), buffer, rb, 1, &copy);
+    }
+    vk_finish();
+    vk_readback_ready();
+    const u64 went = vk_submits(VK_SUB_PERIODIC) - went0, frames = vk_frame_id() - first;
+    vk_mem_budget_cap(saved_budget);
+    g_vk.alloc_cap = saved_cap;
+    vk_frame_next();
+    for (u32 i = 0; i < draws * 16; i++) CHECK(result[i] == i / 16 + 1);
+    printf("%u draws of 1 MiB through the stream under a 16 MiB budget: %llu submissions between them, %llu frames "
+           "ended\n",
+           draws, (unsigned long long)went, (unsigned long long)frames);
+    CHECK(went + frames >= draws / 2 - 2);
+    return 0;
+}
+
 /* A frame that ended at its limit of submissions leaves its slot's counts as they were until the slot is used again:
    vk_frame_check on that slot, fresh after a present, keeps it rather than ending a frame that recorded nothing and
    moving on to the slot whose work was just submitted */
@@ -5062,7 +5108,8 @@ static int check_dma_bands(void) {
    RGBA8 texture's levels wrote 1365 MiB to one frame's rings, and a phone's system ended the app. The frame ends
    between two bands now: 896 lines of 512 bytes into block linear, 448 KiB of source and as much of the
    destination's own bytes staged, with the cap lowered to 64 KiB (bands of 16 KiB of rows, a frame's rings 256 KiB),
-   go over several frames, the rings stay within the two slots' share, and the copy is the CPU's */
+   go over several frames or, where the source goes through the stream (cmd.c's vk_stream_upload), over several
+   submissions of one frame, the rings stay within the two slots' share, and the copy is the CPU's */
 static int check_dma_bands_frames(void) {
     const u64 cap = g_vk.alloc_cap;
     GpuDmaOp o = {0};
@@ -5075,16 +5122,23 @@ static int check_dma_bands_frames(void) {
     o.src = pitch_side(0x1000, 512);
     o.dst = bl_side(0x80000, 512, 896, 1, 0, 0);
     u64 frames = vk_frame_id(), rings = vk_ring_bytes(), copies, bands0, bands1, bytes;
+    u64 went0 = vk_submits(VK_SUB_PERIODIC);
     vk_dma_stats(&copies, &bands0, &bytes);
     int failed = dma_case(o);
     vk_dma_stats(&copies, &bands1, &bytes);
     u64 ended = vk_frame_id() - frames, grown = vk_ring_bytes() > rings ? vk_ring_bytes() - rings : 0;
+    u64 went = vk_submits(VK_SUB_PERIODIC) - went0;
     g_vk.alloc_cap = cap;
     vk_frame_next();
-    printf("dma bands across frames: %llu bands, %llu frames ended, the rings grew by %llu KiB\n",
-           (unsigned long long)(bands1 - bands0), (unsigned long long)ended, (unsigned long long)(grown >> 10));
+    printf("dma bands across frames: %llu bands, %llu frames ended and %llu submissions went between bands, the "
+           "rings grew by %llu KiB\n",
+           (unsigned long long)(bands1 - bands0), (unsigned long long)ended, (unsigned long long)went,
+           (unsigned long long)(grown >> 10));
     CHECK(!failed && bands1 - bands0 >= 8);
-    CHECK(ended >= 2);
+    /* with the stream, the frame's rings and the stream each take half of the bytes here, and a frame's end sends
+       the stream's too: two ends or submissions at least. With the frame's rings alone (vk_stream_ring=0), two frames
+       as before the stream. The rings' growth below is what must hold */
+    CHECK(g_settings.stream_ring ? ended + went >= 2 : ended >= 2);
     CHECK(grown <= (u64)(VK_FRAMES + 1) * VK_FRAME_RING_CAPS * (64 << 10));
     return 0;
 }
@@ -5412,21 +5466,24 @@ static int check_blit_bands(void) {
         failed = 1;
     }
     /* and a frame ends between two bands once its rings hold VK_FRAME_RING_CAPS allocations (256 KiB here), as
-       between a copy engine's (check_dma_bands_frames): the three blits end 3 frames, and none ended without it */
+       between a copy engine's (check_dma_bands_frames), or a submission goes where the bands' source is the stream's:
+       the three blits end 3 frames with the frame's rings alone (vk_stream_ring=0), or a frame and 3 submissions,
+       and none without it */
     vk_finish();
     vk_frame_next();
     g_vk.alloc_cap = 64 << 10;
-    u64 frames = vk_frame_id();
+    u64 frames = vk_frame_id(), went0 = vk_submits(VK_SUB_PERIODIC);
     failed |= blit_case(bl_side(0x1000, 128 * 4, 256, 2, 0, 0), bl_side(0x80000, 128 * 4, 256, 1, 0, 0), 4, 9, 30, 100,
                         200, 128, 256, 0);
     failed |= blit_case(pitch_plane(0x101, 300, 75 * 4, 150), pitch_plane(0x60001, 520, 120 * 4, 240), 4, 3, 2, 110,
                         230, 75, 150, 0);
     failed |= blit_case(pitch_plane(0x3000, 64 * 16, 64 * 16, 100), bl_side(0x80000, 64 * 8, 128, 1, 0, 0), 16, 0, 5,
                         64, 120, 64, 100, GPU_BLIT_FLOAT(4, 4, 4, 2, 0));
-    u64 ended = vk_frame_id() - frames;
+    u64 ended = vk_frame_id() - frames, went = vk_submits(VK_SUB_PERIODIC) - went0;
     g_vk.alloc_cap = cap;
-    printf("blit bands: %llu frames ended between bands\n", (unsigned long long)ended);
-    CHECK(!failed && ended >= 2);
+    printf("blit bands: %llu frames ended and %llu submissions went between bands\n", (unsigned long long)ended,
+           (unsigned long long)went);
+    CHECK(!failed && (g_settings.stream_ring ? ended + went >= 2 : ended >= 2));
     return 0;
 }
 
@@ -6812,6 +6869,42 @@ static int check_vk12_way(void) {
     spv_emit_set_version(version);
     CHECK(guest && other_guest == guest && !memcmp(key, other, guest));
     CHECK(strcmp(key + guest, other + other_guest) != 0);
+    /* the compute subgroups of 32 and the mesh draws as the device has them, either way: the 1.2 way takes the sizes a
+       stage can require from VK_EXT_subgroup_size_control, which a 1.3 device has in its core. The device's own
+       answers, read here through the extension's structures, which hold for both */
+    {
+        SnxVkExtensions dev;
+        CHECK(snx_vk_device_extensions(g_vk.phys, &dev));
+        int sized =
+            g_vk.api >= VK_API_VERSION_1_3 || snx_vk_extensions_has(&dev, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+        int mesh = snx_vk_extensions_has(&dev, VK_EXT_MESH_SHADER_EXTENSION_NAME);
+        snx_vk_extensions_free(&dev);
+        VkPhysicalDeviceMeshShaderFeaturesEXT mf = {.sType =
+                                                        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+        VkPhysicalDeviceSubgroupSizeControlFeatures sf = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES, .pNext = mesh ? &mf : NULL};
+        VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                        .pNext = sized  ? (void*)&sf
+                                                 : mesh ? (void*)&mf
+                                                        : NULL};
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &f2);
+        VkPhysicalDeviceSubgroupSizeControlProperties sp = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sp};
+        if (sized) vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+        int of32 = sized && sf.subgroupSizeControl && sf.computeFullSubgroups && sp.minSubgroupSize <= 32 &&
+                   sp.maxSubgroupSize >= 32;
+        int warp32 = of32 && (sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+        int meshes = g_settings.mesh_draws && mesh && mf.meshShader && of32 &&
+                     (sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_MESH_BIT_EXT) != 0;
+        if (g_vk.has_cs_warp32 != warp32 || g_vk.has_mesh != meshes)
+            fprintf(stderr,
+                    "subgroup sizes: the Vulkan %u.%u way has compute subgroups of 32 %d and mesh draws %d, where "
+                    "the device has %d and %d\n",
+                    VK_API_VERSION_MAJOR(g_vk.api), VK_API_VERSION_MINOR(g_vk.api), g_vk.has_cs_warp32, g_vk.has_mesh,
+                    warp32, meshes);
+        CHECK(g_vk.has_cs_warp32 == warp32 && g_vk.has_mesh == meshes);
+    }
     /* a device with all of them but dynamic rendering, its store op NONE from the EXT */
     VkExtensionProperties list[16] = {{0}};
     static const char* const have[] = {
@@ -7292,6 +7385,7 @@ static int run_headless(int argc, char** argv) {
     }
     if (getenv("SNX_TEST_TRIM_ONLY")) { /* the budget's trim alone: a trim that wants everything takes the others' */
         CHECK(!check_trim_working_set());
+        CHECK(!check_trim_unmapped());
         CHECK(!check_trim_ended());
         CHECK(!check_trim_headroom());
         vk_finish();
@@ -7433,6 +7527,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_staging_overflow()); /* first: it counts the staging blocks of a fresh device */
     CHECK(!check_rings_without_present());
     CHECK(!check_rings_budget_share());
+    CHECK(!check_stream_budget_share());
     CHECK(!check_fresh_frame_kept());
     CHECK(!check_stats_gpu_time());
     CHECK(!check_staging_burst());
@@ -7458,6 +7553,8 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_landing_records_fresh());
     CHECK(!check_mapping_landing());
     CHECK(!check_guest_staging());
+    CHECK(!check_stream_ring());
+    CHECK(!check_stream_split());
     CHECK(!check_owned_writable());
     CHECK(!check_own_trim());
     CHECK(!check_wlog_again());

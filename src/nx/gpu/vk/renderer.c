@@ -177,6 +177,7 @@ static void vkr_mapping_end(void) {
     }
     vk_uma_mapping_end(); /* first: what follows may submit */
     vk_buf_mapping_changed();
+    if (g_mapping_size) vk_surf_mapping_changed(g_mapping_gva, g_mapping_size);
     pend_remap(g_mapping_gva, g_mapping_size);
     g_mapping_size = 0;
     pend_unlock();
@@ -329,6 +330,12 @@ static int vkr_blit(const Surf2D* s, const Surf2D* d, int dx, int dy, int dw, in
     int r = vk_blit2d(s, d, dx, dy, dw, dh, sx, sy, sdx, sdy);
     vk_unlock();
     return r; /* 0: the front end copies through memory, with the renderer's rt_flush and rt_reload around it */
+}
+static int vkr_upscale(const GpuUpscale* u) {
+    vk_lock();
+    int result = vk_upscale(u);
+    vk_unlock();
+    return result;
 }
 static int vkr_blit_filter(const Surf2D* s, const Surf2D* d, int dx, int dy, int dw, int dh, double sx, double sy,
                            double sdx, double sdy, int linear) {
@@ -1248,6 +1255,7 @@ static void vkr_reset(void) {
     vk_surf_forget_all();
     vk_buf_forget_all();
     vk_query_forget_all();
+    vk_upscale_forget();
     if (g_cpu_img) {
         vk_defer_image(g_cpu_img->img, g_cpu_img->mem, VK_NULL_HANDLE, g_cpu_img->att);
         free(g_cpu_img);
@@ -1274,6 +1282,7 @@ const Renderer vk_renderer = {
     .method_barrier = vkr_method_barrier,
     .blit = vkr_blit,
     .blit_filter = vkr_blit_filter,
+    .upscale = vkr_upscale,
     .vic_compose = vkr_vic_compose,
     .nvdec_write = vkr_nvdec_write,
     .nvdec_hw_device = vkr_nvdec_hw_device,

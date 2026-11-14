@@ -86,7 +86,7 @@ typedef struct {
        and features enabled */
     u32 video_family;
     VkVideoCodecOperationFlagsKHR video_codecs;
-    const char* dev_ext[67]; /* create_device enables 67 at most, were every one it can enable there */
+    const char* dev_ext[68]; /* create_device enables 68 at most, were every one it can enable there */
     u32 dev_ext_n;
     VkPhysicalDeviceFeatures2 feat2; /* feat, with the 1.1 to 1.3 features enabled chained (to 1.2 on a 1.2 device) */
     VkPhysicalDeviceVulkan11Features feat11;
@@ -472,6 +472,11 @@ u8* vk_stage(u64 size, u64 align, VkBuffer* buf, u64* off);
 u64 vk_stage_chunk(void);
 /* Streamed buffer snapshots in host RAM, with the same frame lifetime as vk_stage. */
 u8* vk_stage_upload(u64 size, u64 align, VkBuffer* buf, u64* off);
+/* As vk_stage_upload, for bytes that only work recorded now reads: a copy, a dispatch or a draw recorded before the
+   submission being recorded goes, or the one after it, or the ones that follow a vk_submit_split each. The memory
+   is no frame's (cmd.c's stream): it is handed out again once that work is done, so nothing may keep the buffer and
+   offset past it. With vk_stream_ring=0 it is vk_stage_upload */
+u8* vk_stream_upload(u64 size, u64 align, VkBuffer* buf, u64* off);
 /* One-use guest input: host staging for CPU-only bytes, output staging when GPU-owned or in-place writes cover it. */
 u8* vk_stage_guest_input(u64 gva, u64 source_size, u64 bytes, VkBuffer* buf, u64* off);
 /* GPU-written storage, device-local when host-visible memory and its budget allow;
@@ -925,7 +930,6 @@ typedef struct Surf {
     VkPipelineStageFlags2 stage;
     VkAccessFlags2 access;
     u64 last_used;
-    u64 touched; /* when it last went to the recent end of its recency list: ties of last_used in the lists' order */
     u32 wgen;    /* render targets: bumped when drawn to */
     u64 wseq;    /* when its image last changed, counted across surfaces: of two over the same bytes, the higher
                        holds them (vk_surf_wrote) */
@@ -973,17 +977,11 @@ typedef struct Surf {
     u32 crop_gen;
     u64 crop_epoch; /* a snapshot's g_vk_texture_epoch when it was last copied (vk_rt_snapshot) */
     u8 predraw;     /* a copy in crop that is a feedback draw's save attachment of set predraw - 1 (vk_rt_save) */
-    struct Surf* next;
-    /* the recency list it is in (surface.c): textures, render targets (parked ones too), or none (copies, the CPU
-       frame), with the device memory its image takes. A list runs from the least recently used to the most */
-    int lru;
-    struct Surf *lru_prev, *lru_next;
-    /* textures: the game ended the last texture object at its address (gpu/guest_textures.h) and made none there
-       since: in surface.c's list of those, which a trim takes first */
-    u8 ended;
-    u32 ended_at; /* the present the cache learned of it */
-    struct Surf* ended_next;
-    u64 bytes;
+    struct Surf* next; /* copies: the next copy of the same render target */
+    /* its row in surface.c's table, 0 when it is in none (copies, the CPU frame). The row holds its hash chain, its
+       recency list and its place in the list of ended textures */
+    u32 row;
+    u64 bytes; /* the device memory its image takes */
     int took_drawn; /* textures: pixels copied from render targets since the last upload (memory may not have them) */
     /* storage images: the serial of the owner the last publish put over its texels (vk_surf_publish), 0 before one.
        Bytes that owner still holds are the image's own (texture.c pieces_published) */
@@ -1116,6 +1114,10 @@ int vk_gfx_image_holds(const Surf* s); /* s has a storage result waiting to land
    1, or 0 when it can't */
 int vk_depth_pack_mode(u32 zeta);
 int vk_depth_pack(VkCommandBuffer cb, const Surf* s, u32 layer, VkBuffer buf, u64 at, u32 pitch);
+/* upscale.c: renderer.h's upscale (a DLSS evaluation through FSR 2), under vk_lock: 1 when the output was written */
+int vk_upscale(const GpuUpscale* u);
+/* a save state's load: the upscaler's history is of the old picture, so the next evaluation starts it again */
+void vk_upscale_forget(void);
 u64 vk_surf_guest_size(const Surf* s);
 int vk_surf_can_writeback(const Surf* s);
 void vk_surf_flush(Surf* s, const u8* original); /* original preserves newer guest writes for storage images */
@@ -1186,7 +1188,9 @@ void vk_rt_reload(u64 gva);
    target parked or taken back), so what was found there can be kept until it changes */
 extern u32 g_vk_surf_epoch;
 u32 vk_surf_epoch_at(u64 gva); /* the same, for the surfaces of gva's bucket of the table only */
+/* the surfaces of gva's bucket of the table: vk_surf_first, then vk_surf_next until NULL */
 Surf* vk_surf_first(u64 gva);
+Surf* vk_surf_next(const Surf* s);
 void vk_surf_add(Surf* s); /* a texture, into the table and the textures' recency list */
 /* s used now: last_used is this present, and it moves to the recent end of its list */
 void vk_surf_touch(Surf* s);
@@ -1212,6 +1216,9 @@ void vk_surf_each(int kind, void (*fn)(void* ctx, const Surf* s), void* ctx);
    it again there with the same bytes still finds it) */
 void vk_surf_ended_frame(void);
 u64 vk_surf_ended_freed(void); /* statistics: their bytes freed so far */
+/* the game changed the GPU mapping of [gva, gva + size): where its front end has no texture objects, a texture
+   whose memory it unmapped is one it ended (the renderer's bracket of a GMMU change, at its end) */
+void vk_surf_mapping_changed(u64 gva, u64 size);
 /* frees cache entries (surfaces and own buffers), the least recently used first, when the heap's use with `extra`
    bytes more would be past 90% of its budget: idle lossless ones down to 80%, the lossless working set down to 95%,
    then lossy ones (vk_surf_reclaim). Only entries unused for the last two presents go, so the caller may hold any

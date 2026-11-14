@@ -1487,17 +1487,25 @@ VkImageViewType vk_storage_image_type(const ShaderInfo* si, int i) {
                                     : VK_IMAGE_VIEW_TYPE_2D;
 }
 
+/* Whether a is an address of the GPU's address space. gmmu_run looks an address up by its low
+   GMMU_ADDRESS_SPACE_BITS, so a value above them aliases onto whatever is mapped at those bits */
+static int gbuf_address(u64 a) { return a && !(a >> GMMU_ADDRESS_SPACE_BITS); }
 /* An indirect buffer's address (SH_GBUF_INDIRECT): the 64-bit pointer at its cell, read from guest memory as the
    program loads it, a pending write there landed first. The cell is at the address its parent's constant buffer word
-   holds (v). A cell or a pointer with no memory mapped binds nothing (0) */
+   holds (v). A cell or a pointer with no memory mapped binds nothing (0), and so does a cell whose 8 bytes are no
+   address at all. One game's plant culling programs reach a buffer through a pointer at bytes 0x40 to 0x60 of a
+   block that, in their dispatches, holds the view's matrices. Two floats there whose bits 32 to 39 fell on mapped
+   memory passed for a pointer in a frame now and then: the program got 16 MiB at a nonsense, unaligned address, the
+   GPU mirror refused the dispatch for it (compute.c mirror_plan), and the plants' draws did not get that frame's
+   lists. Trees and bushes lost their leaves for one frame, a few times a minute */
 static u64 gbuf_pointer(u32 off, const u32* v) {
     u64 cell = (((u64)v[1] << 32) | v[0]) + SH_GBUF_CELL(off), cpu = 0;
     u32 w[2];
-    if (cell == SH_GBUF_CELL(off) || gmmu_run(cell, 8, &cpu) < 8) return 0;
+    if (cell == SH_GBUF_CELL(off) || !gbuf_address(cell) || gmmu_run(cell, 8, &cpu) < 8) return 0;
     vk_buf_mem_need(cell, 8);
     vk_gmem_words(cell, w, 2);
     u64 pointer = ((u64)w[1] << 32) | w[0];
-    return pointer && gmmu_run(pointer, 4, &cpu) ? pointer : 0;
+    return gbuf_address(pointer) && gmmu_run(pointer, 4, &cpu) ? pointer : 0;
 }
 u32 vk_gbuf_desc(int stage, u32 off, const u32* v, u64* addr) {
     u32 size = v[2];
@@ -1507,6 +1515,7 @@ u32 vk_gbuf_desc(int stage, u32 off, const u32* v, u64* addr) {
        An Ounce game's dispatches leave such an address in a slot, and the GPU mirror took no dispatch with one: each
        copied its written buffers on the CPU instead, about 230 MB a second of one race */
     *addr = SH_GBUF_INDIRECT(off) ? gbuf_pointer(off, v) : ((u64)v[1] << 32) | v[0];
+    if (!gbuf_address(*addr)) *addr = 0;
     if (!shader_gbuf_sized(stage, off)) {
         /* a bare address in the program's own constant buffer has no size beside it: the memory mapped from it on,
            whole words, to the cap below (Eden binds such a buffer to the end of its mapping, at most 8 MiB) */
@@ -3308,6 +3317,13 @@ static int mesh_shaders(const DsState* ds, DrawShaders* o) {
     o->fs0 = (p->on >> 5 & 1)
                  ? vk_shader_get(ds, p->code[5], 0, ST_FS, 0, 0, 0, 0, o->prim, 0, 0, 0, 0, NULL, NULL, 0, 0, 0, 0)
                  : NULL;
+    if (o->fs0 && !o->fs0->failed && o->fs0->si.reads_primitive_id) {
+        /* the mesh translation writes no PrimitiveId, which the fragment program would read undefined */
+        LOG_LIMIT(4, "vulkan: a mesh draw whose fragment program at %llx reads the primitive's number, which the mesh "
+                     "program doesn't write (skipped)\n",
+                  (unsigned long long)p->code[5]);
+        return 0;
+    }
     rt_int_targets(&ds->tgt, &o->rt_int, &o->rt_sint);
     return 1;
 }
@@ -4975,7 +4991,18 @@ retry:
             g_vk_skipped++;
             return;
         }
-        predraw = vk_predraw_next();
+        /* the captured slots' targets, in the order of their side images (shader/spirv_translate.c
+           predraw_prologue), and what else decides the texel a slot fetches from its target: the header's swizzle
+           (tex_map) and the sRGB reading (tex_srgb) */
+        const Surf* targets[SH_PREDRAW_MAX];
+        u32 views[SH_PREDRAW_MAX], ntargets = 0;
+        for (int i = 0; i < SH_MAXTEX && ntargets < SH_PREDRAW_MAX; i++)
+            if (fs->si.predraw_slots >> i & 1) {
+                const TexRes* x = res && res[i].have ? &res[i] : NULL;
+                views[ntargets] = x ? (x->tic[0] >> 19 & 0xFFFu) | (u32)tex_srgb(x->tic, x->tsc) << 12 : 0;
+                targets[ntargets++] = x ? x->t : NULL;
+            }
+        predraw = vk_predraw_next(targets, views, ntargets);
     }
     int zt_ro = 0;
     u32 fb = 0;
@@ -5333,10 +5360,20 @@ retry:
         } else
             programmable_pass = render_begin_empty_area(bound, rt[0]->layers);
     }
+    /* Strict for a save draw (predraw_run), and for a feedback draw that the two draws could not take and samples in
+       place: each reads the targets after every earlier draw of the pass wrote them. Between two of the game's
+       barriers the console's draws all read the targets as they were at the barrier (feedback loops, above), and the
+       interlock's capture gives them that (vk/predraw.c). Here a draw read in place what the draws just before it
+       wrote or had not written yet: crossing rock props that blend into what lies under them read each other in one
+       frame and the cliff in the next, in patches. Ordered, each reads the draws before it, as a copy of the target
+       before each draw gives too, the same every frame. Only with dynamicRenderingLocalRead: without it the order
+       would begin the pass again at each such draw */
+    int strict_feedback = g_predraw.phase == 1 || (!g_predraw.phase && fb && g_vk.feedback_mode == VK_FEEDBACK_PREDRAW &&
+                                                   g_vk.has_local_read);
     if (programmable_blend ? !programmable_pass
         : !n && !zt ? !render_begin_empty()
                     : !render_begin(rt, zt, n, zt_ro, ds->tgt.srgb_write, fb | predraw_pass_slots(rt, n), bound) ||
-                          !feedback_order(fb, writes, 0)) {
+                          !feedback_order(fb, writes, strict_feedback)) {
         draw_images_discard(&images);
         if (late_depth) vk_depth_shadow_cancel();
         return;
