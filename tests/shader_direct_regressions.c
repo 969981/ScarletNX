@@ -1626,6 +1626,54 @@ static void guarded_handle_merges(void) {
     free(code);
 }
 
+/* One game's compute program loads a surface handle under P5 = ISETP(R33), then sets P5 again from another register,
+   branches around a block on P6, and stores under P6 = ISETP(R33) once more: the same compare of the same register,
+   unwritten between, so the store's lanes are the load's. The instruction i lies at word 11 + i + i / 3 */
+static void recomputed_guard_handle(void) {
+    const u64 isetp_p5_r33 = 0x376b03fffff7212full, isetp_p6_r17 = 0x376b03fffff71137ull;
+    const u64 isetp_p5_r1 = 0x376b03fffff7012full, isetp_p6_r33 = 0x376b03fffff72137ull;
+    const u64 load_p5 = 0x4c98078804850013ull; /* @P5 MOV R19, c[0x2][0x120] */
+    const u64 load_r4 = 0x4c98078804870004ull; /* MOV R4, c[0x2][0x120] */
+    const u64 skip = 0xe2400000000e000full | (24ull << 20); /* @!P6 BRA, word 16 to word 20 */
+    const u64 store_r4 = unguarded(0xeb20020200f700a8ull, 8, 0, 4);
+    const u64 store_p6 = (unguarded(0xeb20098200f60d18ull, 8, 0, 19) & ~(0xfull << 16)) | 6ull << 16;
+    const u64 exit_ = 0xe30000000007000full;
+    const u64 program[] = {isetp_p5_r33, isetp_p6_r17, load_p5, isetp_p5_r1, skip,
+                           load_r4,      store_r4,     isetp_p6_r33, store_p6, exit_};
+    ShaderInfo info;
+    size_t words = 0;
+    u32* code = translate(program, 10, ST_CS, &info, &words, 1);
+    check_translated(code, &info, "a store under a guard computed again as its handle's load was reads that handle");
+    check(code && info.nimg >= 1 && info.img[0].bl_cbuf == 2 && info.img[0].cbuf_off == 0x120 / 4,
+          "the store under the recomputed guard binds c[0x2][0x120]");
+    free(code);
+    u64 variant[10];
+    memcpy(variant, program, sizeof variant);
+    variant[5] = 0x4c98078804870021ull; /* MOV R33, c[0x2][0x120] in the skipped block */
+    code = translate(variant, 10, ST_CS, &info, &words, 1);
+    check_refused(code, &info, "untracked surface handle", "a compare of a register written between is another guard");
+    free(code);
+    memcpy(variant, program, sizeof variant);
+    variant[7] = isetp_p6_r17;
+    code = translate(variant, 10, ST_CS, &info, &words, 1);
+    check_refused(code, &info, "untracked surface handle", "a compare of another register is another guard");
+    free(code);
+    /* the same program's other store: P5 itself, unwritten from the load to the store across the branch */
+    const u64 store_p5 = (store_p6 & ~(0xfull << 16)) | 5ull << 16;
+    const u64 kept[] = {isetp_p5_r33, isetp_p6_r17, load_p5, isetp_p6_r17, skip,
+                        load_r4,      store_r4,     isetp_p6_r33, store_p5, exit_};
+    code = translate(kept, 10, ST_CS, &info, &words, 1);
+    check_translated(code, &info, "a store under the predicate its handle was loaded under, kept across a branch");
+    check(code && info.nimg >= 1 && info.img[0].bl_cbuf == 2 && info.img[0].cbuf_off == 0x120 / 4,
+          "the store under the kept predicate binds c[0x2][0x120]");
+    free(code);
+    memcpy(variant, kept, sizeof variant);
+    variant[5] = isetp_p5_r1; /* P5 set again in the skipped block */
+    code = translate(variant, 10, ST_CS, &info, &words, 1);
+    check_refused(code, &info, "untracked surface handle", "a predicate written on the way is another guard");
+    free(code);
+}
+
 static void volume_surface_atomics(void) {
     const u64 operations[] = {0xea40020a00870009ull, 0xea48020a20870009ull, 0xeb50020a00070008ull,
                               0xeb50020a01170008ull};
@@ -1873,6 +1921,36 @@ static void subroutine_calls(void) {
         free(code);
         free(program);
     }
+}
+
+static int adjacent_brx_tables(u32 bank, u32 offset, u32* value) {
+    static const u32 table[4] = {0, 0, 0, 16}; /* c[0][0]: the first BRX's two entries, c[0][8]: the second's */
+    if (bank || offset >= sizeof table) return 0;
+    *value = table[offset / 4];
+    return 1;
+}
+
+/* Two switches without the IMNMX clamp whose tables lie one after the other, as one game's compute program lays out
+   seven: the first table ends where the second starts. Its entries count from the same base, so read on, the second
+   table's last entry lands in the second switch's code (word 15), which the first switch's cases never reach */
+static void brx_adjacent_tables(void) {
+    u64 code[32] = {0};
+    for (u32 i = 10; i < 32; i += 4) code[i] = SCHED;
+    code[11] = 0xef94000000070001ull; /* LDC.B32 R1, c[0][R0] */
+    code[12] = 0xe25000000007010full; /* BRX R1 */
+    code[13] = EXIT;
+    code[15] = 0xef94000000870002ull; /* LDC.B32 R2, c[0][R0 + 8] */
+    code[16] = 0xe25000000007020full; /* BRX R2 */
+    code[17] = EXIT;
+    code[19] = EXIT;
+    u32 targets[64];
+    int (*old)(u32, u32, u32*) = g_shader_cb_read;
+    g_shader_cb_read = adjacent_brx_tables;
+    int first = shader_brx_targets(code, 12, 20, targets, 64);
+    check(first == 2 && targets[0] == 13 && targets[1] == 13, "a jump table ends where the next one in its bank starts");
+    int second = shader_brx_targets(code, 16, 20, targets, 64);
+    check(second == 2 && targets[0] == 17 && targets[1] == 19, "the last jump table runs to its first invalid entry");
+    g_shader_cb_read = old;
 }
 
 static void brx_length(void) {
@@ -6449,6 +6527,7 @@ int main(int argc, char** argv) {
     dc_color_compare();
     unfed_fragment_input();
     brx_length();
+    brx_adjacent_tables();
     subroutine_calls();
     invalid_ldc_bank();
     cbuf_integer_loads();
@@ -6475,6 +6554,7 @@ int main(int argc, char** argv) {
     immediate_sampler_handle();
     constant_buffers_past_the_limit();
     guarded_handle_merges();
+    recomputed_guard_handle();
     volume_surface_atomics();
     surface_atomic_operations();
     draw_buffer_surfaces();
