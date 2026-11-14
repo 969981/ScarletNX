@@ -2425,7 +2425,8 @@ endif()
 if(NOT SNX_TOOLS_ONLY)
     # tex_upload (gpu/vk/texture.c) into the staging buffer: block-linear rows against the layout, mip levels, 3D,
     # pitch linear, a converted format; a format uploaded as it is needs no level-sized buffer
-    add_executable(snx-test-tex-upload-rows tex_upload_rows.c tracy_stubs.c)
+    add_executable(snx-test-tex-upload-rows tex_upload_rows.c tracy_stubs.c
+                   "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/blocklinear.c") # g_gob_native, which astc_kind.h reads
     snx_test_target(snx-test-tex-upload-rows 23)
     target_compile_definitions(snx-test-tex-upload-rows PRIVATE SNX_TEST_DEVMEM_STUBS=1)
     target_link_libraries(snx-test-tex-upload-rows PRIVATE snx_nx_flags)
@@ -3142,6 +3143,14 @@ add_executable(snx-test-astc-bc7-glsl glsl/astc_bc7_glsl.cpp glsl/astc_bc7_cpu.c
 snx_test_target(snx-test-astc-bc7-glsl 23)
 target_include_directories(snx-test-astc-bc7-glsl PRIVATE glsl)
 add_test(NAME astc_bc7_glsl COMMAND snx-test-astc-bc7-glsl)
+# astc_bcn.comp's GLSL, ASTC blocks straight into BC4, BC5 and BC1 ones for the textures whose blocks hold no more
+# (gpu/texture/astc_kind.h), run on the CPU (tests/glsl/glsl.hpp): what each loses against the CPU decoder's texels,
+# held to the floor measured; --measure FILE.astc... gives each file's format and loss beside BC7's. No GPU needed
+add_executable(snx-test-astc-bcn-glsl glsl/astc_bcn_glsl.cpp glsl/astc_bcn_cpu.cpp glsl/astc_bc7_cpu.cpp support/astc.c
+               support/bcn.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/blocklinear.c") # g_gob_native
+snx_test_target(snx-test-astc-bcn-glsl 23)
+target_include_directories(snx-test-astc-bcn-glsl PRIVATE glsl)
+add_test(NAME astc_bcn_glsl COMMAND snx-test-astc-bcn-glsl)
 # the ASTC 4x4 encoder's GLSL (BCn encoded again as ASTC) run on the CPU (tests/glsl/glsl.hpp), its blocks decoded by
 # the CPU's ASTC decoder: no GPU needed
 add_executable(snx-test-astc-encode-glsl glsl/astc_encode_glsl.cpp glsl/astc_encode_cpu.cpp glsl/bcn_astc_cpu.cpp
@@ -3243,6 +3252,12 @@ add_test(NAME texconv_glsl COMMAND snx-test-texconv-glsl)
 add_executable(snx-test-astc-blocks astc_blocks.c support/astc.c)
 snx_test_target(snx-test-astc-blocks 23)
 add_test(NAME astc_blocks COMMAND snx-test-astc-blocks)
+# what an ASTC block can hold, read from its endpoint modes (gpu/texture/astc_kind.h), against the CPU decoder's
+# texels for random blocks of every mode; a level's kind through its layout; the BCn format each kind takes
+add_executable(snx-test-astc-kind astc_kind.c support/astc.c
+               "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/blocklinear.c") # g_gob_native, which the layout reads
+snx_test_target(snx-test-astc-kind 99)
+add_test(NAME astc_kind COMMAND snx-test-astc-kind)
 
 add_executable(snx-test-nvn-command-gap nvn_command_gap.c support/nvn_command_gap.c)
 snx_test_target(snx-test-nvn-command-gap 23)
