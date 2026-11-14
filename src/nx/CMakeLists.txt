@@ -50,7 +50,7 @@ snx_svcgen(snx_kernel)
 snx_component(hle hle/services/services.c hle/services/audren.c hle/services/audren_dsp.c hle/services/sm.c hle/services/am.c hle/services/gsv.c hle/services/native_video.c hle/services/native_video_core.c hle/services/native_video_decoder.c hle/services/set.c  hle/services/acc.c hle/services/users.c hle/services/audio.c
               hle/services/misc.c hle/services/ldr.c hle/services/network/bsd.c hle/services/network/dns.c
               hle/services/network/nifm.c hle/services/network/ssl.c hle/services/network/ldn.c hle/services/network/room.c hle/filesystem/fs.c hle/services/hid.c hle/services/hid_motion.c hle/services/hid_touch.c hle/services/vi.c hle/services/nvdrv.c
-              hle/hook/hook.c hle/hook/jump.c hle/hook/libc.c hle/hook/diag.c hle/hook/codec.c hle/hook/audio_stream.c hle/hook/verify.c hle/hook/version.c
+              hle/hook/hook.c hle/hook/jump.c hle/hook/libc.c hle/hook/gs.c hle/hook/diag.c hle/hook/codec.c hle/hook/audio_stream.c hle/hook/verify.c hle/hook/version.c
               nn/ro.c nn/fs.c nn/time.c nn/pl.c nn/pl_font.c nn/pctl.c nn/nsd.c nn/ngc.c nn/prepo.c
               nn/audio.c nn/audio_renderer.c nn/codec.c)
 # the shared fonts' stand-ins (cmake/shared_fonts.cmake), which nn/pl.c hands out
@@ -107,6 +107,13 @@ if(WIN32)
     list(APPEND platform runtime/platform/plat_win32.c runtime/platform/profiler_win32.c)
 else()
     list(APPEND platform runtime/platform/plat_posix.c)
+endif()
+if(APPLE)
+    # the activity a title takes so App Nap leaves it alone (runtime/platform/plat_apple.m), which is Objective-C
+    enable_language(OBJC)
+    list(APPEND platform runtime/platform/plat_apple.m)
+    # under ARC, as gui/apple.m is: the global that holds the activity's token keeps it
+    set_source_files_properties(runtime/platform/plat_apple.m PROPERTIES COMPILE_OPTIONS -fobjc-arc)
 endif()
 if(ANDROID AND ANDROID_ABI STREQUAL "arm64-v8a")
     # a GPU driver package loaded in place of the system's driver (runtime/platform/gpu_driver_load.c), on the
@@ -327,7 +334,7 @@ if(WIN32)
     target_link_libraries(snx_platform PUBLIC synchronization powrprof) # plat_wait_word's WaitOnAddress, the power notification
 endif()
 if(APPLE AND NOT IOS) # plat_posix.c's power source: IOKit's notifications on CoreFoundation's run loop
-    target_link_libraries(snx_platform PUBLIC "-framework IOKit" "-framework CoreFoundation")
+    target_link_libraries(snx_platform PUBLIC "-framework IOKit" "-framework CoreFoundation" "-framework Foundation")
 endif()
 # the build is part of the key of the shader files, .vkshaders and .vkshipped (gpu/vk/pipeline.c)
 target_link_libraries(snx_vk PRIVATE snx_build_info FFmpeg::avutil) # vk/nvdec.c: FFmpeg's Vulkan device and pictures
