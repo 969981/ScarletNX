@@ -8,6 +8,7 @@
 * [Display](#display)
 * [Graphics](#graphics)
   * [Vulkan Extensions](#vulkan-extensions)
+* [Audio](#audio)
 * [Performance](#performance)
 * [On-screen controls](#on-screen-controls)
 * [Controllers](#controllers)
@@ -26,8 +27,10 @@ A game keeps its settings in its `.ini` (`recompiled/<id>/<id>.ini`), a section 
 Settings show a group for each section ([GUI launcher](gui.md)).
 
 `Game.ini`: help rewritten at startup, most settings hot-reload. `--key=value` overrides one run.
+On every driver's command line a key is also given with a `-` for each `_`, the same setting (`--state-slots=5` is
+`--state_slots=5`); a value it does not take is said by its key, as the `.ini`'s is.
 Restart for `docked` (`Auto` follows the host's power while the game runs, and `hotkey_tv_mode` and the game's menu's
-**TV mode** change the mode for the run), `fullscreen`, `transition_screen`, `language`, `resolution`,
+**TV mode** change the mode for the run), `tv_refresh_rate`, `tv_resolution`, `fullscreen`, `transition_screen`, `language`, `resolution`,
 `anisotropy`, `hdr_game`, `hdr_paperwhite`, `hdr_peak`, `memory_gb`, `memory_fit_mode`, `heap_max_mb`, `thread_stack_mb`, `map_limit_mb`, `map_limit_files`,
 `airplane_mode`, `ldn`, `room`, `pipeline_threads`, `pipeline_libraries`, `prepare_shaders`, `compress_shader_cache`,
 `compress_prepared_shaders`, `jit_threads`, `vertex_input_dynamic_state`, `astc_mode`, every `vk_ext_*`, and
@@ -49,12 +52,16 @@ type, range and help, tab-separated. Every setting, the recompiler's too, is des
 | `cheats_off` | empty | The game's cheats left out, of the Atmosphere-format `cheats/<build id>.txt` in its data folder: their names as their `[name]` lines give them, a `\|` between two. Every other cheat there runs, once per frame shown |
 | `gpu_driver` | empty | The Vulkan driver the game runs with: empty is the system's, else a driver package the launcher's GPU Drivers added, by its folder's name in `gpu_drivers/` of the user's data folder ([Android](../hosts/android-app.md)). Left out, the launcher passes the one its GPU Drivers picked for every game |
 | `freedreno_env` | empty | Mesa's Freedreno and Turnip variables, set as the game starts: `NAME=value`, a `;` between two (`TU_DEBUG=sysmem`), names starting `TU_`, `FD_` or `IR3_`. The launcher's Freedreno Settings write it; left out, the launcher passes its own for every game |
+| `microphone` | `off` | The microphone an Ounce game hears as the console's own: `off` none, so the game hears silence until the player picks one, empty the system's default recording device, else the first recording device whose name holds this text, in any case. It records only while the game records, and a change takes effect at the game's next recording. The log names the device by its format, never by its name |
+| `mic_noise_reduction` | `1` | How the noise the microphone picks up is lowered before the game hears it (the console's audio system has a noise reduction for its microphone, of a strength not known). `1`, Neural: RNNoise 0.1.1, a small recurrent network trained on speech, built in, in frames of 10 ms at 48 kHz; a stream at another rate gets `2`. On the test's synthetic speech it lowered a steady noise by 27 dB and background voices by 6 dB between words, and cost about 0.1 ms a frame. `2`, Spectral: the Speex DSP library's noise suppression (the system's `libspeexdsp`, else none), up to 30 dB, which lowered the steady noise by 18 dB and the voices by 1 dB. Both add 10 ms of delay. `0` gives the game the microphone as it is. It is read every 10 ms, so a change takes effect at once. The log names the method that runs, and the setting's value and why when another runs |
 
 ## Display
 
 | Key | Default | Effect |
 | --- | --- | --- |
 | `docked` | `1` | `1` is TV mode, `0` handheld mode (1280x720), `2` Auto: TV mode while the host is on its charger, handheld mode on its battery. Auto switches while the game runs. `hotkey_tv_mode` (Ctrl+D) and the game's menu's **TV mode** step On, Off and Auto for the run, the `.ini`'s value as it was |
+| `tv_refresh_rate` | `1` | The refresh rates an Ounce game is told its display takes: `0` is 60 Hz, `1` is 120 Hz too where the window's display refreshes at 119 Hz or more, `2` is 120 Hz too on any display. A game that turns 120 Hz on is then paced at 120 frames a second with `fps_limit=game`, and the log says `gsv: the display runs at 120 Hz` |
+| `tv_resolution` | `0` | The picture an Ounce game is told the TV shows in TV mode (its default display resolution): `0` is 1920x1080 (a game's parts made for a 4K TV cost performance, so 4K is the player's choice), `1` is 3840x2160 where the window's display's mode is that large (its pixels, whatever the desktop's scale), else 1920x1080, `2` is 3840x2160 on any display. A Switch game is told 1920x1080 |
 | `fullscreen` | `0` | `1` starts fullscreen, except in timed test runs (`--seconds`, `--frames`). `-f` or `--fullscreen=0` sets it for one run. F11 or Alt+Enter switches without changing it. A 3DS game takes it too (`--fullscreen=1`, not in `--seconds`, `--frames` or `--max-blocks` runs, nor in a `-H` run), with the same keys |
 | `transition_screen` | `1` | `1`: when a collection's program starts another (a game picked in its menu), the new program's window shows the loading screen from a quarter second after it opens until the game draws: the game's name and `(Program N)`, the game's cover, and as its steps the program's number, the one that started it, the user, the version and update, the DLCs, what was handed over, the GPU, the title ID and the build, `?` where not known. The launcher's run screen shows that program's page while no window is open (with the recompile of a program not made). `0`: the window stays black until the game draws, and the run screen shows the log |
 | `language` | `1` | The game's language, English (US). The `.ini` lists the others, `0` to `17`. One the runtime doesn't know is English (US) |
@@ -131,7 +138,9 @@ The settings, each with its extension and, where one took it in, the Vulkan vers
 | `vk_ext_conditional_rendering` | `auto` | `VK_EXT_conditional_rendering` |
 | `vk_ext_conservative_rasterization` | `auto` | `VK_EXT_conservative_rasterization` |
 | `vk_ext_custom_border_color` | `auto` | `VK_EXT_custom_border_color` |
+| `vk_ext_depth_clamp_control` | `auto` | `VK_EXT_depth_clamp_control` |
 | `vk_ext_depth_clip_control` | `auto` | `VK_EXT_depth_clip_control` |
+| `vk_ext_depth_clip_enable` | `auto` | `VK_EXT_depth_clip_enable` |
 | `vk_ext_depth_range_unrestricted` | `auto` | `VK_EXT_depth_range_unrestricted` |
 | `vk_ext_descriptor_buffer` | `auto` | `VK_EXT_descriptor_buffer` |
 | `vk_ext_descriptor_heap` | `auto` | `VK_EXT_descriptor_heap` |
@@ -195,6 +204,12 @@ The settings, each with its extension and, where one took it in, the Vulkan vers
 | `vk_nv_fragment_coverage_to_color` | `auto` | `VK_NV_fragment_coverage_to_color` |
 | `vk_nv_framebuffer_mixed_samples` | `auto` | `VK_NV_framebuffer_mixed_samples` |
 | `vk_valve_shader_mixed_float_dot_product` | `auto` | `VK_VALVE_shader_mixed_float_dot_product` |
+
+## Audio
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `volume` | `100` | How loud the game plays, in percent of its own sound, `0` to `100` (the menus' steps 5 apart): `0` mutes it. The system's volume stays as it is, and the game's own volume (its options, the console's volume it sets) is taken at this share. A change is heard at once, from the game's `.ini` too. The game's menu (Home, F2) has it on a slider ([Usage](usage.md#playing)), kept in the game's `.ini`; the launcher's Settings > Audio > Volume, a slider too, sets it for every game ([GUI launcher](gui.md)). The log's `settings:` line names it when it is not `100`, again after a reload that changes it, and each output the game opens says the volume it plays at. A 3DS game takes it too (`--volume=N`) |
 
 ## Performance
 
@@ -312,7 +327,7 @@ The profiler's rows (`tracy_`) only do something in a build with `SNX_TRACY` (`c
 | `native_bc` | `1` | `1` samples BC1 to BC7 textures as the game's blocks where the GPU samples BCn (desktop GPUs and some phone ones). A GPU without BCn (most phone ones, Mali and Adreno's own driver among them) gets them encoded again on the GPU as ETC2 and EAC as they load, the same bytes a texel, where it samples those (`native_etc2=1`), BC6H decoded to half floats; else all decoded, four to eight times the memory ([BCn without BCn](../layers/gpu/bcn.md)). `0` sends BCn down that path on a GPU that samples BCn too, to compare the two on a desktop GPU |
 | `bcn_astc` | `1` | On a GPU that samples ASTC and not BCn (most phone and tablet ones): `1` (Auto) encodes BC1, BC2, BC3 and BC7 textures again as ASTC 4x4 as they load, several times faster than as ETC2 and closer to the game's blocks ([BCn without BCn](../layers/gpu/bcn.md)). ASTC 4x4 is twice BC1's bytes, so once the GPU's memory runs short the BC1 textures loaded from then on are encoded as ETC2 (`native_etc2`) again, half the bytes and slower to load. `2` (Always) keeps BC1 as ASTC whatever the memory. `0` encodes all of them as ETC2. BC4 and BC5 are encoded as EAC either way |
 | `native_etc2` | `1` | `1` samples ETC2 and EAC textures as the game's blocks where the GPU samples ETC2 (most phone and tablet GPUs), in a quarter to an eighth of the memory, and so are the BCn textures a GPU without BCn gets encoded again as ETC2 (`native_bc`). `0` decodes them on the GPU, as on GPUs without ETC2 (most desktop ones), and BCn too there, to compare the two. On such a GPU `1` is a warning at start |
-| `cpu_extensions` | `0` | `1` decodes LSE atomics, RCpc loads, and PAuth branches and signing with authentication off, as an Ounce game needs. It gives no pointer authentication protection. Recompile the game with the same value as each run |
+| `cpu_extensions` | `0` | `1` decodes LSE atomics, RCpc loads, and PAuth branches and signing with authentication off, for a Switch game. An Ounce game takes its Cortex-A78C's instructions without it ([Ounce](../platforms/nx/ounce.md#the-platform)). It gives no pointer authentication protection. Recompile the game with the same value as each run |
 | `slp_vectorizer` | `0` | `1` runs LLVM's SLP vectorizer, which packs scalar instructions into SIMD ones, in the recompile and the JIT; the next recompile and the JIT's next run take it. Off while LLVM 23 can break a module with it and stop the recompile (llvm-project issue 231525). LLVM Internals' `llvm_slp_vectorization` leaves it running |
 | `fpsr_flags` | `1` | `1` keeps FPSR's cumulative flags (IOC, DZC, OFC, UFC, IXC and QC) as the console raises them, which costs every floating-point or saturating operation a test of its result. `0` keeps only the results exact; a game that never reads FPSR (few do) runs floating-point and saturating code faster. The next recompile and the JIT's next run take it |
 | `abi_contract` | `0` | `1` reads the game's calls as following the AArch64 procedure call standard: the recompiler keeps the callee-saved registers in their host locations across a call and does not store the caller-saved ones that are dead after it. A checking mode in tests reports a function that does not preserve them. The next recompile and the JIT's next run take it |
@@ -355,6 +370,7 @@ The profiler's rows (`tracy_`) only do something in a build with `SNX_TRACY` (`c
 | `vk_record` | `1` | `0` records Vulkan commands on the GPU thread instead of a thread of their own |
 | `compute` | `1` | `0` skips every compute shader dispatch |
 | `hmma_f16` | `0` | `1` sums an SM86 HMMA's products in half floats, two a packed `OpFma`, where the console's tensor core keeps the sum in f32 and an f32 emulation needs two instructions for the same pair: about 2 and a half times the frames a second on a device whose driver offers no matrix unit, and a result is then up to 0.4% of its products' size off (more than that of itself where they cancel), a product or partial sum past 65504 an infinity. `0` is the f32 sum. A device with the matrix unit (`VK_KHR_cooperative_matrix`) uses it in compute; one with the mixed dot product (`VK_VALVE_shader_mixed_float_dot_product`) or without `shaderFloat16` keeps the f32 sum, and the log says so |
+| `hmma_astat` | `0` | `1` forms each product of an SM86 HMMA in the lane that holds its A words, on a device whose driver offers no matrix unit. A lane then takes only B's words from the other lanes, and the partial sums of each quad meet in a butterfly of 12 xor shuffles. The GT 1030 ran the HMMA bench 5.6 times faster than with the gather (`0`), and 2.7 times faster than with A and B through shared memory. The f32 sums are a tree, at most 6 roundings a term where the gather's chain has 16, so a result is at least as exact. `hmma_f16=1` keeps its own form |
 | `vk_max_allocation_mb`, `vk_budget_mb` | `0`, `0` | A smaller cap on each Vulkan allocation and on the GPU memory the caches keep, in MiB, for testing. `0` is the device's |
 | `renderdoc`, `renderdoc_frames` | empty | RenderDoc captures to that path's stem of the presents listed (`500,800`, or `45s` for the first after 45 seconds), and the capture key (`hotkey_capture`) or the game's menu's Capture frame captures the frame after the next present. RenderDoc writes a capture inside the present that ends it, and the game stops meanwhile (a minute for a frame of 1.4 GB): a notice over the game says so as the capture is asked or RenderDoc's program starts its own, the log says how long it has been writing every 5 s, and the log and a notice say how long it took, the file and its size once written, or that it failed. A game RenderDoc's own program started takes them and the presents listed too, its captures where that program keeps them when `renderdoc` is empty; F12 stays the stats' key |
 | `tracy_profiler` | `0` | `1` starts the run with the Tracy client up, in a build with `SNX_TRACY` ([Profiling](../dev/development.md#profiling)): connect the GUI to `127.0.0.1:8086`. A capture and the GUI cannot both have the run |

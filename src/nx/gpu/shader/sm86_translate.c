@@ -88,6 +88,8 @@ typedef struct {
        PrimitiveId in and out (passthrough), the viewport mask it writes (a Function variable, 1 until written) and
        whether its SPH asks for passthrough */
     u32 position_in, primitive_id_in, primitive_id_out, viewport_mask;
+    /* a vertex or geometry program's ClipDistance output, 8 planes (clip_var) */
+    u32 clip;
     int passthrough;
     /* a fragment program at a resolution scale: SNX_VKB_RS's vec4 (scale_component) and the fragment stage's push
        constants, whose uvec4s mark the textures bound to scaled render targets (scaled_slot) */
@@ -649,6 +651,21 @@ static void position_var(Ctx* c) {
         add_interface(c, c->position);
     }
 }
+/* whether a store to clip distance plane reaches the rasterizer or a later stage: the last stage before rasterization
+   writes only the planes the 3D engine enables (SetUserClipEnable), as spirv_translate.c does for Maxwell's */
+static int clip_plane_used(const Ctx* c, u32 plane) {
+    return (c->si->clip_enable & SNX_SH_NOT_LAST) || (c->si->clip_enable & (1u << plane));
+}
+/* the ClipDistance output, made before the program's code, so that each plane starts at 0 and a vertex program's
+   planes that it doesn't write clip nothing. A geometry program's planes are undefined again after each EmitVertex, as
+   on Maxwell's path (spirv_translate.c initializes them once too). It has 8 planes, as spirv_translate.c makes
+   Maxwell's, so that the builtin interfaces of adjacent stages agree */
+static void clip_var(Ctx* c) {
+    if (c->clip) return;
+    spv_emit_clip_distance_capability(&c->e);
+    c->clip = spv_emit_clip_distance_output(&c->e, c->t_f32, c->t_u32, 8);
+    add_interface(c, c->clip);
+}
 
 /* a float to BF16 bits, rounded to nearest even, a NaN kept a NaN */
 static u32 bf16(Ctx* c, u32 f) {
@@ -937,6 +954,14 @@ static void attr_store(Ctx* c, u32 addr, u32 bits) {
         spv_emit_store(&c->e, c->viewport_mask, bits);
         return;
     }
+    if (addr >= 0x2c0 && addr < 0x2e0) {
+        /* ClipDistance0 to 7, a word each: the plane is in clip_var's output, made before the code */
+        u32 plane = (addr - 0x2c0) >> 2;
+        if (c->clip && clip_plane_used(c, plane))
+            spv_emit_store(&c->e, spv_emit_output_element_pointer(&c->e, c->t_f32, c->clip, cu(c, plane)),
+                           to_f(c, bits));
+        return;
+    }
     if (addr == 0x5c) {
         /* NAK's NAK_ATTR_VPRS_TABLE_INDEX from SM86, the primitive's shading rate: the default rate, one fragment
            a pixel, is what the translation gives without it */
@@ -1006,6 +1031,11 @@ static void gs_passthrough(Ctx* c) {
         saved[a] = written ? spv_emit_load(e, c->t_v4f, out[a]) : empty;
     }
     u32 size = c->point_size ? spv_emit_load(e, c->t_f32, c->point_size) : 0;
+    /* and the clip distances, which EmitVertex leaves undefined too (emit_io.c's saved_clip for Maxwell's) */
+    u32 clip_saved[8] = {0};
+    for (u32 plane = 0; plane < 8 && c->clip; plane++)
+        clip_saved[plane] =
+            spv_emit_load(e, c->t_f32, spv_emit_output_element_pointer(e, c->t_f32, c->clip, cu(c, plane)));
     if (!c->primitive_id_in) {
         c->primitive_id_in = spv_emit_builtin_input_u32(e, c->t_u32, SPV_BUILT_IN_PRIMITIVE_ID);
         add_interface(c, c->primitive_id_in);
@@ -1031,6 +1061,8 @@ static void gs_passthrough(Ctx* c) {
             spv_emit_store(e, out[a], value);
         }
         if (c->point_size) spv_emit_store(e, c->point_size, size);
+        for (u32 plane = 0; plane < 8 && c->clip; plane++)
+            spv_emit_store(e, spv_emit_output_element_pointer(e, c->t_f32, c->clip, cu(c, plane)), clip_saved[plane]);
         spv_emit_store(e, c->primitive_id_out, id);
         if (c->position && !(c->si->clip_enable & SNX_SH_NOT_LAST)) vertex_depth_fix(c);
         spv_emit_emit_vertex(e);
@@ -2234,6 +2266,7 @@ static int may_write(const Sm86Insn* in, u32 r) {
         case SM86_TEX_U:
         case SM86_TLD_U:
         case SM86_TLD4_U:
+        case SM86_TXD_U:
         case SM86_TXQ_U: {
             u32 d1 = sm86_field(in, 64, 8);
             if (d1 < SM86_RZ && r >= d1 && r < d1 + 4) return 1;
@@ -2789,7 +2822,8 @@ static void texture_grad(Ctx* c, const Sm86Insn* in) {
         return;
     }
     u32 handle = sm86_field(in, 40, 19);
-    int slot = tex_slot(c, (handle >> 14) & 31, (handle & 0x3fff) * 4, type, array, 0, 0);
+    int slot = in->op == SM86_TXD_U ? (int)c->handle[c->cur].slot - 1 /* memory_handles' */
+                                    : tex_slot(c, (handle >> 14) & 31, (handle & 0x3fff) * 4, type, array, 0, 0);
     if (slot < 0) return;
     u32 a = sm86_field(in, 24, 8), b = sm86_field(in, 32, 8), f[4], dx[3], dy[3], count = 0;
 #define TXD_REG(base, k) ((base) < SM86_RZ ? (base) + (k) : SM86_RZ)
@@ -3054,7 +3088,10 @@ void shader_hmma_choose(int subgroups, int radv_warp32, int shuffle_loops, int s
 void shader_hmma_way(char* out, size_t n) {
     int mixed = g_spirv_translate.mixed_dot && g_spirv_translate.float16,
         halves = !mixed && g_spirv_translate.hmma_f16 && g_spirv_translate.float16;
-    const char* how = g_spirv_translate.hmma_stage ? "A and B through a warp's slot of shared memory"
+    const char* how = g_spirv_translate.hmma_astat && !halves
+                          ? g_spirv_translate.hmma_stage ? "A-stationary, B through a warp's slot of shared memory"
+                                                         : "A-stationary, B by shuffles"
+                      : g_spirv_translate.hmma_stage ? "A and B through a warp's slot of shared memory"
                       : g_spirv_translate.hmma_pairs && g_spirv_translate.quad_compute
                           ? "A by quad broadcasts, B shared by pairs of lanes"
                       : g_spirv_translate.hmma_pairs   ? "A by shuffles, B shared by pairs of lanes"
@@ -3441,6 +3478,129 @@ static int stage_wanted(const Ctx* c) {
 static u32 stage_ptr(Ctx* c, u32 index) {
     return SPV(&c->e, SPV_OP_ACCESS_CHAIN, spv_emit_type_workgroup_pointer(&c->e, c->t_u32), c->stage_slots, index);
 }
+/* HMMA A-stationary (g_spirv_translate.hmma_astat): lane l = 4g + t holds A's pairs of rows g and g + 8 at k words t
+   (a0, a1) and t + 4 (a2, a3), and forms every product they take part in: with B's words of the same k words of each
+   of the 8 columns, those of lane 4c + t (b0, b1). Its partial sum of row i and column c = j ^ 2t sits in slot j (a
+   skew by t, so that the butterfly sends the same slots from every lane): 16 partial sums of 4 products (2 for k8).
+   The lanes of a quad hold the same 16 (row, column) pairs, each summed over its own k words, and D's owner of
+   (row, c) is the quad lane c >> 1. A butterfly over the quad: at bit b (xor 1, then xor 2) a lane sends the slots
+   whose bit b + 1 is set and adds what it receives into slot j ^ (2 << b), which holds the same pair there. Slots 0
+   and 1 are then columns 2t and 2t + 1, all of their k words: D = them + C. 16 B words fetched (shuffles, or loads from
+   the warp's slot where hmma_stage takes it, B at 128 + 2l as hmma's), 12 xor shuffles, 12 adds: ucas's mma chose it
+   under its gt1030 and sm86 models, and proved it over the 32 lanes (each D element exactly its 16 products and C).
+   The sums are a tree: a term goes through 6 roundings at most, where hmma's chain has 16 */
+static void hmma_astat(Ctx* c, const Sm86Insn* in, int k16, int f32, u32 ra, u32 rb, u32 rc) {
+    u32 na = k16 ? 4 : 2, nb = k16 ? 2 : 1, ncd = f32 ? 4 : 2, a[4], b[2], cc[4], k;
+    for (k = 0; k < na; k++) a[k] = ra >= SM86_RZ ? c->zero : rd(c, ra + k);
+    for (k = 0; k < nb; k++) b[k] = rb >= SM86_RZ ? c->zero : rd(c, rb + k);
+    for (k = 0; k < ncd; k++) cc[k] = rc >= SM86_RZ ? c->zero : rd(c, rc + k);
+    int mixed = g_spirv_translate.mixed_dot && g_spirv_translate.float16;
+    u32 t_v2h = 0;
+    if (mixed) {
+        spv_emit_capability(&c->e, SPV_CAPABILITY_FLOAT16);
+        t_v2h = spv_emit_type_vector(&c->e, spv_emit_type_float(&c->e, 16), 2);
+        spv_emit_capability(&c->e, SPV_CAPABILITY_DOT_PRODUCT_FLOAT16_ACC_FLOAT32_VALVE);
+        spv_emit_extension(&c->e, "SPV_VALVE_mixed_float_dot_product");
+    }
+    u32 lane = warp_lane(c);
+    u32 t = spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, lane, cu(c, 3));
+    /* slot j's column is j ^ 2t, its B words lane 4 (j ^ 2t) + t's: (t ^ 8t) ^ 4j */
+    u32 src0 = spv_emit_binary(&c->e, SPV_OP_BITWISE_XOR, c->t_u32, t,
+                               spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, t, cu(c, 3)));
+    u32 b_at = 0;
+    if (stage_wanted(c)) {
+        if (!c->stage_slots) {
+            u32 lanes = (u32)(c->si->cs_local[0] * c->si->cs_local[1] * c->si->cs_local[2]);
+            u32 array = spv_emit_type_array_u32(&c->e, c->t_u32, (lanes + 31) / 32 * HMMA_STAGE_WORDS);
+            c->stage_slots = spv_emit_workgroup_variable(&c->e, spv_emit_type_workgroup_pointer(&c->e, array));
+            add_interface(c, c->stage_slots);
+        }
+        u32 slot = spv_emit_binary(&c->e, SPV_OP_I_MUL, c->t_u32,
+                                   spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32,
+                                                   builtin_u32(c, &c->local_index, SPV_BUILT_IN_LOCAL_INVOCATION_INDEX),
+                                                   cu(c, 5)),
+                                   cu(c, HMMA_STAGE_WORDS));
+        u32 own_b = spv_emit_iadd_u32(
+            &c->e, c->t_u32, slot,
+            spv_emit_iadd_u32(&c->e, c->t_u32,
+                              spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, lane, cu(c, 1)), cu(c, 128)));
+        coop_barrier(c); /* the HMMA before's loads of the slot */
+        for (k = 0; k < nb; k++) spv_emit_store_nonprivate(&c->e, stage_ptr(c, coop_add(c, own_b, k)), b[k]);
+        coop_barrier(c);
+        b_at = coop_add(c, slot, 128); /* lane L's B words at 128 + 2L */
+    }
+    u32 ap[4][2] = {{0}}; /* A's pairs, as two f16 (mixed) or unpacked to two f32 */
+    for (k = 0; k < na; k++)
+        if (mixed)
+            ap[k][0] = spv_emit_unary(&c->e, SPV_OP_BITCAST, t_v2h, a[k]);
+        else {
+            u32 pair = half_pair(c, a[k]);
+            ap[k][0] = spv_emit_vec4_extract(&c->e, c->t_f32, pair, 0);
+            ap[k][1] = spv_emit_vec4_extract(&c->e, c->t_f32, pair, 1);
+        }
+    u32 part[2][8]; /* [row g, g + 8][slot j] */
+    for (u32 j = 0; j < 8; j++) {
+        u32 bw[2];
+        for (k = 0; k < nb; k++) {
+            if (b_at) { /* 2 (src0 ^ 4j): the xor, as src0 has bits where 4j does */
+                u32 at = spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32,
+                                         spv_emit_binary(&c->e, SPV_OP_BITWISE_XOR, c->t_u32, src0, cu(c, 4 * j)),
+                                         cu(c, 1));
+                bw[k] = spv_emit_load_nonprivate(&c->e, c->t_u32,
+                                                 stage_ptr(c, coop_add(c, spv_emit_iadd_u32(&c->e, c->t_u32, b_at, at), k)));
+            } else
+                bw[k] = warp_read(c, b[k], spv_emit_binary(&c->e, SPV_OP_BITWISE_XOR, c->t_u32, src0, cu(c, 4 * j)));
+        }
+        u32 bp[2][2] = {{0}};
+        for (k = 0; k < nb; k++)
+            if (mixed)
+                bp[k][0] = spv_emit_unary(&c->e, SPV_OP_BITCAST, t_v2h, bw[k]);
+            else {
+                u32 pair = half_pair(c, bw[k]);
+                bp[k][0] = spv_emit_vec4_extract(&c->e, c->t_f32, pair, 0);
+                bp[k][1] = spv_emit_vec4_extract(&c->e, c->t_f32, pair, 1);
+            }
+        for (u32 i = 0; i < 2; i++) {
+            u32 acc = 0;
+            for (u32 h = 0; h < nb; h++) { /* A's register 2h + i, B's h: the k words t and t + 4 */
+                if (mixed) {
+                    acc = SPV(&c->e, SPV_OP_F_DOT2_MIX_ACC32_VALVE, c->t_f32, ap[2 * h + i][0], bp[h][0],
+                              acc ? acc : cf(c, 0.0f));
+                    continue;
+                }
+                for (u32 e = 0; e < 2; e++) {
+                    u32 prod = op2(c, SPV_OP_F_MUL, c->t_f32, ap[2 * h + i][e], bp[h][e]);
+                    acc = acc ? op2(c, SPV_OP_F_ADD, c->t_f32, acc, prod) : prod;
+                }
+            }
+            part[i][j] = acc;
+        }
+    }
+    for (u32 bit = 0; bit < 2; bit++) /* the butterfly over the quad */
+        for (u32 j = 0; j < 8; j++) {
+            if (!(j >> (bit + 1) & 1) || (bit == 1 && (j & 2))) continue; /* the slots still live that it sends */
+            for (u32 i = 0; i < 2; i++) {
+                u32 x = to_f(c, warp_xor(c, to_u(c, part[i][j]), 1u << bit));
+                u32 to = j ^ (2u << bit);
+                part[i][to] = op2(c, SPV_OP_F_ADD, c->t_f32, part[i][to], x);
+            }
+        }
+    u32 acc[4]; /* row g columns 2t and 2t + 1, row g + 8 the same: slots 0 and 1 */
+    for (u32 i = 0; i < 2; i++) {
+        u32 pair = f32 ? 0 : half_pair(c, cc[i]);
+        for (u32 j = 0; j < 2; j++) {
+            u32 addend = f32 ? to_f(c, cc[2 * i + j]) : spv_emit_vec4_extract(&c->e, c->t_f32, pair, j);
+            acc[2 * i + j] = op2(c, SPV_OP_F_ADD, c->t_f32, part[i][j], addend);
+        }
+    }
+    u32 d = in->dst;
+    if (d >= SM86_RZ) return;
+    if (f32)
+        for (k = 0; k < 4; k++) wr(c, d + k, to_u(c, acc[k]));
+    else
+        for (u32 i = 0; i < 2; i++)
+            wr(c, d + i, pack_half(c, spv_emit_vec2_construct(&c->e, c->t_v2f, acc[2 * i], acc[2 * i + 1])));
+}
 /* HMMA (0x23c): D = A B + C on the warp's fragments, as PTX's mma.sync.aligned.m16n8k16 (bit 75) or m16n8k8 .row.col
    with f16 A and B, and f16 (bit 76 clear) or f32 C and D (the encodings of CuAssembler's sm_86 records: bits 72-90 8
    16816.F16, 0x18 16816.F32, 0 1688.F16, 0x10 1688.F32; BF16, TF32 and 1684 are other bits). D at 16, A at 24, B at
@@ -3469,6 +3629,10 @@ static void hmma(Ctx* c, const Sm86Insn* in) {
     u32 ra = sm86_field(in, 24, 8), rb = sm86_field(in, 32, 8), rc = sm86_field(in, 64, 8);
     if (c->coop) {
         hmma_coop(c, in, k16, f32, ra, rb, rc);
+        return;
+    }
+    if (g_spirv_translate.hmma_astat && !g_spirv_translate.hmma_f16) {
+        hmma_astat(c, in, k16, f32, ra, rb, rc);
         return;
     }
     u32 na = k16 ? 4 : 2, nb = k16 ? 2 : 1, ncd = f32 ? 4 : 2, a[4], b[2], cc[4], k;
@@ -5392,6 +5556,7 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
         case SM86_TLD_U:
         case SM86_TLD4_U:
         case SM86_TXQ_U:
+        case SM86_TXD_U:
             if (!c->handle || !c->handle[c->cur].slot) { /* memory_handles found no slot */
                 uniform_handle(c, in);
                 return;
@@ -5400,6 +5565,8 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
                 texel_fetch(c, in);
             else if (op == SM86_TXQ_U)
                 texture_query(c, in);
+            else if (op == SM86_TXD_U)
+                texture_grad(c, in);
             else
                 texture(c, in);
             return;
@@ -6044,6 +6211,9 @@ static int mh_may_write(const Sm86Insn* in, int file, u32 r) {
             case SM86_TEX_U:
             case SM86_TLD_U:
             case SM86_TLD4_U:
+            case SM86_TXD:
+            case SM86_TXD_B:
+            case SM86_TXD_U:
             case SM86_SULD_P:
             case SM86_SULD_D:
             case SM86_SULD_P_B:
@@ -6308,14 +6478,14 @@ static int tex_b_cbuf_handle(Ctx* c, u32 i, u32 reg) {
     if (c->stage == ST_CS && w->op == SM86_LDC && sm86_field(w, 24, 8) < SM86_RZ) return 0;
     return (w->op == SM86_MOV && w->b.kind == SM86_SRC_CBUF && !w->b.bindless) || w->op == SM86_LDC;
 }
-/* The handles from memory: TEX, TLD, TLD4 and TXQ with the handle in a uniform register pair (URn the texture's word,
-   URn + 1 the sampler's), and TEX.B whose handle register no constant buffer word gives. Their slots go in
+/* The handles from memory: TEX, TLD, TLD4, TXD and TXQ with the handle in a uniform register pair (URn the texture's
+   word, URn + 1 the sampler's), and TEX.B whose handle register no constant buffer word gives. Their slots go in
    c->handle (the slot + 1), and the instructions that make them in ShaderInfo.memh */
 static void memory_handles(Ctx* c) {
     u32 n = c->n, any = 0;
     for (u32 i = 0; i < n; i++) {
         int op = c->in[i].op;
-        any |= op == SM86_TEX_U || op == SM86_TLD_U || op == SM86_TLD4_U || op == SM86_TXQ_U ||
+        any |= op == SM86_TEX_U || op == SM86_TLD_U || op == SM86_TLD4_U || op == SM86_TXD_U || op == SM86_TXQ_U ||
                ((op == SM86_TEX_B || op == SM86_TXQ_B) && handle_b_reg(&c->in[i]) < SM86_RZ &&
                 !tex_b_cbuf_handle(c, i, handle_b_reg(&c->in[i])));
     }
@@ -6336,7 +6506,8 @@ static void memory_handles(Ctx* c) {
        is sampled as no texture (SH_PROBE_NONE): its instructions are unmarked, and the draw goes on without it */
     for (u32 i = 0; i < n && !c->failed; i++) {
         const Sm86Insn* in = &c->in[i];
-        int op = in->op, u = op == SM86_TEX_U || op == SM86_TLD_U || op == SM86_TLD4_U || op == SM86_TXQ_U;
+        int op = in->op, u = op == SM86_TEX_U || op == SM86_TLD_U || op == SM86_TLD4_U || op == SM86_TXQ_U ||
+                             op == SM86_TXD_U;
         int b = op == SM86_TEX_B || op == SM86_TXQ_B;
         u32 reg = b ? handle_b_reg(in) : SM86_RZ;
         if (!u && !(b && reg < SM86_RZ && !tex_b_cbuf_handle(c, i, reg))) continue;
@@ -6368,7 +6539,9 @@ static void memory_handles(Ctx* c) {
             int op = in->op, slot = -1;
             int query = op == SM86_TXQ_U || op == SM86_TXQ_B;
             if (probe[i][0] == ~0u || query != (pass == 1)) continue;
-            if (op != SM86_TEX_U && op != SM86_TLD_U && op != SM86_TLD4_U && !query && op != SM86_TEX_B) continue;
+            if (op != SM86_TEX_U && op != SM86_TLD_U && op != SM86_TLD4_U && op != SM86_TXD_U && !query &&
+                op != SM86_TEX_B)
+                continue;
             u32 tex = mh_final(c, probe[i][0]), smp = probe[i][1] == ~0u ? 0 : mh_final(c, probe[i][1]);
             int has_smp = probe[i][1] != ~0u;
             if (query) {
@@ -6381,7 +6554,8 @@ static void memory_handles(Ctx* c) {
             } else {
                 u32 type, array, coords;
                 if (!tex_dim(sm86_field(in, 61, 3), &type, &array, &coords)) continue; /* refused where it's written */
-                u32 shadow = op == SM86_TLD_U ? 0 : sm86_field(in, 78, 1),
+                /* TXD has no depth reference: its bit 78 is not the shadow bit */
+                u32 shadow = op == SM86_TLD_U || op == SM86_TXD_U ? 0 : sm86_field(in, 78, 1),
                     ms = op == SM86_TLD_U && sm86_field(in, 78, 1);
                 slot = tex_slot_memory(c, tex, has_smp, smp, type, array, shadow, ms);
             }
@@ -6796,6 +6970,17 @@ u32* sm86_to_spirv_ftz(const u8* code, u32 bytes, int stage, const u32* sph, Sha
             if (insn[i].op == SM86_AST)
                 for (u32 k = 0; k <= sm86_field(&insn[i], 74, 2); k++)
                     output_var(c, sm86_field(&insn[i], 40, 10) + 4 * k);
+        /* and the clip distances of a vertex or geometry program, when it stores one that is used. uses_clip_mask names
+           those planes, as spirv_translate.c's clip_used does: the renderer gives such a program no varying geometry
+           program of its own (render.c), and a tessellation passthrough hands them on (tess_passthrough.c) */
+        for (u32 i = 0; i < n && (stage == ST_VS || stage == ST_GS); i++)
+            if (insn[i].op == SM86_AST)
+                for (u32 k = 0; k <= sm86_field(&insn[i], 74, 2); k++) {
+                    u32 addr = sm86_field(&insn[i], 40, 10) + 4 * k;
+                    if (addr < 0x2c0 || addr >= 0x2e0 || !clip_plane_used(c, (addr - 0x2c0) >> 2)) continue;
+                    c->si->uses_clip_mask |= 1 << ((addr - 0x2c0) >> 2);
+                    clip_var(c);
+                }
         StructEmit se = {0};
         se.st = st;
         se.open = 1;
@@ -6814,6 +6999,8 @@ u32* sm86_to_spirv_ftz(const u8* code, u32 bytes, int stage, const u32* sph, Sha
             for (u32 i = 0; i < 32; i++)
                 if (c->out_attr[i]) spv_emit_store(e, c->out_attr[i], empty);
         }
+        for (u32 plane = 0; plane < 8 && c->clip; plane++)
+            spv_emit_store(e, spv_emit_output_element_pointer(e, c->t_f32, c->clip, cu(c, plane)), cf(c, 0.0f));
         while (!c->failed) {
             int step = structure_step(c, &se);
             if (step == SE_DONE) break;
