@@ -10,7 +10,8 @@
    each screen's image at its render scale into a buffer of its own. The 3DS framebuffer is 240x400/320 portrait, one 240-pixel row per screen column from
    the left, each row from the bottom of the screen up (libctru's console draws pixel (x, y) at x * 240 + 239 - y);
    the window and the dumps show it that way round. A 3D render scaled by its screen's resolution setting is drawn
-   from its render target while the GPU keeps that newer than memory. */
+   from its render target while the GPU keeps that newer than memory, or from the copy that a display transfer made
+   of it. */
 #include "3ds/gpu/present.h"
 #include "3ds/board/clock.h"
 #include "3ds/input/input.h"
@@ -194,7 +195,7 @@ bool snx_ctr_present_init(SnxCtrMemory* memory, const char* frame_dir, bool head
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VkSemaphoreCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    if (!snx_ctr_vk_compute(snx_ctr_present_spv, snx_ctr_present_spv_size / 4, 2, 2, 36, &g_present.decode) ||
+    if (!snx_ctr_vk_compute(snx_ctr_present_spv, snx_ctr_present_spv_size / 4, 3, 2, 52, &g_present.decode) ||
         !frame_make(&g_present.source_dummy, 1, 1, 1) ||
         vkCreateBuffer(v->device, &bi, NULL, &g_present.readback) != VK_SUCCESS) {
         snx_ctr_present_free();
@@ -308,32 +309,37 @@ static void write_pending(bool wait) {
     write_ppm(g_present.pending.screen, g_present.pending.width, g_present.pending.height, g_present.readback_view);
 }
 /* The blit rectangle of a screen in swapchain pixels: in one window the pair scaled to fit and centred, each screen
-   centred across the layout; in its own window the screen scaled to fit and centred. False before a layout and a
-   swapchain exist. */
+   centred across the layout; in its own window the screen scaled to fit and centred. The layout takes each screen at
+   the console's size (its frame's size over its render scale), so screens at different scales keep the console's
+   proportions. False before a layout and a swapchain exist. */
 static bool screen_rect(unsigned screen, VkOffset2D rect[2]) {
     const Frame* frames = g_present.frames;
+    uint32_t width[2], height[2];
+    for (unsigned i = 0; i < 2; ++i) {
+        width[i] = frames[i].scale ? frames[i].width / frames[i].scale : 0;
+        height[i] = frames[i].scale ? frames[i].height / frames[i].scale : 0;
+    }
     unsigned window = g_present.separate ? screen : 0;
     VkExtent2D e = g_present.swap[window].extent;
     if (g_present.separate) {
-        const Frame* f = &frames[screen];
-        if (!f->width || !f->height || !e.width || !e.height) return false;
-        double scale = (double)e.width / f->width < (double)e.height / f->height ? (double)e.width / f->width
-                                                                                 : (double)e.height / f->height;
-        double x = (e.width - f->width * scale) / 2, y = (e.height - f->height * scale) / 2;
+        if (!width[screen] || !height[screen] || !e.width || !e.height) return false;
+        double scale = (double)e.width / width[screen] < (double)e.height / height[screen]
+                           ? (double)e.width / width[screen]
+                           : (double)e.height / height[screen];
+        double x = (e.width - width[screen] * scale) / 2, y = (e.height - height[screen] * scale) / 2;
         rect[0] = (VkOffset2D){(int32_t)x, (int32_t)y};
-        rect[1] = (VkOffset2D){(int32_t)(x + f->width * scale), (int32_t)(y + f->height * scale)};
+        rect[1] = (VkOffset2D){(int32_t)(x + width[screen] * scale), (int32_t)(y + height[screen] * scale)};
         return true;
     }
-    uint32_t layout_w = snx_max_u32(frames[0].width, frames[1].width);
-    uint32_t layout_h = frames[0].height + frames[1].height;
+    uint32_t layout_w = snx_max_u32(width[0], width[1]);
+    uint32_t layout_h = height[0] + height[1];
     if (!layout_w || !layout_h || !e.width || !e.height) return false;
     double scale = (double)e.width / layout_w < (double)e.height / layout_h ? (double)e.width / layout_w
                                                                             : (double)e.height / layout_h;
-    const Frame* f = &frames[screen];
-    double x = (e.width - layout_w * scale) / 2 + (layout_w - f->width) * scale / 2;
-    double y = (e.height - layout_h * scale) / 2 + (screen ? frames[0].height * scale : 0);
+    double x = (e.width - layout_w * scale) / 2 + (layout_w - width[screen]) * scale / 2;
+    double y = (e.height - layout_h * scale) / 2 + (screen ? height[0] * scale : 0);
     rect[0] = (VkOffset2D){(int32_t)x, (int32_t)y};
-    rect[1] = (VkOffset2D){(int32_t)(x + f->width * scale), (int32_t)(y + f->height * scale)};
+    rect[1] = (VkOffset2D){(int32_t)(x + width[screen] * scale), (int32_t)(y + height[screen] * scale)};
     return true;
 }
 /* The touch screen's pixel under a pointer at x and y, in the window's points as SDL reports them. The blit's own scale
@@ -517,13 +523,12 @@ bool snx_ctr_present_frame(unsigned screen, uint32_t pa, unsigned width, unsigne
         return false;
     const SnxCtrVk* v = snx_ctr_vk();
     Frame* f = &g_present.frames[screen];
-    /* A render target the GPU has not stored is the frame at its render scale: the shader reads it instead of the
-       framebuffer, whose pixels it has not written yet */
-    VkImageView source = g_present.source_dummy.view;
-    unsigned scale = 1, flip = 1;
-    static const unsigned target_format[5] = {0, 1, 3, 2, 4}; /* GSP's colour formats to transfer.h's */
-    bool from_target = pitch == width * bytes && snx_ctr_vk_target_image(pa, width, height, target_format[format],
-                                                                        &source, &scale, &flip);
+    /* A render target the GPU has not stored, or a display transfer's copy of one, is the frame at its render scale:
+       the shader reads it instead of the framebuffer, whose pixels it has not written yet, and a copy's bytes it
+       compares with the framebuffer's memory. The GSP's colour format is transfer.h's, as a target's is */
+    SnxCtrVkScaled scaled = {.view = g_present.source_dummy.view, .scale = 1, .flip = 1};
+    bool from_target = snx_ctr_vk_target_image(pa, width, height, format, pitch, &scaled);
+    unsigned scale = scaled.scale;
     unsigned frame_width = height * scale, frame_height = width * scale;
     if (f->width != frame_width || f->height != frame_height) {
         snx_ctr_vk_finish();
@@ -536,7 +541,8 @@ bool snx_ctr_present_frame(unsigned screen, uint32_t pa, unsigned width, unsigne
     if (hash) write_pending(true); /* the readback is about to be written again */
     bool dump = dump_due(screen), readback = dump || hash;
     bool latest = dump && g_present.dumps >= 8 && !hash, waited = readback && !latest;
-    if (!from_target) snx_ctr_vk_sync(pa, pitch * (height - 1) + width * bytes, false); /* the draws over it stored */
+    if (!from_target || scaled.kept) /* the draws over it stored, and its stale pages in the copy */
+        snx_ctr_vk_sync(pa, pitch * (height - 1) + width * bytes, false);
     VkCommandBuffer cb = snx_ctr_vk_commands();
     unsigned slot = snx_ctr_vk_slot(); /* the open recording's, whose semaphores it takes */
     uint64_t recording = snx_ctr_vk_serial();
@@ -544,10 +550,11 @@ bool snx_ctr_present_frame(unsigned screen, uint32_t pa, unsigned width, unsigne
     image_barrier(cb, f->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL); /* the shader writes all of it */
     f->layout = VK_IMAGE_LAYOUT_GENERAL;
     VkDescriptorSet set = snx_ctr_vk_set(g_present.decode.set);
-    VkDescriptorBufferInfo in = {w.buffer, w.offset, w.range}, out = {g_present.readback, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo in = {w.buffer, w.offset, w.range}, out = {g_present.readback, 0, VK_WHOLE_SIZE},
+                           kept = {scaled.kept ? scaled.kept : g_present.readback, 0, VK_WHOLE_SIZE};
     VkDescriptorImageInfo image = {VK_NULL_HANDLE, f->view, VK_IMAGE_LAYOUT_GENERAL};
-    VkDescriptorImageInfo from = {VK_NULL_HANDLE, source, VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet writes[4] = {{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+    VkDescriptorImageInfo from = {VK_NULL_HANDLE, scaled.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet writes[5] = {{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                        .dstSet = set,
                                        .dstBinding = 0,
                                        .descriptorCount = 1,
@@ -563,20 +570,30 @@ bool snx_ctr_present_frame(unsigned screen, uint32_t pa, unsigned width, unsigne
                                        .dstSet = set,
                                        .dstBinding = 2,
                                        .descriptorCount = 1,
-                                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                       .pImageInfo = &image},
+                                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                       .pBufferInfo = &kept},
                                       {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                        .dstSet = set,
                                        .dstBinding = 3,
                                        .descriptorCount = 1,
                                        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                       .pImageInfo = &image},
+                                      {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                       .dstSet = set,
+                                       .dstBinding = 4,
+                                       .descriptorCount = 1,
+                                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                        .pImageInfo = &from}};
-    vkUpdateDescriptorSets(v->device, 4, writes, 0, NULL);
-    uint32_t push[9] = {inside, format, pitch, width, height, readback, from_target, flip, scale};
+    vkUpdateDescriptorSets(v->device, 5, writes, 0, NULL);
+    uint32_t push[13] = {inside,        format,      pitch, width,    height,   readback,
+                         from_target,   scaled.flip, scale, scaled.x, scaled.y, scaled.kept ? 1u : 0u,
+                         scaled.kept_at};
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_present.decode.pipeline);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_present.decode.layout, 0, 1, &set, 0, NULL);
     vkCmdPushConstants(cb, g_present.decode.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
-    unsigned columns = from_target ? width * scale : width, rows = from_target ? height * scale : height;
+    /* the shader writes a block per console pixel, or one image pixel of a direct target */
+    unsigned columns = from_target && !scaled.kept ? width * scale : width;
+    unsigned rows = from_target && !scaled.kept ? height * scale : height;
     vkCmdDispatch(cb, (columns + 7) / 8, (rows + 7) / 8, 1);
     ++g_present.decoded[screen];
     /* both screens in one window, at each top screen frame: a game draws both every frame, and showing at each

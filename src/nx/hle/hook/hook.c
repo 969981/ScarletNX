@@ -207,6 +207,18 @@ int hook_family_off(const char* family) {
     return !g_settings.native_hooks || family_listed(g_settings.hook_families_off, family);
 }
 
+int hook_states_refused(char* why, size_t whysize) {
+    const HostHook* h = &g_host.hook;
+    u32 i;
+    for (i = 0; i < h->count; i++)
+        if (!__atomic_load_n(&h->invalid[i], __ATOMIC_ACQUIRE) &&
+            !strcmp(hook_family_name[hook_family[h->hook[i]]], "cond_var")) {
+            snprintf(why, whysize, "save states need native_cond_var=0 (it is %d)", g_settings.native_cond_var);
+            return -1;
+        }
+    return 0;
+}
+
 /* which calls the module sends through the dispatch slots, once */
 static void routes_say(void) {
     const SnxRoutes* r = g_routes;
@@ -293,9 +305,13 @@ static void install_a32(void) {
     u64 addr;
     u32 i, count = 0, nmods = g_arm_mod->nmods, sdk[HOOK_MODULES];
     unsigned char off[HOOK_FAMILIES + 1] = {0}, missed[HOOK32_COUNT + 1] = {0}, said[HOOK32_COUNT + 1] = {0};
-    for (i = 0; i < HOOK_FAMILIES; i++)
+    for (i = 0; i < HOOK_FAMILIES; i++) {
+        const char* why = hook_family_unready(hook_family_name[i]);
         if ((off[i] = (unsigned char)family_listed(g_settings.hook_families_off, hook_family_name[i])) != 0)
             LOG("hooks: the %s family is off (hooks_off)\n", hook_family_name[i]);
+        else if (why)
+            off[i] = 1, LOG("hooks: the %s family is off: %s\n", hook_family_name[i], why);
+    }
     module_versions(mods, nmods, sdk);
     for (i = 0; kernel_symbol(i, &addr, &name); i++) {
         u32 versions[HOOK_KEYS] = {0};
@@ -364,6 +380,9 @@ void hook_install(void) {
     for (i = 0; i < HOOK_FAMILIES; i++)
         if ((off[i] = (unsigned char)family_listed(g_settings.hook_families_off, hook_family_name[i])) != 0)
             LOG("hooks: the %s family is off (hooks_off)\n", hook_family_name[i]);
+        else if (hook_family_unready(hook_family_name[i]))
+            off[i] = 1, LOG("hooks: the %s family is off: %s\n", hook_family_name[i],
+                            hook_family_unready(hook_family_name[i]));
         else if (!strcmp(hook_family_name[i], LINKER_FAMILY) && !linker_links())
             off[i] = 1; /* nn::ro is the SDK's own while the game's linker runs: linker.c said why */
         else if (family_listed(g_settings.hook_families_verified, hook_family_name[i]))
@@ -394,7 +413,21 @@ void hook_install(void) {
                 text);
         }
         if (k < 0 || off[hook_family[k]]) continue;
+        if (hook_check[k] && !hook_check[k](addr)) {
+            LOG("hook: %s at %llx keeps its own code: %s finds another shape than %s's\n", name,
+                (unsigned long long)addr, hook_handler[k], hook_handler[k]);
+            continue;
+        }
+        if (strcmp(hook_symbol[k], name) && h->count == HOOK_SITES) {
+            if (!said[k]) LOG("hooks: no site left for %s, which %s matches, and the rest it matches\n", name, hook_symbol[k]);
+            said[k] = 1;
+            continue;
+        }
         hook_put(k, addr, name, verify);
+        if (strcmp(hook_symbol[k], name)) {
+            LOG("hook: %s at %llx runs %s (%s)\n", name, (unsigned long long)addr, hook_handler[k], hook_symbol[k]);
+            continue;
+        }
         if (hook_key[k] == HOOK_ANY || said[k]) {
             LOG("hook: %s at %llx runs %s\n", name, (unsigned long long)addr, hook_handler[k]);
             continue;

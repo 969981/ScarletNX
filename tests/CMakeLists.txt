@@ -245,7 +245,7 @@ if(TARGET snx_ctr_board)
     target_link_libraries(snx-test-3ds-ipc PRIVATE snx_ctr_process)
     add_test(NAME 3ds_ipc COMMAND snx-test-3ds-ipc)
     # the SDK's IPC stubs run without the SVC (aot/hook.c)
-    add_executable(snx-test-3ds-hook 3ds_hook.c support/3ds_guest.c)
+    add_executable(snx-test-3ds-hook 3ds_hook.c support/3ds_guest.c support/3ds_stub.c)
     snx_test_target(snx-test-3ds-hook 11)
     target_link_libraries(snx-test-3ds-hook PRIVATE snx_ctr_process)
     add_test(NAME 3ds_hook COMMAND snx-test-3ds-hook)
@@ -308,7 +308,7 @@ if(TARGET snx_ctr_board)
     endif()
     snx_swipc(snx-test-ctr-swipc CTR ROOT "${PROJECT_SOURCE_DIR}" FILES tests/ctr_swipc.swipc)
     add_test(NAME ctr_swipc_dispatch COMMAND snx-test-ctr-swipc)
-    add_executable(snx-test-3ds-process 3ds_process.c)
+    add_executable(snx-test-3ds-process 3ds_process.c support/3ds_stub.c)
     snx_test_target(snx-test-3ds-process 11)
     target_link_libraries(snx-test-3ds-process PRIVATE snx_ctr_process)
     add_test(NAME 3ds_process COMMAND snx-test-3ds-process)
@@ -415,8 +415,61 @@ if(TARGET snx_ctr_board)
     add_test(NAME 3ds_vk_draw_stand_in COMMAND snx-test-3ds-vk-draw --ctr_stand_in=2)
     # the presented screens outside the validation harness, so every host runs that path
     add_test(NAME 3ds_vk_draw_present COMMAND snx-test-3ds-vk-draw --present)
+    # a frame of GSP's RGB565 and RGB5A1 formats drawn at render scale 2 shows its target's image, as an RGBA8 one does
+    add_test(NAME 3ds_vk_draw_scaled_present COMMAND snx-test-3ds-vk-draw --scaled-present)
+    if(NOT WIN32 AND Python3_Interpreter_FOUND)
+        # the presenter's read of a scaled target, under Khronos validation
+        add_test(NAME 3ds_vk_draw_scaled_present_validation
+                 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_vk_validation.py"
+                     $<TARGET_FILE:snx-test-3ds-vk-draw> --scaled-present)
+        set_tests_properties(3ds_vk_draw_scaled_present_validation PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    # a target at a render scale and a display transfer's copy of it, which the presenter shows for a framebuffer in
+    # the destination
+    add_test(NAME 3ds_vk_draw_scaled_transfer COMMAND snx-test-3ds-vk-draw --scaled-transfer)
+    # two destinations a screen alternates between: the copy the presenter looks up is the destination's own, and a
+    # write over one drops its copy alone
+    add_test(NAME 3ds_vk_draw_scaled_rotating COMMAND snx-test-3ds-vk-draw --scaled-rotating)
+    # a destination the CPU writes after the transfer: the presenter compares the memory's bytes with the copy's
+    add_test(NAME 3ds_vk_draw_scaled_verify COMMAND snx-test-3ds-vk-draw --scaled-verify)
+    set_tests_properties(3ds_vk_draw_scaled_transfer 3ds_vk_draw_scaled_rotating 3ds_vk_draw_scaled_verify
+                         PROPERTIES SKIP_RETURN_CODE 77)
+    # the screens laid out at the console's proportions whatever each render scale: a top screen at 2x above a bottom
+    # one at 1x, and a press on the bottom screen's pixel (160, 220) landing on it
+    add_test(NAME 3ds_vk_draw_scaled_layout COMMAND snx-test-3ds-vk-draw --scaled-layout)
+    set_tests_properties(3ds_vk_draw_scaled_layout PROPERTIES SKIP_RETURN_CODE 77
+                         ENVIRONMENT "SDL_VIDEO_DRIVER=offscreen")
+    if(NOT WIN32 AND Python3_Interpreter_FOUND)
+        # the copies' blits, lookups and compare, under Khronos validation
+        add_test(NAME 3ds_vk_draw_scaled_transfer_validation
+                 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_vk_validation.py"
+                     $<TARGET_FILE:snx-test-3ds-vk-draw> --scaled-transfer)
+        add_test(NAME 3ds_vk_draw_scaled_rotating_validation
+                 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_vk_validation.py"
+                     $<TARGET_FILE:snx-test-3ds-vk-draw> --scaled-rotating)
+        add_test(NAME 3ds_vk_draw_scaled_verify_validation
+                 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_vk_validation.py"
+                     $<TARGET_FILE:snx-test-3ds-vk-draw> --scaled-verify)
+        set_tests_properties(3ds_vk_draw_scaled_transfer_validation 3ds_vk_draw_scaled_rotating_validation
+                             3ds_vk_draw_scaled_verify_validation PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    # the scaled modes again on each path the GPU's work can take to the RAM (vk.h)
+    foreach(snx_path copy in_place)
+        set(snx_value 1)
+        if(snx_path STREQUAL "in_place")
+            set(snx_value 2)
+        endif()
+        set(snx_tests "")
+        foreach(snx_mode scaled-present scaled-transfer scaled-rotating scaled-verify)
+            string(REPLACE "-" "_" snx_name "${snx_mode}")
+            add_test(NAME 3ds_vk_draw_${snx_name}_${snx_path}
+                     COMMAND snx-test-3ds-vk-draw --${snx_mode} --vk_memory=${snx_value})
+            list(APPEND snx_tests 3ds_vk_draw_${snx_name}_${snx_path})
+        endforeach()
+        set_tests_properties(${snx_tests} PROPERTIES SKIP_RETURN_CODE 77)
+    endforeach()
     set_tests_properties(3ds_vk_draw 3ds_vk_draw_async 3ds_vk_draw_pipelines 3ds_vk_draw_async_pipelines
-                         3ds_vk_draw_pipeline_cache 3ds_vk_draw_stand_in 3ds_vk_draw_present
+                         3ds_vk_draw_pipeline_cache 3ds_vk_draw_stand_in 3ds_vk_draw_present 3ds_vk_draw_scaled_present
                          PROPERTIES SKIP_RETURN_CODE 77)
     # the GPU's copy of the RAM, page by page: what is copied in and back, and when, and every byte where it belongs
     add_executable(snx-test-3ds-vk-copies 3ds_vk_copies.c)
@@ -429,10 +482,11 @@ if(TARGET snx_ctr_board)
         # reports fails the test, such as a missing barrier (a synchronization hazard), a dispatch, barrier or image
         # transition inside a draw's open rendering, or a command recorded into a buffer that a submission ended
         set(snx_vk_validation_tests 3ds_vk_draw_present_validation 3ds_vk_draw_after_draw_validation
-            3ds_vk_draw_texture_after_draw_validation 3ds_vk_draw_index_copy_validation 3ds_vk_draw_async_validation
+            3ds_vk_draw_texture_after_draw_validation 3ds_vk_draw_index_copy_validation
+            3ds_vk_draw_after_submit_validation 3ds_vk_draw_async_validation
             3ds_vk_draw_shadow_validation)
-        set(snx_vk_validation_modes --present --after-draw --texture-after-draw --draw-after-index-copy --async
-            --shadow)
+        set(snx_vk_validation_modes --present --after-draw --texture-after-draw --draw-after-index-copy
+            --draw-after-submit --async --shadow)
         foreach(snx_test snx_mode IN ZIP_LISTS snx_vk_validation_tests snx_vk_validation_modes)
             add_test(NAME ${snx_test}
                 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_vk_validation.py"
@@ -490,7 +544,7 @@ if(TARGET snx_ctr_board)
             list(APPEND snx_tests ${snx_test}_new3ds${snx_suffix})
         endforeach()
     endforeach()
-    foreach(snx_mode present after-draw texture-after-draw draw-after-index-copy async shadow)
+    foreach(snx_mode present after-draw texture-after-draw draw-after-index-copy draw-after-submit async shadow)
         string(REPLACE "-" "_" snx_name "${snx_mode}")
         add_test(NAME 3ds_vk_draw_${snx_name}_new3ds COMMAND snx-test-3ds-vk-draw --new3ds --${snx_mode})
         list(APPEND snx_tests 3ds_vk_draw_${snx_name}_new3ds)
@@ -1230,6 +1284,16 @@ target_include_directories(snx-test-hook-install PRIVATE "${PROJECT_SOURCE_DIR}/
 snx_service_swipc(snx-test-hook-install)
 snx_hookgen(snx-test-hook-install SPEC "${CMAKE_CURRENT_SOURCE_DIR}/hook/install.hook" A32_MARKED)
 add_test(NAME hook_install COMMAND snx-test-hook-install)
+# native_cond_var (src/nx/hle/hook/family.c, hook.c) over tests/hook/states.hook: the cond_var family's hooks at 1, the
+# game's own wait at 0, and save states refused while the host's wait runs, by a message naming the setting's value
+add_executable(snx-test-hook-states hook_states.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/version.c"
+               "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/jump.c")
+snx_test_target(snx-test-hook-states 23)
+target_link_libraries(snx-test-hook-states PRIVATE scarletnx-common) # jump.c flushes with snx_vm_flush_code
+target_include_directories(snx-test-hook-states PRIVATE "${PROJECT_SOURCE_DIR}/src")
+snx_service_swipc(snx-test-hook-states)
+snx_hookgen(snx-test-hook-states SPEC "${CMAKE_CURRENT_SOURCE_DIR}/hook/states.hook" A32_MARKED)
+add_test(NAME hook_states COMMAND snx-test-hook-states)
 # the jumps written over an invalidated native hook's start (src/nx/hle/hook/jump.c), every architecture's bytes
 # against what llvm-mc disassembles them to, on any host
 add_executable(snx-test-hook-jump hook_jump.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/jump.c")
@@ -1284,11 +1348,60 @@ target_include_directories(snx-test-hook-verify PRIVATE "${PROJECT_SOURCE_DIR}/s
 snx_hookgen(snx-test-hook-verify SPEC "${CMAKE_CURRENT_SOURCE_DIR}/hook/verify.hook")
 add_test(NAME hook_verify COMMAND snx-test-hook-verify)
 # nn::diag's abort hook (src/nx/hle/hook/diag.c) on a fake abort: the values it logs, then its own code run
-add_executable(snx-test-diag-abort diag_abort.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/diag.c")
+# libc_std.c too: the table names its handlers, which run on the host's C library alone
+add_executable(snx-test-diag-abort diag_abort.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/diag.c"
+               "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/libc_std.c" "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/libc_wide.c"
+               "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/libc_fmt.c" "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/libcxx_string.c")
 snx_test_target(snx-test-diag-abort 11) # log.h has _Thread_local
 target_include_directories(snx-test-diag-abort PRIVATE "${PROJECT_SOURCE_DIR}/src")
 snx_hookgen(snx-test-diag-abort SPEC "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/hooks.hook")
 add_test(NAME diag_abort COMMAND snx-test-diag-abort)
+# std::string's hooks (src/nx/hle/hook/libcxx_string.c) on libc++'s layout in guest memory
+add_executable(snx-test-libcxx-string libcxx_string.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/libcxx_string.c")
+snx_test_target(snx-test-libcxx-string 11)
+target_include_directories(snx-test-libcxx-string PRIVATE "${PROJECT_SOURCE_DIR}/src")
+snx_hookgen(snx-test-libcxx-string SPEC "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/hooks.hook")
+add_test(NAME libcxx_string COMMAND snx-test-libcxx-string)
+# std::vector's storage hook (src/nx/hle/hook/alloc.c): the destructor shapes alloc_vector_shape takes and leaves, and
+# alloc_vector_free's empty vector and foreign pointer
+if(NOT WIN32)
+    add_executable(snx-test-alloc-vector alloc_vector.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/alloc.c")
+    snx_test_target(snx-test-alloc-vector 11)
+    target_include_directories(snx-test-alloc-vector PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    snx_hookgen(snx-test-alloc-vector SPEC "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/hooks.hook")
+    add_test(NAME alloc_vector COMMAND snx-test-alloc-vector)
+endif()
+# the sync family's clocks (src/nx/hle/hook/sync.c) against the game's (src/nx/runtime/clock.c): steady_clock stopped
+# by a pause and set by a state's load, system_clock the host's
+add_executable(snx-test-sync-clock sync_clock.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/sync.c"
+               "${PROJECT_SOURCE_DIR}/src/nx/runtime/clock.c")
+snx_test_target(snx-test-sync-clock 11)
+target_include_directories(snx-test-sync-clock PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(snx-test-sync-clock PRIVATE scarletnx-platform)
+snx_hookgen(snx-test-sync-clock SPEC "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/hooks.hook")
+add_test(NAME sync_clock COMMAND snx-test-sync-clock)
+# the alloc family's arena (src/nx/hle/hook/alloc.c) in a program that links jemalloc as scarletnx does, whole and
+# unexported: ready, and its allocations in the guest's window above the layout
+if(SNX_JEMALLOC AND NOT WIN32)
+    add_executable(snx-test-alloc-arena alloc_arena.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/alloc.c")
+    snx_test_target(snx-test-alloc-arena 11)
+    target_include_directories(snx-test-alloc-arena PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    target_link_libraries(snx-test-alloc-arena PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,snx_jemalloc>")
+    snx_hookgen(snx-test-alloc-arena SPEC "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/hooks.hook")
+    target_compile_definitions(snx-test-alloc-arena PRIVATE LIVE_BITS=8) # a table that fills in a few hundred blocks
+    add_test(NAME alloc_arena COMMAND snx-test-alloc-arena)
+    set_tests_properties(alloc_arena PROPERTIES TIMEOUT 60)
+endif()
+# the C library's functions on guest memory (src/nx/hle/hook/libc_std.c): guest addresses back from pointers into an
+# argument, end pointers, strtok's place, div_t and ldiv_t, errno, qsort and bsearch through the guest's comparison
+if(NOT WIN32)
+    add_executable(snx-test-libc-std libc_std.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/libc_std.c"
+                   "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/libc_wide.c" "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/libc_fmt.c")
+    snx_test_target(snx-test-libc-std 11)
+    target_include_directories(snx-test-libc-std PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    snx_hookgen(snx-test-libc-std SPEC "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/hooks.hook")
+    add_test(NAME libc_std COMMAND snx-test-libc-std)
+endif()
 # the event a hooked SDK object attaches to the game's SystemEvent (src/nx/hle/hook/codec.c's hook_attach_event): its
 # references, with the kernel's objects stubbed to their counts
 add_executable(snx-test-hook-event-reference hook_event_reference.c)

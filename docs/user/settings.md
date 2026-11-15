@@ -236,6 +236,7 @@ The settings, each with its extension and, where one took it in, the Vulkan vers
 | `gamepad_background` | `0` | `1` keeps gamepads playing while the window is not focused |
 | `gamepad_joycon_pair` | `1` | `1` plays a left and right Joy-Con together, `0` separately. Restart the game after changing it |
 | `gamepad_assign` | `1` | How controllers take players. `0`, manual: as each player's `gamepad_p<N>_device` names it, the next to connect where it names none. `1`, as a console's (Eden's Modern Console): each controller that connects takes the lowest free player, one that leaves keeps its player 45 seconds and takes it back when it returns, the game pauses once a player's controller has been gone 3 seconds (until it returns, or + is let go on another controller to go on without it), and a notice says each controller that joins or leaves, with its player ([Playing](usage.md#playing)) |
+| `game_mouse` | `0` | How the mouse reaches an Ounce game as its Joy-Con mouse. `0`, Hotkey: nothing reaches the game until `hotkey_mouse` (Ctrl+G) declares mouse mode, which holds the mouse and gives its motion, buttons and wheel to the game, and a second press ends it. `1`, Auto: the mouse always reaches the game, held while the game plays with it, and `hotkey_mouse` lets it go |
 | `gamepad_p<N>_device` (N from 1 to 8) | empty | Player N's controller: empty takes the next to connect, else its SDL GUID as the log names it, `/2` after it for the second of two alike |
 | `gamepad_p<N>_connected` | `1` | `0`: the game never sees player N. It always sees player 1, which the keyboard drives |
 | `gamepad_p<N>_type` | `0` | The controller the game sees for player N: `0` as it is, `1` Pro Controller, `2` two Joy-Cons, `3` a left Joy-Con, `4` a right one |
@@ -267,7 +268,7 @@ the key (with its modifiers held); Esc cancels, Backspace puts the default back,
 | `hotkey_fullscreen_2` | `Alt+Return` | A second key that switches fullscreen |
 | `hotkey_stats` | `F12` | Turns `stats` on and off |
 | `hotkey_capture` | `Ctrl+Shift+F12` | Captures the next frame with RenderDoc while RenderDoc is in the game (`renderdoc`) |
-| `hotkey_mouse` | `Ctrl+G` | Lets the mouse go from a game that holds it (an Ounce game's Joy-Con mouse mode), and holds it again |
+| `hotkey_mouse` | `Ctrl+G` | With `game_mouse` at `0`, declares an Ounce game's Joy-Con mouse mode, and ends it. At `1`, lets the mouse go from a game that holds it, and holds it again |
 | `hotkey_quit` | `Escape` | Quits the game: a first press warns, and a second within 3 seconds quits |
 | `hotkey_tv_mode` | `Ctrl+D` | Steps the TV mode round On, Off and Auto for the run, as the game's menu's **TV mode** row does; `docked` keeps the `.ini`'s choice |
 
@@ -328,6 +329,7 @@ The profiler's rows (`tracy_`) only do something in a build with `SNX_TRACY` (`c
 | `hooks` | `1` | `1` runs the native handler of each of the game's exported functions the runtime has one for (`hle/hook/hooks.hook`: the C library's `memcpy`, `memmove` and `memset`) instead of its own code. `0` runs every function's own code, to tell whether a problem comes from a hook ([Hooks](../platforms/nx/hooks.md)) |
 | `hooks_off` | empty | The families of hooks (`hooks.hook`'s family lines, such as `libc`) whose functions run their own code, separated by commas or spaces, to tell which family a problem comes from. Empty, every family is on |
 | `hooks_verify` | empty | The families of hooks whose pure hooks are checked on every call: the function's own code runs on copies of the memory it writes, then the handler on the game's, and the log names each call whose result, registers or bytes differ ([Hooks](../platforms/nx/hooks.md#verify-mode)). Slow: for checking a hook, never for playing |
+| `native_cond_var` | `1` | `1` has the game's `std::condition_variable`, `std::mutex` and `std::recursive_mutex` wait on the host's own (`hooks.hook`'s `cond_var` family), and save states are refused, as a state can't hold a thread waiting there. `0` has the game's own code wait, and save states can be taken and loaded ([Hooks](../platforms/nx/hooks.md)) |
 | `shader_corpus` | empty | A folder that keeps each translated shader for `snx-shaderc`. With it every shader is translated, and none is kept for the next run |
 | `astc_dump` | empty | A folder that keeps each whole ASTC texture level the game loads, as an `.astc` file (astcenc's format, the layers or slices as its depth), for `snx-test-astc-vulkan --bench` and the BC7 encoder's measurements (the game's own textures: keep them local). At most 2 GiB a run |
 | `sm86_dump` | empty | A folder that keeps the bytes of each Ounce program (SM86) the translator refuses, and of each block of shader memory with no whole program in it, for `tools/snx_sm86.c` (the game's own code: keep it local) |

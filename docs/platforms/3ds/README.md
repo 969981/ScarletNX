@@ -42,8 +42,9 @@ A game's folder is a folder of the data folder's `recompiled/`, named after its 
 ID as a Switch game's is named (`recompiled/0004000000123400/`). It holds the compiled
 module (`<title ID>_code.so`, `_code.dll` on Windows), the blocks runs compiled at
 run time (`<title ID>.hints`), the game's state (`sdmc/`, `savedata/`, frames,
-audio), the 48x48 icon (`icon.rgba`, when the game has an SMDH), `<title ID>.ini`
-and a copy of the runtime named `<title ID>`. The `.ini`
+audio), the 48x48 icon (`icon.rgba`, when the game has an SMDH), `<title ID>.ini`,
+a copy of the runtime named `<title ID>` and, on Windows, the DLLs beside that
+runtime, which the copy loads. The `.ini`
 names the game (`source=`), the console (`model=`) and the system (`system=3ds`),
 which the launcher and a build's deploy pick the driver by. Running the copy plays the
 game, as a Switch game's copy does: `recompiled/<title ID>/<title ID> --seconds=60
@@ -645,7 +646,11 @@ The pair keeps its shape in a window of any size. The 3DS display's Separate
 screens setting gives each screen a window of its own instead, which fills with
 that screen. Top screen resolution and Bottom screen resolution scale the 3D
 rendering of that screen, 1 to 16 times the console's 400x240 and 320x240, and
-the window scales the larger image to its size. The Switch's `vsync` picks how the
+each screen keeps the console's proportions in the window whatever its scale. A
+game that copies a target at a scale above 1 into its framebuffer with a
+display transfer is shown from the
+copy that transfer made, at the target's scale. A write by the guest to one of
+its pixels is shown from memory. The Switch's `vsync` picks how the
 window shows its images, as for a Switch game: `1` each at the display's refresh
 (FIFO), `0` the newest at the next refresh (mailbox) or at once (immediate), and the
 run says at start which it got. Its `fullscreen=1` starts the window fullscreen (the
@@ -747,8 +752,8 @@ extraction would where it reads it (a CIA's content table, the NCCH and ExHeader
 metadata). A launch that reads the game where it lies skips the SHA-256 of each content and of each ExeFS file; an
 extraction checks those too. The game's ExeFS files and its RomFS (level 3, the image the game reads)
 are then read where they lie in the mapping, and only the decompressed `.code` is copied into memory. The game's
-folder keeps its module, its copy of the runtime, its icon (`icon.rgba`) and its state alone: `sdmc/` and the frames
-and audio it writes. An extraction an earlier
+folder keeps its module, its copy of the runtime, the DLLs beside that copy on Windows, its icon (`icon.rgba`) and
+its state alone: `sdmc/` and the frames and audio it writes. An extraction an earlier
 `--extract-container` left there is taken away, its compiled module and saves kept. The image's identity is the same
 either way, so a module compiled in one mode loads in the other. The manifest records which container the game came
 from (`container=`, and `overlay=1` when it is a cartridge's update), which the image loader ignores.
@@ -798,11 +803,13 @@ answered with Cancel where the keyboard has one. A game that checks the text its
 (the callback filter) gets it first, and its answer closes the keyboard or lets the text
 through. The log says what was answered and why (`3ds swkbd: ...`), with the user
 name's length in place of the name. APT answers each step a game takes:
-PrepareToStartLibraryApplet, IsRegistered, the Request for the capture block and its
-Response, StartLibraryApplet, the NotifyToWait before the wakeup, and the WakeupByExit
-the game wakes with, which carries the answer. Any other library applet (the error
-display, say) is one the runtime does not have: preparing it answers as an unknown
-command does.
+PrepareToStartLibraryApplet, PreloadLibraryApplet, IsRegistered, the Request for the
+capture block and its Response, StartLibraryApplet, the NotifyToWait before the
+wakeup, and the WakeupByExit the game wakes with, which carries the answer.
+GetAppletInfo answers a slot's title, media type and attributes, and whether it is
+registered and loaded. Any other library applet (the error display, say) is one the
+runtime does not have: preparing it, or preloading it, answers as an unknown command
+does.
 
 A game that has the player pick a Mii through the Mii selector (its StreetPass Mii,
 say) gets ScarletNX's own Mii at once, as a Mii of the console's database, as Azahar's
@@ -1040,7 +1047,10 @@ port `hle/applets/{swkbd,mii_selector}.{cpp,h}`, `hle/mii.{cpp,h}`,
 (GPL-2.0-or-later): the configurations' and the Mii selector's result's layouts, the
 result codes, the Request, Message and Finalize steps, the default keyboard's answer
 with the user name and its checks, the Mii's checksum; the C implementation is new. The
-Mii's fields are laid out as 3dbrew's Mii page gives them.
+Mii's fields are laid out as 3dbrew's Mii page gives them. The preload and the applet
+info read `hle/service/apt/{apt,applet_manager}.cpp` again at Azahar
+`11eceda5e0e682a1f44e396bf954a1b9137097ca` (GPL-2.0-or-later): the applet a preload
+registers as it finishes loading, and the seven words of a slot's information.
 Stage 2b4 references GPL-2.0-or-later kernel `svc.cpp`, `errors.h`,
 `handle_table.cpp`, `address_arbiter.cpp`, `config_mem.*`, `memory.cpp` and
 `process.cpp` at the same revision for SVC register/result semantics, object
