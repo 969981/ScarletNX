@@ -50,7 +50,7 @@ snx_svcgen(snx_kernel)
 snx_component(hle hle/services/services.c hle/services/audren.c hle/services/audren_dsp.c hle/services/sm.c hle/services/am.c hle/services/gsv.c hle/services/native_video.c hle/services/native_video_core.c hle/services/native_video_decoder.c hle/services/set.c  hle/services/acc.c hle/services/users.c hle/services/audio.c
               hle/services/misc.c hle/services/ldr.c hle/services/network/bsd.c hle/services/network/dns.c
               hle/services/network/nifm.c hle/services/network/ssl.c hle/services/network/ldn.c hle/services/network/room.c hle/filesystem/fs.c hle/services/hid.c hle/services/hid_motion.c hle/services/hid_touch.c hle/services/vi.c hle/services/nvdrv.c
-              hle/hook/hook.c hle/hook/family.c hle/hook/jump.c hle/hook/libc.c hle/hook/alloc.c hle/hook/sync.c hle/hook/libc_std.c hle/hook/libc_wide.c hle/hook/libc_fmt.c hle/hook/libcxx_string.c hle/hook/gs.c hle/hook/diag.c hle/hook/codec.c hle/hook/audio_stream.c hle/hook/verify.c hle/hook/version.c
+              hle/hook/hook.c hle/hook/family.c hle/hook/jump.c hle/hook/ext_skyline.c hle/hook/libc.c hle/hook/alloc.c hle/hook/sync.c hle/hook/os_sync.c hle/hook/libc_std.c hle/hook/libc_wide.c hle/hook/libc_fmt.c hle/hook/libcxx_string.c hle/hook/gs.c hle/hook/diag.c hle/hook/codec.c hle/hook/audio_stream.c hle/hook/verify.c hle/hook/version.c
               nn/ro.c nn/fs.c nn/time.c nn/pl.c nn/pl_font.c nn/pctl.c nn/nsd.c nn/ngc.c nn/prepo.c
               nn/audio.c nn/audio_renderer.c nn/codec.c)
 # the shared fonts' stand-ins (cmake/shared_fonts.cmake), which nn/pl.c hands out
@@ -65,6 +65,9 @@ endif()
 # (patches/*.hook), whose handlers are the .c files beside them
 include("${PROJECT_SOURCE_DIR}/cmake/hookgen.cmake")
 snx_hookgen(snx_hle A32_MARKED)
+# the native hooks of mods' trampolines (hle/hook/ext_skyline.hooks), a table of their own for ext_skyline.c
+snx_hookgen(snx_hle SPEC "${CMAKE_CURRENT_SOURCE_DIR}/hle/hook/ext_skyline.hooks" PREFIX skyline
+            NAME hle/hook/ext_skyline.hooks)
 file(GLOB snx_patch_handlers CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/patches/*.c")
 target_sources(snx_hle PRIVATE ${snx_patch_handlers})
 # the IPC interfaces of the services (docs/platforms/nx/ipc.md): their dispatchers are generated, the handlers are in the services'
@@ -233,6 +236,33 @@ snx_glsl_spirv(snx_vk SOURCE gpu/texture/texconv.comp NAME texconv_astc_b_spv HE
                DEFINES SNX_TC_ASTC SNX_ASTC_ENC=1 SNX_ASTC_PASS=2)
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/texconv.comp NAME texconv_astc_c_spv HEADER nx/gpu/texture/texconv_spv.h
                DEFINES SNX_TC_ASTC SNX_ASTC_ENC=1 SNX_ASTC_PASS=3)
+# and its second and third passes with the encoder of the GPU's vendor (gpu/texture/texconv.glsl's SNX_ASTC_VENDOR,
+# which gpu/vk/texconv.c picks by the device's vendor): Mali's (gpu/texture/astc_encode_arm.glsl, 1) and Adreno's
+# (astc_encode_qcom.glsl, 2). Each again with SPIR-V's packed dot product (bc7_encode.glsl's SNX_BC7_DOT, Vulkan 1.3's
+# shaderIntegerDotProduct) for the GPUs of theirs that say they have an instruction for it: the fitter's inner loop is
+# dot products of packed bytes
+foreach(vendor IN ITEMS arm qcom)
+    if(vendor STREQUAL "arm")
+        set(snx_astc_vendor 1)
+    else()
+        set(snx_astc_vendor 2)
+    endif()
+    foreach(pass IN ITEMS b c)
+        if(pass STREQUAL "b")
+            set(snx_astc_pass 2)
+        else()
+            set(snx_astc_pass 3)
+        endif()
+        snx_glsl_spirv(snx_vk SOURCE gpu/texture/texconv.comp NAME texconv_astc_${vendor}_${pass}_spv
+                       HEADER nx/gpu/texture/texconv_spv.h
+                       DEFINES SNX_TC_ASTC SNX_ASTC_ENC=1 SNX_ASTC_PASS=${snx_astc_pass}
+                               SNX_ASTC_VENDOR=${snx_astc_vendor})
+        snx_glsl_spirv(snx_vk SOURCE gpu/texture/texconv.comp NAME texconv_astc_${vendor}_${pass}_dot_spv
+                       HEADER nx/gpu/texture/texconv_spv.h TARGET vulkan1.3
+                       DEFINES SNX_TC_ASTC SNX_ASTC_ENC=1 SNX_ASTC_PASS=${snx_astc_pass}
+                               SNX_ASTC_VENDOR=${snx_astc_vendor} SNX_BC7_DOT=1)
+    endforeach()
+endforeach()
 # and its conversion build: the blits that convert between pixel formats, which a driver's compiler refused inside the
 # plain build (gpu/vk/texconv.c)
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/texconv.comp NAME texconv_convert_spv HEADER nx/gpu/texture/texconv_spv.h

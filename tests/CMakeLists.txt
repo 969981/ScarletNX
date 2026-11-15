@@ -1302,14 +1302,17 @@ target_link_libraries(snx-test-hook-jump PRIVATE scarletnx-common) # jump.c flus
 target_include_directories(snx-test-hook-jump PRIVATE "${PROJECT_SOURCE_DIR}/src")
 add_test(NAME hook_jump COMMAND snx-test-hook-jump)
 # a native hook the game invalidates (src/nx/hle/hook/hook.c): its adapter rewritten into a jump to the game's code, on
-# this test's own x86_64 code; skipped on another host
+# this test's own x86_64 code, and the mod's trampolines that an ext_skyline hook (tests/hook/ext_skyline.hooks) takes;
+# skipped on another host
 add_executable(snx-test-hook-invalidated hook_invalidated.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/version.c"
-               "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/jump.c")
+               "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/jump.c" "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/ext_skyline.c")
 snx_test_target(snx-test-hook-invalidated 23)
 target_link_libraries(snx-test-hook-invalidated PRIVATE scarletnx-common) # jump.c flushes with snx_vm_flush_code
 target_include_directories(snx-test-hook-invalidated PRIVATE "${PROJECT_SOURCE_DIR}/src")
 snx_service_swipc(snx-test-hook-invalidated)
 snx_hookgen(snx-test-hook-invalidated SPEC "${CMAKE_CURRENT_SOURCE_DIR}/hook/install.hook" A32_MARKED)
+snx_hookgen(snx-test-hook-invalidated SPEC "${CMAKE_CURRENT_SOURCE_DIR}/hook/ext_skyline.hooks" PREFIX skyline
+            NAME hle/hook/ext_skyline.hooks)
 add_test(NAME hook_invalidated COMMAND snx-test-hook-invalidated)
 set_tests_properties(hook_invalidated PROPERTIES SKIP_RETURN_CODE 77)
 # hook_install over a full table (src/nx/hle/hook/hook.c), the spec written here with as many hooks as tools/hookgen
@@ -1381,12 +1384,13 @@ target_link_libraries(snx-test-sync-clock PRIVATE scarletnx-platform)
 snx_hookgen(snx-test-sync-clock SPEC "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/hooks.hook")
 add_test(NAME sync_clock COMMAND snx-test-sync-clock)
 # the alloc family's arena (src/nx/hle/hook/alloc.c) in a program that links jemalloc as scarletnx does, whole and
-# unexported: ready, and its allocations in the guest's window above the layout
+# unexported: ready, and its allocations in the guest's window above the layout; the SDK heap's functions on its
+# blocks, each in the runtime's route list (snx_nx_module's)
 if(SNX_JEMALLOC AND NOT WIN32)
     add_executable(snx-test-alloc-arena alloc_arena.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/alloc.c")
     snx_test_target(snx-test-alloc-arena 11)
     target_include_directories(snx-test-alloc-arena PRIVATE "${PROJECT_SOURCE_DIR}/src")
-    target_link_libraries(snx-test-alloc-arena PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,snx_jemalloc>")
+    target_link_libraries(snx-test-alloc-arena PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,snx_jemalloc>" snx_nx_module)
     snx_hookgen(snx-test-alloc-arena SPEC "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/hooks.hook")
     target_compile_definitions(snx-test-alloc-arena PRIVATE LIVE_BITS=8) # a table that fills in a few hundred blocks
     add_test(NAME alloc_arena COMMAND snx-test-alloc-arena)
@@ -3287,9 +3291,9 @@ snx_test_target(snx-test-astc-bcn-glsl 23)
 target_include_directories(snx-test-astc-bcn-glsl PRIVATE glsl)
 add_test(NAME astc_bcn_glsl COMMAND snx-test-astc-bcn-glsl)
 # the ASTC 4x4 encoder's GLSL (BCn encoded again as ASTC) run on the CPU (tests/glsl/glsl.hpp), its blocks decoded by
-# the CPU's ASTC decoder: no GPU needed
+# the CPU's ASTC decoder, each GPU vendor's build beside the generic one: no GPU needed
 add_executable(snx-test-astc-encode-glsl glsl/astc_encode_glsl.cpp glsl/astc_encode_cpu.cpp glsl/bcn_astc_cpu.cpp
-               glsl/bc7_cpu.cpp support/astc.c support/bcn.c)
+               glsl/astc_vendor_cpu.cpp glsl/bc7_cpu.cpp support/astc.c support/bcn.c)
 snx_test_target(snx-test-astc-encode-glsl 23)
 target_include_directories(snx-test-astc-encode-glsl PRIVATE glsl)
 add_test(NAME astc_encode_glsl COMMAND snx-test-astc-encode-glsl)
@@ -4050,6 +4054,13 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     target_include_directories(snx-test-vk-checkpoints PRIVATE "${volk_SOURCE_DIR}")
     target_link_libraries(snx-test-vk-checkpoints PRIVATE Vulkan::Headers)
     add_test(NAME vk_checkpoints COMMAND snx-test-vk-checkpoints)
+    # the ranges a constant buffer, a root table and a storage copy are bound with (gpu/vk/vk.h vk_cb_range,
+    # vk_sb_round): whole robustBufferAccess2 steps, at least one, within maxUniformBufferRange
+    add_executable(snx-test-vk-robust-ranges vk_robust_ranges.c)
+    snx_test_target(snx-test-vk-robust-ranges 11)
+    target_include_directories(snx-test-vk-robust-ranges PRIVATE "${volk_SOURCE_DIR}")
+    target_link_libraries(snx-test-vk-robust-ranges PRIVATE Vulkan::Headers)
+    add_test(NAME vk_robust_ranges COMMAND snx-test-vk-robust-ranges)
     # the renderer's device memory (gpu/vk/devmem.c) over a driver the test plays, which checks each call as the
     # specification reads: alignment, memory types, no byte and no granularity page shared, memory made for a
     # resource alone, whole atoms flushed; the cap of the GPU's own heap, and requests from several threads

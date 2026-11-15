@@ -202,6 +202,9 @@ throughput with unprofiled runs of the same scene.
 
 ## Profiling
 
+[Profiling](profiling.md) walks through every profiler, CPU and GPU, against a recompiled game; this section is the
+reference of the Tracy integration it uses.
+
 The GPU benchmarks and the search for faster GPU settings (`tools/bench_nvn_draws.py`,
 `tools/bench_gpu_descriptors.py`, `tools/bench_gpu_hotpaths.py`, `tools/tune_gpu.py`) are described with the
 measurements they made, in [GPU preparation benchmarks](../history/gpu-hotpath-bench.md) and
@@ -290,7 +293,8 @@ wait
 
 The timeline has the frontend tick,
 presents, GPU jobs and idle waits, Vulkan record/land/release/submit/wait/present work, shader translation and
-pipeline creation, texture uploads, the BC7 encodes between frames, the landings of the guest memory the GPU owns,
+pipeline creation, texture uploads, the replay of an NVN submission, compute dispatches, the publishes of surfaces
+over guest memory, the BC7 encodes between frames, the landings of the guest memory the GPU owns,
 the input tick, the audio and host1x clocks, every returning SVC except the waits above (named
 as in `hos.svc`) and every IPC command (the service and command number in the zone's text). Frames appear with the
 `frame ms`, guest memory, GPU memory and budget, per-frame draws, shader translations, pipelines made, texture
