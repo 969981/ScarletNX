@@ -145,10 +145,15 @@ typedef struct {
     /* a test's: linked pipelines are never optimized, so every draw binds the link (pipeline.c) */
     int gpl_hold;
     int has_vertex_robustness2; /* exact zero/default components for out-of-range mesh fetches */
+    /* VK_EXT_robustness2's features in effect (device.c): buffer reads past the bound range are zero and writes there
+       dropped, image reads out of bounds are zero with an alpha of 1, and descriptors may be null. A uniform range is
+       checked in steps of robust_ubo_align bytes (vk_cb_round) */
+    int robust_buffer2, robust_image2, null_descriptor;
+    u32 robust_ubo_align;
     int has_calibrated_host;    /* VK_EXT_calibrated_timestamps with CLOCK_MONOTONIC_RAW: the GPU's clock goes next to
                                 the client's, one driver call (gpuprof.c's calibration) */
     int has_portability;        /* a portability driver (MoltenVK): the device lists VK_KHR_portability_subset */
-    int has_xfb;                /* VK_EXT_transform_feedback (without it, g_shader_xfb_stores) */
+    int has_xfb;                /* VK_EXT_transform_feedback (without it, g_spirv_translate.xfb_stores) */
     int has_mixed_samples;      /* VK_NV_framebuffer_mixed_samples: coverage at more samples than color storage */
     /* VK_NV_device_diagnostic_checkpoints, enabled with vk_checkpoints=1 where the device has it: the draw or dispatch a
        GPU fault hangs on (record.c's vk_checkpoint_dump). has_checkpoints below is checkpoints.c's markers, on it too */
@@ -383,6 +388,9 @@ int vk_uma_way(int want, int how, int model, int has_import, int has_ahb);
 void vk_uma_init(void); /* after it */
 int vk_uma(void);       /* guest ranges are read in place where they can be */
 int vk_uma_get(u64 gva, u64 len, u64 align, VkBuffer* buf, u64* off);
+/* 1 where the driver takes every import's pages again at each submission (amdgpu's user pointers): an import costs
+   every submission, and vertices, indices and constant buffers are copied instead (buffer.c) */
+int vk_uma_imports_dear(void);
 u64 vk_uma_bound(void); /* the submit that last read guest memory in place */
 void vk_uma_frame(void);
 void vk_uma_forget_all(void);
@@ -395,6 +403,11 @@ void vk_uma_before_write(u64 gva, u64 len);   /* the runtime writes GPU range [g
    as a pending result instead (buffer.c). vk_lock held */
 int vk_uma_write(u64 gva, u64 len, u64 align, VkBuffer* buf, u64* off);
 void vk_uma_writes_commit(void);                         /* the draw or dispatch was recorded */
+/* the compute program whose writes vk_uma_writes_commit takes next, 0 for a draw's (compute.c sets it around the
+   commit); vk_uma_read_soon(prog): a CPU reader waited for its writes while they were unsubmitted, so its dispatches
+   go to the GPU at once */
+void vk_uma_writer(u64 prog);
+int vk_uma_read_soon(u64 prog);
 void vk_uma_writes_abort(void);                          /* it wasn't */
 void vk_uma_frame_done(u64 frame);                       /* that submit is done: its in-place writes are in memory */
 void vk_uma_host_barrier(VkCommandBuffer cb, u64 frame); /* at that submit's end: its writes visible to the host */
@@ -636,7 +649,8 @@ u32 vk_frame_slot(void);                 /* the frame slot being recorded */
 #define VK_POOL_TYPES 6 /* uniform/storage buffers, combined textures, storage images/texels, sampled images */
 void vk_pool_sizes(VkDescriptorPoolSize* sz, u32 sets, u32 array_sets);
 extern u32 g_vk_buffer_image_slots; /* storage texel buffer bindings in a set, from SNX_VKB_IMGBUF */
-VkDescriptorType vk_cbuf_type(u32 slot); /* the descriptor type of a constant buffer slot (g_shader_uniform_cbufs) */
+VkDescriptorType
+vk_cbuf_type(u32 slot); /* the descriptor type of a constant buffer slot (g_spirv_translate.uniform_cbufs) */
 /* A buffer image: the texels a buffer header describes, bound as a storage texel buffer over their copy. Raw loads
    and atomics view it as R32_UINT, as the console reads it for them whatever its format. Formatted loads and stores
    see the format itself, of the number type the program was keyed on (kind 0 float, 2 unsigned, 3 signed); unkeyed,
@@ -1073,6 +1087,8 @@ void vk_rt_note_read(Surf* s);
 void vk_rt_before_write(u64 gva, u64 size);
 void vk_rt_before_publish_cpu(u64 cpu, u64 size);
 void vk_rt_before_write_cpu(u64 cpu, u64 size);
+/* whether a render target not parked covers a GPU page of the range: pend_lock (or vk_lock) held */
+int vk_rt_pages_hit(u64 gva, u64 size);
 /* an image of a scaled target's format at the guest's size with that many layers, a transfer's source and
    destination: to move it to and from guest memory, or into a texture a blit can't reach. VK_NULL_HANDLE on failure */
 VkImage vk_unscaled_image(const Surf* s, u32 layers, DevMem* mem);
@@ -1744,6 +1760,18 @@ VkImageView vk_null_view(VkImageViewType type, int num, int ms);
 Surf* vk_null_storage(VkImageViewType type, int kind, VkImageView* view);
 /* a storage image header with nothing bound: no format and no component types in word 0 */
 static inline int vk_tic_empty(const u32* tic) { return tic[0] == 0; }
+/* An empty storage image or storage buffer slot takes a null descriptor (VK_EXT_robustness2's nullDescriptor): its
+   reads are zero, its writes and atomics are dropped, and no image or buffer needs barriers for it. A sampled slot
+   keeps vk_null_view's 1x1 image: a size query of an empty header reads 1x1 on the console, and 0 from a null
+   descriptor. Not with descriptor heaps, whose writes (descriptor_heaps.c) have no null form */
+static inline int vk_null_descriptors(void) { return g_vk.null_descriptor && !g_vk.has_descriptor_heaps; }
+/* A constant buffer's bound range: bytes rounded up to 16, or to the step robustBufferAccess2 checks uniform ranges in
+   where that is larger (a power of two). With that feature, reads past the range are zero, and reads inside the last
+   step get the bytes the binding copied, never a neighbour's in staging */
+static inline u32 vk_cb_round(u32 bytes) {
+    u32 step = g_vk.robust_buffer2 && g_vk.robust_ubo_align > 16 ? g_vk.robust_ubo_align : 16;
+    return (bytes + step - 1) & ~(step - 1);
+}
 /* the sampler for a TSC: raise lets anisotropy= raise its filtering (a 2D texture with mipmaps), integer gives its
    border color as integers (an integer texture) */
 VkSampler vk_sampler(const u32* tsc, int raise, int integer);
@@ -1985,6 +2013,7 @@ extern u64 g_vk_dset_new, g_vk_dset_reused; /* statistics: descriptor sets writt
 extern u64 g_vk_itable_uploads, g_vk_itable_reused, g_vk_itable_bytes; /* indexed uniform staging statistics */
 void vk_render_upload_cache_reset(void); /* renderer start: invalidate staging addresses from an earlier device */
 u32 vk_release_value(u32 id);
+u32 vk_release_value_at_least(u32 id);
 /* the event slots the syncpoint increments this thread performed under vk_lock reached, signaled (nvdrv.c's
    syncpt_events): the outermost vk_unlock's, after the lock goes */
 void vk_release_events(void);
@@ -2198,6 +2227,14 @@ VkSh* vk_shader_mesh(const DsState* ds, u64 gva, int stage, const DsMeshKey* k);
 /* whether the constant buffer words s's translation read still hold in ds's bound buffers (vk_shader_get's check on
    a hit, for a caller that kept s) */
 int vk_shader_cb_hold(const DsState* ds, const VkSh* s);
+/* counts the translations put in the shader table: after a new one, vk_shader_get can give another translation of
+   a program than it gave before */
+u32 vk_shader_fold_gen(void);
+/* whether no other translation of s's program folds more constant buffer words than s (cb_fold.h) */
+int vk_shader_fold_top(const VkSh* s);
+/* whether s is the translation of its program that vk_shader_get takes for ds: it holds, and no translation that
+   folds more words holds. For a caller that kept s, where vk_shader_fold_top(s) is 0 */
+int vk_shader_chosen(const DsState* ds, const VkSh* s);
 /* a draw's vertex layout: attributes by location and the bindings they read, as a pipeline's vertex input state
    holds them or vkCmdSetVertexInputEXT sets them */
 typedef struct {
@@ -2358,6 +2395,9 @@ extern VkSemaphore g_vk_csem;  /* timeline semaphore the compute queue signals *
 extern u64 g_vk_cs_wait_value; /* the value graphics work waits for before reading compute results */
 extern u64 g_vk_dispatches, g_vk_cs_batches, g_vk_cs_wait_ns; /* statistics */
 extern u64 g_vk_cs_cpu_reads; /* dispatches kept on the compute queue because the CPU reads what they write */
+/* the submission a unified memory dispatch was left in for the stream's end to submit (vk_release_submit), and how many
+   were left so (statistics) */
+extern u64 g_vk_cs_open, g_vk_cs_left;
 /* uma.c: the device's memory model, and guest memory that the GPU reads in place (vk_memory) */
 int vk_uma_choose(int has_import, int has_ahb, int has_placed);
 void vk_uma_init(void); /* after it */

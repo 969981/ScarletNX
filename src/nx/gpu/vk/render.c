@@ -419,7 +419,7 @@ static int xfb_control_stores(u32* end, u64 control, u32 what, u32 stride) {
 }
 int vk_render_xfb_control(u32 owner_id, u64 control, u32 what, u32 stride, DrawOwner* owner) {
     if ((owner_id & 0x7fffffff) >= GPU_CHANNELS) return 0;
-    if (g_shader_xfb_stores) {
+    if (g_spirv_translate.xfb_stores) {
         if (!xfb_control_stores(g_xfb.end[xfb_counter_offset(owner_id) / 16], control, what, stride)) return 0;
     } else {
         if (!g_vk.has_xfb || !xfb_counters()) return 0;
@@ -438,7 +438,7 @@ int vk_render_xfb_control(u32 owner_id, u64 control, u32 what, u32 stride, DrawO
 /* whether a draw captures its vertices (DsPrograms.xfb_on): by the extension once its counters exist, or by stores */
 static int xfb_wanted(int on) {
     if (!on) return 0;
-    return g_vk.has_xfb ? xfb_counters() : g_shader_xfb_stores;
+    return g_vk.has_xfb ? xfb_counters() : g_spirv_translate.xfb_stores;
 }
 
 /* a draw's capture by stores: the vertex stage's bindings and where each buffer's capture ends */
@@ -494,7 +494,13 @@ static int xfb_bind(const DsState* ds, const DrawOwner* o, const VkSh* vs, int i
     x->size[4] = sizeof params;
     for (u32 b = 0; b < 4; b++) {
         if (!(r->declared >> b & 1)) continue;
-        if (!(r->bound >> b & 1)) { /* nothing stored: a buffer for the binding */
+        if (!(r->bound >> b & 1)) { /* nothing stored: a null buffer, or a buffer for the binding */
+            if (vk_null_descriptors()) {
+                x->buf[b] = VK_NULL_HANDLE;
+                x->off[b] = 0;
+                x->size[b] = VK_WHOLE_SIZE;
+                continue;
+            }
             if (!vk_buf_copy(0, 16, &x->buf[b], &x->off[b])) return 0;
             x->size[b] = 16;
             continue;
@@ -2028,7 +2034,7 @@ static u32 cb_range(const DsState* ds, int stage, const VkSh* s, int i) {
     u32 sz = ds->bind.cb_size[stage][i];
     if (sz > 65536 || !sz) sz = 65536;
     if (s->si.cbuf_max[i] && sz > s->si.cbuf_max[i]) sz = s->si.cbuf_max[i]; /* only the bytes the shader reads */
-    sz = (sz + 15) & ~15u;
+    sz = vk_cb_round(sz);
     if (sz > g_vk.props.limits.maxUniformBufferRange) sz = g_vk.props.limits.maxUniformBufferRange;
     return sz;
 }
@@ -2281,12 +2287,12 @@ static int indexed_uniform(DescWrites* writes, VkDescriptorSet set, int stage, u
     return 1;
 }
 
-/* The elements of SNX_VKB_TEXARRAY (g_shader_tex_array of them), from an indexed texture slot: SNX_TEX_ARRAY handles
-   from the slot's offset on, (1 << shift) bytes apart, or as many as the slot says, its stride apart. A handle past the
-   constant buffer's size, or with a header or sampler index past its pool's limit (no texture on hardware either),
-   reads as its kind's null texture. So does a texture of another kind than the slot's. Targets use snapshots refreshed after a draw changes
-   them. Tables of different kinds share the binding, each element viewed as the kind of the table that names it: a
-   handle that two kinds name has an element for each. */
+/* The elements of SNX_VKB_TEXARRAY (g_spirv_translate.tex_array of them), from an indexed texture slot: SNX_TEX_ARRAY
+   handles from the slot's offset on, (1 << shift) bytes apart, or as many as the slot says, its stride apart. A handle
+   past the constant buffer's size, or with a header or sampler index past its pool's limit (no texture on hardware
+   either), reads as its kind's null texture. So does a texture of another kind than the slot's. Targets use snapshots
+   refreshed after a draw changes them. Tables of different kinds share the binding, each element viewed as the kind of
+   the table that names it: a handle that two kinds name has an element for each. */
 static int tex_tables_set(const DsState* ds, int stage, const VkSh* s, const int* first, int count, Surf** rt, Surf* zt,
                           u32 n, VkImageLayout layout, DescWrites* d, VkDescriptorSet set) {
     /* each table's kind, named by the first table of that kind; a non-shadow kind's elements fill the depth binding
@@ -2330,8 +2336,9 @@ static int tex_tables_set(const DsState* ds, int stage, const VkSh* s, const int
                other (edenprobe's bindless case samples it) */
             if ((!cba && !in.bytes) || at + 4 > size) {
                 if (tk->id == TEX_NO_ENTRY) {
-                    if (used == g_shader_tex_array) {
-                        LOG_LIMIT(4, "vulkan: indexed texture tables exceed %u unique handles\n", g_shader_tex_array);
+                    if (used == g_spirv_translate.tex_array) {
+                        LOG_LIMIT(4, "vulkan: indexed texture tables exceed %u unique handles\n",
+                                  g_spirv_translate.tex_array);
                         return 0;
                     }
                     tk->id = used++;
@@ -2351,8 +2358,9 @@ static int tex_tables_set(const DsState* ds, int stage, const VkSh* s, const int
             u32 id = vk_indexed_handle_find(handle_slots, SNX_TEX_ARRAY, handles, element_kind, used, handle,
                                             (u8)kind_of[table], 8);
             if (id == used) {
-                if (used == g_shader_tex_array) {
-                    LOG_LIMIT(4, "vulkan: indexed texture tables exceed %u unique handles\n", g_shader_tex_array);
+                if (used == g_spirv_translate.tex_array) {
+                    LOG_LIMIT(4, "vulkan: indexed texture tables exceed %u unique handles\n",
+                              g_spirv_translate.tex_array);
                     return 0;
                 }
                 handles[id] = handle;
@@ -2411,7 +2419,7 @@ static int tex_tables_set(const DsState* ds, int stage, const VkSh* s, const int
         }
     }
     /* the first kind's null texture in every entry left: the binding is read whole */
-    for (u32 k = used; k < g_shader_tex_array; k++) {
+    for (u32 k = used; k < g_spirv_translate.tex_array; k++) {
         d->table[k] = kinds[0].info;
         if (depth_fill) {
             d->depth_table[k] = depth_fill->depth;
@@ -2422,7 +2430,7 @@ static int tex_tables_set(const DsState* ds, int stage, const VkSh* s, const int
     *w = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                 .dstSet = set,
                                 .dstBinding = SNX_VKB_TEXARRAY,
-                                .descriptorCount = g_shader_tex_array,
+                                .descriptorCount = g_spirv_translate.tex_array,
                                 .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                 .pImageInfo = d->table};
     if (depth_fill) {
@@ -2675,13 +2683,16 @@ static VkDescriptorSet stage_set_(const DsState* ds, int stage, VkSh* s, Surf** 
         u64 sa = g_vk.props.limits.minStorageBufferOffsetAlignment; /* an earlier draw's result is read in place */
         VkBuffer b;
         u64 o;
-        int ok = gb->aliased            ? (b = gb->buf, o = gb->off, 1)
-                 : addr && gb->writable ? vk_buf_copy_writable(addr, size, &b, &o, ordered)
-                 : addr && gb->bare     ? vk_buf_get_window(addr, size, &b, &o)
-                 : addr                 ? vk_buf_get_input(addr, size, sa, &b, &o)
-                                        : vk_buf_copy(0, size, &b, &o);
+        /* no address: a null buffer where the device has them, which reads zero, else a staging copy of zeros */
+        int ok = gb->aliased             ? (b = gb->buf, o = gb->off, 1)
+                 : addr && gb->writable  ? vk_buf_copy_writable(addr, size, &b, &o, ordered)
+                 : addr && gb->bare      ? vk_buf_get_window(addr, size, &b, &o)
+                 : addr                  ? vk_buf_get_input(addr, size, sa, &b, &o)
+                 : vk_null_descriptors() ? (b = VK_NULL_HANDLE, o = 0, 1)
+                                         : vk_buf_copy(0, size, &b, &o);
         if (!ok) return VK_NULL_HANDLE;
-        dw_buffer(&d, set, SNX_VKB_SSBO + i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, b, o, gb->aliased ? gb->range : size);
+        u64 range = !b ? VK_WHOLE_SIZE : gb->aliased ? gb->range : size;
+        dw_buffer(&d, set, SNX_VKB_SSBO + i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, b, o, range);
     }
     /* each pointer table window's base and length, at its buffer's slot: 16 vec4 of words (SNX_VKB_MBASE, which is
        the fragment stage's SNX_VKB_RS: the translator makes no table for a fragment program) */
@@ -2957,13 +2968,18 @@ static VkDescriptorSet stage_set_(const DsState* ds, int stage, VkSh* s, Surf** 
             if (!dw_buffer_image(&d, set, stage, i, tic, kind, handle)) return VK_NULL_HANDLE;
             continue;
         }
-        /* a slot with nothing bound (an empty header): an empty image, which nothing writes back, as a dispatch
-           takes one (compute.c's vk_dispatch), where the draw was skipped */
+        /* a slot with nothing bound (an empty header): a null descriptor (vk_null_descriptors), or else an empty
+           image, which nothing writes back, as a dispatch takes one (compute.c's vk_dispatch), where the draw was
+           skipped */
         VkImageView null_view = VK_NULL_HANDLE;
-        Surf* null_image =
-            vk_tic_empty(tic) ? vk_null_storage(vk_storage_image_type(&s->si, i), kind, &null_view) : NULL;
-        if (null_image) {
-            vk_surf_use(vk_cmd(), null_image, VK_IMAGE_LAYOUT_GENERAL, image_stages[stage], VK_STORAGE_IMAGE_ACCESS);
+        int null_slot = vk_tic_empty(tic) && vk_null_descriptors();
+        Surf* null_image = vk_tic_empty(tic) && !null_slot
+                               ? vk_null_storage(vk_storage_image_type(&s->si, i), kind, &null_view)
+                               : NULL;
+        if (null_image || null_slot) {
+            if (null_image)
+                vk_surf_use(vk_cmd(), null_image, VK_IMAGE_LAYOUT_GENERAL, image_stages[stage],
+                            VK_STORAGE_IMAGE_ACCESS);
             u32 binding = SNX_VKB_IMG + (u32)i;
             d.ii[binding] = (VkDescriptorImageInfo){VK_NULL_HANDLE, null_view, VK_IMAGE_LAYOUT_GENERAL};
             d.w[d.n++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -3288,6 +3304,15 @@ static struct {
     u32 topology;          /* the draw's argument, before tessellation makes it a patch list */
     u32 epoch;             /* vk_ww_epoch */
     u64 shader_generation; /* instruction invalidations also expire kept draws */
+    /* A program can have more than one translation, each with other constant buffer words folded (cb_fold.h), and
+       vk_shader_get takes the one that folds the most words of those that hold. A kept shader still holds when
+       another translation of its program starts to hold, because it doesn't read the words that the other folds. So
+       fold_gen is vk_shader_fold_gen when the state was kept (no translation came since), and not_top has a bit for
+       each shader of used_shaders that another translation of its program folded more than then. draw_kept
+       asks vk_shader_chosen for those. Without these checks, draw_state_check=1 found 0.22% of the kept draws in one
+       game's town with a fragment program that folded no word, where a lookup gave one that folded a word: the game
+       had set that word to the value the other translation folded */
+    u32 fold_gen, not_top;
     DrawShaders sh;        /* the rest holds when sh.vs is set */
     FsKey fkey;
     VkSh* fs;
@@ -3309,6 +3334,16 @@ static void draw_differs(const char* what) {
                "vulkan: draw_state_check=1: a draw that kept the last draw's state has another %s when it is made "
                "again (%llu draws checked)\n",
                what, (unsigned long long)g_vk_draw_checked);
+}
+/* the kept shaders that hold their constant buffer words: the stages, the fragment program and its variant */
+static void used_shaders(const VkSh* used[6]) {
+    const DrawShaders* s = &g_draw.sh;
+    used[0] = s->vs;
+    used[1] = s->tcs;
+    used[2] = s->tes;
+    used[3] = s->gs;
+    used[4] = s->fs0;
+    used[5] = g_draw.fs;
 }
 /* whether the vertex format f is, in what the kept state read of it, the one it was made from: the attributes the
    vertex program reads, the streams they name, and which of all 32 attributes are integers (they key the program) */
@@ -3335,6 +3370,7 @@ static int draw_kept(const DsState* ds, u32 topology, int mesh, u32 epoch) {
     const DrawShaders* s = &g_draw.sh;
     if (s->mesh != mesh) return 0;
     if (g_draw.shader_generation != g_vk.shader_generation) return 0;
+    if (g_draw.fold_gen != vk_shader_fold_gen()) return 0; /* a translation came that a lookup may take instead */
     if (g_draw.k.heaps != (u32)g_vk.has_descriptor_heaps) return 0;
     if (!s->vs || g_draw.ch_id != ds->owner || g_draw.topology != topology || g_draw.epoch != epoch) return 0;
     for (u32 i = 0; i < sizeof g_draw_groups; i++)
@@ -3347,9 +3383,15 @@ static int draw_kept(const DsState* ds, u32 topology, int mesh, u32 epoch) {
     if (s->xfb_on != xfb_wanted(ds->prog.xfb_on)) return 0; /* capture began or ended, or its counters were made */
     if (s->window_xy != !ds->vp.transform_on) return 0; /* the viewports' group keys no shader otherwise */
     if (s->swizzle != vk_viewport_swizzle_key(&ds->vp)) return 0;
-    const VkSh* used[6] = {s->vs, s->tcs, s->tes, s->gs, s->fs0, g_draw.fs};
-    for (int i = 0; i < 6; i++)
-        if (used[i] && used[i]->cbr.n && !vk_shader_cb_hold(ds, used[i])) return 0;
+    const VkSh* used[6];
+    used_shaders(used);
+    for (int i = 0; i < 6; i++) {
+        if (!used[i]) continue;
+        if (g_draw.not_top >> i & 1) {
+            if (!vk_shader_chosen(ds, used[i])) return 0;
+        } else if (used[i]->cbr.n && !vk_shader_cb_hold(ds, used[i]))
+            return 0;
+    }
     return 1;
 }
 static int draw_shaders_same(const DrawShaders* a, const DrawShaders* b) {
@@ -5368,9 +5410,16 @@ retry:
         g_draw.topology = draw_topo;
         g_draw.epoch = epoch;
         g_draw.shader_generation = g_vk.shader_generation;
+        /* the translations as they are after this draw's lookups, which can have made some */
+        g_draw.fold_gen = vk_shader_fold_gen();
         g_draw.sh = sh;
         g_draw.fkey = fk;
         g_draw.fs = fs;
+        const VkSh* used[6];
+        used_shaders(used);
+        g_draw.not_top = 0;
+        for (int i = 0; i < 6; i++)
+            if (used[i] && !vk_shader_fold_top(used[i])) g_draw.not_top |= 1u << i;
         g_draw.tf = tf;
         if (pl != &g_draw.plan) g_draw.plan = *pl;
         if (k != &g_draw.k) g_draw.k = *k;

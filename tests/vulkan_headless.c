@@ -176,11 +176,11 @@ static int check_desc_pool_arrays(void) {
             CHECK(sz[k].descriptorCount ==
                   1024 * one[k].descriptorCount + kinds[kind] * (arrayed[k].descriptorCount - one[k].descriptorCount));
     }
-    if (!g_shader_texture_arrays || g_vk.has_descriptor_buffers) {
+    if (!g_spirv_translate.texture_arrays || g_vk.has_descriptor_buffers) {
         puts("descriptor pools: no texture arrays here, or descriptor buffers: the pools' sets only");
         return 0;
     }
-    CHECK(arrayed[2].descriptorCount == one[2].descriptorCount + 2 * g_shader_tex_array);
+    CHECK(arrayed[2].descriptorCount == one[2].descriptorCount + 2 * g_spirv_translate.tex_array);
     CHECK(VK_POOL_ARRAY_SETS_FOR(g_vk_dslayout[1][1]) == VK_POOL_ARRAY_SETS_MORE &&
           VK_POOL_ARRAY_SETS_FOR(g_vk_dslayout[0][1]) == VK_POOL_ARRAY_SETS);
     /* each kind of frame pool as vk_desc_pool_new makes it, and how many sets of each fragment layout it holds */
@@ -430,6 +430,70 @@ static int check_uma(void) {
     for (u32 i = 256; i < 512; i++) CHECK(result[i] == 0x33);
     vk_unlock();
     CHECK(mem_unmap(cpu, span) == 0);
+    return 0;
+}
+
+/* uma_copies (gpu/vk/uma.c's vk_uma_imports_dear): 2 copies a vertex range and a constant buffer, so no import is made
+   for them and the GPU reads the bytes of the binding; 1 reads them in place, a CPU write after the binding included;
+   0 copies them on amdgpu's drivers only, where each import costs every submission. A range a write in place is
+   pending over stays in place either way (buffer.c's IN_DEAR) */
+static int check_uma_copies(void) {
+    const u64 gva = 0x7400000, cpu = HEAP_BASE + 0x3400000, span = 0x10000;
+    const int was = g_settings.guest_buffers_copied;
+    VkBuffer b, rb;
+    u64 off;
+    if (!vk_uma()) {
+        printf("skip: guest memory is copied on this device (vk_memory)\n");
+        return 0;
+    }
+#if defined(__linux__)
+    const int linux_amd = g_vk.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY;
+#else
+    const int linux_amd = 0;
+#endif
+    g_settings.guest_buffers_copied = 0;
+    const int amd =
+        g_vk.driver_id == VK_DRIVER_ID_MESA_RADV || g_vk.driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE || linux_amd;
+    CHECK(vk_uma_imports_dear() == amd);
+    CHECK(mem_map(cpu, span, MS_NORMAL, PERM_RW) == 0);
+    gmmu_map(gva, cpu, span);
+    memset(GP(cpu), 0x11, (size_t)span);
+    u8* result = vk_readback_buffer(512, &rb);
+    CHECK(result);
+    /* copied: no import, and the bytes of the binding */
+    g_settings.guest_buffers_copied = 2;
+    CHECK(vk_uma_imports_dear() == 1);
+    vk_lock();
+    CHECK(vk_buf_get_input(gva + 0x100, 256, 4, &b, &off));
+    CHECK(vk_uma_imports(cpu, span) == 0);
+    memset(GP(cpu) + 0x100, 0x5a, 256); /* after the binding: not in the copy */
+    VkBufferCopy c = {off, 0, 256};
+    rec_CmdCopyBuffer(vk_cmd(), b, rb, 1, &c);
+    CHECK(vk_buf_get_uniform(gva + 0x1000, 256, &b, &off));
+    CHECK(vk_uma_imports(cpu, span) == 0);
+    vk_finish();
+    vk_readback_ready();
+    for (u32 i = 0; i < 256; i++) CHECK(result[i] == 0x11);
+    vk_unlock();
+    /* in place: the import, and the write after the binding */
+    g_settings.guest_buffers_copied = 1;
+    CHECK(vk_uma_imports_dear() == 0);
+    vk_lock();
+    CHECK(vk_buf_get_input(gva + 0x2000, 256, 4, &b, &off));
+    CHECK(vk_uma_imports(cpu + 0x2000, 256) == 1);
+    memset(GP(cpu) + 0x2000, 0x6b, 256);
+    c = (VkBufferCopy){off, 256, 256};
+    rec_CmdCopyBuffer(vk_cmd(), b, rb, 1, &c);
+    vk_finish();
+    vk_readback_ready();
+    for (u32 i = 256; i < 512; i++) CHECK(result[i] == 0x6b);
+    vk_unlock();
+    g_settings.guest_buffers_copied = was;
+    CHECK(mem_unmap(cpu, span) == 0);
+    g_renderer->mem_may_have_changed();
+    printf("in place: uma_copies copies vertices and constant buffers at 2 (and at 0 on amdgpu: %d), reads them in "
+           "place at 1\n",
+           amd);
     return 0;
 }
 
@@ -6730,26 +6794,31 @@ static void results_copied(u64 cpu, u64 len) { vk_own_cpu_touched(cpu, len); }
    shared memory) changes the part of the key past the guest part, so a run that chose another form translates its
    programs again */
 static int check_hmma_file_key(void) {
-    int coop_was = g_shader_hmma_coop, pairs_was = g_shader_hmma_pairs, f16_was = g_shader_hmma_f16;
-    int stage_was = g_shader_hmma_stage;
+    int coop_was = g_spirv_translate.hmma_coop, pairs_was = g_spirv_translate.hmma_pairs,
+        f16_was = g_spirv_translate.hmma_f16;
+    int stage_was = g_spirv_translate.hmma_stage;
     char base[1024], other[1024];
     size_t gbase = 0, gother = 0;
-    g_shader_hmma_coop = g_shader_hmma_pairs = g_shader_hmma_f16 = g_shader_hmma_stage = 0;
+    g_spirv_translate.hmma_coop = g_spirv_translate.hmma_pairs = g_spirv_translate.hmma_f16 =
+        g_spirv_translate.hmma_stage = 0;
     vk_pipeline_file_key(base, sizeof base, &gbase);
     CHECK(gbase);
     for (int form = 0; form < 4; form++) {
-        g_shader_hmma_coop = form == 0 ? 65536 : 0, g_shader_hmma_pairs = form == 1, g_shader_hmma_f16 = form == 2;
-        g_shader_hmma_stage = form == 3 ? 65536 : 0;
+        g_spirv_translate.hmma_coop = form == 0 ? 65536 : 0, g_spirv_translate.hmma_pairs = form == 1,
+        g_spirv_translate.hmma_f16 = form == 2;
+        g_spirv_translate.hmma_stage = form == 3 ? 65536 : 0;
         vk_pipeline_file_key(other, sizeof other, &gother);
-        g_shader_hmma_coop = g_shader_hmma_pairs = g_shader_hmma_f16 = g_shader_hmma_stage = 0;
+        g_spirv_translate.hmma_coop = g_spirv_translate.hmma_pairs = g_spirv_translate.hmma_f16 =
+            g_spirv_translate.hmma_stage = 0;
         CHECK(gother == gbase && !memcmp(base, other, gbase));
         if (!strcmp(base + gbase, other + gother))
             fprintf(stderr, "file key: HMMA form %d (0 coop, 1 pairs, 2 hmma_f16, 3 staged) leaves the key as %s\n",
                     form, other + gother);
         CHECK(strcmp(base + gbase, other + gother) != 0);
     }
-    g_shader_hmma_coop = coop_was, g_shader_hmma_pairs = pairs_was, g_shader_hmma_f16 = f16_was;
-    g_shader_hmma_stage = stage_was;
+    g_spirv_translate.hmma_coop = coop_was, g_spirv_translate.hmma_pairs = pairs_was,
+    g_spirv_translate.hmma_f16 = f16_was;
+    g_spirv_translate.hmma_stage = stage_was;
     return 0;
 }
 
@@ -7062,6 +7131,10 @@ static int run_headless(int argc, char** argv) {
             free(copy);
             free(text);
         }
+    /* the checks of guest memory read in place bind vertices and constant buffers there, as the runtime did before
+       uma_copies, whose auto copies them on amdgpu (vk_uma_imports_dear): in place unless the command line says
+       otherwise (--uma_copies=0 or 2), and check_uma_copies takes each value itself */
+    g_settings.guest_buffers_copied = 1;
     /* the runtime's startup flags (-H), its settings as it takes them (--vk_memory=2, --memory_traps=2,
        --vertex_input_dynamic_state=off), and the benchmarks'. Any other argument stops the run: one dropped unsaid ran
        the checks without it */
@@ -7172,7 +7245,7 @@ static int run_headless(int argc, char** argv) {
             fprintf(stderr, "SNX_TEST_TEX_ARRAY=%s is not a whole number from 1 to %u\n", tex_array, SNX_TEX_ARRAY);
             return 2;
         }
-        g_shader_tex_array = (u32)n;
+        g_spirv_translate.tex_array = (u32)n;
     }
     video_init("Headless Vulkan fixture", "");
     CHECK(g_opt_headless && g_renderer_up && g_vk.dev && !g_vk.surface && !g_vk.swapchain && !g_vk.sc_count);
@@ -7427,15 +7500,16 @@ static int run_headless(int argc, char** argv) {
         return 0;
     }
     if (tex_array) { /* the texture arrays at the size asked: their layouts, pools and indexed draws */
-        printf("Texture arrays of %u elements, %u asked\n", g_shader_tex_array, (unsigned)strtoul(tex_array, NULL, 10));
-        CHECK(g_shader_texture_arrays && g_shader_tex_array == strtoul(tex_array, NULL, 10));
+        printf("Texture arrays of %u elements, %u asked\n", g_spirv_translate.tex_array,
+               (unsigned)strtoul(tex_array, NULL, 10));
+        CHECK(g_spirv_translate.texture_arrays && g_spirv_translate.tex_array == strtoul(tex_array, NULL, 10));
         CHECK(!check_desc_pool_arrays());
         CHECK(!check_indexed_texture_feedback());
         CHECK(!check_multisample_shader_gate());
         CHECK(!check_msaa()); /* its indexed multisample fetch (vulkan_indexed_ms.inc) */
         vk_finish();
         vk_pipeline_quiesce();
-        printf("PASS headless Vulkan texture arrays of %u: %u validation messages\n", g_shader_tex_array,
+        printf("PASS headless Vulkan texture arrays of %u: %u validation messages\n", g_spirv_translate.tex_array,
                g_vk_validation_messages);
         return 0;
     }
@@ -7546,6 +7620,7 @@ static int run_headless(int argc, char** argv) {
         if (!strcmp(name, "feedback") && ++ran) CHECK(!check_uma_feedback());
         if (!strcmp(name, "publish") && ++ran) CHECK(!check_uma_publish());
         if (!strcmp(name, "dispatch") && ++ran) CHECK(!check_uma_dispatch());
+        if (!strcmp(name, "dispatch_open") && ++ran) CHECK(!check_uma_dispatch_open());
         if (!strcmp(name, "texture_pending") && ++ran) CHECK(!check_uma_texture_pending());
         if (!strcmp(name, "dispatch_constants") && ++ran) CHECK(!check_uma_dispatch_constants());
         if (!strcmp(name, "dispatch_table") && ++ran) CHECK(!check_uma_dispatch_table());
@@ -7554,12 +7629,14 @@ static int run_headless(int argc, char** argv) {
         if (!strcmp(name, "placed_view") && ++ran) CHECK(!check_uma_placed_view());
         if (!strcmp(name, "logged_back") && ++ran) CHECK(!check_uma_logged_back());
         if (!strcmp(name, "trapped_window") && ++ran) CHECK(!check_uma_trapped_window());
+        if (!strcmp(name, "copies") && ++ran) CHECK(!check_uma_copies());
         if (!ran) {
-            fprintf(stderr,
-                    "SNX_TEST_UMA_ONLY=%s names no check: 1, runtime_write, constants, migrate, way, region_writes, "
-                    "region_merge, writes, feedback, publish, dispatch, texture_pending, dispatch_constants, "
-                    "dispatch_table, header_words, placed, placed_view, logged_back or trapped_window\n",
-                    name);
+            fprintf(
+                stderr,
+                "SNX_TEST_UMA_ONLY=%s names no check: 1, runtime_write, constants, migrate, way, region_writes, "
+                "region_merge, writes, feedback, publish, dispatch, dispatch_open, texture_pending, dispatch_constants, "
+                "dispatch_table, header_words, placed, placed_view, logged_back, trapped_window or copies\n",
+                name);
             return 2;
         }
         vk_pipeline_quiesce();
@@ -7577,6 +7654,7 @@ static int run_headless(int argc, char** argv) {
         CHECK(!check_uma_feedback());
         CHECK(!check_uma_publish());
         CHECK(!check_uma_dispatch());
+        CHECK(!check_uma_dispatch_open());
         CHECK(!check_uma_texture_pending());
         CHECK(!check_uma_dispatch_constants());
         CHECK(!check_uma_dispatch_table());
@@ -7586,6 +7664,7 @@ static int run_headless(int argc, char** argv) {
         CHECK(!check_uma_logged_back());
         CHECK(!check_uma_page_changes());
         CHECK(!check_uma());
+        CHECK(!check_uma_copies());
         CHECK(!check_uma_way());
         CHECK(!check_uma_migrate());
         CHECK(!check_uma_region_writes());
@@ -7800,6 +7879,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_uma_feedback());
     CHECK(!check_uma_publish());
     CHECK(!check_uma_dispatch());
+    CHECK(!check_uma_dispatch_open());
     CHECK(!check_uma_texture_pending());
     CHECK(!check_uma_dispatch_constants());
     CHECK(!check_uma_dispatch_table());
@@ -7812,6 +7892,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_rt_watch());
     CHECK(!check_zt_watch());
     CHECK(!check_uma());
+    CHECK(!check_uma_copies());
     CHECK(!check_uma_way());
     CHECK(!check_uma_migrate());
     CHECK(!check_uma_region_writes());

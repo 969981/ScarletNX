@@ -256,17 +256,17 @@ the key (with its modifiers held); Esc cancels, Backspace puts the default back,
 | `hotkey_help` | `F1` | Shows the keys' help |
 | `hotkey_menu` | `F2` | Opens and closes the game's menu; Back and a controller's Home open it too |
 | `hotkey_screenshot` | `F3` | Takes a screenshot |
-| `hotkey_fps_limit` | `F4` | Turns the FPS limit off and back on |
+| `hotkey_fps_limit` | `F4` | Turns the FPS limit off and back on, and says over the game the limit now and before it (`FPS limit: off (was the game's pace)`) |
 | `hotkey_thread_dump` | `F5` | Writes every thread's state to the log |
-| `hotkey_showcase` | `F6` | Turns `showcase` on and off |
+| `hotkey_showcase` | `F6` | Turns `showcase` on and off, said over the game (`Showcase: on (was off)`) |
 | `hotkey_save_state` | `F7` | Saves the game's state to the selected slot |
 | `hotkey_load_state` | `F8` | Loads the selected slot's state |
 | `hotkey_next_slot` | `F9` | Selects the next save state slot |
 | `hotkey_tracy` | `F10` | Records a 60-second Tracy capture, in a build with `SNX_TRACY` |
-| `hotkey_pause` | `Pause` | Pauses the whole game and resumes it |
+| `hotkey_pause` | `Pause` | Pauses the whole game and resumes it, said over the game (`Pause: on (was off)`), or why it did not pause |
 | `hotkey_fullscreen` | `F11` | Switches fullscreen |
 | `hotkey_fullscreen_2` | `Alt+Return` | A second key that switches fullscreen |
-| `hotkey_stats` | `F12` | Turns `stats` on and off |
+| `hotkey_stats` | `F12` | Turns `stats` on and off, said over the game (`Stats: on (was off)`) |
 | `hotkey_capture` | `Ctrl+Shift+F12` | Captures the next frame with RenderDoc while RenderDoc is in the game (`renderdoc`) |
 | `hotkey_mouse` | `Ctrl+G` | With `game_mouse` at `0`, declares an Ounce game's Joy-Con mouse mode, and ends it. At `1`, lets the mouse go from a game that holds it, and holds it again |
 | `hotkey_quit` | `Escape` | Quits the game: a first press warns, and a second within 3 seconds quits |
@@ -338,6 +338,7 @@ The profiler's rows (`tracy_`) only do something in a build with `SNX_TRACY` (`c
 | `vk_checkpoints` | `0` | `1` logs the work each queue reached when the device is lost (`VK_NV_device_diagnostic_checkpoints`). `0` makes the device without that extension, so a RenderDoc capture also replays on a driver that lacks it |
 | `vk_memory` | `0` | How the GPU reads and writes guest buffers (vertices, indices, storage, the engines' results; [GPU ownership](../layers/gpu/ownership.md)). `1` copies them into the renderer's buffers when they change, and back. `2` reads and writes them where they are in guest memory (`VK_EXT_external_memory_host`; on Android without it, guest memory moves into AHardwareBuffers), as the console's GPU does: for a GPU that shares system memory; on a discrete GPU it goes across the bus, slowly, which still shows that the path is correct. `0` is `2` on a GPU that shares system memory, but never the moves into AHardwareBuffers (unless `uma_memory=2`), else `1`. A 3DS game takes it too (the launcher passes it to `scarletnx-3ds` as `--vk_memory=N`), for the board's RAM: `1` has the GPU work on a copy of it in its own memory, kept in step by page, `2` on the RAM in place, `0` the same choice by the device ([3DS](../platforms/3ds/README.md)) |
 | `uma_memory` | `0` | Android only. Where `vk_memory` has the GPU read guest memory in place, how it reaches it, to compare the two ways on one device. `0` (Auto) imports it where it is (`VK_EXT_external_memory_host`), and without that moves it into AHardwareBuffers when `vk_memory=2`. `1` (Import) only imports: without `VK_EXT_external_memory_host` guest memory is copied. `2` (Move) only moves it into AHardwareBuffers, on a driver that imports too and with `vk_memory=0` as well; elsewhere than Android there are none, and guest memory is copied. The log's `guest buffers` line says the way taken |
+| `uma_copies` | `0` | Where `vk_memory` reads guest memory in place, whether vertices, indices and constant buffers are read there too. `0` (Auto) copies them on amdgpu's drivers (RADV, AMDVLK, AMD's on Linux), where each import costs every submission, and reads them in place elsewhere. `1` reads them in place, `2` copies them. A dispatch's storage ranges and what the GPU writes stay in place either way ([GPU ownership](../layers/gpu/ownership.md)) |
 | `vk_buffer_stats` | `0` | `1` logs what the renderer copies between guest memory and its buffers |
 | `vk_sparse_share` | `1` | `1` lets the blocks of a sparse texture that show the same memory of the game share one piece of GPU memory, where the GPU can bind memory to more than one place of an image. `0` gives each block its own |
 | `vk_stage_memory` | `0` | Which host memory holds the buffers that the CPU fills each frame for the GPU to read. `1` is memory for writes in order, which a driver can map write-combined, where small copies are slow. `2` is cached memory, where the GPU has such a type. `0` is `2` on Intel's Mesa driver, else `1` |

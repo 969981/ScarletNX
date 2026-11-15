@@ -45,7 +45,22 @@ static u32 g_last_x, g_last_y, g_last_w, g_last_h;
 static u32 g_last_transform;
 /* vk_lock once around the hooks: each takes it again only as a depth count. Each took and dropped it on its own, and
    every drop let the lock go (vk_let_go) on the GPU thread's writes, the constant buffer uploads before most draws */
+/* Each hook below only lands what the renderer holds over the bytes and hasn't written to guest memory yet: buffer and
+   compute results, storage images, the mirror's writes, queued releases (all of them count their pages in g_pend_any),
+   render targets (g_rt_pages), and unified memory's imports. Where none covers the bytes, every hook does nothing, so
+   the write doesn't take vk_lock for them: the GPU thread's constant buffer uploads, 14,000 a frame of one or two words
+   in one game's town, took it and asked each hook in turn, about 43 ns each. The tables are read under pend_lock, as
+   vkr_mem_pending reads them: their changes take it too. A result added after the answer and before the write is the
+   race there was after vk_unlock below, before the write, too */
+static int before_write_needed(u64 gva, u64 size) {
+    if (!size || vk_uma()) return 1;
+    pend_lock();
+    int hit = pend_hit(&g_pend_any, gva, size) || vk_rt_pages_hit(gva, size);
+    pend_unlock();
+    return hit;
+}
 static void vkr_before_write(u64 gva, u64 size) {
+    if (!before_write_needed(gva, size)) return;
     vk_lock();
     if (size) vk_release_need(gva, size);
     vk_buf_before_write(gva, size);
@@ -62,6 +77,11 @@ static void vkr_before_write(u64 gva, u64 size) {
    (pending_pages.h) */
 static int vkr_mem_pending(u64 gva, u64 size) {
     int hit;
+    /* every change of the tables holds vk_lock as well (pending_pages.h): a thread that holds it reads them as they
+       are. The renderer's thread asks this of the guest memory each draw reads, and took the tables' lock for it:
+       about 1.5% of its time in one game's busy scene was the system's code for that lock, and the game's threads
+       waited for it there */
+    if (vk_lock_held()) return pend_hit(&g_pend_any, gva, size);
     /* the tables' lock, not vk_lock: the game's threads ask this of each read they make through the GPU's address
        space (gmem_read), and waited here for vk_lock while the GPU thread held it across its waits for the GPU */
     pend_lock();
@@ -1352,6 +1372,7 @@ const Renderer vk_renderer = {
     .release_need = vk_release_need,
     .release_read = vk_release_read,
     .release_value = vk_release_value,
+    .release_value_at_least = vk_release_value_at_least,
     .render_predicate = vk_render_predicate,
     .render_predicate_drop = vk_render_predicate_drop,
     .release_retire = vk_release_retire,

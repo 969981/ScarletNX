@@ -143,6 +143,14 @@ int gmem_write(u64 gva, const void* src, u64 size) {
     gpu_mem_written(gva, size);
     return all ? 0 : -1;
 }
+int gmem_write_cb(u64 gva, const void* src, u64 size) {
+    int all;
+    if (!size) return 0;
+    gmem_before_write(gva, size);
+    all = copy_runs(gva, NULL, (const u8*)src, size);
+    gpu_mem_written_cb(gva, size);
+    return all ? 0 : -1;
+}
 /* the host pointer of [gva, gva + size) when contiguous, what the GPU holds of it landed (memory/own.c): the caller
    reads or writes it on the CPU, maybe with the renderer's lock held */
 u8* gmem_ptr_untracked(u64 gva, u64 size) {
@@ -843,7 +851,9 @@ static void job_end(const GpuItem* j, GpuChannel* ch) {
     dma_snap_finish(j->chan, j->id);
     for (i = 0; i < j->incs; i++) stream_incr(j->chan);
     if (g_renderer->stream_end) g_renderer->stream_end();
-    v = g_renderer->release_value ? g_renderer->release_value(j->chan) : syncpt_read(j->chan);
+    v = g_renderer->release_value_at_least ? g_renderer->release_value_at_least(j->chan)
+        : g_renderer->release_value        ? g_renderer->release_value(j->chan)
+                                           : syncpt_read(j->chan);
     if ((i32)(v - j->expect) < 0)
         WARN_LIMIT(8, "gpu: channel %u ended a submission at syncpoint value %u, short of the %u it promised\n",
                    j->chan, v, j->expect);

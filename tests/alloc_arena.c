@@ -129,6 +129,26 @@ int main(void) {
     assert(g_original == 4);
     alloc_free(&c, region + 0x300);
     assert(g_original == 5);
+    /* the SDK allocator's size of a block: the arena's own from jemalloc, at least what was asked, and the block stays
+       the arena's; any other pointer, a region's piece among them, the SDK's own answer */
+    const int was = g_original;
+    u64 sized = alloc_malloc(&c, 100);
+    assert(alloc_std_size(&c, 0, sized) >= 100 && g_original == was);
+    assert(alloc_std_size(&c, 0, 0x1000) == 777 && g_original == was + 1);
+    assert(alloc_std_size(&c, 0, sized + 16) == 777 && g_original == was + 2);
+    alloc_free(&c, sized);
+    assert(g_original == was + 2);
+    /* the SDK heap's own free and realloc of an arena block, as one game's free calls them: the arena's; any other
+       pointer, the heap's own code */
+    u64 h = alloc_malloc(&c, 64);
+    memset(g_mem + h, 0x3C, 64);
+    u64 h2 = alloc_heap_realloc(&c, 0, h, 4096);
+    assert(h2 >= WINDOW && g_mem[h2] == 0x3C && g_mem[h2 + 63] == 0x3C && g_original == was + 2);
+    alloc_heap_free(&c, 0, h2);
+    assert(g_original == was + 2);
+    alloc_heap_free(&c, 0, h2); /* gone already: the heap's own code */
+    assert(g_original == was + 3);
+    assert(alloc_heap_realloc(&c, 0, 0x2000, 32) == 777 && g_original == was + 4);
     puts("PASS the alloc family's arena: jemalloc found in the program, allocations in the window, a foreign pointer's "
          "own code");
     return 0;
