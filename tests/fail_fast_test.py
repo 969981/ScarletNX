@@ -239,38 +239,50 @@ with tempfile.TemporaryDirectory() as temporary:
         stop(int(pid.group(1)))
 server.shutdown()
 
-# ---- build.yml: who marks a failure, who may fail
+# ---- build.yml: validate the current job failure policy
+# The detached fail-fast.py watcher above is regression-tested with a fake
+# GitHub, but it is not installed into the current workflow's jobs.
+# Essential jobs fail the whole workflow; experimental jobs may fail independently.
+# Do not assert the obsolete fail-fast-mark artifact protocol.
 text = WORKFLOW.read_text()
-optional = re.search(r"^  SNX_OPTIONAL_JOBS: '(.*)'$", text, re.M)
-check("build.yml's env has SNX_OPTIONAL_JOBS", optional)
-optional = re.compile(optional.group(1) if optional else OPTIONAL)
-check("build.yml's SNX_OPTIONAL_JOBS is this test's", optional.pattern == OPTIONAL, optional.pattern)
 body = text[text.index('\njobs:\n') :]
 blocks = re.split(r'\n  (?=[a-z][\w-]*:\n)', body)[1:]
-ARCHES = ('x86_64', 'aarch64', 'ppc64le', 'ppc64', 'riscv64', 'loongarch64')
-seen = 0
+required_jobs = {
+    'linux', 'linux-sanitizers', 'appimage', 'windows',
+    'android', 'appimage-check', 'windows-check', 'edenprobe',
+}
+optional_jobs = {'appimage-cross', 'apple', 'appimage-cross-check'}
+found = set()
 for block in blocks:
     name_id = block.split(':', 1)[0]
-    name = re.search(r'^    name: (.+)$', block, re.M).group(1)
-    arches = [a for a in ARCHES if re.search(rf'["\[ ]{a}["\],]', block)] if '${{ matrix.arch }}' in name else ['']
-    names = [name.replace('${{ matrix.arch }}', a) for a in arches]
-    may_fail = re.search(r'^    continue-on-error: true$', block, re.M) is not None
-    marks = '*fail-fast-mark' in block or '&fail-fast-mark' in block
-    seen += 1
-    if name_id == 'nightly-due':
-        check('Nightly due marks nothing: it cancels its run by design', not marks)
+    found.add(name_id)
+    name_match = re.search(r'^    name: (.+)$', block, re.M)
+    check(f'{name_id} has an observable job name', name_match)
+    if not name_match:
         continue
-    if may_fail:
-        check(f'{name_id}, which may fail, marks nothing', not marks)
-        check(f'{name_id}: SNX_OPTIONAL_JOBS matches {names}', all(optional.search(n) for n in names), names)
-    else:
-        check(f'{name_id}, which may not fail, marks its failure', marks)
-        file_at = max(block.find('*fail-fast-file'), block.find('&fail-fast-file'))
-        mark_at = max(block.find('*fail-fast-mark'), block.find('&fail-fast-mark'))
-        check(f"{name_id} writes the mark's file before it uploads it", 0 <= file_at < mark_at, (file_at, mark_at))
-        check(f'{name_id}: SNX_OPTIONAL_JOBS leaves out {names}', not any(optional.search(n) for n in names), names)
-check("build.yml's jobs read: fewer means this test no longer reads the file as it is", seen >= 14, seen)
-check('no job dispatches a workflow to cancel its run', 'cancel-run.yml' not in text)
+    name = name_match.group(1)
+    optional_job = re.search(r'^    continue-on-error: true$', block, re.M) is not None
+    if name_id in required_jobs:
+        check(f'{name_id} must fail the Build on test/build failure', not optional_job)
+    elif name_id in optional_jobs:
+        check(f'{name_id} is an experimental optional job', optional_job)
+    if optional_job:
+        if '${{ matrix.arch }}' in name:
+            arches = re.findall(r'"arch":"([^"]+)"', block)
+            check(f'{name_id} has a declared architecture matrix', bool(arches))
+            names = [name.replace('${{ matrix.arch }}', arch) for arch in arches]
+        else:
+            names = [name]
+        check(
+            f'{name_id} is limited to documented optional platforms',
+            all(re.search(OPTIONAL, n) for n in names),
+            names,
+        )
+check('all current build jobs covered by the failure policy',
+      found == required_jobs | optional_jobs, sorted(found))
+check('old workflow self-cancellation is not reintroduced without a full review',
+      'fail-fast-mark' not in text and 'cancel-run.yml' not in text)
+
 # upload-artifact refuses a path with a . or .. in it ("Relative pathing '.' and '..' is not allowed"): the mark of
 # 2c12f69 named ../../_temp/_github_workflow/event.json, and no failed job marked its run
 lines = text.splitlines()
@@ -299,12 +311,6 @@ for at, line in enumerate(lines):
         parts = path.lstrip('!').replace('\\', '/').split('/')
         check(f"upload-artifact's path {path} (line {at + 1}) has no . or .. in it", not {'.', '..'} & set(parts))
 check("build.yml's uploads read", uploads >= 10, uploads)
-mark_file = re.search(r'run: echo "\$GITHUB_JOB" > (\S+)', text)
-check(
-    'the mark uploads the file its step before writes',
-    mark_file and f'          path: {mark_file.group(1)}\n          overwrite: true' in text,
-    mark_file and mark_file.group(1),
-)
 
 for failure in failures:
     print('FAIL:', failure)
