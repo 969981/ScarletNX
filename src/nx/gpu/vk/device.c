@@ -18,6 +18,7 @@
 #include "nx/gpu/vk/descriptor_heaps.h"
 #include "nx/gpu/texture/astc_bc.h"
 #include "common/gpu/vk/extension_bans.h"
+#include "common/gpu/vk/extension_commands.h"
 #include "nx/gpu/vk/hdr_swapchain.h"
 #include "common/gpu/vk/swapchain.h"
 #include "common/gpu/vk/vk_common.h"
@@ -573,18 +574,12 @@ static void ban_say(const char* line, int warn) {
         LOG("%s\n", line);
 }
 
-/* the extension settings (settings.txt's g_vk_extensions_ini) applied to e, the device's list: a value not auto, on or
-   off, or off for an extension the renderer can't run without here, stops the game, as vulkan_ban_ignore's unknown key
-   does. Those are the swapchain of a window, a portability driver's subset, which Vulkan has turned on wherever a
-   driver lists it, and on a 1.2 device what 1.3 took in (vk12_extensions, and one of the store op NONE's two) */
-static void apply_extension_settings(SnxVkExtensions* e, int core13) {
-    static VkExtensionSetting settings[160];
-    VkExtensionNeed need[VK12_EXTENSIONS + 4];
-    u32 count = 0, needs = 0;
-    char err[512];
-    for (int i = 0; i < g_vk_extension_settings_count && count < sizeof settings / sizeof *settings; i++)
-        settings[count++] = (VkExtensionSetting){g_vk_extension_settings[i].name, g_vk_extension_settings[i].value,
-                                                 g_vk_extension_settings[i].core};
+/* the extensions the renderer can't run without on this device, of e, the list its driver gives, and why: the swapchain
+   of a window, a portability driver's subset, which Vulkan has turned on wherever a driver lists it, and on a 1.2
+   device what 1.3 took in (vk12_extensions, and one of the store op NONE's two). Into need, VK_NEEDS at most: how many */
+#define VK_NEEDS (VK12_EXTENSIONS + 3)
+static u32 extension_needs(const SnxVkExtensions* e, int core13, VkExtensionNeed* need) {
+    u32 needs = 0;
     if (!g_opt_headless)
         need[needs++] = (VkExtensionNeed){VK_KHR_SWAPCHAIN_EXTENSION_NAME, "the window is drawn with it"};
     need[needs++] = (VkExtensionNeed){"VK_KHR_portability_subset",
@@ -599,6 +594,19 @@ static void apply_extension_settings(SnxVkExtensions* e, int core13) {
                                                               : VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME,
                                                           why};
     }
+    return needs;
+}
+
+/* the extension settings (settings.txt's g_vk_extensions_ini) applied to e, the device's list: a value not auto, on or
+   off, or off for an extension the renderer can't run without here (need), stops the game, as vulkan_ban_ignore's
+   unknown key does */
+static void apply_extension_settings(SnxVkExtensions* e, const VkExtensionNeed* need, u32 needs) {
+    static VkExtensionSetting settings[160];
+    u32 count = 0;
+    char err[512];
+    for (int i = 0; i < g_vk_extension_settings_count && count < sizeof settings / sizeof *settings; i++)
+        settings[count++] = (VkExtensionSetting){g_vk_extension_settings[i].name, g_vk_extension_settings[i].value,
+                                                 g_vk_extension_settings[i].core};
     if (!vk_extension_settings(e, settings, count, need, needs, err, sizeof err)) fatal("settings: %s", err);
 }
 
@@ -662,13 +670,17 @@ static int vk12_commands(const char** lacks) {
     return !*lacks;
 }
 
-static int create_device(void) {
+/* what make_device made: no device, the device, or none as an extension it was made with lacks a command, which
+   vk_bans_lacking keeps for the device create_device makes again */
+enum { DEVICE_FAILED, DEVICE_MADE, DEVICE_AGAIN };
+/* the device, its features and extensions chosen; again: made again, without what the first one lacked */
+static int make_device(int again) {
     g_vk.phys = snx_vk_best_device(g_vk.instance, VK_API_VERSION_1_2, device_rating, NULL);
     if (!g_vk.phys) {
         WARN("vulkan: no Vulkan 1.3 device, or 1.2 with the extensions 1.3 took in, with a suitable %s queue\n",
              g_opt_headless ? "graphics" : "presentation");
         start_failure_devices();
-        return 0;
+        return DEVICE_FAILED;
     }
     vkGetPhysicalDeviceProperties(g_vk.phys, &g_vk.props);
     g_vk.api = vk_api_for(g_vk.props.apiVersion);
@@ -684,13 +696,6 @@ static int create_device(void) {
     VkPhysicalDeviceProperties2 pp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &p12};
     vkGetPhysicalDeviceProperties2(g_vk.phys, &pp2);
     {
-        /* the drivers known to break an extension or feature, read before any is turned on: a table the build
-           carries that does not read is the build's fault, and which bans hold would be unknown */
-        char err[1024];
-        if (!vk_bans_load(snx_vk_extension_bans_text, err, sizeof err)) fatal("vulkan: %s", err);
-        /* the bans a run goes over to test a driver again; a key the table has not stops the game, as the player
-           meant a ban that would otherwise still hold */
-        if (!vk_bans_ignore(g_settings.vulkan_ban_ignore, err, sizeof err)) fatal("settings: %s", err);
         VkBanDevice bd = {g_vk.props.deviceName,    p12.driverName,      p12.driverInfo, (uint32_t)p12.driverID,
                           g_vk.props.driverVersion, g_vk.props.deviceID, vk_ban_system()};
         vk_bans_device(&bd);
@@ -849,11 +854,14 @@ static int create_device(void) {
     const char* index8_ext = NULL; /* VK_KHR_index_type_uint8, or the EXT it was promoted from */
     const char* store_none_ext = NULL; /* a 1.2 device's store op NONE (vk12_store_none) */
     if (!g_opt_headless) ext[next++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    VkExtensionNeed need[VK_NEEDS]; /* what the device can't go without */
+    u32 needs = 0;
     {
         SnxVkExtensions e;
         snx_vk_device_extensions(g_vk.phys, &e);
+        needs = extension_needs(&e, core13, need);
         /* the extension settings (vk_ext_*) first: an off one leaves the list, an on one goes over its bans */
-        apply_extension_settings(&e, core13);
+        apply_extension_settings(&e, need, needs);
         /* the extensions a driver is banned from leave the list before anything below reads it */
         vk_bans_filter(&e, ban_say);
         /* each setting's extension, on or off in the list, and why */
@@ -868,7 +876,7 @@ static int create_device(void) {
                      "%s has Vulkan 1.2 without %s. ScarletNX needs Vulkan 1.3, or 1.2 with the extensions 1.3 took in",
                      g_vk.props.deviceName, lacks12);
             snx_vk_extensions_free(&e);
-            return 0;
+            return DEVICE_FAILED;
         }
         { /* every device here has maintenance4 (core in 1.3, required of 1.2 above) */
             VkPhysicalDeviceMaintenance4Properties m4 = {
@@ -1232,7 +1240,7 @@ static int create_device(void) {
                 "%s has Vulkan 1.2 without the features %s. ScarletNX needs Vulkan 1.3, or 1.2 with the extensions "
                 "1.3 took in and their features",
                 g_vk.props.deviceName, lacks);
-            return 0;
+            return DEVICE_FAILED;
         }
     }
     g_vk.has_present_wait = has_present_id && has_present_wait && qpid.presentId && qpwait.presentWait;
@@ -1283,8 +1291,14 @@ static int create_device(void) {
             has_list_restart ? "VK_EXT_primitive_topology_list_restart without its list feature"
                              : "no VK_EXT_primitive_topology_list_restart");
     g_vk.has_barycentric = has_barycentric && qbarycentric.fragmentShaderBarycentric;
-    /* NVIDIA's compiler deadlocked with pipelines made on several threads at once (snx_vk_compile_serial) */
+    /* NVIDIA's compiler of its Unix driver (libnvidia-gpucomp) deadlocked with pipelines made on several threads at
+       once (snx_vk_compile_serial). The Windows driver has its own compiler: there the lock made each fast link wait
+       behind a part's compile or a background optimized link, 1.2 to 1.7 ms a link where 0.02 ms is the link's own */
+#ifdef _WIN32
+    snx_vk_compile_serial(0);
+#else
     snx_vk_compile_serial(p12.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY);
+#endif
     if (p12.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY)
         LOG("vulkan: fragment inputs are the driver's interpolation (NVIDIA's keeps the console's precision)\n");
     else if (g_vk.has_barycentric)
@@ -1568,6 +1582,8 @@ static int create_device(void) {
     }
     /* shaderDenormPreserveFloat16 is the device's word that it can keep f16 subnormals: without it an SM86 program
        packs those by hand (sm86_translate.c's pack_half), as Turnip on an Adreno 610 flushed them to zero */
+    if (vk_ban("shaderDenormPreserveFloat16", p12.shaderDenormPreserveFloat16, ban_say))
+        p12.shaderDenormPreserveFloat16 = VK_FALSE;
     g_spirv_translate.half_flush = !p12.shaderDenormPreserveFloat16;
     g_spirv_translate.half_rounding = 0;
     if (q12.shaderFloat16 && p12.shaderRoundingModeRTEFloat16 && p12.shaderDenormPreserveFloat16 &&
@@ -2014,7 +2030,7 @@ static int create_device(void) {
                               .enabledExtensionCount = next,
                               .ppEnabledExtensionNames = ext,
                               .pEnabledFeatures = &g_vk.feat};
-    if (!VK_OK(vkCreateDevice(g_vk.phys, &dci, NULL, &g_vk.dev))) return 0;
+    if (!VK_OK(vkCreateDevice(g_vk.phys, &dci, NULL, &g_vk.dev))) return DEVICE_FAILED;
     g_vk.gfx_queues = second ? 2 : 1;
     g_vk.dev_ext_n = next;
     g_vk.feat11 = f11;
@@ -2026,13 +2042,20 @@ static int create_device(void) {
     g_vk.feat2 = (VkPhysicalDeviceFeatures2){
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &g_vk.feat11, .features = g_vk.feat};
     volkLoadDevice(g_vk.dev);
-    /* NVIDIA's 621.01 lists VK_EXT_depth_clamp_control and its depthClampControl, and the device is made with both,
-       yet vkGetDeviceProcAddr has no vkCmdSetDepthClampRangeEXT: the recorder called a null pointer at the first
-       draw that clamps to a range of its own. Without the command no pipeline takes the range as dynamic state */
-    if (g_vk.has_depth_clamp_range && !vkCmdSetDepthClampRangeEXT) {
-        g_vk.has_depth_clamp_range = 0;
-        LOG("vulkan: a clamped depth stays in the viewport transform's range, where the console clamps to the "
-            "viewport's clip range (the driver has VK_EXT_depth_clamp_control without vkCmdSetDepthClampRangeEXT)\n");
+    /* every command each extension the device is made with requires, as its driver gives them: a driver that lists an
+       extension and gives no pointer for one of its commands (NVIDIA's VK_EXT_depth_clamp_control without
+       vkCmdSetDepthClampRangeEXT) has the renderer call a null pointer. Such an extension goes off, its features and
+       their structures with it, as the device is made again without it; one the device can't go without fails the
+       start, saying so */
+    int lacks = snx_vk_device_commands(g_vk.dev, g_vk.props.deviceName, g_vk.api, g_vk.dev_ext, g_vk.dev_ext_n, need,
+                                       needs, g_settings.vulkan_hidden_commands, again, ban_say, g_vk.start_failure,
+                                       sizeof g_vk.start_failure);
+    if (lacks) {
+        vkDestroyDevice(g_vk.dev, NULL);
+        g_vk.dev = VK_NULL_HANDLE;
+        if (lacks > 0) return DEVICE_AGAIN;
+        WARN("vulkan: %s\n", g_vk.start_failure);
+        return DEVICE_FAILED;
     }
     const char* lacks_command = NULL;
     if (!core13 && !vk12_commands(&lacks_command)) {
@@ -2042,7 +2065,7 @@ static int create_device(void) {
                  lacks_command);
         vkDestroyDevice(g_vk.dev, NULL);
         g_vk.dev = VK_NULL_HANDLE;
-        return 0;
+        return DEVICE_FAILED;
     }
     if (g_vk.has_checkpoints) vk_ck_init();
     pm_lock_announce(&g_vklock, "vulkan"); /* the device's calls, every thread's */
@@ -2050,7 +2073,7 @@ static int create_device(void) {
     vkGetDeviceQueue(g_vk.dev, g_vk.compute_family, second ? 1 : 0, &g_vk.compute);
     vk_mem_init(sparse_queue);
     /* the renderer's own allocator (devmem.c): its blocks are 64 MiB at most, and no more than the cap */
-    if (!vk_devmem_init(g_vk.has_descriptor_buffers || g_vk.has_descriptor_heap_support)) return 0;
+    if (!vk_devmem_init(g_vk.has_descriptor_buffers || g_vk.has_descriptor_heap_support)) return DEVICE_FAILED;
     __atomic_store_n(&g_devmem_ready, 1, __ATOMIC_RELEASE);
     { /* a GPU of 4 GiB or less: memory held back for render targets (devmem.c vk_devmem_reserve) */
         VkPhysicalDeviceMemoryProperties mp;
@@ -2154,7 +2177,32 @@ static int create_device(void) {
         LOG("vulkan: draws that sample a color target they render to read a copy of it (no attachment feedback "
             "loops)\n");
     vk_bans_unclaimed(ban_say); /* a ban on something nothing here asked about, said rather than dropped */
-    return 1;
+    return DEVICE_MADE;
+}
+
+/* the device, made again once without the extensions the first one found lacking a command. What making it sets is
+   put back as it was before, so the second decides everything again from there (the swapchain's lock among it, which
+   nothing takes before there is a swapchain) */
+static int create_device(void) {
+    char err[1024];
+    /* the drivers known to break an extension or feature, read before any is turned on: a table the build carries
+       that does not read is the build's fault, and which bans hold would be unknown */
+    if (!vk_bans_load(snx_vk_extension_bans_text, err, sizeof err)) fatal("vulkan: %s", err);
+    /* the bans a run goes over to test a driver again; a key the table has not stops the game, as the player meant a
+       ban that would otherwise still hold */
+    if (!vk_bans_ignore(g_settings.vulkan_ban_ignore, err, sizeof err)) fatal("settings: %s", err);
+    /* the commands a run takes as missing, to test the check of each extension's commands: a name of none stops the
+       game, as one the player mistyped would otherwise test nothing */
+    if (!snx_vk_hide_check(g_settings.vulkan_hidden_commands, err, sizeof err)) fatal("settings: %s", err);
+    const VkState vk = g_vk;
+    const ShCaps translate = g_spirv_translate;
+    int made = make_device(0);
+    if (made == DEVICE_AGAIN) {
+        g_vk = vk;
+        g_spirv_translate = translate;
+        made = make_device(1);
+    }
+    return made == DEVICE_MADE;
 }
 
 /* the swapchain destroyed. Its images' semaphores: a present may still wait on one after the device is idle (the

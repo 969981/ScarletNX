@@ -75,12 +75,14 @@ if(SNX_TEST_SANITIZERS)
         # the menu, its splash, icon and pads
         scarletnx-gui snx_gui_support snx_gui_ui snx_i18n snx_gui_languages snx_gui_languages_test snx_splash snx-test-splash
         snx_window_icon snx-test-window-icon snx_pad_sdl snx_gui_pad
+        # the notice of the 3DS's, the Vita's and the GBA's windows
+        snx_notice
         # the shader corpus translator, which shaderc_sm86 runs
         snx-shaderc
         # GLSL ES into SPIR-V
         snx_glslc snx-glslc-cli snx-test-glslc-lex snx-test-glslc-parse snx-test-glslc-emit snx-test-glslc-fuzz
         # the code generators, which tests run on files they refuse
-        snx-swipc snx-svcgen snx-hookgen snx-settingsgen snx-uigen snx-decodetree)
+        snx-swipc snx-svcgen snx-hookgen snx-settingsgen snx-uigen snx-decodetree snx-vkcmdgen)
 endif()
 # one Python for the scripted tests: without it they are left out
 find_package(Python3 QUIET COMPONENTS Interpreter)
@@ -363,6 +365,16 @@ if(TARGET snx_ctr_board)
     snx_test_target(snx-test-3ds-vk-import-error 11)
     target_link_libraries(snx-test-3ds-vk-import-error PRIVATE snx_ctr_gpu)
     add_test(NAME 3ds_vk_import_error COMMAND snx-test-3ds-vk-import-error)
+    # vk_debug_hide_commands on the 3DS's device: VK_EXT_shader_object's vkCreateShadersEXT taken as missing, the
+    # device made again without the extension and the log saying so (common/gpu/vk/extension_commands.c's
+    # snx_vk_device_commands). The log is the device's stderr, read back through dup2
+    if(NOT WIN32)
+        add_executable(snx-test-3ds-vk-hidden-commands 3ds_vk_hidden_commands.c)
+        snx_test_target(snx-test-3ds-vk-hidden-commands 11)
+        target_link_libraries(snx-test-3ds-vk-hidden-commands PRIVATE snx_ctr_gpu)
+        add_test(NAME 3ds_vk_hidden_commands COMMAND snx-test-3ds-vk-hidden-commands)
+        set_tests_properties(3ds_vk_hidden_commands PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    endif()
     # the samplers' anisotropy for the Switch's setting, and what the run says of it
     add_executable(snx-test-3ds-vk-anisotropy 3ds_vk_anisotropy.c)
     snx_test_target(snx-test-3ds-vk-anisotropy 11)
@@ -1928,7 +1940,7 @@ if(TARGET SDL3::SDL3) # F1's and the Shortcuts pages name the runtime's keys as 
         target_compile_definitions(snx-test-overlay PRIVATE SNX_TRACY=1)
     endif()
     snx_test_target(snx-test-overlay 11)
-    target_link_libraries(snx-test-overlay PRIVATE scarletnx-common snx_splash m SDL3::SDL3)
+    target_link_libraries(snx-test-overlay PRIVATE scarletnx-common snx_splash m SDL3::SDL3 snx_notice)
     target_include_directories(snx-test-overlay PRIVATE "${PROJECT_BINARY_DIR}/generated")
     add_test(NAME overlay COMMAND snx-test-overlay)
 endif()
@@ -1955,6 +1967,13 @@ if(TARGET SDL3::SDL3) # the keys' names are SDL's
     snx_test_target(snx-test-hotkeys 11)
     target_link_libraries(snx-test-hotkeys PRIVATE SDL3::SDL3)
     add_test(NAME hotkeys COMMAND snx-test-hotkeys)
+    # the notice of the windows with no menu of their own (common/utilities/notice.c): the Switch's notice's letters,
+    # place and colours
+    add_executable(snx-test-notice notice.c)
+    snx_test_target(snx-test-notice 99)
+    target_link_libraries(snx-test-notice PRIVATE snx_notice)
+    target_include_directories(snx-test-notice PRIVATE "${PROJECT_BINARY_DIR}/generated") # the theme's colours
+    add_test(NAME notice COMMAND snx-test-notice)
     # the hints every program sets before its SDL video starts (common/utilities/sdl_desktop.h)
     add_executable(snx-test-sdl-desktop-hints sdl_desktop_hints.c)
     snx_test_target(snx-test-sdl-desktop-hints 11)
@@ -2733,6 +2752,12 @@ if(NOT SNX_TOOLS_ONLY)
         snx_test_target(snx-test-vk-bans 11)
         target_link_libraries(snx-test-vk-bans PRIVATE snx_nx_flags snx_vk_common)
         add_test(NAME vk_extension_bans COMMAND snx-test-vk-bans)
+        # the commands each Vulkan device extension requires (common/gpu/vk/extension_commands.c), with no GPU: the
+        # table tools/vkcmdgen generates from the registry, its depends, a stand-in device's check and the hide list
+        add_executable(snx-test-vk-commands vk_extension_commands.c "${volk_SOURCE_DIR}/volk.c")
+        snx_test_target(snx-test-vk-commands 11)
+        target_link_libraries(snx-test-vk-commands PRIVATE snx_nx_flags snx_vk_common)
+        add_test(NAME vk_extension_commands COMMAND snx-test-vk-commands)
     endif()
     if(ANDROID)
         # the GPU driver a run asks for (nx/runtime/platform/gpu_driver_load.c) where none loads: Freedreno's variables set,
@@ -3398,6 +3423,16 @@ if(TARGET snx_vita_program)
     snx_test_target(snx-test-vita-watch 11)
     target_link_libraries(snx-test-vita-watch PRIVATE snx_vita_program)
     add_test(NAME vita_watch COMMAND snx-test-vita-watch)
+    # the Vita's device as a Switch game's is made (gpu/vk.c): VK_KHR_dynamic_rendering_local_read off when the check
+    # of each extension's commands takes its command as missing (vk_debug_hide_commands), the log saying so, and when
+    # its setting says off. The log is the device's stderr, read back through dup2
+    if(NOT WIN32)
+        add_executable(snx-test-vita-vk-device vita_vk_device.c)
+        snx_test_target(snx-test-vita-vk-device 11)
+        target_link_libraries(snx-test-vita-vk-device PRIVATE snx_vita_program)
+        add_test(NAME vita_vk_device COMMAND snx-test-vita-vk-device)
+        set_tests_properties(vita_vk_device PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    endif()
     # the window's Esc, asked twice, as SDL sends it: no device or window
     add_executable(snx-test-vita-quit-key vita_quit_key.c)
     snx_test_target(snx-test-vita-quit-key 11)
@@ -3948,6 +3983,21 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
         add_test(NAME settingsgen COMMAND "${CMAKE_COMMAND}" "-DSETTINGSGEN=$<TARGET_FILE:snx-settingsgen>"
                  "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/settingsgen-test"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/settingsgen.cmake")
+        # tools/vkcmdgen on the registry the build has and on registries of its own: the table's lines for what the
+        # renderer met, the same file from a second run, and each registry it refuses, at its line
+        if(TARGET snx-vkcmdgen)
+            get_property(snx_vk_commands_registry GLOBAL PROPERTY snx_vk_commands_registry)
+            add_test(NAME vkcmdgen COMMAND "${CMAKE_COMMAND}" "-DVKCMDGEN=$<TARGET_FILE:snx-vkcmdgen>"
+                     "-DREGISTRY=${snx_vk_commands_registry}" "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/vkcmdgen-test"
+                     -P "${CMAKE_CURRENT_SOURCE_DIR}/vkcmdgen.cmake")
+            # every device extension a renderer can make its device with (each source of src/ that makes one) has its
+            # setting @VK_ line in settings.txt, which the bans and the player's on and off go through
+            if(Python3_Interpreter_FOUND)
+                add_test(NAME vk_extension_settings COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_CURRENT_SOURCE_DIR}/vk_extension_settings.py" --repo "${PROJECT_SOURCE_DIR}"
+                         --registry "${snx_vk_commands_registry}")
+            endif()
+        endif()
         # its output where iOS compiles it: a default-if SNX_IOS value, which needs common.h. Not on Apple hosts, whose
         # own headers read the TargetConditionals.h the test puts in their place
         if(NOT APPLE)
@@ -4030,6 +4080,13 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
         target_link_libraries(snx-test-vk-ring-uploads PRIVATE snx_vk_common)
         add_test(NAME vk_ring_uploads COMMAND snx-test-vk-ring-uploads)
         set_tests_properties(vk_ring_uploads PROPERTIES SKIP_RETURN_CODE 77)
+        # a window's notice copied over its image after the picture's transfers (common/gpu/vk/notice.c), on whatever
+        # device there is
+        add_executable(snx-test-vk-notice vk_notice.c "${volk_SOURCE_DIR}/volk.c")
+        snx_test_target(snx-test-vk-notice 99)
+        target_link_libraries(snx-test-vk-notice PRIVATE snx_vk_common)
+        add_test(NAME vk_notice COMMAND snx-test-vk-notice)
+        set_tests_properties(vk_notice PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     add_executable(snx-test-vk-uma-budget vk_uma_budget.c)
     snx_test_target(snx-test-vk-uma-budget 99)

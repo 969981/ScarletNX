@@ -21,6 +21,9 @@ typedef struct {
     SnxVkWindow host; /* the window (none headless), the instance and the surface */
     VkPhysicalDevice phys;
     VkDevice device;
+    /* the extensions the device is made with, whose commands are checked once it is (snx_vk_device_commands) */
+    const char* extensions[4];
+    uint32_t extension_count;
     VkQueue queue;
     uint32_t family;
     VkPhysicalDeviceProperties properties;
@@ -57,6 +60,10 @@ bool vita_vk_wait(uint64_t serial);
 unsigned vita_vk_slot(void);
 VkDescriptorSet vita_vk_set(VkDescriptorSetLayout layout);
 uint32_t vita_vk_memory_type(uint32_t bits, VkMemoryPropertyFlags properties);
+/* a line over the game for a few seconds, as a Switch game shows one: Esc's first press */
+void vita_vk_notice(const char* text);
+/* that line while it shows, "" when none does */
+const char* vita_vk_notice_text(void);
 /* the renderer's per-submission resources, freed when the slot's submission is done */
 void vita_vk_on_retire(void (*retire)(unsigned slot, uint64_t serial));
 /* Shows the framebuffer: width by height pixels, pitch pixels a row, R8G8B8A8 bytes at offset in buffer, scaled into

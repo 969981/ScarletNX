@@ -103,10 +103,12 @@ type, range and help, tab-separated. Every setting, the recompiler's too, is des
 
 ### Vulkan Extensions
 
-Each Vulkan extension the Switch's renderer can use has a setting of its own in `[Graphics]`, its name in lowercase:
-`vk_ext_transform_feedback` for `VK_EXT_transform_feedback`, `vk_khr_maintenance5` for `VK_KHR_maintenance5`. The
-launcher's Graphics group shows them on its Vulkan Extensions page. A 3DS game takes them too, and the same bans,
-for the extensions its renderer uses (`--vk-ext-shader-object=off`). Each is `auto` by default:
+Each Vulkan extension a renderer can make its device with has a setting of its own in `[Graphics]`, its name in
+lowercase: `vk_ext_transform_feedback` for `VK_EXT_transform_feedback`, `vk_khr_maintenance5` for `VK_KHR_maintenance5`
+(the `vk_extension_settings` test fails for one without). The launcher's Graphics group shows them on its Vulkan
+Extensions page. A 3DS or Vita game takes them too, and the same bans, for the extensions its renderer uses
+(`--vk-ext-shader-object=off`); the Android apps' renderer takes the bans' check of each extension's commands alone.
+Each is `auto` by default:
 
 | Value | Effect |
 | --- | --- |
@@ -153,6 +155,8 @@ The settings, each with its extension and, where one took it in, the Vulkan vers
 | `vk_ext_external_memory_host` | `auto` | `VK_EXT_external_memory_host` |
 | `vk_ext_fragment_shader_interlock` | `auto` | `VK_EXT_fragment_shader_interlock` |
 | `vk_ext_graphics_pipeline_library` | `auto` | `VK_EXT_graphics_pipeline_library` |
+| `vk_ext_hdr_metadata` | `auto` | `VK_EXT_hdr_metadata` |
+| `vk_ext_image_view_min_lod` | `auto` | `VK_EXT_image_view_min_lod` |
 | `vk_ext_index_type_uint8` | `auto` | `VK_EXT_index_type_uint8` |
 | `vk_ext_load_store_op_none` | `auto` | `VK_EXT_load_store_op_none` |
 | `vk_ext_map_memory_placed` | `auto` | `VK_EXT_map_memory_placed` |
@@ -164,6 +168,7 @@ The settings, each with its extension and, where one took it in, the Vulkan vers
 | `vk_ext_present_timing` | `auto` | `VK_EXT_present_timing` |
 | `vk_ext_primitive_topology_list_restart` | `auto` | `VK_EXT_primitive_topology_list_restart` |
 | `vk_ext_provoking_vertex` | `auto` | `VK_EXT_provoking_vertex` |
+| `vk_ext_rasterization_order_attachment_access` | `auto` | `VK_EXT_rasterization_order_attachment_access` |
 | `vk_ext_robustness2` | `auto` | `VK_EXT_robustness2` |
 | `vk_ext_sample_locations` | `auto` | `VK_EXT_sample_locations` |
 | `vk_ext_shader_atomic_float` | `auto` | `VK_EXT_shader_atomic_float` |
@@ -180,7 +185,9 @@ The settings, each with its extension and, where one took it in, the Vulkan vers
 | `vk_khr_dynamic_rendering_local_read` | `auto` | `VK_KHR_dynamic_rendering_local_read`, promoted to Vulkan 1.4 |
 | `vk_khr_extended_flags` | `auto` | `VK_KHR_extended_flags` |
 | `vk_khr_external_memory_fd` | `auto` | `VK_KHR_external_memory_fd` |
+| `vk_khr_external_memory_win32` | `auto` | `VK_KHR_external_memory_win32` |
 | `vk_khr_format_feature_flags2` | `auto` | `VK_KHR_format_feature_flags2`, promoted to Vulkan 1.3 |
+| `vk_khr_fragment_shader_barycentric` | `auto` | `VK_KHR_fragment_shader_barycentric` |
 | `vk_khr_index_type_uint8` | `auto` | `VK_KHR_index_type_uint8`, promoted to Vulkan 1.4 |
 | `vk_khr_load_store_op_none` | `auto` | `VK_KHR_load_store_op_none`, promoted to Vulkan 1.4 |
 | `vk_khr_maintenance4` | `auto` | `VK_KHR_maintenance4`, promoted to Vulkan 1.3 |
@@ -357,6 +364,7 @@ The profiler's rows (`tracy_`) only do something in a build with `SNX_TRACY` (`c
 | `gpu_trace_target` | empty | `address[:bytes]`: logs the clears and draws that write a render target starting in that GPU address range |
 | `vk_gpu_profile` | `0` | `1` logs the GPU's time per rendering pass every 10 seconds |
 | `vk_checkpoints` | `0` | `1` logs the work each queue reached when the device is lost (`VK_NV_device_diagnostic_checkpoints`). `0` makes the device without that extension, so a RenderDoc capture also replays on a driver that lacks it |
+| `vk_debug_hide_commands` | empty | Vulkan device commands, separated by commas, that the check of each extension's commands takes as missing from the driver, to test that path: an extension that requires one goes off, and the device is made again without it, as with a driver that lists the extension without the command ([Driver bans](../dev/development.md#driver-bans)). The log says each. Empty: none. A name that is no device command of a Vulkan extension stops the game, naming the nearest ones |
 | `vk_memory` | `0` | How the GPU reads and writes guest buffers (vertices, indices, storage, the engines' results; [GPU ownership](../layers/gpu/ownership.md)). `1` copies them into the renderer's buffers when they change, and back. `2` reads and writes them where they are in guest memory (`VK_EXT_external_memory_host`; on Android without it, guest memory moves into AHardwareBuffers), as the console's GPU does: for a GPU that shares system memory; on a discrete GPU it goes across the bus, slowly, which still shows that the path is correct. `0` is `2` on a GPU that shares system memory, but never the moves into AHardwareBuffers (unless `uma_memory=2`), else `1`. A 3DS game takes it too (the launcher passes it to `scarletnx-3ds` as `--vk-memory=N`), for the board's RAM: `1` has the GPU work on a copy of it in its own memory, kept in step by page, `2` on the RAM in place, `0` the same choice by the device ([3DS](../platforms/3ds/README.md)) |
 | `uma_memory` | `0` | Android only. Where `vk_memory` has the GPU read guest memory in place, how it reaches it, to compare the two ways on one device. `0` (Auto) imports it where it is (`VK_EXT_external_memory_host`), and without that moves it into AHardwareBuffers when `vk_memory=2`. `1` (Import) only imports: without `VK_EXT_external_memory_host` guest memory is copied. `2` (Move) only moves it into AHardwareBuffers, on a driver that imports too and with `vk_memory=0` as well; elsewhere than Android there are none, and guest memory is copied. The log's `guest buffers` line says the way taken |
 | `uma_copies` | `0` | Where `vk_memory` reads guest memory in place, whether vertices, indices and constant buffers are read there too. `0` (Auto) copies them on amdgpu's drivers (RADV, AMDVLK, AMD's on Linux), where each import costs every submission, and reads them in place elsewhere. `1` reads them in place, `2` copies them. A dispatch's storage ranges and what the GPU writes stay in place either way ([GPU ownership](../layers/gpu/ownership.md)) |
