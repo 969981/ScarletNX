@@ -525,23 +525,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: ppc64le
-            platform: ppc64le
-            preset: linux-ppc64le-cross
-            qemu: ppc64le
-          - arch: riscv64
-            platform: riscv64
-            preset: linux-riscv64-cross
-            qemu: riscv64
-          - arch: loongarch64
-            platform: loong64
-            preset: linux-loongarch64-cross
-            qemu: loongarch64
-          - arch: ppc64
-            platform: ppc64
-            preset: linux-ppc64-elfv2-cross
-            qemu: ppc64
+        # PR builds only the PowerPC64 diagnostic target; the other three
+        # experimental AppImages are nightly-only as publish-builds.py declares.
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"arch":"ppc64","platform":"ppc64","preset":"linux-ppc64-elfv2-cross","qemu":"ppc64"}]' || '[{"arch":"ppc64le","platform":"ppc64le","preset":"linux-ppc64le-cross","qemu":"ppc64le"},{"arch":"riscv64","platform":"riscv64","preset":"linux-riscv64-cross","qemu":"riscv64"},{"arch":"loongarch64","platform":"loong64","preset":"linux-loongarch64-cross","qemu":"loongarch64"},{"arch":"ppc64","platform":"ppc64","preset":"linux-ppc64-elfv2-cross","qemu":"ppc64"}]') }}
     steps:
       # Artifacts carry the commit they came from: the branch's head in a pull request, else the commit pushed
       - name: Name the commit
@@ -1508,19 +1494,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: # platform as Docker names it, qemu as qemu-user and binfmt_misc do
-          - arch: ppc64le
-            platform: ppc64le
-            qemu: ppc64le
-          - arch: riscv64
-            platform: riscv64
-            qemu: riscv64
-          - arch: loongarch64
-            platform: loong64
-            qemu: loongarch64
-          - arch: ppc64
-            platform: ppc64
-            qemu: ppc64
+        # Keep package checks on the same legs as the corresponding builds.
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"arch":"ppc64","platform":"ppc64","qemu":"ppc64"}]' || '[{"arch":"ppc64le","platform":"ppc64le","qemu":"ppc64le"},{"arch":"riscv64","platform":"riscv64","qemu":"riscv64"},{"arch":"loongarch64","platform":"loong64","qemu":"loongarch64"},{"arch":"ppc64","platform":"ppc64","qemu":"ppc64"}]') }}
     steps:
       - name: Name the commit
         id: commit
