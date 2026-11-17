@@ -178,6 +178,15 @@ static int refs(Res* r) {
     producer_unlock();
     return __atomic_load_n(&r->refs, __ATOMIC_RELAXED);
 }
+/* r's references once a two-step landing (OwnHooks' land_start) released it, waited for up to 10 s. That landing
+   lets go of the producer's lock while the GPU copies, and does not take it again: it lets its pages go, wakes the
+   owners that wait for them, and only then releases its resources (own.c). So the threads it let go can come back
+   before the release, and refs' lock does not wait for it */
+static int refs_released(Res* r) {
+    for (int waited_ms = 0; waited_ms < 10000 && __atomic_load_n(&r->refs, __ATOMIC_ACQUIRE); waited_ms++)
+        plat_sleep_ns(1000000);
+    return __atomic_load_n(&r->refs, __ATOMIC_ACQUIRE);
+}
 static Res* res_new(u64 size, u8 fill) {
     Res* r = (Res*)calloc(1, sizeof *r);
     u64 i;
@@ -757,7 +766,7 @@ static void test_two_step(void) {
     pthread_join(reader, NULL);
     pthread_join(owner, NULL);
     CHECK(__atomic_load_n(&g_two_read, __ATOMIC_ACQUIRE) == (u8)(0xA0 + 0x200) && g_lands == lands + 1);
-    CHECK(__atomic_load_n(&g_two_begun, __ATOMIC_ACQUIRE) && refs(r) == 0);
+    CHECK(__atomic_load_n(&g_two_begun, __ATOMIC_ACQUIRE) && refs_released(r) == 0);
     CHECK(own_trapped(a + 0x3800, 0x100)); /* the new owner's page stays trapped */
     g_own.hooks.land_start = NULL;
     g_own.hooks.land_end = NULL;
@@ -1115,8 +1124,14 @@ static void test_stress(void) {
         g_resolve_res = r;
         g_resolve_lo = g_sa;
         g_resolve_size = 0x20000;
+        /* the watches go on under the producer's lock, as own_watch's callers hold it (the renderer watches each run
+           of a target under vk_lock). Without it, such a late fault's landing came between two of the calls: it
+           resolved the watches made so far, landed the round's owner whole, and the calls after it watched the rest
+           again, for a second resolve */
+        producer_lock();
         for (i = 0; i < 0x20000; i += 0x1800)
             CHECK(own_watch(g_sa + i, 0x20000 - i < 0x1800 ? 0x20000 - i : 0x1800) == 0);
+        producer_unlock();
         for (i = 0; i < THREADS; i++) pthread_create(&t[i], NULL, reader, (void*)(uintptr_t)(i + 1));
         for (i = 0; i < THREADS; i++) pthread_join(t[i], NULL);
         own_acquire(g_sa, 0x20000);
