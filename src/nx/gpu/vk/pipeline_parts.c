@@ -106,6 +106,7 @@ void vk_pipe_part_src(u32 part, const void* key, PipeKey* out) {
         const PipeViKey* vi = key;
         out->topo_class = vi->topo_class;
         out->vi = vi->vi;
+        out->fetch = vi->fetch;
         out->heaps = vi->heaps;
     } else if (part == VK_PART_PR) {
         const PipePrKey* pr = key;
@@ -247,6 +248,7 @@ void vk_pipe_split(const PipeKey* k, VkShaderModule fs, const PipeSplitDevice* d
     *vi = (PipeViKey){0};
     vi->topo_class = k->topo_class;
     vi->vi = k->vi;
+    vi->fetch = k->fetch;
     vi->heaps = k->heaps;
 
     *pr = (PipePrKey){0};
@@ -306,7 +308,7 @@ void vk_pipe_split(const PipeKey* k, VkShaderModule fs, const PipeSplitDevice* d
 }
 
 /* out's text from at, which may be past its end (the text is then cut): where the next one goes */
-static size_t key_say(char* out, size_t n, size_t at, const char* fmt, ...) __attribute__((format(printf, 4, 5)));
+[[gnu::format(printf, 4, 5)]] static size_t key_say(char* out, size_t n, size_t at, const char* fmt, ...);
 static size_t key_say(char* out, size_t n, size_t at, const char* fmt, ...) {
     va_list ap;
     int wrote;

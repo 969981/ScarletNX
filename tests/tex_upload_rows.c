@@ -195,7 +195,7 @@ void rec_CmdClearDepthStencilImage(VkCommandBuffer cb, VkImage img, VkImageLayou
 
 /* ------------------------------------------------ what texture.c reaches otherwise, unused here */
 VkState g_vk;
-u64 g_vk_texture_epoch; /* release.c's: render target snapshots, which no upload takes */
+_Atomic u64 g_vk_texture_epoch; /* release.c's: render target snapshots, which no upload takes */
 /* Uploading into the fixture's existing image never creates views or samplers. Keep the registry boundary
    explicit, and fail if an upload unexpectedly starts exercising object creation. */
 VkResult vk_image_view_create(VkDevice device, const VkImageViewCreateInfo* info,
@@ -211,7 +211,7 @@ VkResult vk_sampler_create(VkDevice device, const VkSamplerCreateInfo* info,
     abort();
 }
 _Atomic int g_cs_any;
-u64 g_tex_cache_hits, g_tex_cache_misses, g_tex_upload_bytes, g_tex_frees;
+_Atomic u64 g_tex_cache_hits, g_tex_cache_misses, g_tex_upload_bytes, g_tex_frees;
 u32 g_vk_present;
 static char g_log[1024]; /* the last line logged */
 void logf_(int lvl, const char* fmt, ...) {
@@ -352,6 +352,9 @@ void vk_surf_use(VkCommandBuffer cb, Surf* s, VkImageLayout layout, VkPipelineSt
                  VkAccessFlags2 access) {
     (void)cb, (void)s, (void)layout, (void)stage_, (void)access;
 }
+/* surface.c's batch of a copy's two barriers: vk_surf_use records nothing here */
+void vk_surf_batch_begin(void) {}
+void vk_surf_batch_end(void) {}
 VkImageAspectFlags vk_aspect(const VkFmt* f) {
     return f->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
 }

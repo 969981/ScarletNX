@@ -79,7 +79,7 @@ u64 g_as_size;
 _Atomic(int) g_cs_any;
 _Atomic(int) g_gfx_any;
 _Atomic(int) g_gfx_img_any;
-int g_gpu_releases;
+_Atomic int g_gpu_releases;
 u8* g_mem;
 OwnState g_own;
 PendPages g_pend_any;
@@ -160,6 +160,9 @@ void vk_mem_use(u64* usage, u64* budget) { abort(); }
 void vk_mirror_done(u64 done) { abort(); }
 void vk_mirror_harvest(VkCommandBuffer cb, u64 submit) { abort(); }
 int vk_mirror_holds(u64 gva, u64 len) { abort(); }
+int vk_mirror_holds_at(u64 cpu, u64 len) { abort(); }
+int vk_mirror_owns_any(void) { return 0; } /* no mirror here */
+int vk_mirror_slice_at(u64 gva, u64 cpu, u64 len, VkBuffer* buf, u64* off) { abort(); }
 u64 vk_mirror_idle(u32 presents) { abort(); }
 void vk_mirror_mem_need(u64 gva, u64 len) { abort(); }
 int vk_mirror_pending(u64 gva, u64 len) { abort(); }
