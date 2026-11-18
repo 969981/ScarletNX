@@ -57,15 +57,15 @@ sentences, no spaced hyphen as a dash.
 
 ## Pull requests
 
-When a run of the Build workflow (`.github/workflows/build.yml`) on a pull request ends, the Pull request checks
-workflow rewrites one comment on it, marked `<!-- scarletnx-builds -->`, that links the Linux, AppImage, Windows and
+When a run of the Build workflow (`.github/workflows/build.yml`) on a pull request ends, the Publish builds workflow
+rewrites one comment on it, marked `<!-- scarletnx-builds -->`, that links the Linux, AppImage, Windows and
 Android builds of the head commit and names any job that did not build (`scripts/pr-builds.sh`). A pull request from a
 fork gets no comment, since its Build ran the fork's own workflow.
 
-A pull request, a draft as one ready for review, is built and tested on every platform: Linux on x86-64 (in its
-AppImage's job) and AArch64, with edenprobe, and ASan and UBSan on x86-64, Windows, Android, macOS and iOS, and the
-big-endian PowerPC64 AppImage, cross-built. The PowerPC64 LE, RISC-V and LoongArch AppImages are built for the
-nightlies alone, and the A64 differential runs on the cross build when a pull request changes the recompiler.
+A pull request, a draft as one ready for review, is built and tested on every platform: Linux on x86-64 and AArch64
+(each in its AppImage's job), with edenprobe, and ASan and UBSan on x86-64, Windows, Android, macOS and iOS, and
+big-endian PowerPC64, cross-built and tested. Its AppImage and the PowerPC64 LE, RISC-V and LoongArch ones are made for
+the nightlies alone, and the A64 differential runs on the cross build when a pull request changes the recompiler.
 
 A job of the Build that fails cancels the rest of its run once it has ended, a pull request's or main's
 (`scripts/fail-fast.py`); the macOS and iOS job and the cross-built AppImages, which may fail without failing the run,

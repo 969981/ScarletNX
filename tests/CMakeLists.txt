@@ -50,8 +50,8 @@ if(SNX_TEST_SANITIZERS)
         scarletnx-common scarletnx-platform scarletnx-net scarletnx-ldn scarletnx-filesystem snx_demangle snx_lz4
         snx_zbic snx_xxhash snx_vk_common snx_https snx_cacert snx_zip snx_cgltf
         snx-logscan
-        # the recompiler and its backends
-        snx_llvm snx_arm_llvm snx_arm_decode scarletnx-recompiler scarletnx-recompiler-shared
+        # the recompiler, its backends and what they take of the common code
+        snx_recompiler_base snx_llvm snx_arm_llvm snx_arm_decode scarletnx-recompiler scarletnx-recompiler-shared
         # the driver, its extraction, the first start's setup, the settings and the build's line
         snx_driver snx_nx_module snx_driver_llvm hactool_lib snx_setup snx_settings snx_settings_runtime snx_build_info
         snx-test-build-info
@@ -1461,6 +1461,17 @@ if(SNX_JEMALLOC AND NOT WIN32)
     add_test(NAME alloc_arena COMMAND snx-test-alloc-arena)
     set_tests_properties(alloc_arena PROPERTIES TIMEOUT 60)
 endif()
+# operator new's check (src/nx/hle/hook/alloc.c's alloc_new_shape): a module whose operator delete looks the block's
+# allocator up by its address and copies that code where no hook takes it, inlined or to a function no symbol names,
+# keeps its own operator new; the deletes' own bodies, the family's functions, loads spread wide, a forwarder, and a
+# copied delete without the lookup (a heap's, by the size, on a link-time table with one global) do not count
+if(NOT WIN32)
+    add_executable(snx-test-alloc-new-shape alloc_new_shape.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/alloc.c")
+    snx_test_target(snx-test-alloc-new-shape gnu23)
+    target_include_directories(snx-test-alloc-new-shape PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    snx_hookgen(snx-test-alloc-new-shape SPEC "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/hooks.hook")
+    add_test(NAME alloc_new_shape COMMAND snx-test-alloc-new-shape)
+endif()
 # the C library's functions on guest memory (src/nx/hle/hook/libc_std.c): guest addresses back from pointers into an
 # argument, end pointers, strtok's place, div_t and ldiv_t, errno, qsort and bsearch through the guest's comparison
 if(NOT WIN32)
@@ -2650,7 +2661,6 @@ if(NOT SNX_TOOLS_ONLY)
     add_executable(snx-test-tex-upload-rows tex_upload_rows.c tracy_stubs.c
                    "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/blocklinear.c") # g_gob_native, which astc_kind.h reads
     snx_test_target(snx-test-tex-upload-rows gnu23)
-    target_compile_definitions(snx-test-tex-upload-rows PRIVATE SNX_TEST_DEVMEM_STUBS=1)
     target_link_libraries(snx-test-tex-upload-rows PRIVATE snx_nx_flags)
     add_test(NAME tex_upload_rows COMMAND snx-test-tex-upload-rows)
     # the page cache's reads (gpu/vk/pagespace.c) over a model of guest memory, the write tracking, the ring and the
@@ -3235,6 +3245,27 @@ add_executable(snx-test-recompiler-library recompiler_library.c)
 snx_test_target(snx-test-recompiler-library gnu23)
 target_link_libraries(snx-test-recompiler-library PRIVATE scarletnx-recompiler)
 add_test(NAME recompiler_library COMMAND snx-test-recompiler-library)
+# what the library's archive needs from outside it: LLVM and the system's libraries alone
+# (tests/recompiler_symbols.cmake). Its program links every object of the archive with those, named here rather than
+# taken from the archive's own link line, which a new library would join. Built by the test, so a library more fails
+# the test and not the build
+add_executable(snx-test-recompiler-symbols EXCLUDE_FROM_ALL recompiler_symbols.c)
+set_target_properties(snx-test-recompiler-symbols PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+target_compile_options(snx-test-recompiler-symbols PRIVATE -pedantic-errors -Wall -Wextra -Werror)
+add_dependencies(snx-test-recompiler-symbols scarletnx-recompiler)
+target_link_directories(snx-test-recompiler-symbols PRIVATE "${SNX_LLVM_LIBRARY_DIR}")
+target_link_libraries(snx-test-recompiler-symbols PRIVATE
+                      "$<LINK_LIBRARY:WHOLE_ARCHIVE,$<TARGET_FILE:scarletnx-recompiler>>" ${SNX_LLVM_LIBS}
+                      ${SNX_LLVM_SYSTEM_LIBS} Threads::Threads ${CMAKE_DL_LIBS})
+if(WIN32)
+    target_link_libraries(snx-test-recompiler-symbols PRIVATE advapi32)
+else()
+    target_link_libraries(snx-test-recompiler-symbols PRIVATE m)
+endif()
+snx_test_sanitize(snx-test-recompiler-symbols) # the sanitizers' runtime, which the archive's objects call there
+add_test(NAME recompiler_symbols COMMAND "${CMAKE_COMMAND}" "-DBUILD=${PROJECT_BINARY_DIR}"
+         -DTARGET=snx-test-recompiler-symbols "-DARCHIVE=$<TARGET_FILE:scarletnx-recompiler>" "-DNM=${CMAKE_NM}"
+         "-DCONFIG=$<CONFIG>" -P "${CMAKE_CURRENT_SOURCE_DIR}/recompiler_symbols.cmake")
 # The Mach-O linker on objects Clang compiles for arm64 macOS, which any host's Clang with AArch64 can: what macOS
 # would check of the dylib (link_macho.c), on hosts that can't load one
 if(TARGET OpenSSL::Crypto)
@@ -3804,6 +3835,9 @@ if(UNIX)
     set_tests_properties(memory_alias_nce PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     add_test(NAME memory_alias_nce_signal_ww COMMAND snx-test-memory-alias --nce --write_tracking=1)
     set_tests_properties(memory_alias_nce_signal_ww PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    # a source given back while the pool can't give its bytes: the fatal says which step failed, and the error
+    add_test(NAME memory_alias_unpool_fails COMMAND snx-test-memory-alias --unpool-read-fails)
+    set_tests_properties(memory_alias_unpool_fails PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     # GPU-owned memory over the real pool and traps, owners whose GPU copy is host memory (77 without traps)
     add_executable(snx-test-memory-own memory_own.c
         "${PROJECT_SOURCE_DIR}/src/nx/memory/mem.c" "${PROJECT_SOURCE_DIR}/src/nx/memory/own.c"
@@ -4249,6 +4283,14 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     target_include_directories(snx-test-vk-devmem PRIVATE "${volk_SOURCE_DIR}")
     target_link_libraries(snx-test-vk-devmem PRIVATE Vulkan::Headers scarletnx-common) # snx_thread_name
     add_test(NAME vk_devmem COMMAND snx-test-vk-devmem)
+    # the trim of the caches (gpu/vk/surface.c vk_mem_trim) over stubs of the rest of the renderer: when it takes the
+    # render targets that later ones drew all over, where the driver moves memory by priority and where it does not
+    add_executable(snx-test-vk-mem-trim vk_mem_trim.c)
+    snx_test_target(snx-test-vk-mem-trim 23)
+    target_compile_definitions(snx-test-vk-mem-trim PRIVATE VK_NO_PROTOTYPES)
+    target_include_directories(snx-test-vk-mem-trim PRIVATE "${volk_SOURCE_DIR}" "${renderdoc_app_SOURCE_DIR}")
+    target_link_libraries(snx-test-vk-mem-trim PRIVATE Vulkan::Headers)
+    add_test(NAME vk_mem_trim COMMAND snx-test-vk-mem-trim)
     add_executable(snx-test-vk-descriptor-heap-setup vk_descriptor_heap_setup.c
         "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/descriptor_heaps.c")
     snx_test_target(snx-test-vk-descriptor-heap-setup gnu23)

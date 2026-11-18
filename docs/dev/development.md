@@ -33,14 +33,19 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 python3 tests/run_filesystem_tree.py --cc clang --sanitize
 clang -std=gnu23 -fsyntax-only -Wall -I src src/common/cpu/aarch64/cpu_helpers.c
+cmake --build build --target cppcheck
 ```
 
 Runtime relink deploys to the data folder's `recompiled/` by default (`SNX_RECOMPILED_DIR`). Recompiler/`src/common/cpu/aarch64/` edits require `-r`.
 Avoid builds during timing runs. Formatting isn't checked: `git clang-format` (clang-format 23) on the changed lines.
+The `cppcheck` target runs cppcheck over every file of `src/` and `tests/` the tree compiles, after a build, and shows
+every finding: `cmake/cppcheck.cfg` says what our headers cannot (`snx_alloc` never returns NULL). A finding fails the
+target unless its check is in `cmake/cppcheck-not-zero.txt`, the checks that still have findings; a check brought to
+zero leaves that list, and fails the target from then on.
 FS tests use production tree/HLE + synthetic temp data; `--only tree|service` selects a suite.
 
 CI: Linux/Windows builds, ABI syntax, native tool/FS regressions, optional Python diagnostics, the Linux AppImages
-and the Windows zip (each then run as installed), the Android APK, and [edenprobe](edenprobe.md)'s probes on lavapipe
+and the Windows zip (run as installed on `main`), the Android APK, and [edenprobe](edenprobe.md)'s probes on lavapipe
 against the cases that passed before (`scripts/edenprobe.py`). A push to `main` cancels the build of the one before it
 still running, as a push to a pull request does that pull request's. `.github/workflows/publish.yml` publishes what
 builds everywhere, each said on Discord (`scripts/publish-builds.py`): a version tag pushed (`v1.0.0`; `v1.0.0-rc1` a

@@ -241,6 +241,7 @@ typedef struct {
        pixel shaded) without either. vrs_texel: the pixels that one texel of the device's rate image covers */
     int vrs;
     VkExtent2D vrs_texel;
+    u8 conservative_said; /* the dilations whose cut the log has said (a bit a quarter pixel): each once */
     /* VK_EXT_graphics_pipeline_library with fast linking (pipeline_parts.h's vk_gpl_choose): a new pipeline links
        parts of its shaders that compile once, and an optimized one is made after it (pipeline.c) */
     int has_gpl;
@@ -278,6 +279,11 @@ typedef struct {
     u32 gfx_timestamp_bits;  /* the graphics queue family's timestampValidBits: 0 where it writes no timestamps */
     /* VK_EXT_memory_budget: the driver tells each heap's use and budget (devmem.c reads them, and guesses without) */
     int has_budget;
+    /* VK_EXT_pageable_device_local_memory with VK_EXT_memory_priority: where the GPU's own memory is short, the driver
+       moves memory of a low priority to system memory first. devmem.c keeps its own use under the driver's budget, so
+       this occurs when the budget falls: other programs or the desktop take video memory. devmem.c gives each block
+       the priority of what it holds (vk_devmem_priority) */
+    int has_pageable;
     int has_checkpoints; /* vk_checkpoints=1 on a driver that has them (checkpoints.c) */
     /* VK_GOOGLE_display_timing, enabled without present waits (Android): presents carry ids and times to be shown at,
        and the swapchain tells when each was */
@@ -383,6 +389,10 @@ int vk_sparse_flush(VkSemaphoreSubmitInfo* wait);
    work submitted before may still read the range, and the batch waits for it. The batch's number, 0 when there is no
    memory for a batch */
 u64 vk_buffer_sparse_bind(VkBuffer buf, const VkSparseMemoryBind* bind, DevMem gone, u64 size, int readers);
+/* readers of a bind: VK_BIND_GFX, the work the graphics queue has been given may read the range. VK_BIND_MOVE, a
+   defrag's move: the compute queue's work too, as a dispatch reads the buffer cache's buffers in place */
+#define VK_BIND_GFX  1
+#define VK_BIND_MOVE 3
 /* img has binds in a batch that hasn't gone to the queue yet, which goes ahead of the next submission */
 int vk_sparse_unissued(VkImage img);
 /* Sparse residency (memory.c), for a texture that guest memory maps only in part. vk_sparse_supported: the device
@@ -419,6 +429,27 @@ int vk_image_sparse_bound(VkImage img, u32 layer, u32 level, u32 y0, u32 y1, u32
    memory) or the GPU's (0, as made); a mip tail takes the GPU's always. vk_image_sparse_level_bytes: the bytes of the
    blocks of its levels before `levels`, every layer */
 void vk_image_sparse_place(VkImage img, int system);
+/* Blocks that move when their device memory block is emptied (devmem.h). vk_image_sparse_mover: the allocations of
+   img's blocks and mip tails have mover as their owner, which vk_devmem_moving gives back; NULL: none moves
+   (vk_defer_image sets it). vk_image_sparse_move_begin: for allocation a of img, the regions whose texels it holds
+   (*n of them, max at most: one of the blocks it holds, as all of them show its texels, or a mip tail's levels) and
+   new memory in a block that is there (DevMemWant.existing): 1 with *to, 0 when no run holds it, -1 when a is not one
+   of img's allocations now or has more regions. The owner copies the regions' texels out and submits that;
+   vk_image_sparse_move_end binds a's blocks or tail to `to` in the batch, which waits for that work, and frees a
+   after it, and the owner copies the texels back in after the batch. It gives 0 when a is gone meanwhile: `to` is
+   freed and nothing moved. A move not ended frees `to` (vk_devmem_free). Each region holds 64 KiB of texels at most,
+   and a move has VK_SPARSE_MOVE_REGIONS at most: a mip tail with more gets no owner */
+#define VK_SPARSE_MOVE_REGIONS 16u
+/* the most memory of a block, a brick or a mip tail that moves: each region's texels fit in a slot of this many bytes
+   of the defrag's scratch (texture.c). One with more memory gets no owner */
+#define VK_SPARSE_MOVE_BYTES (64u << 10)
+void vk_image_sparse_mover(VkImage img, void* mover);
+int vk_image_sparse_move_begin(VkImage img, DevMem a, DevMem* to, VkSparseImageMemoryBind* regions, u32 max,
+                               u32* n);
+int vk_image_sparse_move_end(VkImage img, DevMem a, DevMem to);
+/* the sparse binds waiting in the batch go to the queue now: a batch binds a range once, and a move's binds go after
+   them */
+void vk_sparse_batch_flush(void);
 u64 vk_image_sparse_level_bytes(VkImage img, u32 levels);
 void vk_sparse_stats(u64* binds, u64* bind_ns); /* statistics: sparse binds, and the host's wait for them */
 /* statistics: the blocks and mip tails with memory now of an image of either kind above, 0 for another image */
@@ -709,6 +740,10 @@ void vk_defer_buffer_view(VkBufferView v);
    entry's memory counts as gone from when it is deferred (vk_mem_trim) */
 void vk_defer_bytes(u64 bytes);
 u64 vk_deferred_bytes(void);
+/* bytes of this frame's vk_defer_bytes whose memory is in a block being emptied (devmem.c vk_devmem_moving): released
+   there, where no request takes them, so a trim for an allocation does not count on them (surface.c vk_mem_trim) */
+void vk_defer_moved(u64 bytes);
+u64 vk_deferred_moved(void);
 void vk_defer_call(void (*fn)(void*), void* arg); /* fn(arg) then */
 /* the submission being recorded (a number that grows at every submit: what a submit may have changed, results landed,
    is checked against it), and the frame (grows at vk_frame_next: frame f's work is done once f + VK_FRAMES started) */
@@ -1206,6 +1241,12 @@ typedef struct Surf {
        lod_floor on bound, its finest going where the device's memory runs short (vk_tex_coarser) and coming back
        when it has room (vk_tex_finer) */
     u8 shed;
+    /* textures: its image can move to other device memory when its block is emptied (texture.c vk_tex_defrag_frame):
+       the allocation's owner in devmem.c is the texture */
+    u8 movable;
+    /* textures: made again within 300 presents of the cache's eviction of its key (texture.c): a trim's first step,
+       for headroom, leaves it (surface.c vk_mem_trim) */
+    u8 came_back;
     /* depth targets: undefined but for draws and clears predicated on the GPU, which may not have run, so they count
        as no draw (render.c zt_written) */
     int pred_undefined;
@@ -1505,6 +1546,8 @@ void vk_astc_auto_say(void);
    forced trim makes room for later, and images as big fail at once for the rest of the present: render targets and
    images the GPU writes (owner with VK_OWN_WRITTEN) counted apart from the others. bytes: the device memory it takes */
 #define VK_OWN_WRITTEN 0x100u
+/* with the owner: the image's owner says it can move it when its block is emptied (vk_devmem_owner, DevMemWant.moves) */
+#define VK_OWN_MOVES 0x200u
 int vk_cache_image_create(const VkImageCreateInfo* ii, VkImage* img, DevMem* mem, u32 owner, u64* bytes);
 /* the device memory a surface of the caches takes now: an image whose memory follows its mapping grows and shrinks */
 void vk_surf_bytes(Surf* s, u64 bytes);
@@ -2128,6 +2171,37 @@ void vk_tex_later_frame(void);
    written since its read. Nothing when vk_cmd would wait for the GPU first */
 void vk_tex_kind_frame(void);
 #define VK_KIND_FRAME_BLOCKS (1u << 18)
+/* After that, its own submission too: the textures in the block of device memory that is being emptied move to other
+   blocks, DEFRAG_BYTES at most (texture.c). Nothing on a GPU that shares the system's memory (devmem.c) */
+void vk_tex_defrag_frame(void);
+/* An owner that can move its allocation (vk_devmem_owner) is one of these, by its low two bits: a texture (Surf*,
+   00), an own buffer of the buffer cache (its entry's index, 01), a block, brick or mip tail of a texture with memory
+   where it is bound (its Surf*, 10: vk_image_sparse_mover), or a granule of the buffer cache's pages (pagespace.c's,
+   11: vk_pages_move_begin). The pointers are of malloc, whose low two bits are clear */
+#define VK_MOVE_BUF(i)          ((void*)(((uintptr_t)(i) << 2) | 1u))
+#define VK_MOVE_IS_BUF(o)       (((uintptr_t)(o) & 3u) == 1u)
+#define VK_MOVE_BUF_INDEX(o)    ((u32)((uintptr_t)(o) >> 2))
+#define VK_MOVE_SPARSE(t)       ((void*)((uintptr_t)(t) | 2u))
+#define VK_MOVE_IS_SPARSE(o)    (((uintptr_t)(o) & 3u) == 2u)
+#define VK_MOVE_SPARSE_SURF(o)  ((Surf*)(void*)((uintptr_t)(o) & ~(uintptr_t)3u))
+#define VK_MOVE_PAGE(q)         ((void*)((uintptr_t)(q) | 3u))
+#define VK_MOVE_IS_PAGE(o)      (((uintptr_t)(o) & 3u) == 3u)
+/* pagespace.c: a granule of the buffer cache's pages (owner VK_MOVE_PAGE) moved out of a block that is emptied, as a
+   sparse texture's block is (vk_tex_defrag_frame). vk_pages_move_begin: the sparse buffer and the offset of the
+   granule whose memory is a, and new memory in a block that is there: 1 with *to, 0 when no run holds it, -1 when the
+   granule has gone or a draw wrote it. vk_pages_move_end binds it to `to` in the batch, which waits for the work
+   submitted before it, and frees a after the batch: 0 when the granule has gone meanwhile (`to` is freed). Its bytes
+   are copied as the texels of a texture's block are, out before and back after */
+int vk_pages_move_begin(void* owner, DevMem a, DevMem* to, VkBuffer* buf, u64* offset);
+int vk_pages_move_end(void* owner, DevMem a, DevMem to);
+/* buffer.c: own buffer i, whose memory is from, made again in a run of another block (DevMemWant.existing) and copied
+   there on cb, the old one freed when the frames in flight are done. 1 with *bytes, 0 when no run held it, -1 when
+   the entry no longer has that memory */
+int vk_buf_move(VkCommandBuffer cb, u32 i, DevMem from, u64* bytes);
+/* surface.c: render target s's image made again in a run of another block and copied there on cb, with its attachment
+   view, in the layout it had; the old image and its views go when the frames in flight are done. 1 with *bytes, 0
+   when no run held it, -1 when it cannot move now (a storage result of it still lands) */
+int vk_rt_move(VkCommandBuffer cb, Surf* s, u64* bytes);
 /* the encoder's blocks a frame: 3.3 ms of an RX 6700 XT, which encodes 10 million a second (docs/layers/gpu/astc.md), a tenth of
    a frame at 30 fps */
 #define VK_BC7_LATER_BLOCKS (1u << 15)
@@ -2740,8 +2814,8 @@ void vk_tex_take_counts(u64 out[8]);
 /* since the last log: the texture checks, those quiet (one compare), and those draw_state_check=1 found changed */
 void vk_tex_check_counts(u64* checks, u64* quiet, u64* quiet_wrong);
 /* the full checks since the last log by what ended the quiet: never quiet, a present, an epoch, a write; then the epochs
-   a texture stayed quiet over */
-void vk_tex_full_counts(u64 out[5]);
+   and the presents a texture stayed quiet over */
+void vk_tex_full_counts(u64 out[6]);
 void vk_pipeline_save(int at_exit);
 VkShaderModule vk_module_spv(const u32* words, size_t count);
 VkShaderModule vk_module_spv_location(const u32* words, size_t count, u32 location);
@@ -2801,6 +2875,10 @@ int vk_compute_gpu_src(u64 gva, u64 len, VkBuffer* buf, u64* off);
    found where the windows can't hold them */
 u32 vk_pointer_windows(u64* v, u32 n, u32 windows, u32 reach, int whole, u64* base, u32* len);
 extern VkSemaphore g_vk_csem;  /* timeline semaphore the compute queue signals */
+/* compute.c: the compute timeline's value of its last batch submitted, 0 none. vk_compute_after_gfx: the next batch
+   waits for that graphics timeline value (a defrag's copies back of what a dispatch may read in place) */
+u64 vk_compute_submitted(void);
+void vk_compute_after_gfx(u64 value);
 extern u64 g_vk_cs_wait_value; /* the value graphics work waits for before reading compute results */
 extern u64 g_vk_dispatches, g_vk_cs_batches, g_vk_cs_wait_ns; /* statistics */
 extern u64 g_vk_cs_cpu_reads; /* dispatches kept on the compute queue because the CPU reads what they write */
