@@ -111,7 +111,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/fork-release.py --repo "$GITHUB_REPOSITORY" --run "$BUILD_RUN" --sha "$BUILD_SHA" --out release
-          notes=$(printf 'Automatically synchronized and built from [scarletnx/ScarletNX](https://github.com/scarletnx/ScarletNX).\n\n- Upstream commit: `%s`\n- Built commit: `%s`\n- [Build and test run](https://github.com/%s/actions/runs/%s)\n- Release assets include SHA256SUMS.txt for integrity checks.\n' "$UPSTREAM_SHA" "$BUILD_SHA" "$GITHUB_REPOSITORY" "$BUILD_RUN")
+          notes=$(printf 'Automatically synchronized and built from [scarletnx/ScarletNX](https://github.com/scarletnx/ScarletNX).\n\n- Upstream commit: `%s`\n- Built commit: `%s`\n- [Build and test run](https://github.com/%s/actions/runs/%s)\n- Core platform builds and installed-artifact checks passed. Experimental Build jobs may still have failures (see Build run).\n- Release assets include SHA256SUMS.txt for integrity checks.\n' "$UPSTREAM_SHA" "$BUILD_SHA" "$GITHUB_REPOSITORY" "$BUILD_RUN")
           gh release create "$RELEASE_TAG" release/* \
             --repo "$GITHUB_REPOSITORY" \
             --target "$BUILD_SHA" \
