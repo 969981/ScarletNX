@@ -435,13 +435,13 @@ static void bind_pipeline_run(const void* p) {
     VkPipeline pipe =
         graphics && g_settings.async_pipelines ? vk_pipeline_now(x->p, &pending) : vk_pipeline_resolve(x->p);
     if (graphics) g_rec_unbound = pipe ? 0 : pending ? 2 : 1;
-    if (pipe) vkCmdBindPipeline(x->cb, x->bp, pipe);
+    if (pipe) vk_pipeline_bind(x->cb, x->bp, pipe);
 }
 void rec_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p) {
     if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) vk_descriptor_heaps_pipeline_state(0);
     if (!rec_on(cb)) {
         VkPipeline pipe = vk_pipeline_resolve(p);
-        if (pipe) vkCmdBindPipeline(cb, bp, pipe);
+        if (pipe) vk_pipeline_bind(cb, bp, pipe);
         return;
     }
     BindPipelineArgs* x = rec_push(bind_pipeline_run, sizeof *x);
@@ -845,6 +845,39 @@ void rec_CmdBeginConditionalRenderingEXT(VkCommandBuffer cb, VkBuffer buf, VkDev
     rec_commit();
 }
 
+/* many copies from a list the GPU reads (VK_KHR_copy_memory_indirect) */
+typedef struct {
+    VkCommandBuffer cb;
+    VkAddressCopyFlagsKHR src, dst;
+    u32 count;
+    VkStridedDeviceAddressRangeKHR range;
+} CopyIndirectArgs;
+static void copy_indirect_call(const CopyIndirectArgs* x) {
+    VkCopyMemoryIndirectInfoKHR i = {.sType = VK_STRUCTURE_TYPE_COPY_MEMORY_INDIRECT_INFO_KHR,
+                                     .srcCopyFlags = x->src,
+                                     .dstCopyFlags = x->dst,
+                                     .copyCount = x->count,
+                                     .copyAddressRange = x->range};
+    vkCmdCopyMemoryIndirectKHR(x->cb, &i);
+}
+static void copy_indirect_run(const void* p) { copy_indirect_call(p); }
+void rec_CmdCopyMemoryIndirectKHR(VkCommandBuffer cb, const VkCopyMemoryIndirectInfoKHR* info) {
+    CopyIndirectArgs a = {cb, info->srcCopyFlags, info->dstCopyFlags, info->copyCount, info->copyAddressRange};
+    /* timed for vk_gpu_profile as the copies it takes the place of are (rec_CmdCopyBuffer), its bytes in the GPU's
+       list. Each ring's copy counts, as they do (rec_xfer) */
+    int timed = vk_gpuprof_profiled(cb) &&
+                vk_gpuprof_op_begin(cb, VK_OP_COPY,
+                                    (u64)((const u8*)__builtin_return_address(0) - (const u8*)vk_gpuprof_base()), 0);
+    if (!rec_on(cb))
+        copy_indirect_call(&a);
+    else {
+        g_rec_xfers++;
+        g_rec_xfer_kind[0]++;
+        *(CopyIndirectArgs*)rec_push(copy_indirect_run, sizeof a) = a;
+        rec_commit();
+    }
+    if (timed) vk_gpuprof_op_end(cb);
+}
 /* ------------------------------------------------------------ commands with arrays, copied after their arguments */
 /* the packet's arrays follow its arguments, each at a multiple of 16 */
 #define REC_AL(n) (((n) + 15) & ~(u64)15)

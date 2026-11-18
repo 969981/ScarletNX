@@ -32,7 +32,7 @@ cmake --build build
 ./build/scarletnx -r "$work/Game" Game --jobs 8
 ctest --test-dir build --output-on-failure
 python3 tests/run_filesystem_tree.py --cc clang --sanitize
-clang -fsyntax-only -Wall -I src src/common/cpu/aarch64/cpu_helpers.c
+clang -std=gnu23 -fsyntax-only -Wall -I src src/common/cpu/aarch64/cpu_helpers.c
 ```
 
 Runtime relink deploys to the data folder's `recompiled/` by default (`SNX_RECOMPILED_DIR`). Recompiler/`src/common/cpu/aarch64/` edits require `-r`.
@@ -333,14 +333,15 @@ second tool. The cost of each is one atomic load per emission, and each goes out
 
 | The question | The plot or zone |
 |---|---|
-| Why is this frame slow? | `frame ms`, `jit compile ms` and `jit miss ms` (a compile the game waited for), `pipeline make ms` and `pipeline wait ms`, `texture uploads`, `shaders` |
+| Why is this frame slow? | `frame ms`, `jit compile ms` and `jit miss ms` (a compile the game waited for), `pipeline make ms` and `pipeline wait ms`, `shader translate ms`, `texture uploads` (bytes) and `texture upload count`, `render targets made`, `vk finish ms`, `texture pipeline count` and `texture pipeline ms`, `shaders` |
 | Is the GPU or the CPU the bound? | the GPU track's passes and `gpu gap:` plots beside `frame ms` and the CPU's own zones |
-| Where does the GPU's time go? | the pass zones, `gpu gap: dispatches/copies/barriers/nothing`, `gpu idle: waited/frame/recording/queued`, `gpu busy %`, `gpu submissions/frame`, `copy MB` |
-| Which draw of that pass? | `vk_gpu_draw_profile=1`, and `gpu untimed draws` for the cap |
-| What does the guest cost the host? | `guest cpu` and `process cpu` (of one processor), `guest threads`, `guest top thread ms` |
+| Where does the GPU's time go? | the pass zones, `gpu gap: dispatches/copies/barriers/nothing`, `gpu idle: waited/frame/recording/queued`, `gpu busy` (a percentage), `gpu submissions/frame`, `copy MB`; `gpu round:` splits the CPU's waits by kind, `gpu hold:` the busy time by what it held, `gpu submit:` the submissions by reason |
+| Which draw of that pass? | `vk_gpu_draw_profile=1` adds a zone on each draw and dispatch up to its cap; the log says how many went untimed |
+| What does the guest cost the host? | `guest cpu` and `process cpu` (of one processor), `guest threads`, `guest top thread ms`, `top svc 0/s` to `top svc 5/s` and `top hook 0/s` to `top hook 4/s` (a message names each rank) |
 | What does the game ask of the kernel? | the SVC zones with their result on error, and `svc/s`, `svc miss/s` |
-| What does the JIT do? | `jit compile ms`, `jit batch size`, `jit batch functions`, `jit compiled pcs`, `jit batches`, `jit cache loads`, `jit queue depth`, `jit failures`, `jit dropped batches` |
-| What does NCE do? | the `nce hook` zones and `nce outcalls/s`, `nce hooks/s`, `nce kicks/s` |
+| Which IPC commands cost the most? | `ipc req/s`, `ipc handler ms`, `ipc commands`, `ipc other req/s`, and `ipc top 0 ms` to `ipc top 7 ms` (a message names each rank). The counters are kept while a profiler is attached as well as at `log=2` |
+| What does the JIT do? | `jit compile ms`, `jit batch size`, `jit batch functions`, `jit instructions`, `jit code KiB`, `jit compiled pcs`, `jit batches`, `jit cache loads`, `jit queue depth`, `jit variant hits` and `jit variant misses`, `jit failures`, `jit dropped batches` |
+| What does NCE do? | the `nce hook` zones and `nce outcalls/s`, `nce hooks/s`, `nce kicks/s`, `nce svc/s`, `nce trap/s`, `nce ticks/s`, `nce run/s` |
 | Is the audio behind or clipping? | `audio queued ms`, `audio underruns`, `audio frame ms`, and the `audio voice` zones |
 | What does host1x's worker do? | the `host1x job` zones, with the engine, the class and the syncpoint value |
 | Is the host running out of memory? | `host heap` (the allocator's live bytes), `host rss`, `host free` |
@@ -350,6 +351,8 @@ second tool. The cost of each is one atomic load per emission, and each goes out
 | Does the input tick cost anything, and which voice or part of the audio frame is its cost? | the `hid update` zone with the states it wrote, `hid updates/s`, the `audio voice` zones with their microseconds, `audio mix ms` beside `audio frame ms` |
 | Is the input and output keeping up? | `io read MB/s`, `io write MB/s`, `guest memory` |
 | Is a frame being dropped or a queue growing? | `submits pending`, `compute pending`, `draws`, `dispatches` |
+| What CPU work does a resource take? | `vk resource:` for image requirements, allocation and destruction, target setup and reload, surface reclaim, and buffer maintenance and cache build, each in ms per frame |
+| Which GPU wait held a present back? | `gpu wait: finish/recycle/submit ms` per frame |
 
 The two GPU-queue idle plots are apart on purpose: `gpu thread idle` is the GPU thread's own job-queue wait, and
 `gpu idle:` are the graphics queue's execution idle, which the frame's own work and its waits between them give.
@@ -380,7 +383,7 @@ build/snx-shaderc corpus --validate --out translated
 `--validate` needs `spirv-val`. `--out` writes SPIR-V modules for build comparisons.
 
 The instruction decoder is generated at build time. `src/nx/gpu/shader/sm53.decode` lists each encoding (a
-16-bit pattern of the word's top bits), and `tools/decodetree` (strict C99, built for the build machine in a cross
+16-bit pattern of the word's top bits), and `tools/decodetree` (strict ISO C23, built for the build machine in a cross
 build) checks it and writes a switch-based decoder into the build folder, so nothing is set up at run time.
 Patterns that overlap must be in a `{ }` group, which tries them in order: the narrower first. A new opcode is a
 pattern there and an entry of `SM53_OPS` in `translator.h` (its `O_` name and display name), from which `decode.c`
@@ -517,7 +520,7 @@ no setting names refused, one whose driver lacks a command left out of the devic
 ## SVCs
 
 `src/nx/hle/svc/hos.svc` declares the kernel's SVCs as Eden's SVC generator does, and `tools/svcgen/svcgen.c`
-(strict C99, built for the build machine in a cross build, as swipc is) lays out each SVC's registers in the
+(strict ISO C23, built for the build machine in a cross build, as swipc is) lays out each SVC's registers in the
 64-bit and 32-bit ABIs from the declaration. It writes `hle/svc/hos.svc.inc` into the build folder: the handlers'
 prototypes, a wrapper per SVC and ABI, and the tables by number that both kinds of thread dispatch through. A new
 SVC is implemented by dropping its `stub` mark in `hos.svc` and defining `svc_<Name>` in `svc.c`, with the

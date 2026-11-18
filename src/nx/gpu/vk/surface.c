@@ -840,9 +840,11 @@ static int load_bands(Surf* s, u32 pitch) {
             m.rows = h - y < rows ? h - y : rows;
             vk_bl_range(&m, &lo, &hi);
             u64 from = s->gva + (u64)l * s->layer_size + lo;
-            u8* p = vk_stage_guest_input(from, hi - lo, hi - lo, &staged, &off);
-            if (!p) return load_fail(s, l, y, "staging", hi - lo);
-            vk_guest_read(from, hi - lo, p, staged, off);
+            if (!vk_guest_in_place(from, hi - lo, 16, &staged, &off)) { /* else read in a region */
+                u8* p = vk_stage_guest_input(from, hi - lo, hi - lo, &staged, &off);
+                if (!p) return load_fail(s, l, y, "staging", hi - lo);
+                vk_guest_read(from, hi - lo, p, staged, off);
+            }
             /* after the read, which may land GPU results and submit: the command buffer, and the scratch buffer if
                they grew it, are the ones from then */
             VkCommandBuffer cb = vk_cmd();
@@ -855,10 +857,10 @@ static int load_bands(Surf* s, u32 pitch) {
         }
     return 1;
 }
-/* a block linear target loaded: its guest bytes staged as they are, from where they are, and deswizzled on the GPU.
-   One whose rows need more than VK_PART_SHARE of the cap goes in bands (load_bands); a multisampled one goes whole,
-   its layers drawn from the guest's layout of them (vk_ms_pack), and so do a scaled one, blitted from an unscaled
-   image, and a volume, its slices one move */
+/* a block linear target loaded: its guest bytes staged as they are, from where they are, and deswizzled on the GPU,
+   or read in the region that holds them (vk_guest_in_place). One whose rows need more than VK_PART_SHARE of the cap goes
+   in bands (load_bands); a multisampled one goes whole, its layers drawn from the guest's layout of them (vk_ms_pack),
+   and so do a scaled one, blitted from an unscaled image, and a volume, its slices one move */
 static int surf_load_bl(Surf* s) {
     u64 sz = rt_bytes(s);
     u32 pitch = (guest_w(s) * s->f.bpp + 15) & ~15u, moves = s->volume ? 1 : s->layers, h = guest_h(s);
@@ -869,10 +871,11 @@ static int surf_load_bl(Surf* s) {
     vk_render_end();
     if (lin > g_vk.alloc_cap / VK_PART_SHARE && !s->msaa && s->sw == s->w && s->sh == s->h && !surf_volume(s))
         return load_bands(s, pitch);
-    u8* p = vk_stage_guest_input(s->gva, sz, sz, &staged, &off);
-    if (!p) return load_fail(s, 0, 0, "staging", sz);
+    const int in_place = vk_guest_in_place(s->gva, sz, 16, &staged, &off);
+    u8* p = in_place ? NULL : vk_stage_guest_input(s->gva, sz, sz, &staged, &off);
+    if (!in_place && !p) return load_fail(s, 0, 0, "staging", sz);
     if (!(scratch = vk_bl_scratch(lin, &cap))) return load_fail(s, 0, 0, "scratch buffer", lin);
-    vk_guest_read(s->gva, sz, p, staged, off); /* what the GPU holds of it copied on the GPU */
+    if (!in_place) vk_guest_read(s->gva, sz, p, staged, off); /* what the GPU holds of it copied on the GPU */
     VkCommandBuffer cb = vk_cmd();
     vk_bl_barrier(cb, 1);
     for (u32 i = 0; i < moves; i++)
@@ -881,14 +884,18 @@ static int surf_load_bl(Surf* s) {
     return rt_load_copy(cb, s, scratch, 0, pitch, (u64)pitch * h);
 }
 /* a pitch linear one: its guest bytes staged as they lie, the copy taking the pitch, when it is whole texels (else a
-   row at a time into tight rows); what the GPU holds of them copied on the GPU */
+   row at a time into tight rows); what the GPU holds of them copied on the GPU. Whole texels that a region holds are
+   read there (vk_guest_in_place), at a multiple of 4 and of a texel's bytes */
 static int surf_load_pitch(Surf* s) {
     u32 gh = guest_h(s);
-    u64 sz = rt_bytes(s), row = (u64)guest_w(s) * s->f.bpp;
+    u64 sz = rt_bytes(s), row = (u64)guest_w(s) * s->f.bpp, align = 4;
     int as_is = s->pitch % s->f.bpp == 0;
     VkBuffer buf;
     u64 off;
     vk_render_end();
+    while (s->f.bpp && align % s->f.bpp) align += 4;
+    if (as_is && vk_guest_in_place(s->gva, sz, align, &buf, &off))
+        return rt_load_copy(vk_cmd(), s, buf, off, s->pitch, s->layer_size);
     u8* p = vk_stage_guest_input(s->gva, sz, as_is ? sz : row * gh * s->layers, &buf, &off);
     if (!p) return 0;
     if (as_is)
@@ -975,14 +982,19 @@ static FlushPart flush_whole(const Surf* s) {
 }
 /* part's pixels of s copied into buf at at, in rows of pitch bytes, a layer (or a 3D image's slice) after another. A
    packed depth layer goes whole (flush_parts gives it whole rows). 0 when a scaled one found no memory for the image
-   of the guest's size it goes through */
+   of the guest's size it goes through, -1 when a multisampled layer's samples did not unpack (vk_ms_unpack): its
+   bytes in buf stay as they were */
 static int flush_copy(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 at, u32 pitch, const FlushPart* part) {
     u64 slice = (u64)pitch * part->rows;
     u32 depth = s->type == VK_IMAGE_VIEW_TYPE_3D ? s->depth3d : 1; /* a 3D image's slices in one copy */
     if (s->msaa) { /* the part's samples drawn into the guest's layout of them a layer at a time, copied from there */
+        int left = 0;
         for (u32 layer = part->layer; layer < part->layer + part->layers; layer++) {
             VkImage grid = vk_ms_unpack(cb, s, layer, part->y, part->rows);
-            if (!grid) continue;
+            if (!grid) {
+                left = 1;
+                continue;
+            }
             VkBufferImageCopy c = {
                 .bufferOffset = at + (u64)(layer - part->layer) * slice,
                 .bufferRowLength = pitch / s->f.bpp,
@@ -990,7 +1002,7 @@ static int flush_copy(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 at, u32 pit
                 .imageExtent = {guest_w(s), part->rows, 1}};
             rec_CmdCopyImageToBuffer(cb, grid, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), buf, 1, &c);
         }
-        return 1;
+        return left ? -1 : 1;
     }
     vk_surf_use(cb, s, VK_LAYOUT(TRANSFER_SRC_OPTIMAL),
                 VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -1040,6 +1052,23 @@ static int flush_swizzle(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 at, cons
                   (unsigned long long)s->gva, (unsigned long long)need);
         return 0;
     }
+    if (s->msaa && !surf_volume(s)) {
+        /* a layer at a time through the scratch buffer: one whose samples did not unpack is not moved, and buf keeps
+           its bytes there, as the copy of a pitch linear one does. Moved, it would swizzle the scratch buffer's old
+           bytes over them */
+        for (u32 i = 0; i < moves; i++) {
+            FlushPart one = *part;
+            one.layer = part->layer + i;
+            one.layers = 1;
+            int copied = flush_copy(cb, s, scratch, 0, pitch, &one);
+            if (!copied) return 0;
+            if (copied < 0) continue;
+            vk_bl_barrier(cb, 1);
+            if (!vk_bl_move(cb, &m, 1, buf, at + (u64)i * s->layer_size, scratch, 0)) return 0;
+            vk_bl_barrier(cb, 0);
+        }
+        return 1;
+    }
     if (!flush_copy(cb, s, scratch, 0, pitch, part)) return 0;
     vk_bl_barrier(cb, 1);
     for (u32 i = 0; i < moves; i++)
@@ -1055,7 +1084,7 @@ static int flush_swizzle(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 at, cons
 static int flush_record(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 at, const FlushPart* part) {
     u32 row = guest_w(s) * s->f.bpp, pitch = (row + 15) & ~15u;
     u64 limit = g_vk.alloc_cap / VK_PART_SHARE, first, lo, hi;
-    if (!s->bl) return flush_copy(cb, s, buf, at, row, part);
+    if (!s->bl) return flush_copy(cb, s, buf, at, row, part) != 0;
     if ((u64)pitch * part->rows * part->layers <= limit || surf_volume(s) || depth_packs(s) ||
         (!s->msaa && (s->sw != s->w || s->sh != s->h)))
         return flush_swizzle(cb, s, buf, at, part);
@@ -1134,7 +1163,7 @@ static u32 cpu_newer(const Surf* s, u64 size, CpuRuns* r) {
 static void flush_rebase(Surf* s, u64 size, int kept, u64 gw0) {
     int tracked = 0;
     if (kept) {
-        gpu_mem_written(s->gva, size);
+        gpu_mem_written_by(s->gva, size, GPU_WRITE_TARGET, (u32)s->f.vk, s->gva);
         s->gw = gw0;
         s->draw_wseen = 0;
         s->mem_wseen = 0;
@@ -1285,18 +1314,19 @@ static void flush_land(Surf* s, const u8* p, const u8* original, u64 wgen, u8** 
         for (u32 i = 0; i <= kept; i++) {
             u64 to = i < kept ? newer.run[i][0] : sz;
             if (to > at) {
-                gmem_write(gva + at, tmp + at, to - at);
+                gmem_write_by(gva + at, tmp + at, to - at, GPU_WRITE_TARGET, (u32)s->f.vk, s->gva);
                 flush_note_landed(gva, at, to);
             }
             if (i < kept) at = newer.run[i][1];
         }
         free(tmp);
     } else if (tmp) {
-        gmem_write(gva, tmp, sz);
+        gmem_write_by(gva, tmp, sz, GPU_WRITE_TARGET, (u32)s->f.vk, s->gva);
         flush_note_landed(gva, 0, sz);
         free(tmp);
     } else {
-        gpu_mem_written(gva, sz); /* caches built from this memory check it again */
+        /* caches built from this memory check it again */
+        gpu_mem_written_by(gva, sz, GPU_WRITE_TARGET, (u32)s->f.vk, s->gva);
         flush_note_landed(gva, 0, sz);
     }
     g_rt_flushing = flushing;
@@ -1532,7 +1562,7 @@ static void publish_span(const Surf* s, VkOwnRes* r, u64 base, u64 at, u64 n) {
             vk_own_publish(cpu, k, r, off - base);
         off += k;
     }
-    gpu_mem_written(s->gva + at, n);
+    gpu_mem_written_by(s->gva + at, n, GPU_WRITE_IMAGE, (u32)s->f.vk, s->gva);
 }
 #define RT_OWN_RUNS 4
 static u32 rt_own_runs(const Surf* s, u64 size, u64 run[][2], u32 max);
@@ -1541,6 +1571,36 @@ static u32 rt_own_runs(const Surf* s, u64 size, u64 run[][2], u32 max);
    written all the same, and all that is built from them was loaded again. One game writes each level of its reflection
    cubes through a view of that level, whose layers are a whole mip chain apart, so each view's span holds the other
    views' levels: every view and every cube loaded all its memory again each frame, 30 uploads and 12 MB */
+/* The record of GPU-side writes is by 4 KiB page, and a mip tail's levels share a page: the publish of one level's
+   storage surface stamped the page, and every target or stored surface of another level in it read as written after
+   its draw (vk_rt_drawn_fresh), though no byte of it changed. One game's cubes kept four levels of each face so, and
+   loaded them from memory in each present. The drawn surfaces over [lo, hi)'s pages that are fresh
+   before the publish and share no byte with s's span keep their baseline past its stamp (keep_fresh_after) */
+#define KEEP_FRESH 64
+static u64 g_drawn_max; /* defined with the drawn list below */
+typedef struct {
+    Surf* s[KEEP_FRESH];
+    int n;
+} KeepFresh;
+static void keep_fresh_before(const Surf* s, u64 lo, u64 hi, KeepFresh* k) {
+    Surf* d[KEEP_FRESH];
+    k->n = 0;
+    if (hi <= lo) return;
+    const u64 plo = lo & ~0xFFFull, phi = (hi + 0xFFF) & ~0xFFFull;
+    int n = vk_rt_drawn_in(plo > g_drawn_max ? plo - g_drawn_max : 0, phi, d, KEEP_FRESH);
+    if (n > KEEP_FRESH) n = KEEP_FRESH;
+    for (int i = 0; i < n; i++) {
+        Surf* o = d[i];
+        const u64 olo = o->gva, ohi = o->gva + rt_bytes(o);
+        if (o == s || ohi <= plo || olo >= phi || (olo < hi && lo < ohi) || !o->draw_wseen ||
+            gpu_mem_dirty_since(o->draw_gw, olo, ohi - olo))
+            continue;
+        k->s[k->n++] = o;
+    }
+}
+static void keep_fresh_after(const KeepFresh* k) {
+    for (int i = 0; i < k->n; i++) k->s[i]->draw_gw = gpu_mem_generation();
+}
 static void publish_own(const Surf* s, VkOwnRes* r, u64 size) {
     const u64 own = rt_layer_bytes(s);
     const u32 layers = surf_volume(s) || s->layers < 2 || own >= s->layer_size ? 1 : s->layers;
@@ -1624,6 +1684,71 @@ static int publish_bands(Surf* s, u64 size, u32 mem_wgen, u64 gw0) {
     rt_publish_newer(s, size, 1);
     return 1;
 }
+/* the parts of a publish's span [0, size) that its flush leaves as guest memory has them, as ranges of the span in
+   r[n][2], sorted and apart: 0 when they are more than max, and the caller reads the span whole. Each 2D layer of a
+   block linear target writes every GOB whose 64 bytes and 8 rows its image holds whole: the GOBs left are those at the
+   image's right and bottom edges, which hold padding, and the span past the layout's size. The CPU's newer runs are
+   read too, as the caller copies them out of the read (cpu_newer). Reading the span whole read every result over it,
+   about 35 copies a publish in one game's race, and the flush wrote over nearly all of them */
+static u32 publish_gaps(const Surf* s, u64 size, const CpuRuns* newer, u64 (*r)[2], u32 max) {
+    u32 n = 0;
+    u64 row = (u64)guest_w(s) * s->f.bpp, h = guest_h(s), base = 0;
+    u32 gx = (u32)((row + 63) / 64), gy = (u32)((h + 7) / 8), full_x = (u32)(row / 64), full_y = (u32)(h / 8);
+    u32 bh = bl_height((u32)h, s->bh), block = 1u << bh;
+    u32 blocks_y = (gy + block - 1) >> bh;
+    u64 gob = 512, bsize = gob << bh, layout = (u64)gx * blocks_y * bsize;
+#define GAP(lo_, hi_)                                                                                                  \
+    do {                                                                                                               \
+        u64 lo = (lo_), hi = (hi_) < size ? (hi_) : size;                                                              \
+        if (lo >= hi) break;                                                                                           \
+        if (n && r[n - 1][1] >= lo) {                                                                                  \
+            if (hi > r[n - 1][1]) r[n - 1][1] = hi;                                                                    \
+        } else {                                                                                                       \
+            if (n == max) return 0;                                                                                    \
+            r[n][0] = lo;                                                                                              \
+            r[n++][1] = hi;                                                                                            \
+        }                                                                                                              \
+    } while (0)
+    /* each layer, layer_size apart: blocks in layout order, where a block of a column the image spans whole is
+       left only below its rows, and a column it spans in part, or not at all, is left whole; then the bytes up to the
+       next layer */
+    for (u32 l = 0; l < s->layers; l++, base += s->layer_size) {
+        for (u32 by = 0; by < blocks_y; by++)
+            for (u32 bx = 0; bx < gx; bx++) {
+                u64 at = base + ((u64)by * gx + bx) * bsize;
+                u32 first = by << bh; /* the block's first GOB row */
+                if (bx >= full_x)
+                    GAP(at, at + bsize);
+                else if (first + block > full_y)
+                    GAP(at + (u64)(full_y > first ? full_y - first : 0) * gob, at + bsize);
+            }
+        GAP(base + layout, l + 1 < s->layers ? base + s->layer_size : size);
+    }
+#undef GAP
+    /* the CPU's runs, merged in order */
+    for (u32 i = 0; i < newer->n; i++) {
+        u64 lo = newer->run[i][0], hi = newer->run[i][1];
+        u32 k = 0;
+        while (k < n && r[k][1] < lo) k++;
+        if (k < n && r[k][0] <= hi) { /* overlaps or touches r[k] */
+            if (lo < r[k][0]) r[k][0] = lo;
+            if (hi > r[k][1]) r[k][1] = hi;
+            while (k + 1 < n && r[k + 1][0] <= r[k][1]) { /* and the ones after it it reaches */
+                if (r[k + 1][1] > r[k][1]) r[k][1] = r[k + 1][1];
+                for (u32 j = k + 1; j + 1 < n; j++) r[j][0] = r[j + 1][0], r[j][1] = r[j + 1][1];
+                n--;
+            }
+        } else {
+            if (n == max) return 0;
+            for (u32 j = n; j > k; j--) r[j][0] = r[j - 1][0], r[j][1] = r[j - 1][1];
+            r[k][0] = lo;
+            r[k][1] = hi;
+            n++;
+        }
+    }
+    return n ? n : (u32)-1; /* -1: nothing to read, the flush writes it all */
+}
+u64 g_vk_publish_reads_cut, g_vk_publish_bytes_skipped; /* publishes that read only their gaps, and the bytes left */
 int vk_surf_publish(Surf* s) {
     SNX_ZONE(z_publish, "surface publish");
     u64 size = flush_bytes(s);
@@ -1655,9 +1780,34 @@ int vk_surf_publish(Surf* s) {
        keeps its bytes, and the copy is what brings them; so does a layer's span with room after it, which the copy
        leaves as it found it (publish_own writes each layer's own bytes only) */
     u64 row = (u64)guest_w(s) * s->f.bpp;
-    int covers_all = s->bl && s->layers == 1 && !surf_volume(s) && kept == 0 &&
+    int covers_all = s->bl && !s->msaa && s->layers == 1 && !surf_volume(s) && kept == 0 &&
                      bl_size((u32)row, guest_h(s), s->bh) == row * guest_h(s);
-    if (!covers_all && !vk_guest_read_device(s->gva, size, r->buf, 0)) {
+    /* one list for every publish, as threads publish one at a time (vk_lock). The read below can publish again on the
+       same thread (gmem_need lands a kept storage image, image_flush_at, vk_surf_keep_end), and that publish would
+       write over the list the read walks: it reads its span whole instead */
+    static u64 gaps[4096][2];
+    static int gaps_busy;
+    /* a multisampled target reads its span whole: a layer whose samples fail to unpack (vk_ms_unpack) keeps the bytes
+       guest memory has */
+    u32 ngaps = !gaps_busy && !covers_all && s->bl && !s->msaa && !surf_volume(s) && !depth_packs(s) &&
+                        (s->layers == 1 || s->layer_size >= rt_layer_bytes(s))
+                    ? publish_gaps(s, size, &newer, gaps, sizeof gaps / sizeof *gaps)
+                    : 0;
+    if (ngaps) { /* the parts the flush leaves alone */
+        u64 read = 0;
+        if (ngaps != (u32)-1) {
+            for (u32 i = 0; i < ngaps; i++) read += gaps[i][1] - gaps[i][0];
+            gaps_busy = 1;
+            int ok = vk_guest_read_owned_runs(s->gva, (const u64(*)[2])gaps, ngaps, r);
+            gaps_busy = 0;
+            if (!ok) {
+                vk_own_res_unref(r);
+                return 0;
+            }
+        }
+        g_vk_publish_reads_cut++;
+        g_vk_publish_bytes_skipped += size - read;
+    } else if (!covers_all && !vk_guest_read_owned(s->gva, size, r, 0)) {
         vk_own_res_unref(r);
         return 0;
     }
@@ -1704,7 +1854,10 @@ int vk_surf_publish(Surf* s) {
     const Surf* publishing = g_rt_publishing;
     g_rt_publishing = s;
     const u32 retired = rt_retire_over(s->gva, size, s, r, 0);
+    KeepFresh keep;
+    keep_fresh_before(s, s->gva, s->gva + size, &keep);
     publish_own(s, r, size);
+    keep_fresh_after(&keep);
     g_rt_publishing = publishing;
     s->pub_serial = __atomic_load_n(&r->serial, __ATOMIC_ACQUIRE);
     vk_own_res_unref(r);
@@ -1929,6 +2082,18 @@ static void rt_before_cpu(u64 cpu, u64 size, int publish) {
 /* Before a writer of guest memory on the CPU (the mirror's land_entry): written back, as its write follows at once and
    a publish would trap the pages again between its own_acquire and its write */
 void vk_rt_before_write_cpu(u64 cpu, u64 size) { rt_before_cpu(cpu, size, 0); }
+static void rt_pending_any(void* ctx, u64 gva, u64 size) {
+    int* any = ctx;
+    if (!*any && pend_hit_va(&g_rt_pages, gva, size)) *any = 1;
+}
+int vk_rt_pending_cpu(u64 cpu, u64 size) {
+    int any = 0;
+    if (!size) return 0;
+    vk_lock();
+    gmmu_aliases(cpu, size, rt_pending_any, &any);
+    vk_unlock();
+    return any;
+}
 /* Before a producer's owner goes over [cpu, cpu + size) (own_publish): the older targets there are published, as a
    release's are (rt_publish_now), their spans copied into owners on the GPU that the producer's owner then replaces
    where they meet, with no wait. Written back, each was a readback, a wait for the GPU and the landing of the owners
@@ -2416,12 +2581,19 @@ void vk_rt_drawn_full(Surf* s) {
     vk_rt_drawn(s);
     mem_baseline(s);
 }
-int vk_rt_drawn_fresh(Surf* s) {
-    u64 size = rt_bytes(s);
-    if (!s->draw_wseen || s->layout == VK_IMAGE_LAYOUT_UNDEFINED || gpu_mem_dirty_since(s->draw_gw, s->gva, size))
+int vk_rt_drawn_fresh(Surf* s) { return vk_rt_drawn_fresh_in(s, 0, rt_bytes(s)); }
+void vk_surf_stored(Surf* s) {
+    if (s->gva >> 63) return;
+    vk_rt_drawn_full(s); /* the publish wrote every byte: the baseline is from now, after its stamp */
+}
+int vk_rt_drawn_fresh_in(Surf* s, u64 at, u64 size) {
+    const u64 all = rt_bytes(s);
+    if (at >= all) return 0;
+    if (size > all - at) size = all - at;
+    if (!s->draw_wseen || s->layout == VK_IMAGE_LAYOUT_UNDEFINED || gpu_mem_dirty_since(s->draw_gw, s->gva + at, size))
         return 0;
     if (s->draw_has_hash) return rt_mem_hash(s) == s->draw_hash;
-    int written = vk_written_since(gmem_host(s->gva, size), size, s->draw_wseen);
+    int written = vk_written_since(gmem_host(s->gva + at, size), size, s->draw_wseen);
     if (written < 0) {
         /* no write tracking, and no baseline yet: the target's pixels are taken this once, as the GPU's writes to its
            memory are known and the game's own seldom land in a target it draws to. Its next baselines are hashed */

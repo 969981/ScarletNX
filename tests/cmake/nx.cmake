@@ -4,7 +4,7 @@
 # its variables hold here, and a relative path is from src/nx
 if(BUILD_TESTING)
     add_executable(snx-test-shader-direct "${PROJECT_SOURCE_DIR}/tests/shader_direct.c")
-    snx_test_target(snx-test-shader-direct 11)
+    snx_test_target(snx-test-shader-direct gnu23)
     target_link_libraries(snx-test-shader-direct PRIVATE snx_shader)
     if(NOT WIN32)
         target_link_libraries(snx-test-shader-direct PRIVATE Threads::Threads m)
@@ -12,21 +12,21 @@ if(BUILD_TESTING)
     add_test(NAME shader_direct_structure COMMAND $<TARGET_FILE:snx-test-shader-direct> --check-only)
     add_executable(snx-test-shader-direct-regressions "${PROJECT_SOURCE_DIR}/tests/shader_direct_regressions.c"
                    "${PROJECT_SOURCE_DIR}/tests/support/spv_eval.c")
-    snx_test_target(snx-test-shader-direct-regressions 11)
+    snx_test_target(snx-test-shader-direct-regressions gnu23)
     target_link_libraries(snx-test-shader-direct-regressions PRIVATE snx_shader)
     if(NOT WIN32)
         target_link_libraries(snx-test-shader-direct-regressions PRIVATE Threads::Threads m)
     endif()
     add_test(NAME shader_direct_regressions COMMAND $<TARGET_FILE:snx-test-shader-direct-regressions>)
     add_executable(snx-test-shader-mixed-sample-safe "${PROJECT_SOURCE_DIR}/tests/shader_mixed_sample_safe.c")
-    snx_test_target(snx-test-shader-mixed-sample-safe 11)
+    snx_test_target(snx-test-shader-mixed-sample-safe gnu23)
     target_link_libraries(snx-test-shader-mixed-sample-safe PRIVATE snx_shader)
     if(NOT WIN32)
         target_link_libraries(snx-test-shader-mixed-sample-safe PRIVATE Threads::Threads m)
     endif()
     add_test(NAME shader_mixed_sample_safe COMMAND $<TARGET_FILE:snx-test-shader-mixed-sample-safe>)
     add_executable(snx-test-shader-float-rounding "${PROJECT_SOURCE_DIR}/tests/shader_float_rounding.c")
-    snx_test_target(snx-test-shader-float-rounding 11)
+    snx_test_target(snx-test-shader-float-rounding gnu23)
     target_link_libraries(snx-test-shader-float-rounding PRIVATE snx_shader)
     if(NOT WIN32)
         target_link_libraries(snx-test-shader-float-rounding PRIVATE Threads::Threads m)
@@ -34,7 +34,7 @@ if(BUILD_TESTING)
     add_test(NAME shader_float_rounding COMMAND $<TARGET_FILE:snx-test-shader-float-rounding>)
     # snx-shaderc --sm86 on a compute program that starts past its own length in its window (shaderc_sm86_corpus.c)
     add_executable(snx-test-shaderc-sm86-corpus "${PROJECT_SOURCE_DIR}/tests/shaderc_sm86_corpus.c")
-    snx_test_target(snx-test-shaderc-sm86-corpus 99)
+    snx_test_target(snx-test-shaderc-sm86-corpus c23)
     target_link_libraries(snx-test-shaderc-sm86-corpus PRIVATE snx_shader)
     if(NOT WIN32)
         target_link_libraries(snx-test-shaderc-sm86-corpus PRIVATE Threads::Threads m)
@@ -46,49 +46,49 @@ if(BUILD_TESTING)
     set_tests_properties(shaderc_sm86 PROPERTIES FIXTURES_REQUIRED shaderc_sm86 TIMEOUT 60
         PASS_REGULAR_EXPRESSION "1 shaders: 1 translated, 0 unsupported, 0 failed")
     add_executable(snx-test-shader-indexed-ms "${PROJECT_SOURCE_DIR}/tests/shader_indexed_ms.c")
-    snx_test_target(snx-test-shader-indexed-ms 11)
+    snx_test_target(snx-test-shader-indexed-ms gnu23)
     target_link_libraries(snx-test-shader-indexed-ms PRIVATE snx_shader)
     if(NOT WIN32)
         target_link_libraries(snx-test-shader-indexed-ms PRIVATE Threads::Threads m)
     endif()
     add_test(NAME shader_indexed_ms COMMAND $<TARGET_FILE:snx-test-shader-indexed-ms>)
     add_executable(snx-test-shader-integer-half "${PROJECT_SOURCE_DIR}/tests/shader_integer_half.c")
-    snx_test_target(snx-test-shader-integer-half 11)
+    snx_test_target(snx-test-shader-integer-half gnu23)
     target_link_libraries(snx-test-shader-integer-half PRIVATE snx_shader)
     if(NOT WIN32)
         target_link_libraries(snx-test-shader-integer-half PRIVATE Threads::Threads m)
     endif()
     add_test(NAME shader_integer_half COMMAND $<TARGET_FILE:snx-test-shader-integer-half>)
     add_executable(snx-test-shader-tcs-dead-outputs "${PROJECT_SOURCE_DIR}/tests/shader_tcs_dead_outputs.c")
-    snx_test_target(snx-test-shader-tcs-dead-outputs 11)
+    snx_test_target(snx-test-shader-tcs-dead-outputs gnu23)
     target_link_libraries(snx-test-shader-tcs-dead-outputs PRIVATE snx_shader)
     if(NOT WIN32)
         target_link_libraries(snx-test-shader-tcs-dead-outputs PRIVATE Threads::Threads m)
     endif()
     add_test(NAME shader_tcs_dead_outputs COMMAND $<TARGET_FILE:snx-test-shader-tcs-dead-outputs>)
     add_executable(snx-test-shader-blend-images "${PROJECT_SOURCE_DIR}/tests/shader_blend_images.c")
-    snx_test_target(snx-test-shader-blend-images 11)
+    snx_test_target(snx-test-shader-blend-images gnu23)
     target_link_libraries(snx-test-shader-blend-images PRIVATE snx_shader)
     if(NOT WIN32)
         target_link_libraries(snx-test-shader-blend-images PRIVATE Threads::Threads m)
     endif()
     add_test(NAME shader_blend_images COMMAND $<TARGET_FILE:snx-test-shader-blend-images>)
     add_executable(snx-test-shader-half-native "${PROJECT_SOURCE_DIR}/tests/shader_half_native.c")
-    snx_test_target(snx-test-shader-half-native 11)
+    snx_test_target(snx-test-shader-half-native gnu23)
     target_link_libraries(snx-test-shader-half-native PRIVATE snx_shader)
     if(NOT WIN32)
         target_link_libraries(snx-test-shader-half-native PRIVATE Threads::Threads m)
     endif()
     add_test(NAME shader_half_native COMMAND $<TARGET_FILE:snx-test-shader-half-native>)
     add_executable(snx-test-shader-txd-uniform "${PROJECT_SOURCE_DIR}/tests/shader_txd_uniform.c")
-    snx_test_target(snx-test-shader-txd-uniform 11)
+    snx_test_target(snx-test-shader-txd-uniform gnu23)
     target_link_libraries(snx-test-shader-txd-uniform PRIVATE snx_shader)
     if(NOT WIN32)
         target_link_libraries(snx-test-shader-txd-uniform PRIVATE Threads::Threads m)
     endif()
     add_test(NAME shader_txd_uniform COMMAND $<TARGET_FILE:snx-test-shader-txd-uniform>)
     add_executable(snx-test-shader-half-packing "${PROJECT_SOURCE_DIR}/tests/shader_half_packing.c")
-    snx_test_target(snx-test-shader-half-packing 11)
+    snx_test_target(snx-test-shader-half-packing gnu23)
     target_link_libraries(snx-test-shader-half-packing PRIVATE snx_shader)
     if(NOT WIN32)
         target_link_libraries(snx-test-shader-half-packing PRIVATE Threads::Threads m)
@@ -97,7 +97,7 @@ if(BUILD_TESTING)
     foreach(fixture texture_limits alpha_coverage coverage_resolve blend_resolve known_bits capture_tiles fragment_mask mixed_coverage depth_stencil cast_cache)
         string(REPLACE "_" "-" name "${fixture}")
         add_executable(snx-test-shader-${name} "${PROJECT_SOURCE_DIR}/tests/shader_${fixture}.c")
-        snx_test_target(snx-test-shader-${name} 11)
+        snx_test_target(snx-test-shader-${name} gnu23)
         target_link_libraries(snx-test-shader-${name} PRIVATE snx_shader)
         if(NOT WIN32)
             target_link_libraries(snx-test-shader-${name} PRIVATE Threads::Threads m)
@@ -105,7 +105,7 @@ if(BUILD_TESTING)
         add_test(NAME shader_${fixture} COMMAND $<TARGET_FILE:snx-test-shader-${name}>)
     endforeach()
     add_executable(snx-test-shader-shared-reach "${PROJECT_SOURCE_DIR}/tests/shader_shared_reach.c")
-    snx_test_target(snx-test-shader-shared-reach 11)
+    snx_test_target(snx-test-shader-shared-reach gnu23)
     target_link_libraries(snx-test-shader-shared-reach PRIVATE snx_shader)
     if(NOT WIN32)
         target_link_libraries(snx-test-shader-shared-reach PRIVATE Threads::Threads m)
@@ -251,6 +251,11 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     add_test(NAME vulkan_rt_watch COMMAND snx-test-vulkan -H --vk-memory=1)
     set_tests_properties(vulkan_rt_watch PROPERTIES TIMEOUT 60 ENVIRONMENT "SNX_TEST_RT_WATCH_ONLY=1"
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR;watch: needs traps")
+    # a write log in host memory comes back from its pool clear (tests/vulkan_wlog_clear.inc): the unref clears the
+    # windows its readers found, and reads the flags past them
+    add_test(NAME vulkan_wlog_clear COMMAND snx-test-vulkan -H)
+    set_tests_properties(vulkan_wlog_clear PROPERTIES TIMEOUT 60
+        ENVIRONMENT "SNX_TEST_NVN_CASE=wlog_clear" FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     # the budget's trim alone (tests/vulkan_trim.inc): a trim that wants more than everything held would take what the
     # other checks hold
     add_test(NAME vulkan_trim COMMAND snx-test-vulkan -H)
@@ -273,6 +278,12 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     add_test(NAME vulkan_headless_descriptor_heaps COMMAND snx-test-vulkan -H --vk-descriptors-mode=2)
     set_tests_properties(vulkan_headless_descriptor_heaps PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
+    # the same with draw_state_check=1: each word a stage's table keeps from its last table (memo_get) is found
+    # again the full way, and one that differs fails the test
+    add_test(NAME vulkan_headless_descriptor_heaps_check COMMAND snx-test-vulkan -H --vk-descriptors-mode=2
+        --draw-state-check=1)
+    set_tests_properties(vulkan_headless_descriptor_heaps_check PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR;a descriptor kept from the stage's last table")
     # every check again the Vulkan 1.2 way on a newer device, as a game's .ini with vk_api=1.2 asks (gpu/vk/device.c
     # vk12_extensions): the 1.3 commands by their extensions' names, shaders in SPIR-V 1.5, under the validation layer
     # when it is installed, which takes the instance's 1.2 as the version and flags any 1.3 use left
@@ -306,8 +317,10 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     add_test(NAME vulkan_headless_vertex_input_off COMMAND snx-test-vulkan -H --vertex-input-dynamic-state=off)
     # every check again under the validation layer with graphics pipeline libraries (pipeline_libraries=1, where the
     # device has them) and without them: the parts, their layouts and their dynamic state checked by the layer
-    add_test(NAME vulkan_headless_libraries COMMAND snx-test-vulkan -H --pipeline-libraries=1 --vk-validation=1)
-    add_test(NAME vulkan_headless_libraries_off COMMAND snx-test-vulkan -H --pipeline-libraries=0 --vk-validation=1)
+    add_test(NAME vulkan_headless_libraries COMMAND snx-test-vulkan -H --pipeline-libraries=1 --vk-validation=1
+                                                    --vk-ext-shader-object=off)
+    add_test(NAME vulkan_headless_libraries_off COMMAND snx-test-vulkan -H --pipeline-libraries=0 --vk-validation=1
+                                                        --vk-ext-shader-object=off)
     set_tests_properties(vulkan_headless_libraries vulkan_headless_libraries_off PROPERTIES TIMEOUT 120
         ENVIRONMENT "VK_KHRONOS_VALIDATION_REPORT_FLAGS=error" FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     set_tests_properties(vulkan_headless_vertex_input_off PROPERTIES TIMEOUT 120
@@ -315,13 +328,22 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     # every check again with each draw binding the pipeline linked from its parts, never the one made whole, under the
     # validation layer when it is installed (gpu/vk/pipeline.c, VK_EXT_graphics_pipeline_library; a device that
     # doesn't link them skips, 77); and with each pipeline made whole, with the dynamic state the libraries gave
-    add_test(NAME vulkan_headless_pipeline_library_linked COMMAND snx-test-vulkan -H --vk-validation=1)
-    add_test(NAME vulkan_headless_pipeline_library_whole COMMAND snx-test-vulkan -H)
+    add_test(NAME vulkan_headless_pipeline_library_linked COMMAND snx-test-vulkan -H --vk-validation=1
+                                                                  --vk-ext-shader-object=off)
+    add_test(NAME vulkan_headless_pipeline_library_whole COMMAND snx-test-vulkan -H --vk-ext-shader-object=off)
     set_tests_properties(vulkan_headless_pipeline_library_linked PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         ENVIRONMENT "SNX_TEST_GPL=linked;VK_KHRONOS_VALIDATION_REPORT_FLAGS=error"
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     set_tests_properties(vulkan_headless_pipeline_library_whole PROPERTIES TIMEOUT 120 ENVIRONMENT "SNX_TEST_GPL=whole"
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
+    # every check again under the validation layer with each draw's shader objects (gpu/vk/shader_objects.c,
+    # VK_EXT_shader_object): their dynamic state and the layout their sets are bound with checked by the layer. A device
+    # that draws through pipelines, for any reason its log line gives, skips. The pipeline tests above turn them off, so that they still test pipelines
+    add_test(NAME vulkan_headless_shader_objects COMMAND snx-test-vulkan -H --vk-validation=1)
+    set_tests_properties(vulkan_headless_shader_objects PROPERTIES TIMEOUT 120
+        ENVIRONMENT "VK_KHRONOS_VALIDATION_REPORT_FLAGS=error"
+        SKIP_REGULAR_EXPRESSION "draws go through pipelines:"
+        FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR;refused a shader object")
     # the on-screen layer's pass (gpu/vk/ui.c, tests/vulkan_ui.inc) under the validation layer when it is installed:
     # quads as instances, sampled in texels, and the device's buffer given only the quads that changed
     # a vk_gpu_profile pool smaller than asked for, which a driver gave (check_gpuprof_small_pool)
@@ -332,6 +354,11 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     add_test(NAME vulkan_ui COMMAND snx-test-vulkan -H --vk-validation=1)
     set_tests_properties(vulkan_ui PROPERTIES TIMEOUT 60
         ENVIRONMENT "SNX_TEST_UI_ONLY=1;VK_KHRONOS_VALIDATION_REPORT_FLAGS=error"
+        FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
+    # the window's upscaler and anti-aliasing, recorded between the recording thread's commands
+    add_test(NAME vulkan_present_effects COMMAND snx-test-vulkan -H --vk_validation=1)
+    set_tests_properties(vulkan_present_effects PROPERTIES TIMEOUT 60
+        ENVIRONMENT "SNX_TEST_PRESENT_EFFECTS_ONLY=1;VK_KHRONOS_VALIDATION_REPORT_FLAGS=error"
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     # the texture arrays of 32 elements a device that binds 128 samplers a stage gets (PanVK on Bifrost;
     # gpu/vk/texture_arrays.h), under the validation layer: their layouts, pools and the draws that index them
@@ -433,6 +460,7 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
         gpu/vk/cmd.c gpu/vk/descriptors.c gpu/vk/descriptor_heaps.c gpu/vk/descriptor_objects.c
         gpu/vk/memory.c gpu/vk/ledger.c gpu/vk/resource_stats.c gpu/vk/record.c gpu/vk/checkpoints.c gpu/vk/devmem.c gpu/vk/space.c ${snx_astc_plat} "${volk_SOURCE_DIR}/volk.c"
         "${PROJECT_BINARY_DIR}/generated/spirv/astc_spv.c" "${PROJECT_BINARY_DIR}/generated/spirv/blocklinear_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/blocklinear_runs_spv.c"
         "${PROJECT_BINARY_DIR}/generated/spirv/texconv_spv.c" "${PROJECT_BINARY_DIR}/generated/spirv/texconv_etc2_spv.c"
         "${PROJECT_BINARY_DIR}/generated/spirv/texconv_convert_spv.c"
         "${PROJECT_BINARY_DIR}/generated/spirv/texconv_nv12_spv.c"
@@ -461,7 +489,7 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
         "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc7_mode6_dot_spv.c"
         "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc7_quick_dot_spv.c"
         "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc1_spv.c" "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc4_spv.c"
-        "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc5_spv.c"
+        "${PROJECT_BINARY_DIR}/generated/spirv/astc_bc5_spv.c" "${PROJECT_BINARY_DIR}/generated/spirv/astc_kind_spv.c"
         "${PROJECT_SOURCE_DIR}/tests/glsl/bc7_cpu.cpp" "${PROJECT_SOURCE_DIR}/tests/glsl/astc_bc7_cpu.cpp"
         "${PROJECT_SOURCE_DIR}/tests/glsl/astc_bcn_cpu.cpp"
         "${PROJECT_SOURCE_DIR}/tests/glsl/bcn_etc2_cpu.cpp" "${PROJECT_SOURCE_DIR}/tests/glsl/bcn_astc_cpu.cpp"

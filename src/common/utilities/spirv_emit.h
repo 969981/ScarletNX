@@ -790,6 +790,17 @@ void spv_emit_function_end(SpvEmitter* e);
 /* The caller owns the returned words. A module is assembled once after all functions are emitted. */
 uint32_t* spv_emit_finish(const SpvEmitter* e, size_t* word_count);
 
+/* A place in the function's words that spv_emit_rewind comes back to: the words written after it, and the labels
+   made after it, are taken out of the module again. A fusion of two instructions writes the two of them with their
+   own emitters, comes back to the place before them, and writes the fused one from scratch. The types, constants,
+   capabilities and decorations the two made stay: they are in other sections, and an unused one is of no harm. */
+typedef struct {
+    size_t at;         /* the functions section's count at the mark */
+    uint32_t block;    /* the OpLabels made since the function's start */
+} SpvMark;
+SpvMark spv_emit_mark(const SpvEmitter* e);
+void spv_emit_rewind(SpvEmitter* e, SpvMark mark);
+
 /* ---- the generic layer ---- */
 
 /* an extension, declared once however often it is asked for */
@@ -851,7 +862,7 @@ void spv_emit_void_op(SpvEmitter* e, uint32_t opcode, const uint32_t* operands, 
 uint32_t spv_emit_ext(SpvEmitter* e, uint32_t type, uint32_t instruction, const uint32_t* operands, size_t count);
 
 /* the shorthands: SPV(e, opcode, type, operands...) and SPV_VOID(e, opcode, operands...), SPV_EXT(e, type,
-   instruction, operands...), each with one operand at least (C99 has no empty variadic arguments): an instruction
+   instruction, operands...), each with one operand at least (SPV_ARGS's array of unknown size takes no empty initializer): an instruction
    without any is spv_emit_void_op(e, opcode, NULL, 0) */
 #define SPV_ARGS(...)             ((const uint32_t[]){__VA_ARGS__}), (sizeof((const uint32_t[]){__VA_ARGS__}) / 4)
 #define SPV(e, opcode, type, ...) spv_emit_op((e), (opcode), (type), SPV_ARGS(__VA_ARGS__))

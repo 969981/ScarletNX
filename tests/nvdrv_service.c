@@ -1009,9 +1009,30 @@ static void alias_query(u64 cpu, u64 size) {
         CHECK(alias_seen.count[i] == 1 && alias_seen.lo[i] == a && alias_seen.hi[i] == b);
     }
 }
+/* the edges kept at each change: sorted, two for each run, its start's and its end's */
+static void alias_check_edges(void) {
+    const GAlias* x = &g_hle.nvdrv.alias;
+    const GRun* r = g_hle.nvdrv.gruns;
+    if (!x->edges_ok) return;
+    CHECK(x->nedge == 2 * g_hle.nvdrv.ngruns);
+    u8* had = calloc(g_hle.nvdrv.ngruns + 1, 1);
+    CHECK(had);
+    for (u32 i = 0; i < x->nedge; i++) {
+        const GEdge* e = &x->edge[i];
+        CHECK(!i || x->edge[i - 1].key <= e->key);
+        CHECK(e->run < g_hle.nvdrv.ngruns);
+        if (e->key & 1)
+            CHECK(e->key == (r[e->run].cpage << 1 | 1) && !(had[e->run] & 1));
+        else
+            CHECK(e->key == (r[e->run].cpage + r[e->run].pages) << 1 && !(had[e->run] & 2));
+        had[e->run] |= e->key & 1 ? 1 : 2;
+    }
+    free(had);
+}
 /* the runs are sorted, disjoint, and show what the table does over the test's range */
 static void alias_check_runs(void) {
     const GRun* r = g_hle.nvdrv.gruns;
+    alias_check_edges();
     for (u32 k = 0; k + 1 < g_hle.nvdrv.ngruns; k++) CHECK(r[k].pages && r[k].gpage + r[k].pages <= r[k + 1].gpage);
     for (u32 i = 0; i < ALIAS_PAGES; i++) {
         u64 g = (ALIAS_G >> 12) + i, c = gmmu_translate(g << 12);
@@ -1051,6 +1072,20 @@ static void test_gmmu_aliases(void) {
             gmmu_unmap(ALIAS_G + g * 0x1000, n * 0x1000, 0, 0);
         }
         alias_check();
+    }
+    { /* guest pages far apart, up to the top of a guest's memory (AS_TOP), over the last GPU pages: their edges' keys
+         differ in their high bits as well, so the edges kept in order (grun_change, alias_build) are checked across
+         all of guest memory. The test's other mappings differ in their low bits only */
+        static const u64 apart[] = {0x7FFFF00000ull, ALIAS_C + 0x400000, 0x1234567000ull, 0x2000000000ull,
+                                    ALIAS_C + 0x800000, 0x40000000ull,   0x7F00000000ull, 0x3FFFFFF000ull};
+        const u32 nf = sizeof apart / sizeof *apart;
+        for (u32 k = 0; k < nf; k++) gmmu_map(ALIAS_G + (u64)(ALIAS_PAGES - 2 * nf + 2 * k) * 0x1000, apart[k], 0x2000);
+        alias_check_runs();
+        for (u32 k = 0; k < nf; k++) {
+            alias_query(apart[k], 0x2000);
+            u32 i = ALIAS_PAGES - 2 * nf + 2 * k;
+            CHECK(alias_seen.count[i] == 1 && alias_seen.count[i + 1] == 1);
+        }
     }
     gmmu_unmap(ALIAS_G, (u64)ALIAS_PAGES * 0x1000, 0, 0);
     alias_check();
