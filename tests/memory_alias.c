@@ -15,7 +15,10 @@
 #include "snx_settings.h"
 #include <dirent.h>
 #include <errno.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -476,6 +479,54 @@ static void test_cycles(void) {
     check_tracking(HEAP_BASE, 0x3000); /* the heap's own pages beside it */
 }
 
+/* A view's source given back to its own pages (mem_alias_end) while another thread scans it for writes, as the
+   renderer's scanner does each epoch: the kernel fills the pages from the pool, and where protection tracks the writes
+   a scan that protected one of them meanwhile failed the read with EFAULT (a fatal: one game's, and the renderer's
+   own checks on a host without userfaultfd). The scanner scans only while the source goes back: beside this thread's
+   own writes it would protect each page again before the write that faulted on it went on (seconds a write on
+   FreeBSD) */
+typedef struct {
+    u64 a, size;
+    _Atomic int scan, stop; /* this thread's asks */
+    _Atomic int scanning;   /* the scanner's answer to scan, once it has scanned or stopped */
+} UnpoolScans;
+static void on_scanned(u8* p, u64 size) { (void)p, (void)size; }
+static void* scanner(void* arg) {
+    UnpoolScans* u = (UnpoolScans*)arg;
+    while (!atomic_load_explicit(&u->stop, memory_order_seq_cst)) {
+        int scan = atomic_load_explicit(&u->scan, memory_order_seq_cst);
+        if (scan)
+            plat_ww_scan(GP(u->a), u->size, on_scanned);
+        else
+            sched_yield();
+        atomic_store_explicit(&u->scanning, scan, memory_order_seq_cst);
+    }
+    return NULL;
+}
+/* the scanner scanning, or not any more: on a busy host it may get no time beside this thread without the wait */
+static void scanner_ask(UnpoolScans* u, int scan) {
+    atomic_store_explicit(&u->scan, scan, memory_order_seq_cst);
+    while (atomic_load_explicit(&u->scanning, memory_order_seq_cst) != scan) sched_yield();
+}
+static void test_unpool_under_scans(void) {
+    UnpoolScans u = {HEAP_BASE + 0x140000, 0x40000, 0, 0, 0};
+    pthread_t t;
+    if (!g_ww) return;
+    CHECK(pthread_create(&t, NULL, scanner, &u) == 0);
+    for (u32 i = 0; i < 300; i++) {
+        for (u64 at = 0; at < u.size; at += 0x1000) gw32(u.a + at, i + (u32)at);
+        CHECK(mem_alias_begin(u.a, u.size) == 0);
+        scanner_ask(&u, 1);
+        mem_alias_end(u.a, u.size);
+        scanner_ask(&u, 0);
+        for (u64 at = 0; at < u.size; at += 0x1000) CHECK(gr32(u.a + at) == i + (u32)at);
+    }
+    atomic_store_explicit(&u.stop, 1, memory_order_seq_cst);
+    pthread_join(t, NULL);
+    CHECK(mem_pool_used() == 0);
+    check_tracking(u.a, u.size);
+}
+
 #if defined(__linux__)
 /* a buffer a GPU would share (an AHardwareBuffer's on Android), a memfd here, and another view of its pages */
 static int buffer(u64 size, u8** view) {
@@ -794,6 +845,7 @@ int main(int argc, char** argv) {
     test_shared_memory();
     test_pool_full(info);
     test_cycles();
+    test_unpool_under_scans();
     test_physical_pool();
 #if defined(__linux__)
     test_migrate();

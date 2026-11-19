@@ -22,6 +22,7 @@
 #include "nx/gpu/texture/astc_bc.h"
 #include "common/gpu/vk/extension_bans.h"
 #include "common/gpu/vk/device_settings.h"
+#include "common/gpu/vk/gpu_pstate.h"
 #include "nx/gpu/vk/hdr_swapchain.h"
 #include "common/gpu/vk/swapchain.h"
 #include "common/gpu/vk/vk_common.h"
@@ -486,21 +487,21 @@ static VkPhysicalDeviceSubgroupSizeControlProperties subgroup_sizes(int has, voi
 /* An Ounce's mesh draws (render.c): VK_EXT_mesh_shader's mesh stage, and its task stage when the device has one. The
    programs' lanes are a warp's (sm86.h), so both stages need a required subgroup size of 32 in full subgroups
    (subgroupSizeControl, computeFullSubgroups, requiredSubgroupSizeStages: sizes says whether the device has them,
-   Vulkan 1.3's or VK_EXT_subgroup_size_control's). Without them, or with the experimental mesh_draws setting off, the
-   draws are skipped, and the log says why once */
+   Vulkan 1.3's or VK_EXT_subgroup_size_control's). Without them, or with the extension off (a ban on the device's
+   driver, or vk_ext_mesh_shader=off: its own line says which), the draws are skipped, and the log says why once */
 static void mesh_choose(int has_ext, const VkPhysicalDeviceMeshShaderFeaturesEXT* f,
                         const VkPhysicalDeviceVulkan13Features* f13, int sizes) {
     VkPhysicalDeviceMeshShaderPropertiesEXT mp = {.sType =
                                                       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
     VkPhysicalDeviceSubgroupSizeControlProperties sp = subgroup_sizes(sizes, has_ext ? &mp : NULL);
     const VkShaderStageFlags both = VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_TASK_BIT_EXT;
-    const char* why = !g_settings.mesh_draws                                    ? "mesh_draws off (experimental)"
-                      : !has_ext                                                ? "no VK_EXT_mesh_shader"
-                      : !f->meshShader                                          ? "no meshShader"
-                      : !f13->subgroupSizeControl || !f13->computeFullSubgroups ? "no subgroup size control"
-                      : sp.minSubgroupSize > 32 || sp.maxSubgroupSize < 32      ? "no subgroups of 32"
+    const char* why = !has_ext         ? "VK_EXT_mesh_shader is off (the line on VK_EXT_mesh_shader says why)"
+                      : !f->meshShader ? "this GPU has no meshShader"
+                      : !f13->subgroupSizeControl || !f13->computeFullSubgroups
+                          ? "this GPU has no subgroup size control"
+                      : sp.minSubgroupSize > 32 || sp.maxSubgroupSize < 32 ? "this GPU has no subgroups of 32"
                       : (sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_MESH_BIT_EXT) == 0
-                          ? "no required subgroup size in the mesh stage"
+                          ? "this GPU has no required subgroup size in the mesh stage"
                           : NULL;
     g_vk.has_mesh = why == NULL;
     g_vk.has_task = g_vk.has_mesh && f->taskShader && (sp.requiredSubgroupSizeStages & both) == both;
@@ -515,7 +516,7 @@ static void mesh_choose(int has_ext, const VkPhysicalDeviceMeshShaderFeaturesEXT
     g_vk.mesh_vertex_granule = mp.meshOutputPerVertexGranularity;
     g_vk.mesh_primitive_granule = mp.meshOutputPerPrimitiveGranularity;
     if (why)
-        LOG("vulkan: mesh draws are skipped: %s%s\n", g_settings.mesh_draws ? "this GPU has " : "", why);
+        LOG("vulkan: mesh draws are skipped: %s\n", why);
     else
         LOG("vulkan: mesh draws use VK_EXT_mesh_shader%s\n",
             g_vk.has_task ? " with task shaders" : ", without task shaders");
@@ -712,6 +713,9 @@ typedef struct {
     ShCaps translate;
     int core13, second, sparse_queue;
     const char* store_none_ext;
+    int has_drm; /* VK_EXT_physical_device_drm in the device's list, after its setting and the bans */
+    int pstate;  /* gpu_pstate's value (SNX_GPU_PSTATE_*) */
+    const char* boost_lacks; /* why an NVIDIA GPU that gpu_pstate holds has no VK_NV_low_latency2, NULL for none */
 } DeviceChoice;
 
 /* extension_needs, of a device as common/gpu/vk/device.c asks for them */
@@ -1012,6 +1016,8 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         has_calibrated_khr = snx_vk_choice_has(c, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
         has_google_timing = !g_opt_headless && snx_vk_choice_has(c, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
         has_host_import = snx_vk_choice_has(c, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+        /* the render node gpu_pstate holds an AMD GPU's clocks on: its properties read, the device not made with it */
+        d->has_drm = snx_vk_choice_has(c, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME);
         has_placed = snx_vk_choice_has(c, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME);
         has_map2 = snx_vk_choice_has(c, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME);
         has_dmabuf = snx_vk_choice_has(c, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) &&
@@ -2232,6 +2238,18 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     }
     if (g_vk.has_display_timing)
         snx_vk_choice_enable(c, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME); /* when presents are shown */
+    /* an NVIDIA GPU's clocks held through VK_NV_low_latency2's boost (gpu_pstate.h), which needs present ids */
+    SnxGpuPstateDevice pstate = {.vendor = g_vk.props.vendorID, .type = (int)g_vk.props.deviceType};
+    d->boost_lacks = NULL;
+    if (pstate.vendor == SNX_GPU_VENDOR_NVIDIA && snx_gpu_pstate_wanted(d->pstate, &pstate)) {
+        if (!snx_vk_choice_has(c, VK_NV_LOW_LATENCY_2_EXTENSION_NAME))
+            d->boost_lacks = "its device has no VK_NV_low_latency2 (the extension's line says why)";
+        else if (!g_vk.has_present_wait && !g_vk.has_present_timing)
+            d->boost_lacks = "its presents carry no ids (VK_KHR_present_id with present_wait, or their 2s), which "
+                             "VK_NV_low_latency2 needs: a run without a window, or vk_ext_khr_present_id off";
+        else
+            g_vk.has_low_latency2 = snx_vk_choice_enable(c, VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+    }
     VkPhysicalDevicePipelineRobustnessFeaturesEXT fpipeline = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT,
         .pNext = chain,
@@ -2288,11 +2306,42 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     return true;
 }
 
+static void pstate_say(const char* line, int warn) {
+    if (warn)
+        WARN("vulkan: %s\n", line);
+    else
+        LOG("vulkan: %s\n", line);
+}
+
+/* The GPU's clocks held while the game runs, as gpu_pstate asks (common/gpu/vk/gpu_pstate.h), on the render node the
+   driver names where the device lists VK_EXT_physical_device_drm (has_drm). A value the setting doesn't take stops the
+   game here, as a player who wrote gpu_pstate=of would otherwise play with what they meant to turn off */
+static void gpu_pstate_hold(int mode, int has_drm, const char* boost_lacks) {
+    VkPhysicalDeviceDrmPropertiesEXT drm = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT};
+    if (has_drm) {
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drm};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+    }
+    SnxGpuPstateDevice d = {g_vk.props.deviceName,
+                            g_vk.props.vendorID,
+                            (int)g_vk.props.deviceType,
+                            drm.hasRender,
+                            drm.renderMajor,
+                            drm.renderMinor,
+                            "/sys",
+                            "/dev",
+                            boost_lacks};
+    snx_gpu_pstate_hold(mode, &d, pstate_say);
+}
+
 /* The device, on the device device_rating rates highest (choose_device), made again once without an extension the
    first one's driver lacked a command of (common/gpu/vk/device.h), and what the renderer sets up on it. 0 with the
    reason in g_vk.start_failure */
 static int create_device(void) {
-    DeviceChoice d = {.vk = g_vk, .translate = g_spirv_translate};
+    /* the GPU's clocks held (gpu_pstate_hold): read here, as an NVIDIA device is made with what holds them */
+    int pstate = snx_gpu_pstate_mode(g_settings.gpu_pstate);
+    if (pstate < 0) fatal("settings: gpu_pstate=%s is not auto, on or off", g_settings.gpu_pstate);
+    DeviceChoice d = {.vk = g_vk, .translate = g_spirv_translate, .pstate = pstate};
     VkExtensionSetting settings[VK_EXTENSION_SETTINGS];
     char none[160], err[1024];
     snprintf(none, sizeof none,
@@ -2395,6 +2444,7 @@ static int create_device(void) {
         snprintf(g_vk.driver_name, sizeof g_vk.driver_name, "%s", dp.driverName);
         LOG("vulkan: the driver that runs: %s, %s (driver ID %d)\n", dp.driverName, dp.driverInfo, (int)dp.driverID);
     }
+    gpu_pstate_hold(pstate, d.has_drm, d.boost_lacks);
     if (g_vk.api_cap && g_vk.props.apiVersion >= VK_API_VERSION_1_3)
         LOG("vulkan: vk_api=1.2 runs the Vulkan 1.2 way on this %u.%u device\n",
             VK_API_VERSION_MAJOR(g_vk.props.apiVersion), VK_API_VERSION_MINOR(g_vk.props.apiVersion));
@@ -2702,6 +2752,10 @@ int vk_swapchain_create(int kind) {
                                    .presentMode = mode,
                                    .clipped = VK_TRUE,
                                    .oldSwapchain = old};
+    /* a swapchain that takes a sleep mode, for the boost below (gpu_pstate_hold) */
+    VkSwapchainLatencyCreateInfoNV latency = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV,
+                                              .latencyModeEnable = VK_TRUE};
+    if (g_vk.has_low_latency2) ci.pNext = &latency;
     /* old is retired by the create, made or not: on any failure it goes too, and the next present starts anew */
     VkSwapchainKHR sc;
     VkSemaphore done[VK_SC_MAX];
@@ -2728,6 +2782,19 @@ int vk_swapchain_create(int kind) {
     }
     if (old) swapchain_retire();
     g_vk.swapchain = sc;
+    if (g_vk.has_low_latency2) {
+        /* the boost alone: no sleep is asked, so its low latency mode stays off and the game keeps its own pace */
+        VkLatencySleepModeInfoNV boost = {.sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV,
+                                          .lowLatencyMode = VK_FALSE,
+                                          .lowLatencyBoost = VK_TRUE};
+        VkResult br = vkSetLatencySleepModeNV(g_vk.dev, sc, &boost);
+        if (br != VK_SUCCESS)
+            WARN("vulkan: gpu_pstate: vkSetLatencySleepModeNV refused the swapchain's boost: %s (%d): the driver "
+                 "chooses the clocks\n",
+                 snx_vk_result_str(br), (int)br);
+        else if (!g_vk.sc_made)
+            LOG("vulkan: gpu_pstate: the swapchain asks the GPU's boost (vkSetLatencySleepModeNV, lowLatencyBoost)\n");
+    }
     /* the times presents are held until: the system's CLOCK_MONOTONIC (plat_monotonic_ns) if the swapchain has it,
        else a present stage's own clock, calibrated against CLOCK_MONOTONIC at each present (display.c), the stage
        the first pixel goes out at if it can be. VK_GOOGLE_display_timing's are CLOCK_MONOTONIC's, under FIFO */

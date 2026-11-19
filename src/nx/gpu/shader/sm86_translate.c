@@ -96,7 +96,7 @@ typedef struct {
     u32 nfrags, nacc;
     u32 coop_gen[256];               /* the writes each register took, which the matrices are held against */
     u32 stage_slots;                 /* hmma's A and B staged a warp each (g_spirv_translate.hmma_stage, Workgroup) */
-    u32 warp_base;                   /* warp_read's index high bits, made once: every read of a module's is the same */
+    u32 warp_base;                   /* warp_read's index high bits, made once a block (coop_flow forgets it) */
     u32 push, push_ptr; /* a vertex program's push constant vec4: the base instance, the depth fix (vk/render.c) */
     /* with cb_windows, a vertex or fragment program's one push block (unified_push): the members of push and
        scaled_push, then the three uvec4 of its constant buffers' window offsets from member cbw_member */
@@ -157,6 +157,10 @@ typedef struct {
     BrxTable* brx_table; /* by instruction, the jump table that brx_resolve found for its BRX */
     int brx_resolved;    /* brx_resolve has looked for the tables */
     u32 cur;         /* the instruction being written */
+    /* the registers an IPA that ipa_over_w takes writes, and those a MUFU.RCP writes, a bit each, made at the first
+       FMUL fmul_over_w looks at: an FMUL of two others needs no search */
+    u32 over_w_ipa[8], over_w_rcp[8];
+    int over_w_known;
     u32 branch_cond; /* the condition of the BRA that ends the body before, 0 for always */
     u32 branch_target; /* the instruction that the BRX which ends the body before goes to */
     /* a task or mesh program's ISBE (isbe_var): a mesh program's attribute area and map (Workgroup), a task
@@ -533,6 +537,33 @@ static u32 f64_type(Ctx* c) {
 static u32 nocontract(Ctx* c, u32 v) {
     spv_emit_no_contraction(&c->e, v);
     return v;
+}
+/* p + q for two pairs of floats, rounded to odd: where the sum is not exact, the f32 next to it whose last bit is 1,
+   toward the exact sum. HFMA2 rounds a * b + c once to f16, and a * b is exact in f32, but the sum rounded to the
+   nearest f32 and then by PackHalf2x16 to the nearest f16 can land on an f16 tie that the exact sum is not on (1.5 *
+   35040 + 0.0018 is 52560.0018: 52576, not 52544). The odd f32 is never on one, and f32's 13 more bits make its
+   nearest f16 the exact sum's. TwoSum's error of the nearest sum is exact, as Vulkan's f32 adds are rounded correctly (a sum
+   of f16 values is a multiple of 2^-48, so neither is below the normals); a sum not a number keeps its error from
+   moving it */
+static u32 sum_to_odd(Ctx* c, u32 p, u32 q) {
+    u32 t = c->t_v2f, tu = c->t_v2u, tb = spv_emit_type_vector(&c->e, c->t_bool, 2);
+    u32 s = nocontract(c, op2(c, SPV_OP_F_ADD, t, p, q));
+    u32 qs = nocontract(c, op2(c, SPV_OP_F_SUB, t, s, p)), ps = nocontract(c, op2(c, SPV_OP_F_SUB, t, s, qs));
+    u32 err = nocontract(c, op2(c, SPV_OP_F_ADD, t, nocontract(c, op2(c, SPV_OP_F_SUB, t, p, ps)),
+                                nocontract(c, op2(c, SPV_OP_F_SUB, t, q, qs))));
+    u32 fzero = spv_emit_constant_vec2(&c->e, t, cf(c, 0.0f), cf(c, 0.0f));
+    u32 one = spv_emit_constant_vec2(&c->e, tu, cu(c, 1), cu(c, 1)),
+        zero = spv_emit_constant_vec2(&c->e, tu, c->zero, c->zero);
+    u32 bits = spv_emit_unary(&c->e, SPV_OP_BITCAST, tu, s);
+    u32 even = op2(c, SPV_OP_I_EQUAL, tb, op2(c, SPV_OP_BITWISE_AND, tu, bits, one), zero);
+    u32 move = op2(c, SPV_OP_LOGICAL_AND, tb, op2(c, SPV_OP_F_ORD_NOT_EQUAL, tb, err, fzero), even);
+    /* away from zero where the error has the sum's sign: one more of the magnitude's bits, else one less */
+    u32 away = op2(c, SPV_OP_LOGICAL_EQUAL, tb, op2(c, SPV_OP_F_ORD_LESS_THAN, tb, err, fzero),
+                   op2(c, SPV_OP_F_ORD_LESS_THAN, tb, s, fzero));
+    u32 step = spv_emit_ternary(&c->e, SPV_OP_SELECT, tu, away, one,
+                                spv_emit_constant_vec2(&c->e, tu, cu(c, ~0u), cu(c, ~0u)));
+    bits = spv_emit_ternary(&c->e, SPV_OP_SELECT, tu, move, op2(c, SPV_OP_I_ADD, tu, bits, step), bits);
+    return spv_emit_unary(&c->e, SPV_OP_BITCAST, t, bits);
 }
 /* NAK's FRndMode (bits 78-79): 0 to nearest even, 1 toward -inf, 2 toward +inf, 3 toward zero. r is the result
    rounded to nearest, and above and below say if the exact result is above or below it. A directed mode moves r
@@ -1552,12 +1583,14 @@ static u32 global_address(Ctx* c, const Sm86Insn* in, int uniform_form, int writ
    windows of a pointer table (SH_GBUF_TABLE): its culling programs count and fill their lists at pointers they load
    from cbuf 4 */
 enum { DYN_STORE, DYN_LOAD, DYN_ATOMIC };
+/* the registers a load of mem_type (NAK's MemType) writes: 64 bits two, 128 four */
+static u32 mem_words(u32 type) { return type == 5 ? 2 : type == 6 ? 4 : 1; }
 static void mem_load(Ctx* c, u32 buffer, u32 address, u32 type, u32 dst, int uniform_dst);
 static void mem_store(Ctx* c, u32 buffer, u32 address, u32 type, u32 data);
 static u32 atomic_fadd(Ctx* c, u32 buffer, u32 address, u32 data);
 static void global_dynamic(Ctx* c, const Sm86Insn* in, int kind, u32 opcode, int fadd) {
     int op = in->op, ldst_uniform = op == SM86_LDG || op == SM86_STG;
-    u32 type = sm86_field(in, 73, 3), words = kind == DYN_ATOMIC ? 1 : type == 5 ? 2 : type == 6 ? 4 : 1;
+    u32 type = sm86_field(in, 73, 3), words = kind == DYN_ATOMIC ? 1 : mem_words(type);
     u32 reg = sm86_field(in, 24, 8), imm = sm86_field(in, 40, 24);
     u32 hi = sm86_field(in, ldst_uniform ? 90 : 72, 1) && reg < SM86_RZ ? rd(c, reg + 1) : c->zero;
     u32 address = pair64(c, rd(c, reg), hi);
@@ -1794,7 +1827,7 @@ static void track_step(Ctx* c, u32 i, TrackState* s) {
         return;
     }
     if (op == SM86_LDS || op == SM86_LDL) { /* data from memory, as a load from global memory's */
-        u32 type = sm86_field(in, 73, 3), words = type == 5 ? 2 : type == 6 ? 4 : 1;
+        u32 type = sm86_field(in, 73, 3), words = mem_words(type);
         for (u32 w = 0; w < words && in->dst + w < SM86_RZ; w++) {
             track_write(c, s, 0, in->dst + w, 0, 0, 1, (u16)op, always);
             s->rtab[in->dst + w] = 0, s->rtabx[in->dst + w] = 0, s->rcell[in->dst + w] = 0;
@@ -2265,7 +2298,7 @@ static void mem_ptrs(Ctx* c, u32 buffer, u32 address, u32 n, u32 ptrs[4]) {
 }
 /* a load of mem_type (NAK's MemType) into registers dst on */
 static void mem_load(Ctx* c, u32 buffer, u32 address, u32 type, u32 dst, int uniform_dst) {
-    u32 words = type == 5 ? 2 : type == 6 ? 4 : 1, ptrs[4];
+    u32 words = mem_words(type), ptrs[4];
     mem_ptrs(c, buffer, address, dst >= SM86_RZ ? 1 : words, ptrs);
     for (u32 k = 0; k < words; k++) {
         u32 v = mem_word_load(c, buffer, ptrs[k]);
@@ -2317,7 +2350,7 @@ static void mem_store(Ctx* c, u32 buffer, u32 address, u32 type, u32 data) {
         }
         return;
     }
-    u32 words = type == 5 ? 2 : type == 6 ? 4 : 1, ptrs[4];
+    u32 words = mem_words(type), ptrs[4];
     mem_ptrs(c, buffer, address, words, ptrs);
     for (u32 k = 0; k < words; k++) mem_word_store(c, buffer, ptrs[k], rd(c, data >= SM86_RZ ? data : data + k));
 }
@@ -2741,11 +2774,56 @@ static int reg_const_at(Ctx* c, u32 i, u32 r, u32* value) {
     *value = v;
     return 1;
 }
+/* whether a texture instruction's results go two halves a register: .F16 (bit 79, NAK's note on TLD) on a float
+   result, which all but TXQ's are */
+static int tex_halves(const Sm86Insn* in) {
+    return sm86_field(in, 79, 1) && in->op != SM86_TXQ && in->op != SM86_TXQ_B && in->op != SM86_TXQ_U;
+}
+/* the registers a texture instruction writes (tex_results): one a component of its channel mask, or one a pair of
+   them with tex_halves */
+static u32 tex_result_count(const Sm86Insn* in) {
+    u32 n = snx_popcount64(sm86_field(in, 72, 4));
+    return tex_halves(in) ? (n + 1) / 2 : n;
+}
+/* the register a texture instruction's result k goes to: the first two (one with tex_halves) into dst and on, the
+   others into dst1 (bits 64-71) and on, or on from dst when dst1 is RZ */
+static u32 tex_result_reg(const Sm86Insn* in, u32 k) {
+    u32 d0 = in->dst, d1 = sm86_field(in, 64, 8), first = tex_halves(in) ? 1u : 2u;
+    if (d1 < SM86_RZ && k >= first) return d1 + k - first;
+    return d0 >= SM86_RZ ? d0 : d0 + k;
+}
 /* may_write, of the words an instruction really writes where its type tells: an ALU's result is one but for those of
-   64 bits, and an LDC's as its size says */
+   64 bits, an IPA's one, a load's as its size says, and a texture instruction's those its channel mask selects */
 static int writes_word(const Sm86Insn* in, u32 r) {
     if (!may_write(in, r)) return 0;
-    if (in->op == SM86_LDC) return r < in->dst + (sm86_field(in, 73, 3) == 5 ? 2u : 1u);
+    switch (in->op) {
+        case SM86_IPA: return r == in->dst;
+        case SM86_LDC: return r < in->dst + (sm86_field(in, 73, 3) == 5 ? 2u : 1u);
+        case SM86_LDG:
+        case SM86_LDG_NOU:
+        case SM86_LDL: return r < in->dst + mem_words(sm86_field(in, 73, 3));
+        case SM86_TEX:
+        case SM86_TEX_B:
+        case SM86_TLD:
+        case SM86_TLD_B:
+        case SM86_TLD4:
+        case SM86_TLD4_B:
+        case SM86_TMML:
+        case SM86_TMML_B:
+        case SM86_TXD:
+        case SM86_TXD_B:
+        case SM86_TXQ:
+        case SM86_TXQ_B:
+        case SM86_TEX_U:
+        case SM86_TLD_U:
+        case SM86_TLD4_U:
+        case SM86_TXD_U:
+        case SM86_TXQ_U:
+            for (u32 k = 0; k < tex_result_count(in); k++)
+                if (tex_result_reg(in, k) == r) return 1;
+            return 0;
+        default: break;
+    }
     if (sm86_ops[in->op].kind != SM86_K_ALU) return 1;
     switch (in->op) {
         case SM86_DADD:
@@ -3061,16 +3139,15 @@ static int tex_operands(const Sm86Insn* in, u32 n0, u32 n1, u32* regs) {
    with a zero high half. One game's text programs take an alpha that way (HADD2.F32 R, -RZ, R.H0_H0), and with each
    component in a register of its own their glyphs read the low bits of a float */
 static void tex_results(Ctx* c, const Sm86Insn* in, u32 value, u32 scalar) {
-    u32 mask = sm86_field(in, 72, 4), d0 = in->dst, d1 = sm86_field(in, 64, 8), written = 0;
-    if (scalar == c->t_f32 && sm86_field(in, 79, 1)) {
+    u32 mask = sm86_field(in, 72, 4), written = 0;
+    if (tex_halves(in)) {
         u32 half[4], n = 0;
         for (u32 k = 0; k < 4; k++)
             if (mask & (1u << k)) half[n++] = spv_emit_vec4_extract(&c->e, scalar, value, k);
         for (u32 p = 0; 2 * p < n; p++) {
             u32 pair =
                 spv_emit_vec2_construct(&c->e, c->t_v2f, half[2 * p], 2 * p + 1 < n ? half[2 * p + 1] : cf(c, 0.0f));
-            u32 r = p == 0 || d1 >= SM86_RZ ? (d0 >= SM86_RZ ? d0 : d0 + p) : d1;
-            wr(c, r, pack_half(c, pair));
+            wr(c, tex_result_reg(in, p), pack_half(c, pair));
         }
         return;
     }
@@ -3078,9 +3155,7 @@ static void tex_results(Ctx* c, const Sm86Insn* in, u32 value, u32 scalar) {
         if (!(mask & (1u << k))) continue;
         u32 v = spv_emit_vec4_extract(&c->e, scalar, value, k);
         if (scalar != c->t_u32) v = to_u(c, v);
-        u32 r = written < 2 || d1 >= SM86_RZ ? (d0 >= SM86_RZ ? d0 : d0 + written) : d1 + written - 2;
-        wr(c, r, v);
-        written++;
+        wr(c, tex_result_reg(in, written++), v);
     }
 }
 static u32 coord_vector(Ctx* c, const u32* f, u32 count) {
@@ -3531,7 +3606,7 @@ static u32 warp_lane(Ctx* c) {
     return spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, system_value(c, 0), cu(c, 31));
 }
 /* value as lane j (0-31) of the invocation's own 32 holds it. The index's high bits are the address of the lanes'
-   own 32 in the subgroup's, which every read of a module takes as one value (warp_base) */
+   own 32 in the subgroup's, which every read of a block takes as one value (warp_base) */
 static u32 warp_read(Ctx* c, u32 value, u32 j) {
     if (!c->warp_base)
         c->warp_base = spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, system_value(c, 0), cu(c, ~31u));
@@ -3820,8 +3895,10 @@ static int coop_acc_hold(Ctx* c, u32 d, u32 shape, const u32* mat, u32 nmat) {
     return 1;
 }
 /* the block's end, at its branches and labels: D's words back to their registers, one held D after the other, and the
-   caches empty. A matrix defined here has no value at a label the block's other arms reach too */
+   caches empty. A matrix defined here has no value at a label the block's other arms reach too, nor has warp_read's
+   lane base, which the next block that reads another lane makes again */
 static void coop_flow(Ctx* c) {
+    c->warp_base = 0;
     u32 n = c->nacc;
     c->nacc = c->nfrags = 0; /* the writes below must not find them again */
     if (!n) return;
@@ -4411,9 +4488,8 @@ static u32 ballot32(Ctx* c, u32 pred) {
     return SPV(&c->e, SPV_OP_VECTOR_EXTRACT_DYNAMIC, c->t_u32, all, half);
 }
 
-/* IPA of component k of generic input i: at the centroid (loc 1) or the default place, and with the program's
-   multiply by w taken back for a perspective input of frequency 0 */
-static u32 ipa_input(Ctx* c, u32 i, u32 k, u32 loc, u32 freq) {
+/* component k of generic input i as Vulkan interpolates it, at the centroid (loc 1) or the default place */
+static u32 ipa_attr(Ctx* c, u32 i, u32 k, u32 loc) {
     u32 v = to_f(c, input_load(c, i, k));
     if (loc == 1 && c->in_attr[i] && !(c->centroid_mask & (1u << i))) {
         /* a variable has one location: centroid when any IPA of the input asks for it. An input that no stage
@@ -4422,6 +4498,12 @@ static u32 ipa_input(Ctx* c, u32 i, u32 k, u32 loc, u32 freq) {
         spv_emit_decorate(&c->e, c->in_attr[i], SPV_DECORATION_CENTROID, NULL, 0);
         c->centroid_mask |= 1u << i;
     }
+    return v;
+}
+/* IPA of component k of generic input i, with the program's multiply by w taken back for a perspective input of
+   frequency 0 */
+static u32 ipa_input(Ctx* c, u32 i, u32 k, u32 loc, u32 freq) {
+    u32 v = ipa_attr(c, i, k, loc);
     /* The hardware interpolates attr/w for a perspective input, and the program multiplies by w (the reciprocal of
        a[0x7c]). Vulkan's input is attr itself: times the interpolated 1/w, FragCoord.w */
     if (interp_mode(c, i) == 2 && freq == 0) {
@@ -4430,13 +4512,70 @@ static u32 ipa_input(Ctx* c, u32 i, u32 k, u32 loc, u32 freq) {
     }
     return v;
 }
+/* the last instruction before i in program order that writes register r (writes_word), -1 for none */
+static int nearest_write(Ctx* c, u32 i, u32 r) {
+    for (u32 j = i; j-- > 0;)
+        if (writes_word(&c->in[j], r)) return (int)j;
+    return -1;
+}
+/* the attribute address the IPA at k reads where ipa_input multiplies it by FragCoord.w (a perspective generic at
+   frequency 0, read as the IPA case reads it, which refuses the program for the IPA forms it doesn't take), 0 for
+   another */
+static u32 ipa_over_w(Ctx* c, u32 k) {
+    const Sm86Insn* in = &c->in[k];
+    if (in->op != SM86_IPA || sm86_field(in, 78, 2)) return 0;
+    u32 addr = sm86_field(in, 64, 8) * 4;
+    if (shader_legacy_group(addr) >= 0) addr = shader_legacy_address(addr);
+    return addr >= 0x80 && addr < 0x280 && interp_mode(c, (addr - 0x80) >> 4) == 2 ? addr : 0;
+}
+/* the FMUL at i, with no scale, of two registers with no modifier: one an IPA's that ipa_input multiplied by
+   FragCoord.w (ipa_over_w), the other MUFU.RCP, with no modifier, of IPA's read of a[0x7c] at frequency 0, which is
+   FragCoord.w. Each the one write that reaches its use however control went (reaching_write). That product is the
+   input itself: as Vulkan interpolates it, with neither multiply, whose roundings (the FMUL's in its own mode, toward
+   zero in one game's programs) and infinity past the float range it doesn't take. 0 for another FMUL */
+static u32 fmul_over_w(Ctx* c, u32 i) {
+    const Sm86Insn* in = &c->in[i];
+    if (sm86_field(in, 84, 3) != 4 || in->b.kind != SM86_SRC_REG || in->a.neg || in->a.abs || in->b.neg || in->b.abs)
+        return 0;
+    if (!c->over_w_known) {
+        for (u32 j = 0; j < c->n; j++) {
+            const Sm86Insn* x = &c->in[j];
+            if (x->dst >= SM86_RZ) continue;
+            if (ipa_over_w(c, j)) c->over_w_ipa[x->dst >> 5] |= 1u << (x->dst & 31);
+            if (x->op == SM86_MUFU && sm86_field(x, 74, 6) == 4) c->over_w_rcp[x->dst >> 5] |= 1u << (x->dst & 31);
+        }
+        c->over_w_known = 1;
+    }
+    for (u32 side = 0; side < 2; side++) {
+        /* each operand's write before it in program order first, which costs no walk of the flow, then the walks that
+           prove it the one that reaches it */
+        u32 ra = side ? in->b.reg : in->a.reg, rb = side ? in->a.reg : in->b.reg;
+        if (!(c->over_w_ipa[ra >> 5] >> (ra & 31) & 1) || !(c->over_w_rcp[rb >> 5] >> (rb & 31) & 1)) continue;
+        int k = nearest_write(c, i, ra), m = nearest_write(c, i, rb);
+        u32 addr = k >= 0 ? ipa_over_w(c, (u32)k) : 0;
+        if (!addr || m < 0) continue;
+        const Sm86Insn* r = &c->in[m];
+        if (r->op != SM86_MUFU || sm86_field(r, 74, 6) != 4 || sm86_field(r, 73, 1) || r->b.kind != SM86_SRC_REG ||
+            r->b.neg || r->b.abs)
+            continue;
+        int w = nearest_write(c, (u32)m, r->b.reg);
+        if (w < 0) continue;
+        const Sm86Insn* v = &c->in[w];
+        if (v->op == SM86_IPA && sm86_field(v, 64, 8) * 4 == 0x7c && !sm86_field(v, 78, 2) &&
+            reaching_write(c, i, ra) == k && reaching_write(c, i, rb) == m && reaching_write(c, (u32)m, r->b.reg) == w)
+            return ipa_attr(c, (addr - 0x80) >> 4, (addr >> 2) & 3, sm86_field(&c->in[k], 76, 2));
+    }
+    return 0;
+}
 
 /* ---- one instruction ---- */
 
 /* the fragment program's outputs from the registers when it ends: the colours of the render targets the SPH's omap
    enables, four registers a target, then the sample mask's register and the depth's after it (Maxwell's layout, as
    emit_flow.c reads it: the depth is the last colour register plus two whether the program writes a sample mask or
-   not, as nouveau's nvc0_fp_assign_output_slots has it from Kepler on) */
+   not, as nouveau's nvc0_fp_assign_output_slots has it from Kepler on). An integer target (the key's rt_int_mask,
+   signed in rt_sint_mask) takes the registers' bits in an output of its own numeric type: Vulkan leaves a float
+   output's values undefined in an integer attachment */
 static void epilogue(Ctx* c) {
     if (c->stage == ST_VS && c->position && !(c->si->clip_enable & SNX_SH_NOT_LAST)) vertex_depth_fix(c);
     if (c->stage == ST_GS && c->passthrough) gs_passthrough(c);
@@ -4444,13 +4583,18 @@ static void epilogue(Ctx* c) {
     u32 target = c->sph[18], reg = 0;
     for (u32 rt = 0; rt < 8; rt++) {
         if (!((target >> (rt * 4)) & 15)) continue;
+        int integer = c->si->rt_int_mask >> rt & 1, sign = integer && (c->si->rt_sint_mask >> rt & 1);
+        u32 type = !integer ? c->t_v4f : sign ? spv_emit_type_vec4(&c->e, c->t_i32) : c->t_v4u;
         if (!c->color[rt]) {
-            c->color[rt] = spv_emit_output_vec4(&c->e, c->t_v4f, rt);
+            c->color[rt] = spv_emit_output_vec4(&c->e, type, rt);
             add_interface(c, c->color[rt]);
         }
         u32 v[4];
-        for (u32 k = 0; k < 4; k++) v[k] = to_f(c, rd(c, reg + k));
-        spv_emit_store(&c->e, c->color[rt], spv_emit_vec4_construct(&c->e, c->t_v4f, v));
+        for (u32 k = 0; k < 4; k++) {
+            u32 bits = rd(c, reg + k);
+            v[k] = !integer ? to_f(c, bits) : sign ? spv_emit_unary(&c->e, SPV_OP_BITCAST, c->t_i32, bits) : bits;
+        }
+        spv_emit_store(&c->e, c->color[rt], spv_emit_vec4_construct(&c->e, type, v));
         reg += 4;
     }
     /* reg: the sample mask, which a single-sampled target ignores */
@@ -4830,8 +4974,11 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
             int on = (int)sm86_field(in, 80, 1);
             u32 mode = sm86_field(in, 78, 2), scale = sm86_field(in, 84, 3), v;
             note_ftz(c, on);
-            u32 x = ftz(c, src_f(c, &in->a), on);
-            if (op == SM86_FADD)
+            u32 attr = op == SM86_FMUL ? fmul_over_w(c, c->cur) : 0;
+            u32 x = attr ? 0 : ftz(c, src_f(c, &in->a), on);
+            if (attr)
+                v = attr;
+            else if (op == SM86_FADD)
                 v = float_add(c, mode, x, ftz(c, src_f(c, second(in)), on));
             else if (op == SM86_FMUL) {
                 if (!scale) {
@@ -5463,10 +5610,10 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
                 j = spv_emit_binary(&c->e, SPV_OP_BITWISE_OR, c->t_u32, min_lane,
                                     spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, b, not_seg));
                 ok = op2(c, SPV_OP_U_LESS_THAN_EQUAL, c->t_bool, j, max_lane);
-            } else if (mode == 1) {
+            } else if (mode == 1) { /* UP: in range from the clamp's lane on, as PTX's j >= maxLane */
                 j = spv_emit_binary(&c->e, SPV_OP_I_SUB, c->t_u32, lane, b);
                 ok = op2(c, SPV_OP_S_GREATER_THAN_EQUAL, c->t_bool, spv_emit_unary(&c->e, SPV_OP_BITCAST, c->t_i32, j),
-                         spv_emit_unary(&c->e, SPV_OP_BITCAST, c->t_i32, min_lane));
+                         spv_emit_unary(&c->e, SPV_OP_BITCAST, c->t_i32, max_lane));
             } else {
                 j = mode == 2 ? spv_emit_iadd_u32(&c->e, c->t_u32, lane, b)
                               : spv_emit_binary(&c->e, SPV_OP_BITWISE_XOR, c->t_u32, lane, b);
@@ -5486,10 +5633,11 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
         case SM86_VOTE:
         case SM86_UVOTE: {
             /* NAK's OpVote: the ballot of the predicate at 87-90 into the destination, and ALL (0), ANY (1) or EQ
-               (2, bits 72-73) of it into the predicate at 81-83. The ballot is of the invocation's 32 lanes */
+               (2, bits 72-73) of it into the predicate at 81-83. The ballot, and the vote, are of the invocation's 32
+               lanes, from the ballots of the predicate and of the active lanes: a vote of the subgroup takes both
+               warps of a subgroup of 64 */
             u32 pred = prd(c, sm86_field(in, 87, 3), sm86_field(in, 90, 1), 0), how = sm86_field(in, 72, 2);
             spv_emit_capability(&c->e, SPV_CAPABILITY_GROUP_NON_UNIFORM_BALLOT);
-            spv_emit_capability(&c->e, SPV_CAPABILITY_GROUP_NON_UNIFORM_VOTE);
             u32 ballot = ballot32(c, pred);
             if (op == SM86_UVOTE)
                 uwr(c, sm86_field(in, 16, 6), ballot);
@@ -5499,11 +5647,12 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
                 fail(c, "VOTE mode %u", how);
                 return;
             }
-            u32 vote = SPV(&c->e,
-                           how == 0   ? SPV_OP_GROUP_NON_UNIFORM_ALL
-                           : how == 1 ? SPV_OP_GROUP_NON_UNIFORM_ANY
-                                      : SPV_OP_GROUP_NON_UNIFORM_ALL_EQUAL /* All, Any, AllEqual */,
-                           c->t_bool, cu(c, SPV_SCOPE_SUBGROUP), pred);
+            u32 active = ballot32(c, c->true_v);
+            u32 all = op2(c, SPV_OP_I_EQUAL, c->t_bool, ballot, active),
+                none = op2(c, SPV_OP_I_EQUAL, c->t_bool, ballot, c->zero);
+            u32 vote = how == 0   ? all
+                       : how == 1 ? spv_emit_unary(&c->e, SPV_OP_LOGICAL_NOT, c->t_bool, none)
+                                  : op2(c, SPV_OP_LOGICAL_OR, c->t_bool, all, none);
             pwr(c, sm86_field(in, 81, 3), vote, op == SM86_UVOTE);
             return;
         }
@@ -5696,7 +5845,7 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
                                          op2(c, SPV_OP_U_LESS_THAN, c->t_bool, more, sum));
                 sum = more;
             }
-            if (!is_signed) pwr(c, sm86_field(in, 81, 3), carry, uniform);
+            pwr(c, sm86_field(in, 81, 3), carry, uniform); /* signed too: its 64 bits' carry, as IMAD.WIDE's */
             dwr(c, in, hi32(c, sum));
             return;
         }
@@ -5771,7 +5920,8 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
                modifiers at 83 (abs) and 84 (neg), not where a three-source float's are. Bit 79 is .RELU: a result at or
                below zero becomes zero where the predicate at 87 holds, while infinity and NaN stay. Bit 86 is .H0_NH1:
                b's halves swap and the new low one is negated, the second term of a complex product. Bits 78 and 85 are
-               refused. A product of two halves is exact in a float of 32 bits */
+               refused. A product of two halves is exact in a float of 32 bits, and its sum with c is rounded once
+               (sum_to_odd), as the console's fused multiply-add of halves is */
             int relu = (int)sm86_field(in, 79, 1), h0_nh1 = (int)sm86_field(in, 86, 1);
             if (sm86_field(in, 78, 1) || sm86_field(in, 85, 1) || (relu && sm86_field(in, 77, 1))) {
                 fail(c, "HFMA2 with modes 0x%x, 0x%x, saturate %u", sm86_field(in, 78, 2), sm86_field(in, 85, 2),
@@ -5812,8 +5962,8 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
                 if (neg) pair = SPV(&c->e, SPV_OP_F_NEGATE, c->t_v2f, pair);
                 v[k] = pair;
             }
-            u32 r = nocontract(c, op2(c, SPV_OP_F_ADD, c->t_v2f,
-                                      nocontract(c, spv_emit_binary(&c->e, SPV_OP_F_MUL, c->t_v2f, v[0], v[1])), v[2]));
+            u32 p = nocontract(c, spv_emit_binary(&c->e, SPV_OP_F_MUL, c->t_v2f, v[0], v[1]));
+            u32 r = sum_to_odd(c, p, v[2]);
             if (sm86_field(in, 77, 1))
                 r = SPV_EXT(&c->e, c->t_v2f, SPV_GLSL_N_CLAMP, r,
                             spv_emit_vec2_construct(&c->e, c->t_v2f, cf(c, 0.0f), cf(c, 0.0f)),
@@ -6973,7 +7123,7 @@ static u32 mh_words(const Sm86Insn* in) {
     u32 type = sm86_field(in, 73, 3);
     switch (in->op) {
         case SM86_LDG:
-        case SM86_LDG_NOU: return type == 5 ? 2 : type == 6 ? 4 : 1;
+        case SM86_LDG_NOU: return mem_words(type);
         case SM86_LDC:
         case SM86_ULDC:
         case SM86_ULDC_IDX: return type == 5 ? 2 : 1;
@@ -7725,15 +7875,17 @@ u32* sm86_to_spirv_ftz(const u8* code, u32 bytes, int stage, const u32* sph, Sha
             break;
         }
     /* after the CALLs are inlined and before the passes that move instructions: the pairs of instructions that one
-       operation takes the place of (fuse.c), whose spans the array moves invalidate */
+       operation takes the place of (fuse.c), whose spans the array moves invalidate. A pair whose second half a jump
+       lands on (a BRA's target, a BRX's case, flow_sources' edges) stays two, as that jump runs the second alone */
     {
-        u32 nfuse = 0;
+        u32 nfuse = 0, kept = 0;
         FuseSpan* fuse = sm86_fuse_find(insn, n, &nfuse);
-        if (fuse) { /* the array this function allocates, which the translation reads through c->in */
-            sm86_fuse_make(insn, &n, fuse, nfuse);
-            c->in = insn;
-            c->n = n;
+        if (fuse && !flow_sources(c)) fail(c, "out of memory");
+        for (u32 s = 0; fuse && s < nfuse && !c->failed; s++) {
+            u32 second = fuse[s].pos + 1;
+            if (c->jump_first[second] == c->jump_first[second + 1]) fuse[kept++] = fuse[s];
         }
+        sm86_fuse_make(insn, n, fuse, c->failed ? 0 : kept);
     }
     if (!c->failed && !track_globals(c)) fail(c, "out of memory");
     ShStructure* st = c->failed ? NULL : build_structure(c);

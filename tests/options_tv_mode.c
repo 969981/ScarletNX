@@ -53,7 +53,7 @@ static struct {
     int asked;      /* plat_power_watch's calls */
     int am, hid;    /* am_display_mode_changed's and hid_mode_changed's calls */
     int lines;      /* the log's lines */
-    char logged[256];
+    char logged[2048]; /* a line as options.c makes its longest (say_deprecated's), never cut */
     char said[4096]; /* every line, one after the other */
     int write;       /* plat_replace_file replaces the file: ini_open writes it */
 } g_test;
@@ -79,8 +79,9 @@ void logf_(int lvl, const char* fmt, ...) {
     va_list ap;
     (void)lvl;
     va_start(ap, fmt);
-    vsnprintf(g_test.logged, sizeof g_test.logged, fmt, ap);
+    int n = vsnprintf(g_test.logged, sizeof g_test.logged, fmt, ap);
     va_end(ap);
+    CHECK(n >= 0 && (size_t)n < sizeof g_test.logged); /* a cut line would fail a check of its end, on a long path */
     if (strlen(g_test.said) + strlen(g_test.logged) < sizeof g_test.said) strcat(g_test.said, g_test.logged);
     g_test.lines++;
 }
@@ -437,7 +438,8 @@ static void test_dropped_keys_old(void) {
                                       "mme_verify=0",
                                       "astc_background_threads=4",
                                       "press=10",
-                                      "press_at=2000"};
+                                      "press_at=2000",
+                                      "mesh_draws=0"};
     char *text, file[1024] = "[Debug]\n", key[64], line[256];
     size_t i;
     for (i = 0; i < sizeof old / sizeof old[0]; ++i)
@@ -451,8 +453,9 @@ static void test_dropped_keys_old(void) {
         snprintf(line, sizeof line, "\n; %s: %s\n%s\n", key, ini_deprecated(key), old[i]);
         CHECK(strstr(text, line) && strstr(text, "\n[Deprecated]\n") < strstr(text, line));
     }
-    CHECK(strstr(g_test.said, "keeps 9 keys this version does not use (nvn_direct, nvn_verify, nvn_trace, mme_hle, "
-                              "mme_jit, mme_verify, astc_background_threads, press, press_at), under [Deprecated]"));
+    CHECK(strstr(g_test.said, "keeps 10 keys this version does not use (nvn_direct, nvn_verify, nvn_trace, mme_hle, "
+                              "mme_jit, mme_verify, astc_background_threads, press, press_at, mesh_draws), under "
+                              "[Deprecated]"));
     free(text);
     g_test.write = 0;
 }

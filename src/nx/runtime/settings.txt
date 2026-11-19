@@ -390,15 +390,6 @@ setting Vulkan driver
     help which driver runs and why. On every other system the game runs on the system's driver whatever the value (on
     help Android, gpu_driver's), and the log says so for moltenvk and kosmickrisp. Any other value stops the game,
     help saying so
-setting Mesh draws
-    key mesh_draws
-    label Mesh shader draws (experimental)
-    int 0 1
-    default 0
-    startup
-    words Off|On
-    help 1 = an Ounce game's mesh draws (DrawMeshTasks) draw with VK_EXT_mesh_shader, where the GPU has it.
-    help Experimental: on one NVIDIA GPU most runs with them ended in a GPU fault. 0 = they are skipped
 setting Vertex input dynamic state
     key vertex_input_dynamic_state
     text 16
@@ -602,6 +593,20 @@ setting Thread stack (MB)
     startup
     help The host stack of each of the game's threads, in MB: a game's deep calls take it. Less leaves address space
     help for more threads where a device has little, and a game that calls very deep may then stop
+setting GPU pstate
+    label GPU clocks held
+    key gpu_pstate
+    text 16
+    default auto
+    startup
+    words auto=Auto|on=On|off=Off
+    help Holds the GPU's clocks up while the game runs. A frame keeps the GPU half idle (it waits for the frame's
+    help commands, then the game waits for it), and a driver that sets the clocks by how busy the GPU is lowers them,
+    help which makes every frame slower. auto = held on a discrete GPU where its driver lets a program do it: AMD's on
+    help Linux (amdgpu's peak stable pstate, from the level auto), NVIDIA's (VK_NV_low_latency2's boost); and on a
+    help phone's Adreno (kgsl's top power level while frames are presented); not on a computer's integrated GPU, which
+    help shares its power with the CPU. on = held there too. off = the driver sets them. The log says which, and why
+    help where they are not held. Any other value stops the game, saying so
 setting Pipeline threads
     key pipeline_threads
     int 0 32
@@ -2107,6 +2112,7 @@ setting @VK_EXT_memory_budget
 setting @VK_EXT_memory_priority
 setting @VK_EXT_mesh_shader
 setting @VK_EXT_pageable_device_local_memory
+setting @VK_EXT_physical_device_drm
 setting @VK_EXT_pipeline_creation_feedback
 setting @VK_EXT_pipeline_robustness
 setting @VK_EXT_post_depth_coverage
@@ -2160,6 +2166,7 @@ setting @VK_KHR_video_queue
 setting @VK_NV_device_diagnostic_checkpoints
 setting @VK_NV_fragment_coverage_to_color
 setting @VK_NV_framebuffer_mixed_samples
+setting @VK_NV_low_latency2
 setting @VK_NV_shading_rate_image
 setting @VK_VALVE_shader_mixed_float_dot_product
 

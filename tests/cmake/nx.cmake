@@ -184,9 +184,17 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
         target_link_libraries(snx-test-vulkan PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,snx_jemalloc>")
     endif()
     add_test(NAME vulkan_headless COMMAND snx-test-vulkan -H)
-    # an Ounce game's mesh draws, which the experimental mesh_draws setting turns on (check_mesh_draws)
-    add_test(NAME vulkan_headless_mesh COMMAND snx-test-vulkan -H --mesh-draws=1)
+    # an Ounce game's mesh draws (check_mesh_draws) with VK_EXT_mesh_shader over any ban on it: the retest of its lines in
+    # src/common/gpu/vk/extension_bans.txt. vulkan_headless draws them too where no ban holds
+    add_test(NAME vulkan_headless_mesh COMMAND snx-test-vulkan -H --vk-ext-mesh-shader=on)
     set_tests_properties(vulkan_headless_mesh PROPERTIES TIMEOUT 60
+        FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
+    # an Ounce fragment program's colour into integer targets (tests/vulkan_ounce_int_targets.inc) under the validation
+    # layer when it is installed, which reports a float output in an integer attachment
+    add_test(NAME vulkan_ounce_int_targets COMMAND snx-test-vulkan -H --vk-validation=1)
+    set_tests_properties(vulkan_ounce_int_targets PROPERTIES TIMEOUT 60
+        ENVIRONMENT "SNX_TEST_OUNCE_INT_ONLY=1"
+        PASS_REGULAR_EXPRESSION "PASS headless Vulkan Ounce integer targets only"
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     # a save state of a game whose NVN the runtime runs, saved and loaded through state.c: the frame before the save
     # comes back after the load (tests/vulkan_nvn_savestate.inc). Alone, as the load replaces the guest memory. With

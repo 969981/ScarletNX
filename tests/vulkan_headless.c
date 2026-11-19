@@ -7390,6 +7390,8 @@ static int check_pipeline_stats_compute(void) {
 #include "vulkan_alpha_coverage.inc"
 #include "vulkan_indexed_feedback.inc"
 #include "vulkan_scaled_fragment.inc"
+#include "vulkan_sm86_perspective_fold.inc"
+#include "vulkan_ounce_int_targets.inc"
 #include "vulkan_slices_from_targets.inc"
 #include "vulkan_targetless_stores.inc"
 #include "vulkan_storage_image_keep.inc"
@@ -7646,6 +7648,9 @@ static int check_vk12_way(void) {
             g_vk.api >= VK_API_VERSION_1_3 || snx_vk_extensions_has(&dev, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
         int mesh = snx_vk_extensions_has(&dev, VK_EXT_MESH_SHADER_EXTENSION_NAME);
         snx_vk_extensions_free(&dev);
+        /* the extension as the renderer took it: an off ban on it that holds for this driver takes it out, unless
+           vk_ext_mesh_shader=on goes over the ban (vk_ban_find answers 0 then) */
+        int mesh_on = mesh && !vk_ban_find(VK_EXT_MESH_SHADER_EXTENSION_NAME);
         VkPhysicalDeviceMeshShaderFeaturesEXT mf = {.sType =
                                                         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
         VkPhysicalDeviceSubgroupSizeControlFeatures sf = {
@@ -7662,8 +7667,8 @@ static int check_vk12_way(void) {
         int of32 = sized && sf.subgroupSizeControl && sf.computeFullSubgroups && sp.minSubgroupSize <= 32 &&
                    sp.maxSubgroupSize >= 32;
         int warp32 = of32 && (sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
-        int meshes = g_settings.mesh_draws && mesh && mf.meshShader && of32 &&
-                     (sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_MESH_BIT_EXT) != 0;
+        int meshes =
+            mesh_on && mf.meshShader && of32 && (sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_MESH_BIT_EXT) != 0;
         if (g_vk.has_cs_warp32 != warp32 || g_vk.has_mesh != meshes)
             fprintf(stderr,
                     "subgroup sizes: the Vulkan %u.%u way has compute subgroups of 32 %d and mesh draws %d, where "
@@ -8092,6 +8097,8 @@ static int run_headless(int argc, char** argv) {
             result = check_draw_memo();
         else if (!strcmp(name, "surface_loads"))
             result = check_layered_surface_loads();
+        else if (!strcmp(name, "targetless_stores"))
+            result = check_targetless_stores();
         else if (!strcmp(name, "owned_page_reads"))
             result = check_owned_page_reads();
         else if (!strcmp(name, "cross_stage_blend"))
@@ -8266,6 +8273,13 @@ static int run_headless(int argc, char** argv) {
         vk_finish();
         vk_pipeline_quiesce();
         printf("PASS headless Vulkan resolution scale only: %u validation messages\n", g_vk_validation_messages);
+        return 0;
+    }
+    if (getenv("SNX_TEST_OUNCE_INT_ONLY")) { /* an Ounce program's colour into integer targets alone */
+        CHECK(!check_ounce_integer_targets());
+        vk_finish();
+        vk_pipeline_quiesce();
+        printf("PASS headless Vulkan Ounce integer targets only: %u validation messages\n", g_vk_validation_messages);
         return 0;
     }
     if (getenv("SNX_TEST_PIPELINE_STATS_ONLY")) { /* pipeline_stats' compute rows alone: run with --pipeline-stats */
@@ -8542,6 +8556,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_storage_image_formats());
     CHECK(!check_scaled_compute());
     CHECK(!check_scaled_fragment());
+    CHECK(!check_ounce_integer_targets());
     CHECK(!check_slices_from_targets());
     CHECK(!check_volume_surface_atomics());
     CHECK(!check_layered_surface_loads());
@@ -8560,6 +8575,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_owned_page_reads());
     CHECK(!check_frag_coord_origin());
     CHECK(!check_varying_passes());
+    CHECK(!check_sm86_perspective_fold());
     CHECK(!check_rt_other_layout());
     CHECK(!check_vertex_restride());
     CHECK(!check_vertex_input_layouts());
