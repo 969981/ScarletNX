@@ -564,7 +564,7 @@ SNX_INLINE void dc_zva(u8* M, u64 a) { memset(MP(a & ~(u64)63), 0, 64); }
    type once the helpers are inlined into each other */
 /* Guest memory, the guest's registers and the settings stay plain objects the code reads without atomics; their few
    atomic accesses go through an _Atomic T*, which needs _Atomic T laid out as T */
-static_assert(sizeof(_Atomic u8) == 1 && sizeof(_Atomic u16) == 2 && sizeof(_Atomic u32) == 4 &&
+_Static_assert(sizeof(_Atomic u8) == 1 && sizeof(_Atomic u16) == 2 && sizeof(_Atomic u32) == 4 &&
                   sizeof(_Atomic u64) == 8 && sizeof(_Atomic int) == sizeof(int) &&
                   sizeof(_Atomic float) == sizeof(float) && alignof(_Atomic u16) == alignof(u16) &&
                   alignof(_Atomic u32) == alignof(u32) && alignof(_Atomic u64) == alignof(u64) &&
