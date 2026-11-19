@@ -60,7 +60,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           patch="$RUNNER_TEMP/scarletnx-upstream.patch"
-          git diff --binary "$previous" "$upstream_sha" -- . ':(exclude).github/workflows/**' > "$patch"
+          # These checks are fork-specific: they validate our customized build.yml and\n          # must not be overwritten by the upstream test suite during a source sync.\n          git diff --binary "$previous" "$upstream_sha" -- . \\\n            ':(exclude).github/workflows/**' \\\n            ':(exclude)tests/build_caches_test.py' \\\n            ':(exclude)tests/fail_fast_test.py' > "$patch"
           source_changed=false
           if [ -s "$patch" ]; then
             git apply --3way --index "$patch"
