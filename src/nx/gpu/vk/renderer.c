@@ -24,6 +24,7 @@
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
 #include "nx/runtime/platform/stats.h"
+#include "nx/runtime/platform/overlay.h"
 #include "nx/runtime/platform/prepare_screen.h"
 #include "nx/runtime/guest_stats.h"
 #include "nx/gpu/vk/vk.h"
@@ -827,8 +828,21 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
                 gpu.busy_ns = vk_gpuprof_busy_ns();
                 gpu.timed = vk_gpuprof_timed();
                 vk_mem_driver_use(&gpu.vram, &gpu.vram_budget, &gpu.vram_ours);
+                gpu.compiled = is[0]; /* vk_pipeline_stats' pipelines made */
+                gpu.encoded = vk_astc_dispatches();
             }
             stats_frame(now_ns, &gpu);
+        }
+        { /* the caches of earlier runs found empty, said over the game once: the frames to come wait for the work */
+            static int cold_said;
+            if (!cold_said) {
+                const int shaders = vk_pipeline_cache_cold(), textures = vk_bc7_cache_cold();
+                if ((cold_said = overlay_cold_cache(shaders, textures)))
+                    LOG("vulkan: %s%s%s: \"%s\" over the game\n",
+                        shaders ? "the shader cache started empty (no shader or pipeline of an earlier run)" : "",
+                        shaders && textures ? ", and " : "", textures ? "the BC7 cache started empty" : "",
+                        overlay_cold_cache_words(shaders, textures));
+            }
         }
         if (g_vk_present == 1 || g_vk_present % 600 == 0) {
             guest_stats_log(now_ns, g_vk_present);
@@ -1266,7 +1280,7 @@ static void vkr_refresh(void) {
 
 /* a part of a surface (x, y, w x h), blitted to RGBA8 at dw x dh, scaled on the GPU, and read back: the pixels, good
    until the next readback, or NULL */
-/* With no device memory for surf_read's image (a game that fills the GPU's: Mario Kart World on 2 GB got no
+/* With no device memory for surf_read's image (a game that fills the GPU's: one on 2 GB got no
    screenshot after its first, and the driver puts no such image in system memory): an RGBA8 surface's part read as
    it is, its pixels taken nearest to the size asked on the CPU. NULL where it is turned, or of another format */
 static const u8* surf_read_direct(Surf* s, u32 x, u32 y, u32 w, u32 h, u32 transform, u32 dw, u32 dh) {

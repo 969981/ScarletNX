@@ -1,37 +1,51 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* The integer, hint and barrier emitters and the branch operands tools/sailgen generates from the Sail (ir_sail.c)
-   against the hand-written ones they replaced (support/ir_int_reference.c), word by word: the same IR, and the same
+/* The integer, hint, barrier, general-purpose load and store and scalar floating-point emitters and the branch operands
+   tools/sailgen generates from the Sail (ir_sail.c) against the hand-written ones they replaced
+   (support/ir_int_reference.c, ir_ldst_reference.c, ir_fpu_reference.c), word by word: the same IR, and the same
    results.
-     snx-test-llvm-sail-ir [--report FILE] [--samples N] [--states N]
+     snx-test-llvm-sail-ir [--report FILE] [--samples N] [--states N] [--part K/N]
    The words: samples of every decoder row the generated subset covers (llvm_qemu_words.c), decoded for the ounce target
-   (TARGET: the Switch's features with PAuth and FlagM), each again with its register fields 31 (the zero register or
+   (TARGET: the Switch's features with PAuth and FlagM), or for every feature where only that has the op (FJCVTZS,
+   FRINT32Z and the others of FEAT_FRINTTS, BFCVT), each again with its register fields 31 (the zero register or
    SP). On three paths (x86-64 with SSE4.2's CRC32C, AArch64 with CRC32, and the generic one other hosts take; a path
    whose target this LLVM lacks is said and skipped) each word becomes a step (snx_ir_static_step) in two modules, one
    emitted by each, optimized as a game's module is (snx_ir_module_optimize, O2, the SLP vectorizer off as the setting's
-   default), and the two functions are compared. Then both sets of steps run on this host from random states, and every
-   register, the flags, the exclusive monitor, the next pc, UNDEF and the runtime's calls for SEV and WFE must match.
-   Sequences that hand flags or a register from one instruction to the next (SUBS then CSEL, CMP then CCMP then CSEL,
-   ADDS then ADC, SUBS then B.HI, a load from a register an ADD just wrote, FCMP then CSEL) are emitted as functions
-   (snx_ir_emit) and must give the hand-written emitters' IR, so a compare's flags still reach the condition as the
-   compare, and a value one emitter writes is the one the other reads back, whichever of the two (generated or written
-   by hand) wrote it. Both keep their state in one per-block cache (the back end's), so in a sequence the hand-written
-   integer emitters run with no value carried through it from one instruction to the next (reference_uncached): a cache
+   default), and the two functions are compared. Then both sets of steps run on this host from random states (the
+   SIMD&FP registers' low lanes zeros, infinities, NaNs, denormals, rounding ties and conversion edges as often as
+   random bits; FPCR's rounding mode, FZ, DN, AHP and FZ16, and FPSR's sticky flags, random), and every register, the
+   flags, the exclusive monitor, FPCR, FPSR, the next pc, UNDEF and the runtime's calls for SEV and WFE must match; a
+   load or store runs on guest memory of random bytes, its address registers made to point into it (ldst_start), and the
+   bytes it may write must match too. Sequences that hand flags or a register from one instruction to the next (SUBS
+   then CSEL, CMP then CCMP then CSEL, ADDS then ADC, SUBS then B.HI, a load from a register an ADD just wrote, FCMP
+   then CSEL, a sum FMUL reads, FCMP then FCSEL or B.GT, CMP then FCCMP) are emitted as functions (snx_ir_emit) and
+   must give the hand-written emitters' IR, so a compare's flags still reach the condition as the compare, and a value
+   one emitter writes is the one the other reads back, whichever of the two (generated or written by hand) wrote it.
+   Both keep their state in one per-block cache (the back end's), so in a sequence the hand-written emitters run with
+   no value carried through it from one instruction to the next (reference_uncached, fpu_reference_uncached): a cache
    that kept a stale one shows in the generated side only. Two IRs that differ only in the order of their instructions
    and their names count as the same; a step's that differs otherwise may not have more instructions than the
-   hand-written one, nor be another IR for an op whose effect running can't see (strict_ops), and is listed. --report
-   writes each difference's two IR texts; --time ROUNDS only times the two emitters (time_emitters) */
+   hand-written one, nor be another IR for an op whose effect running can't see (strict_ops) or a load or store
+   (unless ldst_other names its form, with why), so a dropped fence, ordering or atomicity shows, and is listed.
+   --report writes each difference's two IR texts; --time ROUNDS only times the two emitters (time_emitters); --part
+   K/N compares and runs only every Nth word from the Kth, and the sequences in part 1, so N ctest runs share the
+   words */
 #include "llvm_steps.h"
 #include "llvm_qemu_words.h"
 #include "support/ir_int_reference.h"
+#include "support/ir_ldst_reference.h"
+#include "support/ir_fpu_reference.h"
+#include "support/ir_vec_reference.h"
 #include "common/cpu/aarch64/a64_decoder.h"
 #include "common/utilities/endian.h"
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* the ops ir_int.c sends to the Sail: the data-processing ones (generated()), the branches' operands
-   (generated_branch()) */
+   (generated_branch()); then ir_ldst.c's (generated()), from "STR_i" on (FIRST_LDST) */
 static const char* const generated_ops[] = {
     "ADR",      "ADRP",     "ADD_i",   "ADDS_i",    "SUB_i",     "SUBS_i",    "AND_i",     "ORR_i",   "EOR_i",
     "ANDS_i",   "MOVN",     "MOVZ",    "MOVK",      "SBFM",      "BFM",       "UBFM",      "EXTR",    "AND_r",
@@ -44,8 +58,27 @@ static const char* const generated_ops[] = {
     "SETF8",    "SETF16",   "B_cond",  "CBZ",       "TBZ",       "BR",        "BLR",       "RET",     "BRA",
     "BRAZ",     "BLRA",     "BLRAZ",   "RETA",      "NOP",       "YIELD",     "WFE",       "WFI",     "SEV",
     "SEVL",     "ESB",      "XPACLRI", "PACIA1716", "PACIB1716", "AUTIA1716", "AUTIB1716", "PACIAZ",  "PACIASP",
-    "PACIBZ",   "PACIBSP",  "AUTIAZ",  "AUTIASP",   "AUTIBZ",    "AUTIBSP",   "CLREX",     "DSB_DMB", "ISB"};
+    "PACIBZ",   "PACIBSP",  "AUTIAZ",  "AUTIASP",   "AUTIBZ",    "AUTIBSP",   "CLREX",     "DSB_DMB", "ISB",
+    "STR_i",    "LDR_i",    "STR",     "LDR",       "LD_lit",    "STP",       "LDP",       "STXR",    "LDXR",
+    "STXP",     "LDXP",     "STLR",    "LDAR",      "LDAPR",     "LDAPR_i",   "STLR_i",    "CAS",     "CASP",
+    "LDADD",    "LDCLR",    "LDEOR",   "LDSET",     "LDSMAX",    "LDSMIN",    "LDUMAX",    "LDUMIN",  "SWP"};
 #define GENERATED_OPS (sizeof generated_ops / sizeof *generated_ops)
+#define FIRST_LDST    (GENERATED_OPS - 27)
+/* and the ones ir_fpu.c sends to it: every scalar floating-point instruction */
+static const char* const fp_ops[] = {
+    "FADD_s",    "FSUB_s",     "FDIV_s",     "FMUL_s",     "FNMUL_s",    "FMAX_s",    "FMIN_s",    "FMAXNM_s",
+    "FMINNM_s",  "FMADD",      "FMSUB",      "FNMADD",     "FNMSUB",     "FMOV_s",    "FABS_s",    "FNEG_s",
+    "FSQRT_s",   "FRINTN_s",   "FRINTP_s",   "FRINTM_s",   "FRINTZ_s",   "FRINTA_s",  "FRINTX_s",  "FRINTI_s",
+    "BFCVT_s",   "FRINT32Z_s", "FRINT32X_s", "FRINT64Z_s", "FRINT64X_s", "FCVT_s_ds", "FCVT_s_hs", "FCVT_s_sd",
+    "FCVT_s_hd", "FCVT_s_sh",  "FCVT_s_dh",  "FMOVI_s",    "FCMP",       "FCCMP",     "FCSEL",     "SCVTF_g",
+    "UCVTF_g",   "FCVTNS_g",   "FCVTNU_g",   "FCVTPS_g",   "FCVTPU_g",   "FCVTMS_g",  "FCVTMU_g",  "FCVTZS_g",
+    "FCVTZU_g",  "FCVTAS_g",   "FCVTAU_g",   "FJCVTZS",    "FMOV_ws",    "FMOV_sw",   "FMOV_xd",   "FMOV_dx",
+    "FMOV_xu",   "FMOV_ux",    "FMOV_xh",    "FMOV_hx"};
+#define FP_OPS (sizeof fp_ops / sizeof *fp_ops)
+/* and the SIMD ones ir_vec.c sends to it (generated()), each element loop one vector operation */
+static const char* const vec_ops[] = {"ADD_v",  "SUB_v",  "CMEQ_v", "CMTST_v", "CMGE_v", "CMGT_v", "CMHI_v",
+                                      "CMHS_v", "SMAX_v", "SMIN_v", "UMAX_v",  "UMIN_v", "NEG_v",  "ABS_v"};
+#define VEC_OPS (sizeof vec_ops / sizeof *vec_ops)
 
 typedef struct {
     const char* name;
@@ -88,15 +121,38 @@ static const struct {
      "CFINV's generated emitter flips C alone, the hand-written one packs NZCV and unpacks it"},
     {"ADCS then B.HS", {0xba020020u, 0x54000042u, 0x91000400u, 0xd65f03c0u}, NULL},
     {"SUBS, LDR, CSEL EQ", {0xeb020020u, 0xf9400003u, 0x9a8600a4u, 0xd65f03c0u}, NULL},
+    {"FADD then FMUL of its sum", {0x1e222820u, 0x1e240803u, 0xd65f03c0u}, NULL},
+    {"FMOV S0 from W1, FADD, FMOV W2 from S2", {0x1e270020u, 0x1e232802u, 0x1e260042u, 0xd65f03c0u}, NULL},
+    {"FCMP then FCSEL GT", {0x1e612000u, 0x1e64cc62u, 0xd65f03c0u}, NULL},
+    {"SUBS then FCSEL LT", {0xeb020020u, 0x1e24bc62u, 0xd65f03c0u}, NULL},
+    {"FCMP then B.GT", {0x1e612000u, 0x5400004cu, 0x91000400u, 0xd65f03c0u}, NULL},
+    {"CMP #3, FCCMP NE, CSEL GT", {0xf1000c1fu, 0x1e211404u, 0x9a86c0a0u, 0xd65f03c0u}, NULL},
+    {"FCMP, FCCMPE EQ, FCSEL EQ", {0x1e612000u, 0x1e610410u, 0x1e230c41u, 0xd65f03c0u}, NULL},
+    {"SCVTF then FCVTZS", {0x9e620020u, 0x1e780002u, 0xd65f03c0u}, NULL},
+    {"FMADD then FNMUL of it", {0x1f420c20u, 0x1e658804u, 0xd65f03c0u}, NULL},
+    {"FCMP #0 then CSET MI", {0x1e202008u, 0x9a9f57e0u, 0xd65f03c0u}, NULL},
 };
 #define SEQUENCES (sizeof sequences / sizeof *sequences)
+
+/* guest memory for the loads and stores: each side's own, guest address 0 MEMORY_ZERO bytes in, the same random
+   bytes in both before each run. The address registers of a load or store are made 0x1000 to 0x1ff0 (16-aligned, so
+   the exclusives and the atomics are aligned host atomics), so every access lands below MEMORY_TOUCHED, which a run
+   compares and puts back; a literal reaches pc 0x1000 plus or minus 1 MiB, which only loads read */
+#define MEMORY_SIZE    (4u << 20)
+#define MEMORY_ZERO    (2u << 20)
+#define MEMORY_TOUCHED 0x14000u
 
 static struct {
     u64 seed;
     FILE* report;
     unsigned failures;
     unsigned undef, sev, wfe; /* the UNDEFs a step raised, its runtime calls for SEV and WFE */
+    /* each side's guest memory, and the bytes both start from (run_compare); 16-aligned, as the 128-bit exclusives and
+       CASP are 16-byte host atomics (x86-64's cmpxchg16b, AArch64's exclusive pairs), which fault on another address */
+    _Alignas(16) u8 memory[3][MEMORY_SIZE];
     size_t outcomes[4];
+    u32 word;          /* the word being emitted where says (a path, a sequence, the runs), for on_abort */
+    const char* where; /* NULL while nothing is emitted */
 } g_test;
 
 static u64 rnd(void) {
@@ -109,9 +165,23 @@ static u64 rnd(void) {
 /* the guest the words are decoded, emitted and run for: the ounce target, the Switch's features with PAuth and FlagM,
    for which every op ir_int.c sends to the Sail exists (on the Switch's alone 15 of them are UNDEF on both sides) */
 #define TARGET SNX_A64_TARGET_OUNCE
+static int is_fp_op(const char* name) {
+    for (size_t i = 0; i < FP_OPS; ++i)
+        if (!strcmp(name, fp_ops[i])) return 1;
+    return 0;
+}
+/* the target a word is decoded for: TARGET, or every feature for a floating-point op TARGET lacks (FEAT_JSCVT,
+   FEAT_FRINTTS, FEAT_BF16), which no target of the console has and the generated emitters must still match */
+static SnxU64 word_target(u32 word) {
+    SnxA64Insn insn;
+    if (snx_a64_decode_word(word, TARGET, &insn) != SNX_A64_OP_UNDEF) return TARGET;
+    if (snx_a64_decode_word(word, SNX_A64_TARGET_MAX, &insn) != SNX_A64_OP_UNDEF && is_fp_op(snx_a64_op_text(insn.op)))
+        return SNX_A64_TARGET_MAX;
+    return TARGET;
+}
 static const char* op_name(u32 word) {
     SnxA64Insn insn;
-    return snx_a64_decode_word(word, TARGET, &insn) != SNX_A64_OP_UNDEF ? snx_a64_op_text(insn.op) : NULL;
+    return snx_a64_decode_word(word, word_target(word), &insn) != SNX_A64_OP_UNDEF ? snx_a64_op_text(insn.op) : NULL;
 }
 
 static int generated(u32 word) {
@@ -119,7 +189,44 @@ static int generated(u32 word) {
     if (!name) return 0;
     for (size_t i = 0; i < GENERATED_OPS; ++i)
         if (!strcmp(name, generated_ops[i])) return 1;
+    for (size_t i = 0; i < VEC_OPS; ++i)
+        if (!strcmp(name, vec_ops[i])) return 1;
+    return is_fp_op(name);
+}
+
+/* a load or store: its IR is held to the hand-written one's instructions, and it runs with guest memory */
+static int is_ldst(u32 word) {
+    const char* name = op_name(word);
+    for (size_t i = FIRST_LDST; name && i < GENERATED_OPS; ++i)
+        if (!strcmp(name, generated_ops[i])) return 1;
     return 0;
+}
+
+/* the loads and stores whose generated IR may be another than the hand-written one (not longer), and why, for the words
+   whose bits under mask are value (and with one_register, whose Rt and Rt2 are one): any other must give the same
+   instructions, so an access that lost its ordering, its width or its atomicity shows */
+static const struct {
+    const char* op;
+    u32 mask, value;
+    int one_register;
+    const char* why;
+} ldst_other[] = {
+    {"STP", 1u << 31, 0, 1,
+     "a pair of words of one register (Rt == Rt2): the value stored is its low word times 0x100000001, one instruction "
+     "fewer"},
+    {"LDXP", 1u << 30, 0, 0, "a pair of words is one 8-byte load-exclusive (ldx), the hand-written one ldxp of words"},
+    {"STXP", 1u << 30, 0, 0,
+     "a pair of words is one 8-byte store-exclusive (stx), which an 8-byte ldx arms, the hand-written one stxp of words, "
+     "which ldxp of words arms"},
+    {NULL, 0, 0, 0, NULL},
+};
+static const char* ldst_other_why(u32 word) {
+    const char* name = op_name(word);
+    for (size_t i = 0; name && ldst_other[i].op; ++i)
+        if (!strcmp(name, ldst_other[i].op) && (word & ldst_other[i].mask) == ldst_other[i].value &&
+            (!ldst_other[i].one_register || (word & 0x1fu) == (word >> 10 & 0x1fu)))
+            return ldst_other[i].why;
+    return NULL;
 }
 
 /* a function's text without its name and its metadata attachments, which number differently from module to module */
@@ -297,6 +404,9 @@ static SnxIr* path_ir(const Path* p, int reference, char* error, size_t size) {
     if (reference) {
         ir->int_reference = snx_ir_int_reference;
         ir->operand_reference = snx_ir_int_operand_reference;
+        ir->ldst_reference = snx_ir_ldst_reference;
+        ir->fpu_reference = snx_ir_fpu_reference;
+        ir->vec_reference = snx_ir_vec_reference;
     }
     return ir;
 }
@@ -313,8 +423,8 @@ static int strict(const char* op) {
     return 0;
 }
 
-/* one comparison: counted; a longer generated IR fails, and another IR of a strict op; the report gets every one that
-   is not the same text */
+/* one comparison: counted; a longer generated IR fails, and another IR of a strict op or of a load or store
+   ldst_other does not name; the report gets every one that is not the same text */
 static void judge(int r, const char* what, u32 word, const char* path, const char* a, const char* b,
                   const size_t* sizes) {
     ++g_test.outcomes[r];
@@ -322,7 +432,8 @@ static void judge(int r, const char* what, u32 word, const char* path, const cha
         ++g_test.failures;
         fprintf(stderr, "FAIL: %s %08x (%s): the generated IR has %zu instructions, the hand-written %zu\n", what,
                 (unsigned)word, path, sizes[1], sizes[0]);
-    } else if (r == OTHER_NOT_LONGER && strict(what)) {
+    } else if (r == OTHER_NOT_LONGER &&
+               (strict(what) || (is_ldst(word) && !strcmp(what, op_name(word)) && !ldst_other_why(word)))) {
         ++g_test.failures;
         fprintf(stderr,
                 "FAIL: %s %08x (%s): the generated IR is another than the hand-written, and running can't tell\n", what,
@@ -350,8 +461,11 @@ static int compare_path(const Path* p, const u32* words, size_t count, size_t* e
         for (size_t i = 0; i < count; ++i) {
             char name[32];
             snprintf(name, sizeof name, "S_%zu", i);
-            fn[k][i] = snx_ir_static_step(ir[k], words[i], 0x1000, TARGET, name);
+            g_test.word = words[i];
+            g_test.where = p->name;
+            fn[k][i] = snx_ir_static_step(ir[k], words[i], 0x1000, word_target(words[i]), name);
         }
+        g_test.where = NULL;
         if (ir[k]->fallbacks) {
             fprintf(stderr, "FAIL: %s: no emitter for %08x (%s)\n", k ? "generated" : "hand-written",
                     (unsigned)ir[k]->fallback_word, op_name(ir[k]->fallback_word));
@@ -387,6 +501,26 @@ static void reference_uncached(SnxIr* ir, const void* decoded, SnxU32 word, SnxU
     ir_registers_invalidate(ir);
     ir->state.flags.valid = 0;
     snx_ir_int_reference(ir, decoded, word, pc);
+    ir_registers_invalidate(ir);
+    ir->state.flags.valid = 0;
+}
+/* and the hand-written floating-point ones, with the SIMD&FP registers' cache dropped too. The flags an FP compare
+   made stay cached, as on the generated side: dropped, a B.cond in another block reads them from the CPU structure,
+   which ir_promote_registers turns into phis the generated side never has (the flags' own cache is the integer
+   sequences' to check) */
+static void fpu_reference_uncached(SnxIr* ir, const void* decoded, SnxU32 word, SnxU64 pc) {
+    ir_registers_invalidate(ir);
+    ir_vectors_invalidate(ir);
+    snx_ir_fpu_reference(ir, decoded, word, pc);
+    ir_registers_invalidate(ir);
+    ir_vectors_invalidate(ir);
+}
+
+/* the same for the hand-written loads and stores */
+static void reference_ldst_uncached(SnxIr* ir, const void* decoded, SnxU32 word, SnxU64 pc) {
+    ir_registers_invalidate(ir);
+    ir->state.flags.valid = 0;
+    snx_ir_ldst_reference(ir, decoded, word, pc);
     ir_registers_invalidate(ir);
     ir->state.flags.valid = 0;
 }
@@ -427,8 +561,14 @@ static void compare_sequence(unsigned s) {
         if (k == 0) {
             ir->int_reference = reference_uncached;
             ir->operand_reference = snx_ir_int_operand_reference;
+            ir->ldst_reference = reference_ldst_uncached;
+            ir->fpu_reference = fpu_reference_uncached;
+            ir->vec_reference = snx_ir_vec_reference;
         }
+        g_test.word = sequences[s].words[0];
+        g_test.where = sequences[s].what;
         snx_ir_emit(ir, &codegen, &function);
+        g_test.where = NULL;
         if (snx_ir_module_optimize(ir, ir->mod, '2', error, sizeof error)) {
             fprintf(stderr, "FAIL: %s: %s\n", sequences[s].what, error);
             ++g_test.failures;
@@ -465,17 +605,124 @@ static void on_wfe(CPU* c) {
     ++g_test.wfe;
 }
 
+/* a load or store's start: its address registers in the window; for a store-exclusive the monitor armed at its
+   address in some states, with the value there (it stores) or another (it fails), for the size its own load-exclusive
+   arms: STXR's, and STXP's of doublewords (ldxp's 0x13). A pair of words is left unarmed: its generated emitter is a
+   64-bit stx, which a 64-bit ldx arms, where the hand-written one was stxp, which ldxp arms (cpu.h) */
+static void ldst_start(CPU* c, u32 word, unsigned s) {
+    SnxA64Insn insn;
+    u64 address;
+    snx_a64_decode_word(word, TARGET, &insn);
+    c->x[31] = 0x1000 + (rnd() & 0xff0);
+    c->x[insn.args.rn] = 0x1000 + (rnd() & 0xff0);
+    c->x[insn.args.rm] = 0x1000 + (rnd() & 0xff0);
+    if (insn.op == SNX_A64_OP_LDAPR_i || insn.op == SNX_A64_OP_STLR_i) /* the base plus the offset aligned (ordered) */
+        c->x[insn.args.rn] -= (c->x[insn.args.rn] + (u64)(int64_t)insn.args.imm) & ((1u << insn.args.sz) - 1);
+    address = c->x[insn.args.rn];
+    c->excl_on = 0;
+    if (!(s & 1)) return;
+    if (insn.op == SNX_A64_OP_STXR || (insn.op == SNX_A64_OP_STXP && insn.args.sz == 3)) {
+        c->excl_on = 1;
+        c->excl_addr = address;
+        memcpy(&c->excl_val, g_test.memory[2] + MEMORY_ZERO + address, 8);
+        memcpy(&c->excl_val2, g_test.memory[2] + MEMORY_ZERO + address + 8, 8);
+        if (s & 2) c->excl_val = ~c->excl_val;
+        c->excl_size = insn.op == SNX_A64_OP_STXP ? 0x13 : (u32)insn.args.sz;
+    }
+}
+
+/* an ordered access's address (an acquire or a release, an exclusive, an atomic) when it is off the alignment it needs,
+   its size or a pair's two, which an AArch64 host's ldar, stlr, ldxp or cas fault on and an x86-64 host's do not: 0
+   when it is on it, or the access is a plain one */
+static u64 ordered_misaligned(const CPU* c, u32 word) {
+    SnxA64Insn insn;
+    u64 address, size;
+    snx_a64_decode_word(word, TARGET, &insn);
+    address = c->x[insn.args.rn];
+    size = 1ull << insn.args.sz;
+    switch (insn.op) {
+        case SNX_A64_OP_LDAPR_i:
+        case SNX_A64_OP_STLR_i: address += (u64)(int64_t)insn.args.imm; break;
+        case SNX_A64_OP_STXP:
+        case SNX_A64_OP_LDXP:
+        case SNX_A64_OP_CASP: size *= 2; break;
+        case SNX_A64_OP_STXR:
+        case SNX_A64_OP_LDXR:
+        case SNX_A64_OP_STLR:
+        case SNX_A64_OP_LDAR:
+        case SNX_A64_OP_LDAPR:
+        case SNX_A64_OP_CAS:
+        case SNX_A64_OP_LDADD:
+        case SNX_A64_OP_LDCLR:
+        case SNX_A64_OP_LDEOR:
+        case SNX_A64_OP_LDSET:
+        case SNX_A64_OP_LDSMAX:
+        case SNX_A64_OP_LDSMIN:
+        case SNX_A64_OP_LDUMAX:
+        case SNX_A64_OP_LDUMIN:
+        case SNX_A64_OP_SWP: break;
+        default: return 0;
+    }
+    return address % size ? address : 0;
+}
+
+/* a SIMD&FP register's low lanes and FPCR and FPSR for state s: the values the floating-point paths branch on (signed
+   zeros, infinities, quiet and signalling NaNs, denormals, the smallest normal, ties, the integers' edges) in half of
+   the registers, random bits in the rest; state 0 in round to nearest without FZ, as most games run */
+static void fp_state(CPU* c, unsigned s) {
+    static const u64 doubles[] = {
+        0x0000000000000000ull, 0x8000000000000000ull, 0x7FF0000000000000ull, 0xFFF0000000000000ull,
+        0x7FF8000000000001ull, 0x7FF0000000000001ull, 0x000FFFFFFFFFFFFFull, 0x8000000000000001ull,
+        0x0010000000000000ull, 0x3FF8000000000000ull, 0xC004000000000000ull, 0x3FE0000000000000ull,
+        0x41E0000000000000ull, 0xC3E0000000000000ull, 0x43F0000000000000ull, 0x3FF0000000000000ull};
+    static const u32 singles[] = {0x00000000u, 0x80000000u, 0x7F800000u, 0xFF800000u, 0x7FC00001u, 0x7F800001u,
+                                  0x007FFFFFu, 0x80000001u, 0x00800000u, 0x3FC00000u, 0xC0200000u, 0x3F000000u,
+                                  0x4F000000u, 0xDF000000u, 0x5F800000u, 0x3F800000u};
+    static const u16 halves[] = {0x0000u, 0x8000u, 0x7C00u, 0xFC00u, 0x7E01u, 0x7C01u, 0x03FFu, 0x8001u,
+                                 0x0400u, 0x3E00u, 0xC100u, 0x3800u, 0x7BFFu, 0xFBFFu, 0x3C01u, 0x3C00u};
+    for (unsigned r = 0; r < 32; ++r) {
+        c->v[r].d[0] = rnd();
+        c->v[r].d[1] = rnd();
+        switch (rnd() & 7) {
+            case 0: c->v[r].d[0] = doubles[rnd() & 15]; break;
+            case 1: c->v[r].d[0] = (c->v[r].d[0] & ~0xFFFFFFFFull) | singles[rnd() & 15]; break;
+            case 2: c->v[r].d[0] = (c->v[r].d[0] & ~0xFFFFull) | halves[rnd() & 15]; break;
+            case 3: c->v[r].d[0] = (doubles[rnd() & 15] & ~0xFFFull) | (rnd() & 0xFFFull); break;
+            default: break;
+        }
+    }
+    c->fpcr = s ? (u32)(rnd() & ((3u << 22) | (1u << 24) | (1u << 25) | (1u << 26) | (1u << 19))) : 0;
+    c->fpsr = (u32)(rnd() & 0x9Fu);
+}
+
 static int run_compare(const u32* words, size_t count, unsigned states) {
     char error[1024];
     LlvmSteps set[2];
     RtAPI rt = {.undef = on_undef, .sev = on_sev, .wfe = on_wfe, .cas128 = snx_runtime_cas128};
+    if ((uintptr_t)g_test.memory % 16)
+        return snx_error("the guest memory at %p is not 16-aligned: the 128-bit atomics would fault",
+                         (void*)g_test.memory);
+    for (size_t i = 0; i < MEMORY_SIZE; i += 8) {
+        u64 v = rnd();
+        memcpy(g_test.memory[2] + i, &v, 8);
+    }
+    memcpy(g_test.memory[0], g_test.memory[2], MEMORY_SIZE);
+    memcpy(g_test.memory[1], g_test.memory[2], MEMORY_SIZE);
     for (int k = 0; k < 2; ++k) {
         if (llvm_steps_begin(&set[k], 0, LLVM_STEPS_HOST, error, sizeof error)) return snx_error("%s", error);
         if (k == 0) {
             set[k].ir->int_reference = snx_ir_int_reference;
             set[k].ir->operand_reference = snx_ir_int_operand_reference;
+            set[k].ir->ldst_reference = snx_ir_ldst_reference;
+            set[k].ir->fpu_reference = snx_ir_fpu_reference;
+            set[k].ir->vec_reference = snx_ir_vec_reference;
         }
-        for (size_t i = 0; i < count; ++i) llvm_steps_add(&set[k], words[i], 0x1000, TARGET);
+        for (size_t i = 0; i < count; ++i) {
+            g_test.word = words[i];
+            g_test.where = "the runs";
+            llvm_steps_add(&set[k], words[i], 0x1000, word_target(words[i]));
+        }
+        g_test.where = NULL;
         if (llvm_steps_load(&set[k], error, sizeof error)) return snx_error("%s", error);
     }
     for (size_t i = 0; i < count; ++i)
@@ -483,6 +730,7 @@ static int run_compare(const u32* words, size_t count, unsigned states) {
             CPU start = {0}, end[2];
             u64 next[2];
             unsigned undef[2], sev[2], wfe[2];
+            int ldst = is_ldst(words[i]), memory;
             for (unsigned r = 0; r < 32; ++r) start.x[r] = rnd();
             if (s & 1) start.x[(rnd() & 31)] = 0; /* zeros and edges reach the divisions and the shifts */
             if (s & 2) start.x[(rnd() & 31)] = 0x8000000000000000ull;
@@ -492,20 +740,35 @@ static int run_compare(const u32* words, size_t count, unsigned states) {
             start.cf = rnd() & 1;
             start.vf = rnd() & 1;
             start.excl_on = (u32)(rnd() & 1); /* CLREX clears it */
+            fp_state(&start, s);
+            if (ldst) ldst_start(&start, words[i], s);
+            if (ldst && ordered_misaligned(&start, words[i])) {
+                ++g_test.failures;
+                fprintf(stderr, "FAIL: %s %08x state %u: its ordered access at %llx is off its alignment\n",
+                        op_name(words[i]), (unsigned)words[i], s,
+                        (unsigned long long)ordered_misaligned(&start, words[i]));
+                break;
+            }
             start.rt = &rt;
             start.pc = 0x1000;
             for (int k = 0; k < 2; ++k) {
                 end[k] = start;
+                end[k].mem = g_test.memory[k] + MEMORY_ZERO;
                 g_test.undef = g_test.sev = g_test.wfe = 0;
                 next[k] = set[k].steps[i](&end[k]);
                 undef[k] = g_test.undef;
                 sev[k] = g_test.sev;
                 wfe[k] = g_test.wfe;
             }
+            memory = ldst && memcmp(g_test.memory[0] + MEMORY_ZERO, g_test.memory[1] + MEMORY_ZERO, MEMORY_TOUCHED);
+            if (ldst)
+                for (int k = 0; k < 2; ++k)
+                    memcpy(g_test.memory[k] + MEMORY_ZERO, g_test.memory[2] + MEMORY_ZERO, MEMORY_TOUCHED);
             if (next[0] != next[1] || undef[0] != undef[1] || sev[0] != sev[1] || wfe[0] != wfe[1] ||
                 memcmp(end[0].x, end[1].x, sizeof end[0].x) || end[0].n != end[1].n || end[0].z != end[1].z ||
                 end[0].cf != end[1].cf || end[0].vf != end[1].vf || end[0].pc != end[1].pc ||
-                end[0].excl_on != end[1].excl_on) {
+                end[0].excl_on != end[1].excl_on || memory || memcmp(end[0].v, end[1].v, sizeof end[0].v) ||
+                end[0].fpcr != end[1].fpcr || end[0].fpsr != end[1].fpsr) {
                 ++g_test.failures;
                 fprintf(stderr, "FAIL: %s %08x state %u: the generated emitter's result differs\n", op_name(words[i]),
                         (unsigned)words[i], s);
@@ -516,8 +779,19 @@ static int run_compare(const u32* words, size_t count, unsigned states) {
     return 0;
 }
 
+/* sailgen's back end ends the process on what it can't make (sg_fail, an abort): the word being emitted is named as a
+   failure, before the abort goes on */
+static void on_abort(int signal_number) {
+    const char* name = g_test.where ? op_name(g_test.word) : NULL;
+    (void)signal_number;
+    if (g_test.where)
+        fprintf(stderr, "FAIL: %s %08x (%s): the test stopped while it was emitted\n", name ? name : "UNDEF",
+                (unsigned)g_test.word, g_test.where);
+}
+
 /* --time ROUNDS: what each emitter costs the recompile, the corpus's steps emitted and optimized (O2) ROUNDS times
-   with each, alternating, on this host, in processor time; the best round of each, not a gate */
+   with each, alternating, on this host, in processor time; each round's line, so a chart shows the noise, then the
+   best round of each, not a gate */
 /* the processor time this process has used, in s (the emitting and optimizing run on this one thread) */
 static double now_seconds(void) { return (double)snx_process_cpu_ns() / 1e9; }
 static int time_emitters(const u32* words, size_t count, unsigned rounds) {
@@ -526,21 +800,30 @@ static int time_emitters(const u32* words, size_t count, unsigned rounds) {
     if (!snx_process_cpu_ns()) return snx_error("--time: this system gives no processor time (snx_process_cpu_ns)");
     for (unsigned r = 0; r < rounds; ++r)
         for (int k = 0; k < 2; ++k) {
-            double start = now_seconds(), emitted;
+            double start = now_seconds(), emitted, total;
             SnxIr* ir = snx_ir_new("timing", '2', error, sizeof error);
             if (!ir) return snx_error("%s", error);
             if (k == 0) {
                 ir->int_reference = snx_ir_int_reference;
                 ir->operand_reference = snx_ir_int_operand_reference;
+                ir->ldst_reference = snx_ir_ldst_reference;
+                ir->fpu_reference = snx_ir_fpu_reference;
+                ir->vec_reference = snx_ir_vec_reference;
             }
             for (size_t i = 0; i < count; ++i) {
                 char name[32];
                 snprintf(name, sizeof name, "S_%zu", i);
-                snx_ir_static_step(ir, words[i], 0x1000, TARGET, name);
+                g_test.word = words[i];
+                g_test.where = "--time";
+                snx_ir_static_step(ir, words[i], 0x1000, word_target(words[i]), name);
+                g_test.where = NULL;
             }
             emitted = now_seconds();
             if (snx_ir_module_optimize(ir, ir->mod, '2', error, sizeof error)) return snx_error("%s", error);
-            if (now_seconds() - start < best[k]) best[k] = now_seconds() - start;
+            total = now_seconds() - start;
+            printf("round %u, %s: %.4f s (emit %.4f s)\n", r + 1, k ? "generated" : "hand-written", total,
+                   emitted - start);
+            if (total < best[k]) best[k] = total;
             if (emitted - start < emit_best[k]) emit_best[k] = emitted - start;
             snx_ir_free(ir);
         }
@@ -552,7 +835,7 @@ static int time_emitters(const u32* words, size_t count, unsigned rounds) {
 }
 
 int main(int argc, char** argv) {
-    unsigned samples = 4, states = 8, rounds = 0;
+    unsigned samples = 4, states = 8, rounds = 0, part = 1, parts = 1;
     u32* words;
     size_t count, equal = 0, compared = 0;
     char error[1024];
@@ -567,9 +850,17 @@ int main(int argc, char** argv) {
             states = (unsigned)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--time") && i + 1 < argc)
             rounds = (unsigned)strtoul(argv[++i], NULL, 10);
-        else
-            return snx_error("unknown argument %s (--report FILE, --samples N, --states N, --time ROUNDS)", argv[i]);
+        else if (!strcmp(argv[i], "--part") && i + 1 < argc) {
+            char end;
+            ++i;
+            if (strspn(argv[i], "0123456789/") != strlen(argv[i]) ||
+                sscanf(argv[i], "%u/%u%c", &part, &parts, &end) != 2 || !part || part > parts)
+                return snx_error("--part %s is not K/N with 1 <= K <= N", argv[i]);
+        } else
+            return snx_error("unknown argument %s (--report FILE, --samples N, --states N, --time ROUNDS, --part K/N)",
+                             argv[i]);
     }
+    signal(SIGABRT, on_abort);
     if (snx_ir_init(error, sizeof error)) return snx_error("%s", error);
     /* the other paths' targets, and the SLP vectorizer off, as a game's module is made by default */
     LLVMInitializeAllTargetInfos();
@@ -578,12 +869,15 @@ int main(int argc, char** argv) {
     LLVMInitializeAllAsmPrinters();
     snx_ir_slp_vectorizer(0);
     count = corpus(samples, &words);
-    printf("%zu words of the %zu generated ops\n", count, GENERATED_OPS);
-    for (size_t i = 0; i < GENERATED_OPS; ++i) { /* each op has words, or it is compared nowhere */
+    printf("%zu words of the %zu generated ops\n", count, GENERATED_OPS + FP_OPS + VEC_OPS);
+    for (size_t i = 0; i < GENERATED_OPS + FP_OPS + VEC_OPS; ++i) { /* each op has words, or it is compared nowhere */
+        const char* name = i < GENERATED_OPS            ? generated_ops[i]
+                           : i < GENERATED_OPS + FP_OPS ? fp_ops[i - GENERATED_OPS]
+                                                        : vec_ops[i - GENERATED_OPS - FP_OPS];
         size_t k = 0;
-        while (k < count && strcmp(op_name(words[k]), generated_ops[i])) ++k;
+        while (k < count && strcmp(op_name(words[k]), name)) ++k;
         if (k == count) {
-            fprintf(stderr, "FAIL: %s has no word in the corpus\n", generated_ops[i]);
+            fprintf(stderr, "FAIL: %s has no word in the corpus\n", name);
             ++g_test.failures;
         }
     }
@@ -591,6 +885,12 @@ int main(int argc, char** argv) {
         int r = time_emitters(words, count, rounds);
         free(words);
         return r;
+    }
+    if (parts > 1) {
+        size_t n = 0;
+        for (size_t i = part - 1; i < count; i += parts) words[n++] = words[i];
+        count = n;
+        printf("part %u of %u: %zu words\n", part, parts, count);
     }
     for (size_t p = 0; p < PATHS; ++p) {
         size_t before = equal;
@@ -610,8 +910,10 @@ int main(int argc, char** argv) {
             g_test.outcomes[OTHER_NOT_LONGER] - outcomes[OTHER_NOT_LONGER], g_test.outcomes[LONGER] - outcomes[LONGER]);
         (void)before;
     }
-    for (unsigned s = 0; s < SEQUENCES; ++s) compare_sequence(s);
-    printf("%zu sequences compared\n", SEQUENCES);
+    if (part == 1) {
+        for (unsigned s = 0; s < SEQUENCES; ++s) compare_sequence(s);
+        printf("%zu sequences compared\n", SEQUENCES);
+    }
     if (run_compare(words, count, states)) return 1;
     printf("%zu words run from %u states each\n", count, states);
     free(words);

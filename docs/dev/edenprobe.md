@@ -45,7 +45,8 @@ ScarletNX every time, and the word `unban` runs them.
 `--setting KEY=VALUE` gives each launch that runtime setting as `--KEY=VALUE`, for example `vk_memory=2` to read guest
 buffers in place, the default on an integrated GPU, where a driver can still refuse the imports and copy. Lavapipe,
 which CI runs on, copies by default: its GPU is the CPU, which can't read pages the runtime traps. To run lavapipe
-without installing it, point `VK_DRIVER_FILES` at its ICD file.
+without installing it, point `VK_DRIVER_FILES` at its ICD file. CI's runs of the NRO and the ctest entries below take
+`fps-limit=0`, no FPS limit: the vsync comes every millisecond rather than at 60 Hz, so no case waits on a display.
 
 With `-DSNX_TEST_EDENPROBE=/path/to/edenprobe.nro`, ctest runs it as `edenprobe_vk_memory_1` (copied) and
 `edenprobe_vk_memory_2` (in place) against the baseline.
@@ -91,8 +92,8 @@ their submissions drew nothing and each case waited for memory that the GPU woul
 
 ## In CI
 
-The `edenprobe` job of `.github/workflows/build.yml`, one job for every run it has, takes the Linux x86-64 install (on a
-pull request, the x86-64 AppImage build's) and runs the NRO `EDENPROBE_NRO` of Amberlith's release `EDENPROBE_VERSION`,
+The Linux x86-64 job of `.github/workflows/build.yml` (`Linux AppImage (x86_64)`), once its tests pass, installs the
+AppImage's runtime apart and runs the NRO `EDENPROBE_NRO` of Amberlith's release `EDENPROBE_VERSION`,
 pinned by `EDENPROBE_SHA256`, on lavapipe with the words of `EDENPROBE_MODE`, against
 `tests/edenprobe/linux-x86_64.txt`. The result goes in the run's
 summary and in the pull request's comment of builds; the artifact `edenprobe-<commit>-<attempt>` holds the report,
@@ -101,11 +102,11 @@ pictures, logs and `baseline.txt`.
 A regression there fails the Build run, and a run that failed publishes nothing: neither the nightly nor a version.
 
 A push, a tag, the nightly's schedule and a run by hand run every run. A pull request runs each only when it changes
-what that run loads (the job's first step: `git diff --name-only` of its merge commit through
+what that run loads (a step before the build: `git diff --name-only` of its merge commit through
 `scripts/edenprobe.py runs`): the NRO for `src/nx/`, `src/common/` and its baseline; the APK for `src/android/`,
 `src/gnuabi/`, `src/glslc/`, `src/common/gpu/` and its baseline; both for `src/multicall/`, `scripts/edenprobe.py`, this
-workflow, `CMakeLists.txt`, `CMakePresets.json`, `cpmfile.json` and `cmake/`. One that changes neither ends the job in
-seconds, passed, its notice (and the comment's line) saying why. The runs called for go one after the other, each with
+workflow, `CMakeLists.txt`, `CMakePresets.json`, `cpmfile.json` and `cmake/`. One that changes neither runs neither,
+its notice (and the comment's line) saying why. The runs called for go one after the other, each with
 its own output, summary and exit (side by side, with the others at the lowest priority so that the NRO's kernel family,
 which times its threads, passes, they took no less time in all), and the job fails when the NRO's or the APK's does.
 
@@ -154,7 +155,7 @@ its own, with `machine=scarletnx-android@<the runtime's commit>` beside them; `q
 The probe takes a folder of 160 characters at most, so an `--out` that makes it longer is refused. The
 launches, the report and the baseline are the NRO's.
 
-In CI the `edenprobe` job runs it beside the NRO, on the same install with the JRE of the build's JDK, as
+In CI the Linux x86-64 job runs it after the NRO, on the same install with the JVM of the build's JDK, as
 `EDENPROBE_APK` of the release `EDENPROBE_APK_VERSION`, pinned by `EDENPROBE_APK_SHA256`, with the words of
 `EDENPROBE_APK_MODE`, against `tests/edenprobe/android-x86_64.txt`, written as the NRO's is. Its notice follows the
 NRO's on the probe's line of the pull request's comment, and its files are under `edenprobe-android/` in the job's

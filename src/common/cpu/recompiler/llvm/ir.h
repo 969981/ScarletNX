@@ -222,6 +222,12 @@ typedef struct SnxIr {
     void (*int_reference)(struct SnxIr* ir, const void* decoded, SnxU32 word, SnxU64 pc);
     /* and the branches' hand-written operands (snx_ir_int_operand's) the generated ones replaced, the same way */
     LLVMValueRef (*operand_reference)(struct SnxIr* ir, const void* decoded, SnxU32 word, SnxU64 pc);
+    /* and the general-purpose registers' loads and stores written by hand (tests/support/ir_ldst_reference.c) */
+    void (*ldst_reference)(struct SnxIr* ir, const void* decoded, SnxU32 word, SnxU64 pc);
+    /* and the hand-written scalar floating-point emitters (tests/support/ir_fpu_reference.c), the same way */
+    void (*fpu_reference)(struct SnxIr* ir, const void* decoded, SnxU32 word, SnxU64 pc);
+    /* and the hand-written SIMD emitters of the ops generated from their Sail (tests/support/ir_vec_reference.c) */
+    void (*vec_reference)(struct SnxIr* ir, const void* decoded, SnxU32 word, SnxU64 pc);
 } SnxIr;
 
 void ir_state_invalidate(SnxIr* ir);
@@ -314,8 +320,10 @@ char* snx_ir_text(SnxIr* ir);
 
 /* ---- functions (ir_codegen.c) ---- */
 /* the stack probe a generated function for Windows x86-64 calls when its frame is a page or more: the runtime
-   library's (rtlib.c), which every module and the JIT's code arena link */
-#define SNX_IR_STACK_PROBE "snx_stack_probe"
+   library's (rtlib.c), which every module and the JIT's code arena link. On Windows on Arm the probe is __chkstk, the
+   name LLVM's AArch64 backend calls, which the runtime library defines there */
+#define SNX_IR_STACK_PROBE       "snx_stack_probe"
+#define SNX_IR_STACK_PROBE_ARM64 "__chkstk"
 /* F_<address>, declared on first use, defined by snx_ir_emit */
 LLVMValueRef snx_ir_guest_function(SnxIr* ir, SnxU64 address);
 void snx_ir_emit(SnxIr* ir, SnxCodegen* codegen, const SnxFunction* function);

@@ -300,6 +300,37 @@ static int icon_drawn(unsigned icon) {
             return 1;
     return 0;
 }
+/* the icon of the notification that says text, after its band's blank cell, backed: GUI_ICON_NONE where it has none
+   or text shows nowhere */
+static unsigned toast_icon(const char* text) {
+    float x, y;
+    int i;
+    if (!text_xy(text, &x, &y)) return GUI_ICON_NONE;
+    for (i = 0; i < list.n; ++i) {
+        const SnxUiQuadView q = qv(&list.q[i]);
+        if (q.ink == UI_ICON && q.backed && q.y == y && q.x + q.w + q.w / 2 == x)
+            return GUI_ICON_FIRST + (unsigned)(q.u - SNX_UI_ICONS_X) / 16;
+    }
+    return GUI_ICON_NONE;
+}
+/* every notification's time up: none shows from here */
+static void toasts_gone(void) {
+    static SnxUiQuad gone[2048];
+    SnxUiList l = {gone, 0, 2048};
+    overlay_draw(&l, SW, SH, 1ull << 62);
+}
+/* the list at now_ns as a renderer's frame makes it, from no faded span (ui_dirty_begin): the spans it gave, into
+   fades, and how many */
+static int draw_fades(u64 now_ns, SnxUiFade fades[SNX_UI_FADES]) {
+    int first, end;
+    ui_dirty_begin(NULL);
+    ui_dirty_end(&first, &end);
+    list.q = quads;
+    list.n = 0;
+    list.max = 2048;
+    overlay_draw(&list, SW, SH, now_ns);
+    return ui_fades(fades);
+}
 /* F1's page, from the page showing: the runtime's keys and the game's buttons, a row each with its icon and its keys
    on a band of ink in the page's colour, none in focus; Up/Down, the D-pad and the wheel go over its rows, each of
    which fits the narrowest panel; any other key, button or tap goes back to the game, F1 again too, and the other
@@ -1223,6 +1254,7 @@ int main(void) {
         ++picks.changes;
         draw();
         assert(text_at(6, 11, "Exit") && shows("Clean Old Settings: 2 taken out")); /* its row gone, the toast */
+        assert(toast_icon("Clean Old Settings: 2 taken out") == GUI_ICON_ERASER);   /* after the row's icon */
         overlay_move(6); /* Volume, as the first page was */
     }
     /* Settings, after Volume: the game's .ini's sections the menu has no page for (a section's own page after it), Debug
@@ -1824,6 +1856,7 @@ int main(void) {
         assert(shows("SCARLETNX  /  MENU"));
     }
     /* a notification over the game, closed or open, until its time is up */
+    toasts_gone();
     overlay_state_saved("slot 2", 0, 1000);
     assert(overlay_toasting(1000) && !overlay_toasting(1000 + (u64)SNX_OVERLAY_TOAST_MS * 1000000u));
     overlay_toggle();
@@ -1834,23 +1867,29 @@ int main(void) {
     assert(shows("Saved over slot 2"));
     overlay_state_saved("slot 2", 0, 1000);
     draw();
-    /* over the game it is its letters and a blank cell at either end, a row from the corner, each backed by the
-       layer's ground, the menu's ink, in its page's colour: a band of cells side by side with no fill under them. Its
-       letters are the stats box's and showcase's, a step under the menu's, which drew them a size larger than every
-       other text over a running game */
+    /* over the game it is a blank cell, its icon, the menu's Save States' (the save icon, the launcher's too), a blank
+       cell, its letters and a blank cell, a row from the corner, each backed by the layer's ground, the menu's ink, in
+       its page's colour, as a line of the stats box: a band of cells side by side with no fill under them. Its letters
+       are the stats box's and showcase's, a step under the menu's, which drew them a size larger than every other text
+       over a running game */
     {
         static const char said[] = "Saved to slot 2";
         const u32 page = 0xFF000000u | (SNX_GUI_THEME_YORHA_PAGE & 0xFFu) << 16 | (SNX_GUI_THEME_YORHA_PAGE & 0xFF00u) |
                          (SNX_GUI_THEME_YORHA_PAGE >> 16 & 0xFFu);
         int i, t = stats_scale(s);
         assert(s > 1 && t < s); /* a picture where the two sizes differ */
-        assert(list.n == (int)strlen(said) + 2 && ui_ground() == ui_rgba(ink));
+        assert(list.n == (int)strlen(said) + 4 && ui_ground() == ui_rgba(ink));
+        assert(toast_icon(said) == GUI_ICON_SAVE);
         for (i = 0; i < list.n; ++i) {
             SnxUiQuadView q = qv(&list.q[i]);
-            assert(q.ink == UI_GLYPH && q.backed && q.glyph == (u8)(i && i < list.n - 1 ? said[i - 1] : ' '));
-            assert(q.uw == 8 && q.vh == 16 && q.rgba == ui_rgba(page));
-            assert(q.x == (float)(8 * t * (1 + i)) && q.y == (float)(16 * t));
-            assert(q.w == (float)(8 * t) && q.h == (float)(16 * t));
+            int cell = i < 2 ? 1 + i : i + 2; /* the icon takes two */
+            assert(q.backed && q.rgba == ui_rgba(page) && q.y == (float)(16 * t) && q.h == (float)(16 * t));
+            assert(q.x == (float)(8 * t * cell) && q.w == (float)(8 * t * (i == 1 ? 2 : 1)));
+            if (i == 1)
+                assert(q.ink == UI_ICON && q.uw == 16 && q.vh == 16);
+            else
+                assert(q.ink == UI_GLYPH && q.uw == 8 && q.vh == 16 &&
+                       q.glyph == (u8)(i > 2 && i < list.n - 1 ? said[i - 3] : ' '));
         }
     }
     /* the 3DS's, the Vita's and the GBA's notice (common/utilities/notice.h) is this band: its letters' scale, its
@@ -1860,7 +1899,11 @@ int main(void) {
         static const float scales[] = {1.0f, 1.25f, 1.5f, 2.0f, 2.6f};
         SnxNotice n = {0};
         int rect[4], t = stats_scale(s), sc, x, y;
-        const SnxUiQuadView last = qv(&list.q[list.n - 1]);
+        SnxUiQuadView last;
+        overlay_state_toast("", 1000);
+        overlay_toast(GUI_ICON_NONE, "Saved to slot 2", 1000); /* its icon aside: the 3DS's notice has none */
+        draw();
+        last = qv(&list.q[list.n - 1]);
         snx_notice_show(&n, "Saved to slot 2", 0);
         assert(snx_notice_scale(SW, SH, overlay_display_percent()) == t && snx_notice_rect(&n, SW, SH, t, rect));
         assert(rect[0] == (int)qv(&list.q[0]).x && rect[1] == (int)qv(&list.q[0]).y);
@@ -1875,6 +1918,8 @@ int main(void) {
         overlay_set_display_scale(1.0f);
         overlay_place(SW, SH, &x, &y, &sc);
         assert(sc == s);
+        overlay_toast(GUI_ICON_NONE, "", 1000);
+        overlay_state_saved("slot 2", 0, 1000);
     }
     /* the stats' box in that corner too: the band goes under it, from the box's left, half a line apart; back in its
        corner with the box in another, or off; and in the picture's top right where there is no room under the box */
@@ -1898,13 +1943,13 @@ int main(void) {
             assert(left == box[0]);
         }
         draw();
-        assert(list.n == (int)strlen("Saved to slot 2") + 2 && shows("Saved to slot 2"));
+        assert(list.n == (int)strlen("Saved to slot 2") + 4 && shows("Saved to slot 2"));
         assert(qv(&list.q[0]).x == box[0] && qv(&list.q[0]).y == box[1] + box[3] + ch / 2);
         h = (int)(box[1] + box[3]) + 4; /* a picture that ends four pixels under the box */
         overlay_place(SW, h, &short_x, &short_y, &short_s);
         list.n = 0;
         overlay_draw(&list, SW, h, 0);
-        assert(list.n == (int)strlen("Saved to slot 2") + 2);
+        assert(list.n == (int)strlen("Saved to slot 2") + 4);
         assert(qv(&list.q[0]).y == (float)(16 * stats_scale(short_s)) &&
                qv(&list.q[list.n - 1]).x + qv(&list.q[list.n - 1]).w == (float)(SW - 8 * stats_scale(short_s)));
         stats_corner_set(corner, "br");
@@ -1921,15 +1966,188 @@ int main(void) {
         draw();
         assert(qv(&list.q[0]).x == cw && qv(&list.q[0]).y == ch);
     }
-    overlay_toast("", 0); /* none */
+    toasts_gone();
     /* a notice from any thread (RenderDoc's): the notification once the next frame draws it, the last given before
-       then, and taken once */
-    overlay_notice("RenderDoc: written in 2 s: one.rdc (2 KiB)");
-    overlay_notice("RenderDoc: written in 3 s: two.rdc (2 KiB)");
+       then, with its icon, and taken once */
+    overlay_notice(GUI_ICON_FIRST, "RenderDoc: written in 2 s: one.rdc (2 KiB)");
+    overlay_notice(overlay_key_icon(HOTKEY_CAPTURE), "RenderDoc: written in 3 s: two.rdc (2 KiB)");
     assert(!overlay_toasting(0));
     draw();
     assert(shows("RenderDoc: written in 3 s: two.rdc (2 KiB)") && !shows("one.rdc") && overlay_toasting(0));
-    overlay_toast("", 0);
+    assert(toast_icon("RenderDoc: written in 3 s") == GUI_ICON_IMAGE);
+    toasts_gone();
+    assert(!overlay_toasting(0));
+    draw();
+    assert(!list.n);
+    /* each notification after the icon the launcher and the menu give what it says. A runtime key's, its row's on F1's
+       page: a screenshot's the picture (no camera among the icons), a pause's the play, the quit's warning the door */
+    assert(overlay_key_icon(HOTKEY_SCREENSHOT) == GUI_ICON_IMAGE && overlay_key_icon(HOTKEY_PAUSE) == GUI_ICON_PLAY);
+    assert(overlay_key_icon(HOTKEY_QUIT) == GUI_ICON_LOG_OUT && overlay_key_icon(HOTKEY_CAPTURE) == GUI_ICON_IMAGE);
+    assert(overlay_key_icon(-1) == GUI_ICON_NONE);
+    /* a setting changed, its group's in the launcher's Settings (Performance's gauge, Display's screen, Graphics'
+       picture, Debug's bug, Overlay's pointer for On-screen controls), or its page's where that has one */
+    assert(overlay_setting_icon("fps_limit") == GUI_ICON_GAUGE && gui_group_icon("Performance") == GUI_ICON_GAUGE);
+    assert(overlay_setting_icon("showcase") == GUI_ICON_MONITOR && overlay_setting_icon("stats") == GUI_ICON_MONITOR);
+    assert(overlay_setting_icon("docked") == GUI_ICON_MONITOR && gui_group_icon("Display") == GUI_ICON_MONITOR);
+    assert(overlay_setting_icon("upscaler") == GUI_ICON_IMAGE &&
+           overlay_setting_icon("anti_aliasing") == GUI_ICON_IMAGE);
+    assert(overlay_setting_icon("log_max") == GUI_ICON_BUG &&
+           overlay_setting_icon("controls_scale") == GUI_ICON_POINTER);
+    assert(overlay_setting_icon("gamepad_rumble") == gui_group_icon("Controllers"));
+    assert(overlay_setting_icon("gamepad_p1_rumble") == gui_group_icon("Controllers")); /* Player's page has none */
+    {
+        const IniOpt* o = NULL;
+        int k, t;
+        for (k = 0; k < g_ini_sections_count && !o; ++k)
+            for (t = 0; t < 3 && g_ini_sections[k].table[t] && !o; ++t)
+                if (g_ini_sections[k].page[t] && !strcmp(g_ini_sections[k].page[t], "Vulkan Extensions"))
+                    o = g_ini_sections[k].table[t];
+        assert(o && o->key && overlay_setting_icon(o->key) == GUI_ICON_GPU); /* Graphics' Vulkan Extensions */
+    }
+    assert(overlay_setting_icon("no_such_key") == GUI_ICON_NONE);
+    overlay_setting_toast("fps_limit", "FPS limit: off", 0);
+    draw();
+    assert(shows("FPS limit: off") && toast_icon("FPS limit: off") == GUI_ICON_GAUGE);
+    toasts_gone();
+    overlay_state_toast("Slot 3: 2026-10-22 14:05  0:02:00", 0);
+    draw();
+    assert(toast_icon("Slot 3: ") == GUI_ICON_SAVE);
+    toasts_gone();
+    /* A line comes in and goes as the launcher's screens fade from black and to it, over its theme's fade_in_ms and
+       fade_out_ms, on the launcher's curve and black (run_theme.h's snx_fade_done and snx_fade_shade, as
+       src/gui/main.c's overlay takes them): what that black leaves of the screen, 0 at its start, 128 at the half
+       (the black's 127), whole at the end; the same going. While it fades its quads are a faded span of the layer at
+       that alpha, the same quads from frame to frame; whole, there is no span */
+    {
+        const u64 t0 = 5000000000ull, ms = 1000000ull, until = t0 + (u64)SNX_OVERLAY_TOAST_MS * ms;
+        static const char said[] = "Compiling shaders";
+        const SnxRunTheme theme = {.fade_in_ms = 250, .fade_out_ms = 500};
+        SnxUiQuad held[64];
+        SnxUiFade fades[SNX_UI_FADES];
+        u32 taken[2];
+        int n = (int)strlen(said) + 4;
+        overlay_fades(&theme, taken);
+        assert(taken[0] == 250 && taken[1] == 500);
+        overlay_toast(SNX_STATS_ICON_COMPILE, said, t0);
+        assert(overlay_toast_alpha(0, t0) == 0 && overlay_toast_alpha(0, t0 + 125 * ms) == 128);
+        assert(overlay_toast_alpha(0, t0 + 200 * ms) ==
+               255 - snx_fade_shade(1.0f - snx_fade_done(t0 / ms + 200, t0 / ms, 250)));
+        assert(overlay_toast_alpha(0, t0 + 250 * ms) == 255 && overlay_toast_alpha(0, t0 + 1000 * ms) == 255);
+        assert(overlay_toast_alpha(0, until - 500 * ms) == 255 && overlay_toast_alpha(0, until - 250 * ms) == 128);
+        assert(overlay_toast_alpha(0, until - 100 * ms) ==
+               255 - snx_fade_shade(snx_fade_done(until / ms - 100, until / ms - 500, 500)));
+        assert(overlay_toast_alpha(0, until - ms) == 1 &&
+               overlay_toast_alpha(0, until) == 0); /* black 254, then gone */
+        assert(overlay_toast_alpha(1, t0 + 1000 * ms) == 0 && overlay_toast_alpha(-1, t0 + 1000 * ms) == 0); /* none */
+        /* at 0: its quads, all of their black */
+        assert(draw_fades(t0, fades) == 1 && list.n == n && fades[0].alpha == 0 && !fades[0].first &&
+               fades[0].end == n);
+        assert(draw_fades(t0 + 125 * ms, fades) == 1 && list.n == n && fades[0].alpha == 128 && fades[0].end == n);
+        memcpy(held, list.q, sizeof *held * (size_t)n);
+        assert(draw_fades(t0 + 200 * ms, fades) == 1 && list.n == n &&
+               fades[0].alpha == (unsigned)overlay_toast_alpha(0, t0 + 200 * ms) &&
+               !memcmp(held, list.q, sizeof *held * (size_t)n));
+        /* whole: no span, the same quads */
+        assert(!draw_fades(t0 + 1000 * ms, fades) && list.n == n && !memcmp(held, list.q, sizeof *held * (size_t)n));
+        assert(draw_fades(until - 250 * ms, fades) == 1 && list.n == n && fades[0].alpha == 128 &&
+               !memcmp(held, list.q, sizeof *held * (size_t)n));
+        /* behind the menu's quads, the span is the notification's alone */
+        overlay_toggle();
+        assert(draw_fades(until - 250 * ms, fades) == 1 && fades[0].alpha == 128 && fades[0].first > 0 &&
+               fades[0].end == list.n && fades[0].end - fades[0].first == n);
+        overlay_toggle();
+        /* two lines, each fading on its own: the one given later, under it, its own span and alpha; given again, a
+           line keeps its fade in, its words changed */
+        overlay_toast(SNX_STATS_ICON_ENCODE, "Encoding textures", t0 + 100 * ms);
+        assert(draw_fades(t0 + 200 * ms, fades) == 2 && fades[0].first == 0 && fades[0].end == n &&
+               fades[1].first == n && fades[1].end == list.n);
+        assert(fades[0].alpha == (unsigned)overlay_toast_alpha(0, t0 + 200 * ms) &&
+               fades[1].alpha == (unsigned)overlay_toast_alpha(1, t0 + 200 * ms) && fades[1].alpha < fades[0].alpha);
+        assert(overlay_toast_alpha(1, t0 + 225 * ms) == 128); /* its own half */
+        overlay_toast(SNX_STATS_ICON_ENCODE, "Encoding again", t0 + 600 * ms);
+        assert(!draw_fades(t0 + 600 * ms, fades) && shows("Encoding again") && !shows("Encoding textures"));
+        assert(overlay_toast_alpha(1, t0 + 600 * ms) == 255);
+        overlay_toast(SNX_STATS_ICON_ENCODE, "", t0 + 600 * ms);
+        /* YoRHa's built in, where the launcher's theme can't be read: its theme.ini's (gui_theme_colors.h) */
+        overlay_fades(NULL, taken);
+        assert(taken[0] == SNX_GUI_THEME_YORHA_FADE_IN_MS && taken[1] == SNX_GUI_THEME_YORHA_FADE_OUT_MS);
+        assert(overlay_toast_alpha(0, t0 + SNX_GUI_THEME_YORHA_FADE_IN_MS / 2 * ms) ==
+               255 - snx_fade_shade(
+                         1.0f - snx_fade_done(SNX_GUI_THEME_YORHA_FADE_IN_MS / 2, 0, SNX_GUI_THEME_YORHA_FADE_IN_MS)));
+        /* a fade out longer than the notification, given as the clock starts: 3 s of its 10 s left at its start */
+        toasts_gone();
+        overlay_fades(&(SnxRunTheme){.fade_out_ms = 10000}, taken);
+        overlay_toast(SNX_STATS_ICON_COMPILE, said, 1000);
+        assert(overlay_toast_alpha(0, 1000) == 77 && overlay_toast_alpha(0, 1500 * ms) == 39);
+        toasts_gone();
+        overlay_toast(SNX_STATS_ICON_COMPILE, said, t0);
+        /* a theme with no fades: whole from its start to its end */
+        overlay_fades(&(SnxRunTheme){0}, taken);
+        assert(!taken[0] && !taken[1] && overlay_toast_alpha(0, t0) == 255 &&
+               overlay_toast_alpha(0, until - ms) == 255);
+        toasts_gone();
+    }
+    /* One a line, the oldest at the top, each a band of its own after its icon: a setting changed its own line, the
+       next change of its key taking that line where it is; another's by its icon (a save state's slot picked, then
+       saved: one line). OVERLAY_TOASTS at most: one more takes the oldest's place. Each goes when its own time is up,
+       those under it up a line; empty words take their subject's line out */
+    {
+        const u64 ms = 1000000ull;
+        const int t = stats_scale(s);
+        const float ch = 16.0f * (float)t, cw = 8.0f * (float)t;
+        SnxUiFade fades[SNX_UI_FADES];
+        float x, y;
+        assert(OVERLAY_TOASTS == 4 && OVERLAY_TOASTS <= SNX_UI_FADES);
+        overlay_setting_toast("fps_limit", "FPS limit: off", 0);
+        overlay_setting_toast("showcase", "Showcase: on", 100 * ms);
+        assert(!draw_fades(200 * ms, fades) && list.n == (int)(strlen("FPS limit: off") + strlen("Showcase: on")) + 8);
+        assert(text_xy("FPS limit: off", &x, &y) && x == 5 * cw && y == ch &&
+               toast_icon("FPS limit") == GUI_ICON_GAUGE);
+        assert(text_xy("Showcase: on", &x, &y) && x == 5 * cw && y == 2 * ch &&
+               toast_icon("Showcase: on") == GUI_ICON_MONITOR);
+        overlay_setting_toast("fps_limit", "FPS limit: the game's pace", 300 * ms); /* F4 again: its line */
+        draw_fades(300 * ms, fades);
+        assert(!shows("FPS limit: off") && text_xy("FPS limit: the game's pace", &x, &y) && y == ch);
+        assert(text_xy("Showcase: on", &x, &y) && y == 2 * ch);
+        overlay_setting_toast("stats", "Stats: on", 400 * ms); /* Display's icon too, its key its own line */
+        draw_fades(400 * ms, fades);
+        assert(text_xy("Stats: on", &x, &y) && y == 3 * ch && toast_icon("Stats: on") == GUI_ICON_MONITOR);
+        overlay_state_toast("Slot 2: 2026-10-22 14:05  0:02:00", 500 * ms);
+        overlay_state_saved("slot 2", 0, 600 * ms);
+        draw_fades(600 * ms, fades);
+        assert(!shows("Slot 2: ") && text_xy("Saved to slot 2", &x, &y) && y == 4 * ch);
+        overlay_toast(overlay_key_icon(HOTKEY_PAUSE), "Pause: on", 700 * ms); /* a fifth: FPS limit's goes */
+        draw_fades(700 * ms, fades);
+        assert(!shows("FPS limit") && text_xy("Showcase: on", &x, &y) && y == ch);
+        assert(text_xy("Stats: on", &x, &y) && y == 2 * ch && text_xy("Saved to slot 2", &x, &y) && y == 3 * ch);
+        assert(text_xy("Pause: on", &x, &y) && y == 4 * ch && toast_icon("Pause: on") == GUI_ICON_PLAY);
+        /* the showcase's time up, given at 100 ms: the rest up a line */
+        draw_fades(100 * ms + (u64)SNX_OVERLAY_TOAST_MS * ms, fades);
+        assert(!shows("Showcase") && text_xy("Stats: on", &x, &y) && y == ch && text_xy("Pause: on", &x, &y) &&
+               y == 3 * ch);
+        assert(overlay_toasting(700 * ms + (u64)SNX_OVERLAY_TOAST_MS * ms - 1) &&
+               !overlay_toasting(700 * ms + (u64)SNX_OVERLAY_TOAST_MS * ms));
+        overlay_setting_toast("stats", "", 3200 * ms);
+        draw_fades(3200 * ms, fades);
+        assert(!shows("Stats") && text_xy("Saved to slot 2", &x, &y) && y == ch);
+        toasts_gone();
+        assert(!overlay_toasting(0));
+    }
+    /* the caches of earlier runs found empty as the game starts: the shaders' words, else the textures'; none for
+       neither, nor while the shader cache is still read (-1), which then says nothing to keep; said once a run, as
+       the next frame's notification */
+    assert(!overlay_cold_cache_words(0, 0) && !strcmp(overlay_cold_cache_words(1, 0), "Compiling shaders"));
+    assert(!strcmp(overlay_cold_cache_words(1, 1), "Compiling shaders"));
+    assert(!strcmp(overlay_cold_cache_words(0, 1), "Encoding textures"));
+    assert(!overlay_cold_cache(0, 0) && !overlay_cold_cache(-1, 1) && !overlay_cold_cache(-1, 0));
+    draw();
+    assert(!list.n);
+    assert(overlay_cold_cache(0, 1));
+    draw();
+    assert(shows("Encoding textures") && overlay_toasting(0) &&
+           toast_icon("Encoding textures") == SNX_STATS_ICON_ENCODE);
+    toasts_gone();
+    assert(!overlay_cold_cache(1, 0) && !overlay_cold_cache(1, 1)); /* once */
     draw();
     assert(!list.n);
     overlay_toggle();

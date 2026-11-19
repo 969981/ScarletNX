@@ -285,7 +285,7 @@ static int check_descriptor_room(void) {
     u32 slot = vk_frame_slot();
     u64 submit = vk_submit_number(), tables = 0;
     while (vk_descriptors_room(slot)) { /* what vk_frame_check asks before each draw */
-        for (int stage = 0; stage < 5; stage++) CHECK(vk_descriptors_write(g_vk_dslayout[0][0], 1, &write));
+        for (int stage = 0; stage < 5; stage++) CHECK(vk_descriptors_write(g_vk_dslayout[0][0], 1, &write, 0));
         tables += 5;
         CHECK(vk_frame_slot() == slot && vk_submit_number() == submit); /* no submit inside the "setup" */
     }
@@ -1606,6 +1606,63 @@ static int check_big_volume(void) {
     CHECK(t && t->type == VK_IMAGE_VIEW_TYPE_3D && t->w == 1024 && t->h == 1024 && t->depth3d == 513);
     CHECK(!memcmp(got, block, sizeof got));
     puts("big volume: a 1024x1024x513 BC1 texture is made, its first block from memory");
+    return 0;
+}
+/* A 3D pitch-linear level bigger than the staging one piece may take (texture.c's band, a quarter of the allocation
+   cap, faked here to 1 MiB) whose slice's rows fit the band exactly: staged a slice at a time, each slice comes from
+   memory. RGBA8, 8x64x8 with rows 4096 bytes apart, 256 KiB of rows a slice and 2 MiB the level. Staged whole, the 2
+   MiB passed what an allocation may be, and the level was left out */
+static int check_pitch_volume_band(void) {
+    const u64 gva = 0x9e0000000ull, cpu = HEAP_BASE + 0x3c600000;
+    const u32 w = 8, h = 64, d = 8, pitch = 4096;
+    if (vk_uma()) {
+        puts("pitch volume band: memory is shared with the CPU, where the rows are read in place: not checked");
+        return 0;
+    }
+    CHECK(mem_map(cpu, (u64)pitch * h * d, MS_NORMAL, PERM_RW) == 0);
+    gmmu_map(gva, cpu, (u64)pitch * h * d);
+    for (u32 z = 0; z < d; z++)
+        for (u32 y = 0; y < h; y++)
+            for (u32 x = 0; x < w * 4; x++) GP(cpu)[((u64)z * h + y) * pitch + x] = (u8)(z * 31 + y * 7 + x);
+    /* A8B8G8R8 UNORM, pitch linear, 3D */
+    const u32 tic[8] = {0x08 | 2u << 7 | 2u << 10 | 2u << 13 | 2u << 16 | 2u << 19 | 3u << 22 | 4u << 25 | 5u << 28,
+                        (u32)gva,
+                        (u32)(gva >> 32) | 2u << 21,
+                        pitch >> 5,
+                        (w - 1) | 2u << 23,
+                        (h - 1) | (d - 1) << 16,
+                        0,
+                        0};
+    u8 got[8 * 4] = {0}, want[8 * 4];
+    for (u32 x = 0; x < sizeof want; x++) want[x] = (u8)((d - 1) * 31 + (h - 1) * 7 + x);
+    const u64 cap = g_vk.alloc_cap;
+    vk_lock();
+    g_vk.alloc_cap = 1u << 20;
+    Surf* t = vk_tex_from_tic(tic);
+    g_vk.alloc_cap = cap;
+    const int valid = t && t->upload_valid;
+    VkBuffer buffer;
+    u8* result = valid ? vk_readback_buffer(sizeof got, &buffer) : NULL;
+    if (result) { /* the last row of the last slice */
+        VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                  .imageOffset = {0, (i32)h - 1, (i32)d - 1},
+                                  .imageExtent = {w, 1, 1}};
+        vk_surf_use(vk_cmd(), t, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
+                    VK_ACCESS_2_TRANSFER_READ_BIT);
+        rec_CmdCopyImageToBuffer(vk_cmd(), t->img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), buffer, 1, &copy);
+        vk_finish();
+        vk_readback_ready();
+        memcpy(got, result, sizeof got);
+    }
+    vk_unlock();
+    if (!valid || memcmp(got, want, sizeof got))
+        fprintf(stderr,
+                "pitch volume band: texture %d, loaded %d, the last row's first texel %02x%02x%02x%02x, not "
+                "%02x%02x%02x%02x\n",
+                t != NULL, valid, got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+    CHECK(t && t->type == VK_IMAGE_VIEW_TYPE_3D && !t->bl && t->depth3d == d);
+    CHECK(valid && !memcmp(got, want, sizeof got));
+    puts("pitch volume band: an 8x64x8 pitch-linear level of 2 MiB is staged a slice at a time and loads whole");
     return 0;
 }
 static int check_depth_array(void) {
@@ -7255,6 +7312,7 @@ static void results_copied(u64 cpu, u64 len) { vk_own_cpu_touched(cpu, len); }
 #include "vulkan_shader_invalidate.inc"
 #include "vulkan_shader_windows.inc"
 #include "vulkan_shared_clamp.inc"
+#include "vulkan_compute_arena.inc"
 #include "vulkan_index_draws.inc"
 #include "vulkan_polygon_lines.inc"
 #include "vulkan_pass_breaks.inc"
@@ -7296,6 +7354,7 @@ static int check_pipeline_stats_compute(void) {
 #include "vulkan_rect_textures.inc"
 #include "vulkan_minmax_program.inc"
 #include "vulkan_compute_depth.inc"
+#include "vulkan_depth_state.inc"
 #include "vulkan_owned_readback.inc"
 #include "vulkan_own_trim.inc"
 #include "vulkan_wlog_again.inc"
@@ -7324,6 +7383,7 @@ static int check_pipeline_stats_compute(void) {
 #include "vulkan_draw_texture.inc"
 #include "vulkan_lone_lane.inc"
 #include "vulkan_descriptor_heaps.inc"
+#include "vulkan_cb_address.inc"
 #include "vulkan_descriptor_memo.inc"
 #include "vulkan_sample_raster.inc"
 #include "vulkan_mixed_coverage.inc"
@@ -8030,6 +8090,8 @@ static int run_headless(int argc, char** argv) {
             result = check_fragment_quad();
         else if (!strcmp(name, "draw_memo"))
             result = check_draw_memo();
+        else if (!strcmp(name, "surface_loads"))
+            result = check_layered_surface_loads();
         else if (!strcmp(name, "owned_page_reads"))
             result = check_owned_page_reads();
         else if (!strcmp(name, "cross_stage_blend"))
@@ -8070,6 +8132,8 @@ static int run_headless(int argc, char** argv) {
             result = check_poll_kick();
         else if (!strcmp(name, "descriptor_heaps"))
             result = check_descriptor_heaps();
+        else if (!strcmp(name, "cb_address"))
+            result = check_cb_address();
         else if (!strcmp(name, "indirect_dispatch"))
             result = check_indirect_dispatch_once();
         else if (!strcmp(name, "integer_half"))
@@ -8470,6 +8534,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_texture_quiet_present());
     CHECK(!check_memo_over_target());
     CHECK(!check_descriptor_heaps());
+    CHECK(!check_cb_address());
     CHECK(!check_descriptor_memo());
     CHECK(!check_fragment_barrier_backend());
     CHECK(!check_capture_cap());
@@ -8508,6 +8573,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_packed_depth());
     CHECK(!check_astc_mode());
     CHECK(!check_depth_array());
+    CHECK(!check_depth_save_state());
     CHECK(!check_depth_writeback());
     CHECK(!check_big_volume());
     CHECK(!check_srgb_write());
@@ -8531,6 +8597,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_indirect_dispatch_once());
     CHECK(!check_shared_clamp());
     CHECK(!check_shared_spill());
+    CHECK(!check_compute_arena_count());
     CHECK(!check_vic());
     CHECK(!check_vic_chain(shot));
     CHECK(!check_nvdec_vic());
@@ -8547,6 +8614,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_publish_padding());
     CHECK(!check_dma_texture());
     CHECK(!check_sparse_volume());
+    CHECK(!check_pitch_volume_band());
     CHECK(!check_sparse_view());
     CHECK(!check_sparse_tiles());
     CHECK(!check_sparse_alias());

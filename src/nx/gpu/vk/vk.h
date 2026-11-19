@@ -75,6 +75,7 @@ typedef struct {
     int has_copy_indirect;
     int has_inplace_loads; /* block linear loads read GPU results by device address (vk_bl_move_src) */
     int has_descriptor_heaps;
+    int cb_address; /* the vk_cb_address setting: with heaps, constant buffers by address (vk_cb_addr_mask) */
     int has_descriptor_heap_support; /* enabled device feature, retained during a draw's buffer fallback */
     VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_props;
     VkPhysicalDeviceDescriptorHeapPropertiesEXT descriptor_heap_props;
@@ -283,6 +284,7 @@ typedef struct {
        vk_swapchain_create found it. Atomic: the display session's thread reads it */
     _Atomic int hdr_display;
     u32 gfx_timestamp_bits;  /* the graphics queue family's timestampValidBits: 0 where it writes no timestamps */
+    u32 compute_timestamp_bits; /* the compute queue family's (astc.c's stream times its encodes there) */
     /* VK_EXT_memory_budget: the driver tells each heap's use and budget (devmem.c reads them, and guesses without) */
     int has_budget;
     /* VK_EXT_pageable_device_local_memory with VK_EXT_memory_priority: where the GPU's own memory is short, the driver
@@ -659,6 +661,16 @@ u64 vk_stage_buffer_size(VkBuffer b); /* a ring chunk's size, 0 for another buff
 u64 vk_stage_chunk(void);
 /* Streamed buffer snapshots in host RAM, with the same frame lifetime as vk_stage. */
 u8* vk_stage_upload(u64 size, u64 align, VkBuffer* buf, u64* off);
+/* the host's writes to staging made visible to the GPU before a submission to another queue reads them */
+void vk_stage_flush(void);
+/* the waits a graphics submission takes at most (cmd.c's submit, record.c's copy of them): vk_submit_after's or the
+   present's acquire, the compute batch's, the ASTC stream's and the sparse binds' */
+#define VK_SUBMIT_WAITS 4
+/* what is recorded goes to the GPU with no landing and no wait: the first half of the BC7 encoder's pace (astc.c),
+   which can run in a draw's setup, as vk_submit_upload_wait can */
+void vk_submit_pace(void);
+/* a buffer's or an image's sharing for the graphics and the compute queue both, with no ownership transfers */
+void vk_both_queues(VkSharingMode* mode, u32* count, const u32** families);
 /* As vk_stage_upload, for bytes that only work recorded now reads: a copy, a dispatch or a draw recorded before the
    submission being recorded goes, or the one after it, or the ones that follow a vk_submit_split each. The memory
    is no frame's (cmd.c's stream): it is handed out again once that work is done, so nothing may keep the buffer and
@@ -686,9 +698,10 @@ void vk_submit_for_readback(void);
 /* the commands recorded since the last submission submitted, when a command buffer is begun: what a change of an
    image's sparse binding has to follow (memory.c) */
 void vk_submit_recorded(void);
-/* the same, and waits for the GPU, landing nothing: an upload's own pace. let_go: with vk_lock let go meanwhile where
-   it can be (then 1), for an upload that holds nothing of the frame's slot across it, in a setup that starts again */
-int vk_submit_upload_wait(int let_go);
+/* the same, and waits for the GPU, landing nothing: an upload's own pace. upto: the submission to wait for (0: this
+   one, all of the GPU's work). let_go: with vk_lock let go meanwhile where it can be (then 1), for an upload that holds
+   nothing of the frame's slot across it, in a setup that starts again */
+int vk_submit_upload_wait(int let_go, u64 upto);
 int vk_upload_letting_go(void); /* vk_submit_upload_wait has let go of vk_lock (read under vk_lock) */
 /* vk_cmd() returns without waiting: the frame slot is recording, or the GPU is done with its last use */
 int vk_cmd_ready(void);
@@ -845,6 +858,21 @@ void vk_pool_sizes(VkDescriptorPoolSize* sz, u32 sets, u32 array_sets);
 extern u32 g_vk_buffer_image_slots; /* storage texel buffer bindings in a set, from SNX_VKB_IMGBUF */
 VkDescriptorType
 vk_cbuf_type(u32 slot); /* the descriptor type of a constant buffer slot (g_spirv_translate.uniform_cbufs) */
+/* The constant buffer slots of a stage that descriptor heaps map by address (VK_DESCRIPTOR_MAPPING_SOURCE_INDIRECT_
+   ADDRESS_EXT), with no descriptor: uniform buffers the shader reads only at constant offsets (cbuf_max under 64 KiB),
+   whose binding then covers every byte it reads (render.c's stage_set_). An address has no range: a read at an offset
+   from a register, which the translator doesn't bound, keeps the descriptor and its robust range. The pipeline's
+   mappings (PipeKey.cb_addr) and the draw's table take the mask from the same ShaderInfo */
+static inline u32 vk_cb_addr_mask(const ShaderInfo* si) {
+    u32 m = 0;
+    if (!g_vk.has_descriptor_heaps || !g_vk.cb_address) return 0;
+    for (u32 b = si->cbuf_mask & 0x3FFFFu; b; b &= b - 1) {
+        u32 i = snx_ctz32(b);
+        if (si->cbuf_max[i] && si->cbuf_max[i] < 0x10000 && vk_cbuf_type(i) == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
+            m |= 1u << i;
+    }
+    return m;
+}
 /* A buffer image: the texels a buffer header describes, bound as a storage texel buffer over their copy. Raw loads
    and atomics view it as R32_UINT, as the console reads it for them whatever its format. Formatted loads and stores
    see the format itself, of the number type the program was keyed on (kind 0 float, 2 unsigned, 3 signed); unkeyed,
@@ -1840,6 +1868,23 @@ int vk_tc_convert_vi(VkCommandBuffer cb, u32 fmt, u32 w, u32 rows, VkBuffer in, 
    the BC7 cache when they are there, with no decode and no encode, and an encode's blocks go into the cache once its
    submission is done (vk_astc_frame_done) */
 typedef int (*VkAstcRows)(void* ctx, VkCommandBuffer* cb, u32 z, u32 nz, u32 y, u32 n, VkBuffer* buf, u64* off);
+/* The ASTC stream: the uploads of new ASTC textures recorded for the compute queue, where the device has one of its
+   own, so that their decodes and encodes run beside the graphics queue's work and an upload's pace waits for them
+   alone. Each graphics submission submits what the stream recorded first and waits for it (cmd.c's submit), so the
+   frame's staging, descriptor sets and readback ring that the stream uses live until it is done. Only a texture that
+   no graphics work has used yet (layout undefined) goes there, its guest bytes all the CPU's (texture.c's
+   astc_stream_guest): nothing on the graphics queue writes what the stream reads, or reads what it writes.
+   vk_astc_stream_fits: t can go to the stream; vk_astc_stream_cmd: the stream's command buffer, begun;
+   vk_astc_stream_on: cb is it; vk_astc_stream_submit: what it recorded to the compute queue, the next graphics
+   submission waiting for it (g_vk_astc_sem at g_vk_astc_wait_value); vk_astc_stream_bl: the stream's own scratch
+   buffer for the block linear moves of its uploads (vk_bl_scratch's) */
+int vk_astc_stream_fits(const Surf* t);
+VkCommandBuffer vk_astc_stream_cmd(void);
+int vk_astc_stream_on(VkCommandBuffer cb);
+void vk_astc_stream_submit(void);
+VkBuffer vk_astc_stream_bl(u64 size, u64* cap_out);
+extern VkSemaphore g_vk_astc_sem;
+extern u64 g_vk_astc_wait_value;
 int vk_astc_upload(VkCommandBuffer cb, Surf* t, u32 x, u32 y, u32 w, u32 h, u32 depth, u32 level, u32 layer,
                    VkAstcRows rows, void* ctx, const u64* content);
 /* the same for a whole level of layers layers of a 2D array from layer, as a 3D level's slices: rows's z and nz count
@@ -1906,6 +1951,8 @@ void vk_bc7_key(const u64 content[2], const VkBc7Level* lv, u64 key[2]);
    no cache (another process holds the file, or it cannot be written) */
 int vk_bc7_cache_open(const char* path, const u64 version[2], u64 max);
 void vk_bc7_cache_close(void);
+/* 1 while the cache is open and held no level as it opened: every ASTC level is encoded as it first loads */
+int vk_bc7_cache_cold(void);
 u64 vk_bc7_cache_find(const u64 key[2]); /* the bytes of key's blocks, 0 when they aren't there */
 /* key's blocks, size bytes of them, into dst: 0 when they aren't there or don't check out (then dropped) */
 int vk_bc7_cache_read(const u64 key[2], u8* dst, u64 size);
@@ -2129,6 +2176,15 @@ VkImageView vk_tex_storage_view(Surf* s, VkImageViewType type);
 /* an empty texture of a view type: num 0 float, 1 unsigned, 2 signed integer, 3 depth at 1.0 (shadow samplers);
    ms: a multisampled one (2D and 2D array views, not depth) */
 VkImageView vk_null_view(VkImageViewType type, int num, int ms);
+/* Whether the header tic names no texture by itself: an empty one (word 0 nought, whose four swizzles read zero on
+   the console whatever its format) or one of a format the renderer has no Vulkan format for. A sampled slot reads the
+   null texture (vk_null_view) in its place, and the draw goes on */
+int vk_tic_names_none(const u32* tic);
+/* 1 the first time a slot reads the null texture for the header at tic_at, for the first 64 headers: the caller says
+   which slot, the header's address and what it reads in its place, once for each header */
+int vk_null_header_first(u64 tic_at);
+/* no header said yet: a test's checks of those lines start from none */
+void vk_null_headers_forget(void);
 /* The texture table (table.c): the set of ShCaps.tex_table, with a slot for each sampled view in a layout and for each
    sampler. vk_table_init says if the device can hold it (and why not, in why), and makes it */
 int vk_table_init(char* why, size_t size);
@@ -2808,6 +2864,7 @@ typedef struct {
     u32 logic_op;        /* 0, or the VkLogicOp the color targets take in place of blending, plus 1 */
     u32 arrays;          /* the sets with texture arrays: its layout, vk_playout(arrays) */
     u32 heaps;           /* graphics descriptor heap mappings instead of descriptor-set layouts */
+    u32 cb_addr[5];      /* with heaps, by set: the constant buffer slots mapped by address (vk_cb_addr_mask) */
     u32 samples;         /* the targets' VkSampleCountFlagBits (0 taken as 1) */
     VkCoverage coverage; /* color-only target-independent rasterization, all zero for ordinary multisampling */
     VkSampleLocations sample_locations;
@@ -2852,6 +2909,10 @@ VkPipeline vk_pipeline_now(VkPipeline h, int* pending);
 /* so far: pipelines made, how many of them the pipeline cache had, ms the workers took making them, ms the GPU thread
    waited for new ones, shaders translated, ms translating them */
 void vk_pipeline_stats(u64* pipes, u64* hits, u64* make_ms, u64* wait_ms, u64* shaders, u64* shader_ms);
+/* the shader cache of earlier runs (the pipeline file) as it was read: 1 when it held no shader and no pipeline,
+   which this run then translates and makes as draws ask; 0 when it held some, or when none is kept (shaders
+   recorded); -1 while it is still being read */
+int vk_pipeline_cache_cold(void);
 /* of those shaders, the ones translated beside a translation of their program that held, to hold more of a draw's
    constant buffer words as constants (cb_fold.h) */
 u64 vk_shader_folds(void);
@@ -2969,6 +3030,9 @@ void vk_uma_forget_all(void);
 /* the dispatches skipped so far; why (size bytes) gets their reasons with each one's count, " (12 not translated, 3
    a texture not bound)", or "" when none was */
 u64 vk_cs_skipped(char* why, size_t size);
+/* the dispatches whose bindings took more of the compute arena than its space check counted (0 where it counts each
+   binding as the arena takes it), the first four said by a log line */
+u64 vk_cs_arena_short(void);
 
 /* render.c */
 /* ends the dynamic rendering pass, if one is open. The caller's file and line count the passes it ended, which the

@@ -167,7 +167,7 @@ static Gran* gran_bind(u64 g) {
     DevMemInfo info[2];
     if (!r->shadow) goto fail;
     /* the GPU's memory, else system memory, where the programs read and write it over the bus: a granule that found
-       none left its dispatches the slow way each time, under a frame a second for seconds in Mario Kart World on a GPU
+       none left its dispatches the slow way each time, under a frame a second for seconds in a racing game on a GPU
        of 2 GB. Its mask goes with it */
     int got = 0;
     for (int at = 0; at < 2 && !got; at++) {
@@ -296,6 +296,19 @@ static int up_owned(u64 cpu, u64 n) {
         at = o[15].addr + o[15].size;
     }
     return copied;
+}
+
+/* the work recorded before, writes of the owners' resources and of the mirror among it, before the copies recorded
+   after: up_owned's copies read those resources and write the mirror */
+static void copies_after_work(void) {
+    VkMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                          .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                          .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                          .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                          .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT};
+    VkDependencyInfo d = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &b};
+    vk_render_end();
+    rec_CmdPipelineBarrier2(vk_cmd(), &d);
 }
 
 typedef struct {
@@ -947,6 +960,7 @@ void vk_mirror_publish(void) {
     u64* pages = malloc((size_t)n * sizeof *pages);
     if (!pages) fatal("Out of memory keeping the GPU mirror's writes");
     Up u = {0};
+    int ordered = 0; /* the owners' copies after the work before them: once a publish */
     for (u32 i = 0; i < n; i++) {
         const u32* e = q + i * MIR_ENTRY_PAGE;
         const u32* mask = e + 4;
@@ -964,18 +978,30 @@ void vk_mirror_publish(void) {
         u32 owned = own_stage(cpu, 4096, page, o, 16);
         if (owned > 16) continue; /* other owners' bytes all over it: theirs went into the mirror when it was bound */
         if (!valid) {
-            for (u32 a = 0; a < 4096;) {
+            /* every byte the program didn't log but the owned parts', which own_stage left in page as they were
+               (another page's): their owners' bytes go in from the resources (up_owned), recorded now, before the
+               copy of the bytes gathered here */
+            for (u32 a = 0, k = 0; a < 4096;) {
+                const u32 own_at = k < owned ? (u32)(o[k].addr - cpu) : 4096;
+                if (a >= own_at) {
+                    a = (u32)(o[k].addr + o[k].size - cpu);
+                    k++;
+                    continue;
+                }
                 if (bit(mask, a)) {
                     a++;
                     continue;
                 }
                 u32 b = a + 1;
-                while (b < 4096 && !bit(mask, b)) b++;
+                while (b < own_at && !bit(mask, b)) b++;
                 memcpy(up_bytes(&u, cpu + a, b - a), page + a, b - a);
                 a = b;
             }
-            /* owned parts: their owners' bytes, copied in after these (up_owned) */
-            if (owned) up_owned(cpu, 4096);
+            if (owned) {
+                if (!ordered) copies_after_work();
+                ordered = 1;
+                up_owned(cpu, 4096);
+            }
             continue;
         }
         for (u32 k = 0; k < owned; k++) memcpy(page + (o[k].addr - cpu), sh + (o[k].addr - cpu), o[k].size);

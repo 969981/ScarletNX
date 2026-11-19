@@ -3633,8 +3633,9 @@ static u32 hmma_zero(Ctx* c) {
    whatever the 64 words after its 8 hold (the start of D's), which only reach D's columns 8-15, never read back. A
    16 wide K pads a .1688's k of 8 with zeros in A's columns and B's rows 8-15, as stale words there could be
    infinities or NaNs, and 0 times those poisons the sums; a 16x8x8 shape splits a .16816's K in two products and an
-   8x8x8 its M in two more. The accumulator starts at zero and C is added to the lane's four elements of D after the
-   product: staging C as well (4 stores, 8 loads) cost one game's video upscaler half of the gain. A subgroup barrier
+   8x8x8 its M in two more. The accumulator starts at zero and an f16 D's C is added to the lane's four elements of D
+   after the product: staging C as well (4 stores, 8 loads) cost one game's video upscaler half of the gain. An f32 D,
+   which stays in its matrix (below), takes a C from the registers staged as its accumulator. A subgroup barrier
    comes before the stores (the last HMMA's loads of the slot), between them and the matrix loads, and between D's
    store and the lanes' loads of it; RADV makes them no instruction, a wave's LDS accesses being in order.
    The products of two f16 are exact in f32, and the device sums them in f32 inside the instruction, rounded as it
@@ -3665,7 +3666,7 @@ static int coop_wanted(const Ctx* c) {
     u32 own = c->si->shared_size > 0 ? (u32)c->si->shared_size : 16384u; /* shared_var's */
     if (own + lanes / 32 * COOP_WORDS * 4 > (u32)g_spirv_translate.hmma_coop) return 0;
     for (u32 i = 0; i < c->n; i++)
-        if (c->in[i].op == SM86_HMMA) return 1;
+        if (c->in[i].op == SM86_HMMA || c->in[i].op == SM86_LDSM_HMMA) return 1;
     return 0;
 }
 static void coop_barrier(Ctx* c) {
@@ -3764,9 +3765,7 @@ static int coop_acc_find(Ctx* c, u32 r) {
     }
     return -1;
 }
-/* the words of a D matrix to its registers: the words take a store, so one block's matrices are stored between one
-   pair of subgroup barriers (coop_flow) where there are many, or one matrix alone where one register asks. Both take
-   the slot's base and the lane's word, which a block of matrices makes once */
+/* the words of a D matrix to its registers go through the slot's D words, one matrix's room (coop_acc_write) */
 static void coop_d_store(Ctx* c, u32 shape, const u32* mat, u32 nmat, u32 base) {
     for (u32 m = 0; m < nmat; m++)
         SPV_VOID(&c->e, SPV_OP_COOPERATIVE_MATRIX_STORE_KHR,
@@ -3779,6 +3778,17 @@ static void coop_d_read(Ctx* c, u32 shape, u32 at_d, u32 out[4]) {
     for (u32 k = 0; k < 4; k++)
         out[k] = to_f(c, spv_emit_load_nonprivate(&c->e, c->t_u32, coop_d_word(c, shape, at_d, k)));
 }
+/* a held D's words to its registers, through the slot's D words: stored, then read back by each lane. The barrier
+   before the store keeps the last reads of those words (another D's, or a 16 wide B's, which spans their start) from
+   it, and the one after it the reads from the store */
+static void coop_acc_write(Ctx* c, const CoopAcc* a, u32 base) {
+    u32 out[4];
+    coop_barrier(c);
+    coop_d_store(c, a->shape, a->mat, a->nmat, base);
+    coop_barrier(c);
+    coop_d_read(c, a->shape, coop_d_at(c, a->shape), out);
+    for (u32 k = 0; k < 4; k++) wr(c, a->first + k, to_u(c, out[k]));
+}
 /* the words of the matrix r's register is one of, before a read or a write of it: an other entry stays held, and its
    words are still the matrix's */
 static void coop_acc_take(Ctx* c, u32 r) {
@@ -3787,15 +3797,20 @@ static void coop_acc_take(Ctx* c, u32 r) {
     CoopAcc a = c->coop_acc[i];
     c->coop_acc[i] = c->coop_acc[c->nacc - 1];
     c->nacc--; /* the writes below must not find it again */
-    u32 base = coop_base(c), at_d = coop_d_at(c, a.shape), out[4];
-    coop_d_store(c, a.shape, a.mat, a.nmat, base);
-    coop_barrier(c);
-    coop_d_read(c, a.shape, at_d, out);
-    for (u32 k = 0; k < 4; k++) wr(c, a.first + k, to_u(c, out[k]));
+    coop_acc_write(c, &a, coop_base(c));
 }
 /* an HMMA's f32 result kept as the D matrix of the registers it names, instead of their words: 1 where it is held,
-   0 where the block already holds its share of matrices and the words must be written */
+   0 where the block already holds its share of matrices and the words must be written. A held D of the same four
+   registers is this one's to replace, and one that shares only some of them goes to its registers first: the others
+   keep its words */
 static int coop_acc_hold(Ctx* c, u32 d, u32 shape, const u32* mat, u32 nmat) {
+    for (u32 k = 0; k < 4; k++) {
+        int i = coop_acc_find(c, d + k);
+        if (i >= 0 && c->coop_acc[i].first == d)
+            c->coop_acc[i] = c->coop_acc[--c->nacc];
+        else if (i >= 0)
+            coop_acc_take(c, d + k);
+    }
     for (u32 k = 0; k < 4; k++) c->coop_gen[d + k]++; /* the words are the matrix's now */
     if (c->nacc == COOP_ACC) return 0;
     CoopAcc* a = &c->coop_acc[c->nacc++];
@@ -3804,26 +3819,14 @@ static int coop_acc_hold(Ctx* c, u32 d, u32 shape, const u32* mat, u32 nmat) {
     for (u32 k = 0; k < nmat; k++) a->mat[k] = mat[k];
     return 1;
 }
-/* the block's end, at its branches and labels: D's words back to their registers, and the caches empty. A matrix
-   defined here has no value at a label the block's other arms reach too */
+/* the block's end, at its branches and labels: D's words back to their registers, one held D after the other, and the
+   caches empty. A matrix defined here has no value at a label the block's other arms reach too */
 static void coop_flow(Ctx* c) {
-    if (!c->nacc && !c->nfrags) return;
-    if (c->nacc) {
-        u32 n = c->nacc;
-        c->nacc = c->nfrags = 0; /* the writes below must not find them again */
-        u32 base = coop_base(c), at_d = coop_d_at(c, c->coop_acc[0].shape);
-        for (u32 i = 0; i < n; i++)
-            coop_d_store(c, c->coop_acc[i].shape, c->coop_acc[i].mat, c->coop_acc[i].nmat, base);
-        coop_barrier(c);
-        for (u32 i = 0; i < n; i++) {
-            CoopAcc a = c->coop_acc[i];
-            u32 out[4], at = a.shape == c->coop_acc[0].shape ? at_d : coop_d_at(c, a.shape);
-            coop_d_read(c, a.shape, at, out);
-            for (u32 k = 0; k < 4; k++) wr(c, a.first + k, to_u(c, out[k]));
-        }
-        return;
-    }
-    c->nfrags = 0;
+    u32 n = c->nacc;
+    c->nacc = c->nfrags = 0; /* the writes below must not find them again */
+    if (!n) return;
+    u32 base = coop_base(c);
+    for (u32 i = 0; i < n; i++) coop_acc_write(c, &c->coop_acc[i], base);
 }
 static void hmma_coop(Ctx* c, const Sm86Insn* in, int k16, int f32, u32 ra, u32 rb, u32 rc, const u32* ldsm_a) {
     u32 na = k16 ? 4 : 2, nb = k16 ? 2 : 1, ncd = f32 ? 4 : 2, a[4], b[2], cc[4], k;
@@ -3860,7 +3863,7 @@ static void hmma_coop(Ctx* c, const Sm86Insn* in, int k16, int f32, u32 ra, u32 
     int c_chain = 0;
     if (f32 && rc < SM86_RZ) {
         int i = coop_acc_find(c, rc);
-        if (i >= 0 && c->coop_acc[i].shape == shape) {
+        if (i >= 0 && c->coop_acc[i].shape == shape && c->coop_acc[i].first == rc) {
             for (u32 m = 0; m < mblocks; m++) c_mat[m] = c->coop_acc[i].mat[m];
             c_chain = 1;
         } else if (i >= 0)
@@ -3869,38 +3872,52 @@ static void hmma_coop(Ctx* c, const Sm86Insn* in, int k16, int f32, u32 ra, u32 
     /* the words the staging writes: a .1688's second K half is zeros where the shape's K is 16, and an 8 wide K reads
        only the first half's, whose .1688 has none to zero */
     u32 ka = k16 || depth == 16 ? 4 : 2, kb = k16 || depth == 16 ? 2 : 1;
-    /* C's words, which the product takes from the registers where no matrix stands for them: added to the lane's
-       words after the product, as they were before the matrices stayed. Staging them instead costs a matrix load for
-       the 4 word loads and adds it takes */
+    /* C's words, which the product takes from the registers where no matrix stands for them: an f16 D's are added to
+       the lane's words after the product, as they were before the matrices stayed (staging them costs a matrix load
+       for the 4 word loads and adds it takes), and an f32 D's are staged as the product's accumulator, as that D
+       stays in its matrix, where nothing would add them after */
+    int stage_c = f32 && rc < SM86_RZ && !c_chain;
     if (rc < SM86_RZ && !c_chain)
         for (k = 0; k < ncd; k++) cc[k] = rd(c, rc + k);
     /* the fragments no matrix stands for, staged in the slot, with the barrier that keeps the last HMMA's loads of it
        away. An RZ fragment's zeros stage too, as the words there can be anything */
-    int words = (ra < SM86_RZ ? fa < 0 : 1) || (rb < SM86_RZ ? fb < 0 : 1);
+    int words = (ra < SM86_RZ ? fa < 0 : 1) || (rb < SM86_RZ ? fb < 0 : 1) || stage_c;
     u32 base = words || fa < 0 || fb < 0 ? coop_base(c) : 0, g8 = 0, t = 0, at_a = 0, at_b = 0;
     if (words) {
-        if (ra < SM86_RZ && fa < 0)
-            for (k = 0; k < na; k++) a[k] = ldsm_a ? ldsm_a[k] : rd(c, ra + k);
-        if (rb < SM86_RZ && fb < 0)
-            for (k = 0; k < nb; k++) b[k] = rd(c, rb + k);
+        if (fa < 0) /* an RZ fragment's too: zeros */
+            for (k = 0; k < na; k++) a[k] = ra >= SM86_RZ ? c->zero : ldsm_a ? ldsm_a[k] : rd(c, ra + k);
+        if (fb < 0)
+            for (k = 0; k < nb; k++) b[k] = rb >= SM86_RZ ? c->zero : rd(c, rb + k);
         coop_lane(c, &g8, &t, 0);
         at_a = spv_emit_iadd_u32(&c->e, c->t_u32, base, spv_emit_iadd_u32(&c->e, c->t_u32, g8, t));
         at_b = coop_add(c, at_a, COOP_B);
         coop_barrier(c);
         static const u32 a_at[4] = {0, 64, 4, 68};
+        /* a .1688's K pad: -0 halves in A's and +0 in B's, whose -0 products leave the sum and its sign of zero */
         if (ra < SM86_RZ ? fa < 0 : 1)
             for (k = 0; k < ka; k++)
                 spv_emit_store_nonprivate(&c->e, coop_ptr(c, coop_add(c, at_a, a_at[k])),
-                                          k < na ? a[k] : c->zero);
+                                          k < na ? a[k] : cu(c, 0x80008000u));
         if (rb < SM86_RZ ? fb < 0 : 1)
             for (k = 0; k < kb; k++)
                 spv_emit_store_nonprivate(&c->e, coop_ptr(c, coop_add(c, at_b, 4 * k)), k < nb ? b[k] : c->zero);
+        if (stage_c) { /* where the lane reads its D words back: B's spare columns of a 16 wide one take them too */
+            u32 at_c = coop_d_at(c, shape);
+            for (k = 0; k < 4; k++) spv_emit_store_nonprivate(&c->e, coop_d_word(c, shape, at_c, k), cc[k]);
+        }
         coop_barrier(c);
     }
+    for (u32 m = 0; stage_c && m < mblocks; m++)
+        c_mat[m] =
+            SPV(&c->e, SPV_OP_COOPERATIVE_MATRIX_LOAD_KHR, t_acc,
+                coop_ptr(c, coop_add(c, coop_add(c, base, COOP_D), m ? 64 : 0)),
+                cu(c, SPV_COOPERATIVE_MATRIX_LAYOUT_ROW_MAJOR_KHR), cu(c, cols), SPV_MEMORY_ACCESS_NON_PRIVATE_POINTER);
     /* the products: an 8 wide K splits a .16816's K in two, an 8 wide M its 16 rows in two blocks of 8, each block's
        K halves adding into one accumulator. A 16 wide K is one product */
     static const u32 half_at[2] = {0, 4}, block_at[2] = {0, 64};
-    u32 zero_acc = spv_emit_const_composite(&c->e, t_acc, (const u32[]){cf(c, 0.0f)}, 1);
+    /* the sum's start where no C is in it: an RZ C's +0, which the console adds, or -0 where a C is added after, so
+       that the sum of -0 products and a -0 C stays -0 */
+    u32 zero_acc = spv_emit_const_composite(&c->e, t_acc, (const u32[]){cf(c, rc < SM86_RZ ? -0.0f : 0.0f)}, 1);
     u32 d_mat[2], ma_mat[4], mb_mat[2];
     for (u32 h = 0; h < kblocks; h++) /* B's matrix, one a k half: the same words for every M block */
         if (fb < 0)
@@ -3909,7 +3926,7 @@ static void hmma_coop(Ctx* c, const Sm86Insn* in, int k16, int f32, u32 ra, u32 
                              cu(c, SPV_COOPERATIVE_MATRIX_LAYOUT_COLUMN_MAJOR_KHR), cu(c, 8),
                              SPV_MEMORY_ACCESS_NON_PRIVATE_POINTER);
     for (u32 m = 0; m < mblocks; m++) {
-        u32 acc = c_chain ? c_mat[m] : 0;
+        u32 acc = c_chain || stage_c ? c_mat[m] : 0;
         for (u32 h = 0; h < kblocks; h++) {
             u32 ma = fa >= 0 ? c->coop_frags[fa].mat[m * kblocks + h]
                              : SPV(&c->e, SPV_OP_COOPERATIVE_MATRIX_LOAD_KHR, t_a,
@@ -3937,7 +3954,7 @@ static void hmma_coop(Ctx* c, const Sm86Insn* in, int k16, int f32, u32 ra, u32 
     coop_barrier(c);
     u32 acc[4];
     coop_d_read(c, shape, at_d, acc);
-    if (rc < SM86_RZ && !c_chain) /* C was the product's accumulator operand where its matrix stayed */
+    if (rc < SM86_RZ && !c_chain && !stage_c) /* C was the product's accumulator where it had a matrix */
         for (u32 i = 0; i < 2; i++) {
             u32 pair = f32 ? 0 : half_pair(c, cc[i]);
             for (u32 j = 0; j < 2; j++) {
@@ -4328,9 +4345,7 @@ static void ldsm_words(Ctx* c, u32 reg, u32 imm, u32 count, int trans, u32* out)
         }
     }
 }
-/* the LDSM's reads into out, and the destination registers' words, which the two halves of a fused pair give
-   twice: once each with its own emitter, whose block the fuse deletes, and once with the fuse's words given to the
-   HMMA (out kept for the second of them) */
+/* the LDSM's reads into out (a fused pair's, which its HMMA takes), and the destination registers' words */
 static void ldsm_do(Ctx* c, u32 dst, u32 reg, u32 imm, u32 count, int trans, u32* out) {
     u32 out4[4];
     if (!out) out = out4;
@@ -4347,32 +4362,16 @@ static void ldsm(Ctx* c, const Sm86Insn* in) {
     u32 imm = sm86_field(in, 40, 24), bias = imm & 0x800000u ? imm | 0xff000000u : imm;
     ldsm_do(c, in->dst, sm86_field(in, 24, 8), bias, count, (int)trans, NULL);
 }
-/* the fused pair of an LDSM and the HMMA that reads its fragments (fuse.c's SM86_LDSM_HMMA). The two halves are
-   written first, each with its own emitter, whose SPIR-V the fuse then deletes and writes over from scratch: the
-   properties the two halves make (the capabilities, the shared variable, the cooperative slot, the registers) are
-   the module's, in sections the delete does not touch, and the caches the deleted block made go with it. The fused
-   one reads the tiles once, writes the destination registers with the words and gives them to the HMMA, which puts
-   A's words into the slot without a read of the registers */
+/* the fused pair of an LDSM and the HMMA that reads its fragments (fuse.c's SM86_LDSM_HMMA): the LDSM's reads of the
+   tiles, once, write the destination registers and go to the HMMA as A's words, which it then takes without a read
+   of those registers */
 static void fused_ldsm_hmma(Ctx* c, const Sm86Insn* in) {
-    SpvMark mark = spv_emit_mark(&c->e);
-    u32 nfrags = c->nfrags, nacc = c->nacc, warp_base = c->warp_base;
-    u32 out4[4];
-    ldsm_words(c, sm86_fuse_ldsm_a(in), sm86_field(in, 40, 24), sm86_fuse_ldsm_count(in), sm86_fuse_ldsm_trans(in),
-               out4);
-    hmma(c, in, NULL, NULL);
-    spv_emit_rewind(&c->e, mark);
-    c->nfrags = nfrags, c->nacc = nacc; /* and the caches, and any value the module made in the deleted block: the
-        ids it made are of the words that are gone, so the fused block makes them again */
-    c->warp_base = warp_base;
-    /* coop_gen[] and hmma_count also advanced in the deleted block: the generation marks only compare equal within
-       a block, and hmma_zero only needs a value that is never zero in a lane that runs, so both still hold. */
     u32 count = sm86_fuse_ldsm_count(in), trans = sm86_fuse_ldsm_trans(in);
     u32 imm = sm86_field(in, 40, 24), bias = imm & 0x800000u ? imm | 0xff000000u : imm;
     int k16 = (int)(sm86_field(in, 72, 19) >> 3 & 1);
     u32 na = k16 ? 4 : 2, a[4], out[4];
     ldsm_do(c, sm86_fuse_ldsm_dst(in), sm86_fuse_ldsm_a(in), bias, count, trans, out);
     if (c->failed) return;
-    if (sm86_fuse_ldsm_dst(in) != sm86_field(in, 24, 8)) return;
     if (1u << count < 4u)
         for (u32 k = 1u << count; k < 4; k++) out[k] = c->zero; /* fewer fragments: the rest is zero */
     for (u32 k = 0; k < na; k++) a[k] = out[k];

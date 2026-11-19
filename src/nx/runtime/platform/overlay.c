@@ -55,6 +55,11 @@ enum {
     M_EXIT,
     M_COUNT
 };
+/* their icons; Clean Old Settings' is its notification's too */
+static const unsigned MAIN_ICONS[M_COUNT] = {
+    GUI_ICON_POINTER, GUI_ICON_GAMEPAD_2, GUI_ICON_SAVE,     GUI_ICON_KEYBOARD,
+    GUI_ICON_MONITOR, GUI_ICON_ACTIVITY,  GUI_ICON_VOLUME_2, GUI_ICON_SLIDERS_HORIZONTAL,
+    GUI_ICON_IMAGE,   GUI_ICON_ERASER,    GUI_ICON_LOG_OUT};
 /* the Settings page's entries: the sections of the game's .ini (settings.txt's) the launcher's Settings group, those
    the menu has a page of its own for left out, in the launcher's order with Debug last, a section's own page (Vulkan
    Extensions) after it. Each a table of g_ini_sections, the game's own rows (INI_IN_GAME) left out of its page */
@@ -224,9 +229,19 @@ static int nslots = 1, slot_at, ask, slots_stale;
 /* what the question asks besides the OVERLAY_ codes it gives back: the on-screen controls put back */
 enum { ASK_RESET = -1, ASK_CLEAN = -2 };
 static u32 slots_gen; /* counts the lists given: the picture is set again */
-static char toast[OVERLAY_COLS_MAX + 1];
-static u64 toast_until;
-static u32 toast_version; /* counts the toasts given */
+/* the notifications showing, a line each, the oldest first (overlay_toast) */
+#define TOAST_KEY 64
+typedef char snx_toasts_fade_apart[OVERLAY_TOASTS <= SNX_UI_FADES ? 1 : -1]; /* each line fades as a span of its own */
+static struct {
+    char text[OVERLAY_COLS_MAX + 1];
+    char key[TOAST_KEY]; /* the setting it says (overlay_setting_toast), "" for another */
+    unsigned icon;       /* the icon before it */
+    u64 from, until;     /* when it was given, which its fade in starts from, and when its time is up */
+} toasts[OVERLAY_TOASTS];
+static int ntoasts;
+static u32 toast_version;        /* counts the changes to the lines */
+static _Atomic u64 toasts_until; /* the last line's time up, which overlay_toasting reads from any thread */
+static u32 toast_fade[2];        /* overlay_fades': the fade in's and the fade out's ms */
 static int pad_player; /* the player the gamepads' page shows: 0 every player's, 1 to SNX_GAMEPADS */
 /* the Shortcuts page: its row in focus waits for a key, and what the last key given was refused for ("" none) */
 static int listening;
@@ -807,7 +822,7 @@ static int act(int i, int step) {
         char said[64];
         snprintf(said, sizeof said, "Clean Old Settings: %d taken out", ini_old_settings());
         ini_clean_old();
-        overlay_notice(said);
+        overlay_notice(MAIN_ICONS[M_CLEAN], said);
         page_open(PAGE_MAIN);
         return OVERLAY_NONE;
     }
@@ -869,24 +884,120 @@ void overlay_slots_set(const OverlaySlot* given, int n) {
 void overlay_state_saved(const char* slot, int over, u64 now_ns) {
     char text[OVERLAY_COLS_MAX + 1];
     snprintf(text, sizeof text, "Saved %s %s", over ? "over" : "to", slot);
-    overlay_toast(text, now_ns);
+    overlay_state_toast(text, now_ns);
 }
-void overlay_toast(const char* text, u64 now_ns) {
-    snprintf(toast, sizeof toast, "%s", text);
-    toast_until = now_ns + (u64)SNX_OVERLAY_TOAST_MS * 1000000u;
+void overlay_state_toast(const char* text, u64 now_ns) { overlay_toast(MAIN_ICONS[M_STATES], text, now_ns); }
+/* the lines changed: counted, and the last one's time up told */
+static void toasts_changed(void) {
+    u64 until = 0;
+    int i;
+    for (i = 0; i < ntoasts; ++i)
+        if (toasts[i].until > until) until = toasts[i].until;
+    atomic_store_explicit(&toasts_until, until, memory_order_relaxed);
     ++toast_version;
 }
-int overlay_toasting(u64 now_ns) { return toast[0] && now_ns < toast_until; }
+/* the lines whose time is up at now_ns out, the others up in their places */
+static void toasts_drop(u64 now_ns) {
+    int i, n = 0;
+    for (i = 0; i < ntoasts; ++i)
+        if (now_ns < toasts[i].until) toasts[n++] = toasts[i];
+    if (n == ntoasts) return;
+    ntoasts = n;
+    toasts_changed();
+}
+/* line i out, those under it up */
+static void toast_out(int i) {
+    memmove(&toasts[i], &toasts[i + 1], sizeof *toasts * (size_t)(ntoasts - i - 1));
+    --ntoasts;
+    toasts_changed();
+}
+/* text after icon on the line of its subject (key, a setting's; "" for another, whose icon is its subject), or a new
+   one under the others */
+static void toast_give(unsigned icon, const char* key, const char* text, u64 now_ns) {
+    int i;
+    toasts_drop(now_ns);
+    for (i = 0; i < ntoasts; ++i)
+        if (key[0] ? !strcmp(toasts[i].key, key) : !toasts[i].key[0] && toasts[i].icon == icon) break;
+    if (!text[0]) {
+        if (i < ntoasts) toast_out(i);
+        return;
+    }
+    if (i == ntoasts) { /* a new line under the others: past the most, the oldest goes */
+        if (ntoasts == OVERLAY_TOASTS) toast_out(0);
+        i = ntoasts++;
+        toasts[i].from = now_ns;
+        snprintf(toasts[i].key, sizeof toasts[i].key, "%s", key);
+    } else if (toasts[i].from > now_ns) /* given again before it was first: from now */
+        toasts[i].from = now_ns;
+    /* a line already in keeps its fade in: its words change, it does not come in again */
+    snprintf(toasts[i].text, sizeof toasts[i].text, "%s", text);
+    toasts[i].icon = icon;
+    toasts[i].until = now_ns + (u64)SNX_OVERLAY_TOAST_MS * 1000000u;
+    toasts_changed();
+}
+void overlay_toast(unsigned icon, const char* text, u64 now_ns) { toast_give(icon, "", text, now_ns); }
+int overlay_toasting(u64 now_ns) { return now_ns < atomic_load_explicit(&toasts_until, memory_order_relaxed); }
+unsigned overlay_setting_icon(const char* key) {
+    int s, t;
+    for (s = 0; s < g_ini_sections_count; ++s)
+        for (t = 0; t < 3 && g_ini_sections[s].table[t]; ++t)
+            if (ini_find(g_ini_sections[s].table[t], key)) {
+                const char* in = g_ini_sections[s].page[t];
+                unsigned icon = in ? gui_page_icon(in) : GUI_ICON_NONE;
+                return icon != GUI_ICON_NONE ? icon : gui_group_icon(gui_group_name(g_ini_sections[s].name));
+            }
+    return GUI_ICON_NONE;
+}
+void overlay_setting_toast(const char* key, const char* text, u64 now_ns) {
+    toast_give(overlay_setting_icon(key), key, text, now_ns);
+}
+unsigned overlay_key_icon(int action) {
+    size_t i;
+    for (i = 0; i < sizeof KEYS / sizeof *KEYS; ++i)
+        if (action >= 0 && KEYS[i].action == action) return KEYS[i].icon; /* -1: the game's buttons' rows */
+    return GUI_ICON_NONE;
+}
+void overlay_fades(const SnxRunTheme* theme, u32 ms[2]) {
+    toast_fade[0] = theme ? theme->fade_in_ms : SNX_GUI_THEME_YORHA_FADE_IN_MS;
+    toast_fade[1] = theme ? theme->fade_out_ms : SNX_GUI_THEME_YORHA_FADE_OUT_MS;
+    ms[0] = toast_fade[0];
+    ms[1] = toast_fade[1];
+}
+int overlay_toast_alpha(int line, u64 now_ns) {
+    const u64 now = now_ns / 1000000u;
+    u64 from, until;
+    u8 in, out;
+    if (line < 0 || line >= ntoasts || now_ns >= toasts[line].until) return 0;
+    from = toasts[line].from / 1000000u;
+    until = toasts[line].until / 1000000u;
+    /* the launcher's black coming in from it, and going out to it: that fade begins fade_out_ms before the end,
+       counted on from there, a fade longer than the toast too */
+    in = snx_fade_shade(1.0f - snx_fade_done(now, from, toast_fade[0]));
+    out = toast_fade[1] ? snx_fade_shade(snx_fade_done(now + toast_fade[1], until, toast_fade[1])) : 0;
+    return 255 - (in > out ? in : out);
+}
 /* overlay_notice's line until the next draw takes it ("" none), under a lock of its own: its callers may hold ui_lock
    or not */
 static PMutex notice_lock = PMUTEX_INIT;
 static char notice[OVERLAY_COLS_MAX + 1];
+static unsigned notice_icon;
 static _Atomic int notice_given; /* a line waits: the draw takes the lock only then */
-void overlay_notice(const char* text) {
+void overlay_notice(unsigned icon, const char* text) {
     pm_lock(&notice_lock);
     snprintf(notice, sizeof notice, "%s", text);
+    notice_icon = icon;
     atomic_store_explicit(&notice_given, 1, memory_order_release);
     pm_unlock(&notice_lock);
+}
+const char* overlay_cold_cache_words(int shaders, int textures) {
+    return shaders ? "Compiling shaders" : textures ? "Encoding textures" : NULL;
+}
+int overlay_cold_cache(int shaders, int textures) {
+    static _Atomic int said;
+    const char* words = shaders < 0 ? NULL : overlay_cold_cache_words(shaders, textures);
+    if (!words || atomic_exchange_explicit(&said, 1, memory_order_relaxed)) return 0;
+    overlay_notice(shaders ? SNX_STATS_ICON_COMPILE : SNX_STATS_ICON_ENCODE, words);
+    return 1;
 }
 void overlay_toggle(void) {
     changed();
@@ -1615,14 +1726,10 @@ static void menu_dialog(Dialog* d, char (*text)[OVERLAY_COLS_MAX + 1], char (*va
     d->focus = focus;
     d->shown = n - top < visible() ? n - top : visible();
     for (r = 0; r < d->shown; ++r) {
-        static const unsigned main_icons[M_COUNT] = {GUI_ICON_POINTER,  GUI_ICON_GAMEPAD_2, GUI_ICON_SAVE,
-                                                     GUI_ICON_KEYBOARD, GUI_ICON_MONITOR,   GUI_ICON_ACTIVITY,
-                                                     GUI_ICON_VOLUME_2, GUI_ICON_SLIDERS_HORIZONTAL,
-                                                     GUI_ICON_IMAGE,    GUI_ICON_ERASER,    GUI_ICON_LOG_OUT};
         const IniOpt* o = slider(top + r);
         label(top + r, text[r], sizeof *text, value[r], sizeof *value);
         d->label[r] = text[r];
-        d->icon[r] = page == PAGE_MAIN ? main_icons[main_item(top + r)] : GUI_ICON_NONE;
+        d->icon[r] = page == PAGE_MAIN ? MAIN_ICONS[main_item(top + r)] : GUI_ICON_NONE;
         d->tone[r] = item_tone(top + r);
         d->value[r] = value[r];
         if (o) {
@@ -1792,32 +1899,49 @@ static const char* pads_hint(char* out, size_t size) {
         snprintf(out, size, "%s", gamepad_name(0));
     return out;
 }
-/* the notification: a band of one row in the picture's top left corner, which is its letters, backed (ui.h's
-   UI_BACKED) by the layer's ink, between a blank cell at either end: nothing is drawn under them. Its letters are the
-   stats box's and showcase's (stats_scale), the other text over a running game, not the menu's that stops it */
-static void toast_draw(SnxUiList* l, int sw, int sh, const float* stats) {
-    int px, py, s;
-    float cw, ch, x, y, w;
+/* the notifications: a band of one row each from the picture's top left corner down, the oldest first, which is its
+   icon, a blank cell and its letters, as the stats box's lines, backed (ui.h's UI_BACKED) by the layer's ink, between a
+   blank cell at either end: nothing is drawn under them. Their letters are the stats box's and showcase's
+   (stats_scale), the other text over a running game, not the menu's that stops it. Each line's first quad into span,
+   and its end after the last */
+static float toast_width(int i, float cw) {
+    return cw * (float)(strlen(toasts[i].text) + 2 + (toasts[i].icon != GUI_ICON_NONE ? 3 : 0));
+}
+static void toast_draw(SnxUiList* l, int sw, int sh, const float* stats, int span[OVERLAY_TOASTS + 1]) {
+    int px, py, s, i, right = 0;
+    float cw, ch, x, y, w = 0, h;
     overlay_place(sw, sh, &px, &py, &s);
     s = stats_scale(s);
     cw = 8.0f * (float)s;
     ch = 16.0f * (float)s;
     x = cw;
     y = ch;
-    w = cw * (float)(strlen(toast) + 2);
-    /* the stats' box (x, y, w, h; NULL for none) in that corner too: the band goes under it, from its left, half a
-       line apart, where it would lie on it; in the picture's top right corner when there is no room under the box */
-    if (stats && x < stats[0] + stats[2] && x + w > stats[0] && y < stats[1] + stats[3] && y + ch > stats[1]) {
+    for (i = 0; i < ntoasts; ++i)
+        if (toast_width(i, cw) > w) w = toast_width(i, cw);
+    h = ch * (float)ntoasts;
+    /* the stats' box (x, y, w, h; NULL for none) in that corner too: the bands go under it, from its left, half a
+       line apart, where they would lie on it; in the picture's top right corner, each to its edge, when there is no
+       room under the box */
+    if (stats && x < stats[0] + stats[2] && x + w > stats[0] && y < stats[1] + stats[3] && y + h > stats[1]) {
         x = stats[0];
         y = stats[1] + stats[3] + ch / 2;
-        if (y + ch > (float)sh) {
-            x = (float)sw - cw - w;
+        if (y + h > (float)sh) {
+            right = 1;
             y = ch;
         }
     }
-    x += ui_text_backed(l, x, y, s, " ", UI_PAGE);
-    x += ui_text_backed(l, x, y, s, toast, UI_PAGE);
-    ui_text_backed(l, x, y, s, " ", UI_PAGE);
+    for (i = 0; i < ntoasts; ++i) {
+        float at = right ? (float)sw - cw - toast_width(i, cw) : x, row = y + (float)i * ch;
+        span[i] = l->n;
+        at += ui_text_backed(l, at, row, s, " ", UI_PAGE);
+        if (toasts[i].icon != GUI_ICON_NONE) {
+            at += ui_icon_backed(l, at, row, s, toasts[i].icon, UI_PAGE);
+            at += ui_text_backed(l, at, row, s, " ", UI_PAGE);
+        }
+        at += ui_text_backed(l, at, row, s, toasts[i].text, UI_PAGE);
+        ui_text_backed(l, at, row, s, " ", UI_PAGE);
+    }
+    span[ntoasts] = l->n;
 }
 /* the slot whose thumbnail shows beside the save states' pages: the one in focus on the list, or the page's. Given
    again when the layer's picture is no longer the one it gave (the loading screen's cover took it meanwhile) */
@@ -1861,9 +1985,10 @@ static struct {
     u32 version;
 } g_menu;
 static struct {
-    SnxUiQuad q[2 * OVERLAY_COLS_MAX + 4];
+    SnxUiQuad q[OVERLAY_TOASTS * (OVERLAY_COLS_MAX + 4)]; /* a line's letters, its blanks and its icon */
     int n, sw, sh, percent, boxed;
-    float stats[4]; /* the stats' box it was placed for, when boxed */
+    int span[OVERLAY_TOASTS + 1]; /* each line's first quad, and the end of them (toast_draw) */
+    float stats[4];               /* the stats' box it was placed for, when boxed */
     u32 given, version;
 } g_toast;
 static void watch(const void* var) {
@@ -1912,7 +2037,7 @@ void overlay_draw(SnxUiList* l, int sw, int sh, u64 now_ns) {
     MenuKey key;
     if (atomic_load_explicit(&notice_given, memory_order_acquire)) {
         pm_lock(&notice_lock);
-        if (notice[0]) overlay_toast(notice, now_ns);
+        if (notice[0]) overlay_toast(notice_icon, notice, now_ns);
         notice[0] = 0;
         atomic_store_explicit(&notice_given, 0, memory_order_relaxed);
         pm_unlock(&notice_lock);
@@ -1939,14 +2064,15 @@ void overlay_draw(SnxUiList* l, int sw, int sh, u64 now_ns) {
         if (!g_menu.laid || memcmp(&key, &g_menu.key, sizeof key) || !watched_same()) menu_lay(sw, sh, &key);
         ui_append_kept(l, &(SnxUiList){g_menu.q, g_menu.n, g_menu.n}, g_menu.version, &g_menu, NULL);
     }
-    if (overlay_toasting(now_ns)) {
-        int percent = overlay_display_percent();
+    toasts_drop(now_ns);
+    if (ntoasts) {
+        int percent = overlay_display_percent(), first = l->n, i;
         float stats[4] = {0};
         int boxed = stats_box_drawn(stats); /* the stats' box, which it keeps clear of */
         if (g_toast.given != toast_version || g_toast.sw != sw || g_toast.sh != sh || g_toast.percent != percent ||
             g_toast.boxed != boxed || memcmp(g_toast.stats, stats, sizeof stats) || !g_toast.version) {
             SnxUiList t = {g_toast.q, 0, (int)(sizeof g_toast.q / sizeof *g_toast.q)};
-            toast_draw(&t, sw, sh, boxed ? stats : NULL);
+            toast_draw(&t, sw, sh, boxed ? stats : NULL, g_toast.span);
             g_toast.boxed = boxed;
             memcpy(g_toast.stats, stats, sizeof stats);
             g_toast.n = t.n;
@@ -1957,6 +2083,8 @@ void overlay_draw(SnxUiList* l, int sw, int sh, u64 now_ns) {
             ++g_toast.version;
         }
         ui_append_kept(l, &(SnxUiList){g_toast.q, g_toast.n, g_toast.n}, g_toast.version, &g_toast, NULL);
+        for (i = 0; i < ntoasts; ++i) /* as one fades: its quads the same, their alpha moving; whole, no span */
+            ui_fade_set(first + g_toast.span[i], first + g_toast.span[i + 1], (unsigned)overlay_toast_alpha(i, now_ns));
     }
 }
 int overlay_error_hit(const SnxOverlayRect* r, float x, float y) {

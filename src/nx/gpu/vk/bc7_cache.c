@@ -19,7 +19,7 @@
 
    Beside it, <file>.idx: the same header, then the index's entries in the file's order, {u64 key[2], u64 at, u64
    bytes} (BC7_IDX), one appended with each record. The cache opens from it, where the records' own headers lie all
-   through the file: Mario Kart World's 91,000 records, 4.3 GB, took minutes to open off a disk whose cache had let
+   through the file: a racing game's 91,000 records, 4.3 GB, took minutes to open off a disk whose cache had let
    the file go, where its index is 3 MB. An entry is taken while it lies past the last one and its blocks within the
    file; the file is cut after the last one taken (a record after it, written as a crash came before its entry, is
    lost). Without an index of the file's version, the records' headers are read as before and the index written from
@@ -100,6 +100,7 @@ typedef struct {
     u32 cap; /* slots in map, a power of two */
     u32 used;
     u64 hits, stored, restarts;
+    int started_empty;   /* it held no level as it opened (vk_bc7_cache_cold) */
     u8 piece[BC7_PIECE]; /* what a close clears ends before it */
     Bc7Reader rd;        /* kept over a close: its failed reads go to their owners still */
 } Bc7Cache;
@@ -320,11 +321,12 @@ int vk_bc7_cache_open(const char* path, const u64 version[2], u64 max) {
             return 0;
         }
         LOG("vulkan: the BC7 cache %s starts empty\n", path);
+        g_bc7_cache.started_empty = 1;
         return 1;
     }
     /* the records' headers, each where the one before it ends, until one is cut short or makes no sense. Read where
        they lie (plat_pread), not through the stream: after a seek each read of 32 bytes filled the stream's buffer of a
-       block (128 KiB on ZFS), and Mario Kart World's cache of 84,000 records, 4.3 GB, took minutes to open */
+       block (128 KiB on ZFS), and a racing game's cache of 84,000 records, 4.3 GB, took minutes to open */
     if (fseek(g_bc7_cache.f, 0, SEEK_END)) {
         bc7_off("its size could not be read");
         return 0;
@@ -359,8 +361,10 @@ int vk_bc7_cache_open(const char* path, const u64 version[2], u64 max) {
 #endif
     LOG("vulkan: the BC7 cache %s holds %u levels of %llu MB\n", path, g_bc7_cache.used,
         (unsigned long long)(bytes >> 20));
+    g_bc7_cache.started_empty = !g_bc7_cache.used;
     return 1;
 }
+int vk_bc7_cache_cold(void) { return g_bc7_cache.started_empty; } /* a close clears it */
 
 /* size bytes of key's record, its blocks at `at`, read from f through piece and checked on the way into dst: 1, 0 when
    they don't check out, -1 when its header can't be read */

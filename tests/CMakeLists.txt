@@ -94,6 +94,11 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME gnu_extensions COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/gnu_extensions.py"
                                          --repo "${PROJECT_SOURCE_DIR}")
 endif()
+# every C source of src/ compiled with -Werror=atomic-implicit-seq-cst, no test's own (cmake/atomic_explicit.cmake)
+if(Python3_Interpreter_FOUND AND CMAKE_EXPORT_COMPILE_COMMANDS)
+    add_test(NAME atomic_explicit COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/atomic_explicit_test.py"
+                                          "${PROJECT_BINARY_DIR}" "${PROJECT_SOURCE_DIR}")
+endif()
 # each native hook of a mod's trampoline (src/nx/hle/hook/ext_skyline.hooks) as the function's own native hook
 if(Python3_Interpreter_FOUND)
     add_test(NAME ext_skyline_hooks COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/ext_skyline_hooks.py")
@@ -460,6 +465,15 @@ if(TARGET snx_ctr_board)
     add_test(NAME 3ds_vk_draw_scaled_verify COMMAND snx-test-3ds-vk-draw --scaled-verify)
     set_tests_properties(3ds_vk_draw_scaled_transfer 3ds_vk_draw_scaled_rotating 3ds_vk_draw_scaled_verify
                          PROPERTIES SKIP_RETURN_CODE 77)
+    # a texture made from a scaled target keeps the target's scale: a second target at the same scale samples its image
+    add_test(NAME 3ds_vk_draw_scaled_texture_from_target COMMAND snx-test-3ds-vk-draw --scaled-texture-from-target)
+    set_tests_properties(3ds_vk_draw_scaled_texture_from_target PROPERTIES SKIP_RETURN_CODE 77)
+    # a texture made from a scaled depth buffer keeps the scale: a second target at the same scale samples it
+    add_test(NAME 3ds_vk_draw_scaled_texture_from_depth COMMAND snx-test-3ds-vk-draw --scaled-texture-from-depth)
+    set_tests_properties(3ds_vk_draw_scaled_texture_from_depth PROPERTIES SKIP_RETURN_CODE 77)
+    # two targets over one depth buffer at the scale: the second takes the first's depth, not the 1x reload
+    add_test(NAME 3ds_vk_draw_scaled_shared_depth COMMAND snx-test-3ds-vk-draw --scaled-shared-depth)
+    set_tests_properties(3ds_vk_draw_scaled_shared_depth PROPERTIES SKIP_RETURN_CODE 77)
     # the screens laid out at the console's proportions whatever each render scale: a top screen at 2x above a bottom
     # one at 1x, and a press on the bottom screen's pixel (160, 220) landing on it
     add_test(NAME 3ds_vk_draw_scaled_layout COMMAND snx-test-3ds-vk-draw --scaled-layout)
@@ -480,8 +494,20 @@ if(TARGET snx_ctr_board)
         add_test(NAME 3ds_vk_draw_scaled_verify_validation
                  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_vk_validation.py"
                      $<TARGET_FILE:snx-test-3ds-vk-draw> --scaled-verify)
+        add_test(NAME 3ds_vk_draw_scaled_texture_from_target_validation
+                 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_vk_validation.py"
+                     $<TARGET_FILE:snx-test-3ds-vk-draw> --scaled-texture-from-target)
+        add_test(NAME 3ds_vk_draw_scaled_texture_from_depth_validation
+                 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_vk_validation.py"
+                     $<TARGET_FILE:snx-test-3ds-vk-draw> --scaled-texture-from-depth)
+        add_test(NAME 3ds_vk_draw_scaled_shared_depth_validation
+                 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_vk_validation.py"
+                     $<TARGET_FILE:snx-test-3ds-vk-draw> --scaled-shared-depth)
         set_tests_properties(3ds_vk_draw_scaled_transfer_validation 3ds_vk_draw_scaled_rotating_validation
                              3ds_vk_draw_scaled_verify_validation PROPERTIES SKIP_RETURN_CODE 77)
+        set_tests_properties(3ds_vk_draw_scaled_texture_from_target_validation
+                             3ds_vk_draw_scaled_texture_from_depth_validation
+                             3ds_vk_draw_scaled_shared_depth_validation PROPERTIES SKIP_RETURN_CODE 77)
         # the window's rendering, with the screens drawn by a copy and through the effects, under Khronos validation
         foreach(snx_mode scaled-layout scaled-layout-effects)
             string(REPLACE "-" "_" snx_name "${snx_mode}")
@@ -603,6 +629,11 @@ if(TARGET snx_ctr_board)
     add_executable(snx-test-3ds-windows 3ds_windows.c)
     snx_test_target(snx-test-3ds-windows gnu23)
     target_link_libraries(snx-test-3ds-windows PRIVATE snx_ctr_gpu)
+    # the one window's screen layouts: the rectangles for each, the pure geometry the presenter uses
+    add_executable(snx-test-3ds-layouts 3ds_layouts.c)
+    snx_test_target(snx-test-3ds-layouts 11)
+    target_link_libraries(snx-test-3ds-layouts PRIVATE snx_ctr_gpu)
+    add_test(NAME 3ds_layouts COMMAND snx-test-3ds-layouts)
     add_test(NAME 3ds_windows COMMAND snx-test-3ds-windows "${CMAKE_CURRENT_BINARY_DIR}/window-frames")
     add_test(NAME 3ds_windows_separate
              COMMAND snx-test-3ds-windows "${CMAKE_CURRENT_BINARY_DIR}/window-frames-separate" --separate)
@@ -1288,7 +1319,7 @@ foreach(case IN ITEMS register field)
                      "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_${case}.sail")
 endforeach()
 set_tests_properties(sailgen_refused_register PROPERTIES PASS_REGULAR_EXPRESSION
-    "refused_register.sail:6: error: the register FPCR: the back end llvm.h defines no sg_FPCR_read")
+    "refused_register.sail:6: error: the register DBGDTR_EL0: the back end llvm.h defines no sg_DBGDTR_EL0_read")
 set_tests_properties(sailgen_refused_field PROPERTIES PASS_REGULAR_EXPRESSION
     "refused_field.sail:12: error: PSTATE.D: the back end llvm.h defines no SG_PSTATE_D")
 # the same two through a back end that only mentions those names (a comment, a string, a declaration, a call, an
@@ -1301,7 +1332,7 @@ foreach(case IN ITEMS register field)
                      "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_${case}.sail")
 endforeach()
 set_tests_properties(sailgen_refused_mention_register PROPERTIES PASS_REGULAR_EXPRESSION
-    "refused_register.sail:6: error: the register FPCR: the back end mention_backend.h defines no sg_FPCR_read")
+    "refused_register.sail:6: error: the register DBGDTR_EL0: the back end mention_backend.h defines no sg_DBGDTR_EL0_read")
 set_tests_properties(sailgen_refused_mention_field PROPERTIES PASS_REGULAR_EXPRESSION
     "refused_field.sail:12: error: PSTATE.D: the back end mention_backend.h defines no SG_PSTATE_D")
 # a word handed on to the next clause (Error_See) under a run-time condition, and a write to a field a let holds fixed
@@ -1316,6 +1347,50 @@ set_tests_properties(sailgen_refused_see PROPERTIES PASS_REGULAR_EXPRESSION
     "refused_see.sail:7: error: a throw of Error_See under a condition known only at run time")
 set_tests_properties(sailgen_refused_pin PROPERTIES PASS_REGULAR_EXPRESSION
     "refused_pin.sail:14: error: PSTATE.EL written, which the let PSTATE_EL holds fixed")
+# a struct's field may take a value known when the recompiler runs, not one known only when the guest runs
+add_test(NAME sailgen_refused_struct
+         COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_struct.roots"
+                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
+                 -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused_struct.inc"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_struct.sail")
+set_tests_properties(sailgen_refused_struct PROPERTIES PASS_REGULAR_EXPRESSION
+    "refused_struct.sail:17: error: the field flag assigned a value known only at run time")
+# the back end's function gives nothing, bits, a bool, an enum or a tuple of bits: one whose val gives an integer is
+# refused where it is called
+add_test(NAME sailgen_refused_action
+         COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_action.roots"
+                 --backend "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/action_backend.h"
+                 -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused_action.inc"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_action.sail")
+set_tests_properties(sailgen_refused_action PROPERTIES PASS_REGULAR_EXPRESSION
+    "refused_action.sail:8: error: Peek gives an integer: the back end's functions give nothing, bits, a bool, an enum or a tuple of bits")
+# a function the back end lowers: --extract copies its val and the types it names, not its Sail; called under a
+# run-time condition by a back end function that takes none, it is refused with its line
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sailgen/lower.sail"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/sailgen"
+    COMMAND snx-sailgen --extract "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/lower.roots"
+            -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/lower.sail" "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/lower.sail"
+    DEPENDS snx-sailgen "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/lower.roots" "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/lower.sail"
+    VERBATIM)
+add_custom_target(snx_sailgen_lower_test ALL DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/sailgen/lower.sail")
+add_test(NAME sailgen_extract_lower COMMAND "${CMAKE_COMMAND}" -E compare_files --ignore-eol
+         "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/lower_expected.sail" "${CMAKE_CURRENT_BINARY_DIR}/sailgen/lower.sail")
+add_test(NAME sailgen_refused_path
+         COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_path.roots"
+                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
+                 -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused_path.inc"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_path.sail")
+set_tests_properties(sailgen_refused_path PROPERTIES PASS_REGULAR_EXPRESSION
+    "refused_path.sail:9: error: InstructionSynchronizationBarrier, the back end's action, under a condition known only at run time")
+# an element loop is one vector operation only when its body sets locals per lane: one that carries a local from one
+# element to the next, or whose element is read after it, stays a loop of elements
+add_test(NAME sailgen_lanes
+         COMMAND "${CMAKE_COMMAND}" "-DSAILGEN=$<TARGET_FILE:snx-sailgen>"
+                 "-DBACKEND=${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h" "-DDIR=${CMAKE_CURRENT_SOURCE_DIR}/sailgen"
+                 "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/sailgen/lanes.inc"
+                 -P "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/lanes_check.cmake")
+set_tests_properties(sailgen_lanes PROPERTIES PASS_REGULAR_EXPRESSION
+    "sailgen_lanes: lanes=lanes carried=loop last=loop")
 # and the A64 subsets of src/common/cpu/aarch64/sail/ generate whole, with the NX's fixups
 add_test(NAME sailgen_a64
          COMMAND snx-sailgen --generate "${PROJECT_SOURCE_DIR}/src/common/cpu/aarch64/sail/a64.roots"
@@ -2377,6 +2452,11 @@ add_test(NAME system_sdl3 COMMAND "${CMAKE_COMMAND}" "-DSRC=${PROJECT_SOURCE_DIR
 # where cmake/cross.cmake puts -mabi=elfv2: PowerPC64's compiles and links, no other processor's
 add_test(NAME cross_flags COMMAND "${CMAKE_COMMAND}" "-DSRC=${PROJECT_SOURCE_DIR}" -P
          "${CMAKE_CURRENT_SOURCE_DIR}/cross_flags_test.cmake")
+# every Configure target cmake/openssl.cmake names is one the pinned OpenSSL defines
+if(EXISTS "${snx_openssl_src}/Configure")
+    add_test(NAME openssl_targets COMMAND "${CMAKE_COMMAND}" "-DSRC=${PROJECT_SOURCE_DIR}" "-DOPENSSL=${snx_openssl_src}" -P
+             "${CMAKE_CURRENT_SOURCE_DIR}/openssl_targets_test.cmake")
+endif()
 # the meson machine file dav1d's build gets for each target (cmake/meson_machine.cmake), read back by meson where the
 # configure found one
 add_test(NAME meson_machine COMMAND "${CMAKE_COMMAND}" "-DSRC=${PROJECT_SOURCE_DIR}"
@@ -2594,6 +2674,9 @@ add_executable(snx-test-extract extract.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/
     "${PROJECT_SOURCE_DIR}/src/nx/loader/match.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/driver/game_name.c")
 snx_test_target(snx-test-extract gnu23)
 target_link_libraries(snx-test-extract PRIVATE snx_test_common hactool_internals snx_lz4 OpenSSL::Crypto snx_nx_module)
+if(WIN32) # a scenario's crash says where it was (one ended 0xC0000005 on Windows on Arm, saying nothing)
+    target_sources(snx-test-extract PRIVATE win32_crash.c)
+endif()
 add_test(NAME extraction_native COMMAND snx-test-extract)
 
 add_executable(snx-test-loader loader_test.c "${PROJECT_SOURCE_DIR}/src/nx/loader/loader.c"
@@ -2902,12 +2985,11 @@ if(NOT SNX_TOOLS_ONLY)
         add_test(NAME vk_device_make COMMAND snx-test-vk-device)
     endif()
     if(ANDROID)
-        # the GPU driver a run asks for (nx/runtime/platform/gpu_driver_load.c) where none loads: Freedreno's variables set,
+        # the GPU driver a run asks for (common/gpu/vk/gpu_driver_load.c) where none loads: Freedreno's variables set,
         # a wrong one, a package asked for here and a folder name that is none stopping the run with why, a run a case
-        add_executable(snx-test-gpu-driver-load gpu_driver_load.c
-                    "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/gpu_driver_load.c")
+        add_executable(snx-test-gpu-driver-load gpu_driver_load.c)
         snx_test_target(snx-test-gpu-driver-load gnu23)
-        target_link_libraries(snx-test-gpu-driver-load PRIVATE snx_nx_flags scarletnx-common)
+        target_link_libraries(snx-test-gpu-driver-load PRIVATE snx_nx_flags snx_vk_common scarletnx-common)
         foreach(case IN ITEMS env sets badenv here badid)
             add_test(NAME gpu_driver_load_${case} COMMAND snx-test-gpu-driver-load ${case})
         endforeach()
@@ -2979,15 +3061,21 @@ if(NOT WIN32)
     snx_decodetree_a64(snx-test-llvm-lowering)
     add_test(NAME llvm_lowering COMMAND snx-test-llvm-lowering "${CMAKE_CURRENT_SOURCE_DIR}/llvm_lowering_expected.txt")
     set_tests_properties(llvm_lowering PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
-    # the integer emitters sailgen generates from the Sail against the hand-written ones they replaced
-    # (support/ir_int_reference.c): the same optimized IR word by word on three paths, the same results run here
-    add_executable(snx-test-llvm-sail-ir llvm_sail_ir.c llvm_qemu_words.c llvm_steps.c support/ir_int_reference.c)
+    # the integer, branch, general-purpose load and store and scalar floating-point emitters sailgen generates from the
+    # Sail against the hand-written ones they replaced (support/ir_int_reference.c, ir_ldst_reference.c,
+    # ir_fpu_reference.c): the same optimized IR word by word on three paths, the same results (registers, flags, FPCR,
+    # FPSR, guest memory) run here
+    add_executable(snx-test-llvm-sail-ir llvm_sail_ir.c llvm_qemu_words.c llvm_steps.c support/ir_int_reference.c
+                   support/ir_ldst_reference.c support/ir_fpu_reference.c support/ir_vec_reference.c)
     snx_test_target(snx-test-llvm-sail-ir gnu23)
     target_include_directories(snx-test-llvm-sail-ir PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(snx-test-llvm-sail-ir PRIVATE snx_llvm snx_driver ${CMAKE_DL_LIBS})
     snx_decodetree_a64(snx-test-llvm-sail-ir)
-    add_test(NAME llvm_sail_ir COMMAND snx-test-llvm-sail-ir)
-    set_tests_properties(llvm_sail_ir PROPERTIES TIMEOUT 600)
+    # a third of the words each, so the sanitizers' build runs each part in its timeout and the parts run side by side
+    foreach(part 1 2 3)
+        add_test(NAME llvm_sail_ir_${part} COMMAND snx-test-llvm-sail-ir --part ${part}/3)
+        set_tests_properties(llvm_sail_ir_${part} PROPERTIES TIMEOUT 600)
+    endforeach()
     # snx_ir_object's check of the symbols an object names (llvm_object_symbols.c)
     add_executable(snx-test-llvm-object-symbols llvm_object_symbols.c)
     snx_test_target(snx-test-llvm-object-symbols c23)
@@ -3116,8 +3204,9 @@ snx_test_target(snx-test-runtime-module-abi c23)
 target_link_libraries(snx-test-runtime-module-abi PRIVATE snx_test_common)
 add_test(NAME runtime_module_abi COMMAND snx-test-runtime-module-abi $<TARGET_FILE:scarletnx>
     $<TARGET_FILE:snx-test-module-abi> $<TARGET_FILE:snx-test-module-abi-arm>)
-# Amberlith (edenprobe before 1.0.0; docs/dev/edenprobe.md) as CI runs it, against its baseline, once with guest
-# buffers copied and once read in place (vk_memory=2: the path a GPU that shares memory takes, lavapipe's in CI).
+# Amberlith (edenprobe before 1.0.0; docs/dev/edenprobe.md) as CI runs it, with no FPS limit, against its baseline,
+# once with guest buffers copied and once read in place (vk_memory=2: the path a GPU that shares memory takes,
+# lavapipe's in CI).
 # -DSNX_TEST_EDENPROBE=/path/to/the.nro, of the release that .github/workflows/build.yml pins
 if(SNX_TEST_EDENPROBE AND Python3_Interpreter_FOUND AND NOT CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
    AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
@@ -3129,7 +3218,7 @@ if(SNX_TEST_EDENPROBE AND Python3_Interpreter_FOUND AND NOT CMAKE_CROSSCOMPILING
                 --mode "quick notime cpu fs video display kernel audio hooks"
                 --out "${CMAKE_CURRENT_BINARY_DIR}/edenprobe-vk_memory-${snx_memory}"
                 --baseline "${PROJECT_SOURCE_DIR}/tests/edenprobe/linux-x86_64.txt" --timeout 120
-                --setting vk_memory=${snx_memory})
+                --setting fps-limit=0 --setting vk_memory=${snx_memory})
         set_tests_properties(edenprobe_vk_memory_${snx_memory} PROPERTIES TIMEOUT 1800 RUN_SERIAL TRUE LABELS external)
     endforeach()
 endif()
@@ -3221,6 +3310,13 @@ if(NOT WIN32)
     add_test(NAME elf_relocate COMMAND snx-test-elf-relocate)
     set_tests_properties(elf_relocate PROPERTIES TIMEOUT 120)
 endif()
+# Windows on Arm's COFF objects (code_loader_coff.c, link_coff.c): relocations, veneers, a module and a JIT load, read
+# back on any host
+add_executable(snx-test-coff-arm64 coff_arm64.c)
+snx_test_target(snx-test-coff-arm64 gnu23)
+target_link_libraries(snx-test-coff-arm64 PRIVATE snx_llvm)
+add_test(NAME coff_arm64 COMMAND snx-test-coff-arm64)
+set_tests_properties(coff_arm64 PROPERTIES TIMEOUT 120)
 # not a test: timings of the generated code (llvm_bench SCARLETNX REPO CLANG)
 add_executable(snx-llvm-bench llvm_bench.c)
 snx_test_target(snx-llvm-bench gnu23)

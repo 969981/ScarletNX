@@ -101,3 +101,192 @@ function AddPACGA (x, y) = {
     let t4 : bits(64) = EOR(t3, LSR(t3, 32));
     return(t4[63 .. 32] @ Zeros(32))
 }
+
+// ---- loads and stores ----
+// An access descriptor is EL0's (PSTATE_EL above) in the Non-secure state, with no MPAM partition kept: sail-arm's
+// asks the security state and MPAM's controls, which no register here keeps
+val NewAccDesc : AccessType -> AccessDescriptor
+function NewAccDesc acctype = {
+    accdesc : AccessDescriptor = undefined;
+    accdesc.acctype = acctype;
+    accdesc.el = EL0;
+    accdesc.ss = SS_NonSecure;
+    accdesc.acqsc = false;
+    accdesc.acqpc = false;
+    accdesc.relsc = false;
+    accdesc.limitedordered = false;
+    accdesc.exclusive = false;
+    accdesc.rcw = false;
+    accdesc.rcws = false;
+    accdesc.atomicop = false;
+    accdesc.nontemporal = false;
+    accdesc.read = false;
+    accdesc.write = false;
+    accdesc.pan = false;
+    accdesc.nonfault = false;
+    accdesc.firstfault = false;
+    accdesc.first = false;
+    accdesc.contiguous = false;
+    accdesc.streamingsve = false;
+    accdesc.ls64 = false;
+    accdesc.mops = false;
+    accdesc.a32lsmd = false;
+    accdesc.tagchecked = false;
+    accdesc.tagaccess = false;
+    accdesc.transactional = false;
+    return(accdesc)
+}
+
+// and an unprivileged load or store (LDTR, STTR) is EL0's as any other
+val AArch64_IsUnprivAccessPriv : unit -> bool
+function AArch64_IsUnprivAccessPriv () = false
+
+// A pair of registers is one access of both (the pairs' path for FEAT_LSE2, which reaches HaveLSE2Ext alone here):
+// GuestMemRead and GuestMemWrite make it one 64-bit access for a pair of words and two 64-bit ones for a pair of
+// doublewords, the accesses ScarletNX always made. The NX's CPUs have no FEAT_LSE2 (a64.profile), whose 16-byte
+// single-copy atomicity that second one is not. LDPSW and STNP, which Arm makes two accesses on any CPU, stay two
+val HaveLSE2Ext : unit -> bool
+function HaveLSE2Ext () = true
+
+val Mem_read__1 : forall ('ispair : Bool) 'size, 'size * 8 >= 0.
+  (bits(64), int('size), AccessDescriptor, bool('ispair)) -> bits('size * 8)
+function Mem_read__1 (address, size, accdesc, ispair) = Mem_read(address, size, accdesc)
+
+val Mem_set__1 : forall ('ispair : Bool) 'size, 'size * 8 >= 0.
+  (bits(64), int('size), AccessDescriptor, bool('ispair), bits('size * 8)) -> unit
+function Mem_set__1 (address, size, accdesc, ispair, value_name) = Mem_set(address, size, accdesc, value_name)
+
+// Horizon runs EL0 little-endian (SCTLR_EL1.E0E clear)
+val BigEndian : AccessType -> bool
+function BigEndian acctype = false
+
+// A guest access is the host's (llvm.h's GuestMemRead), at any address: ScarletNX raises no alignment fault, of the
+// stack pointer's or an exclusive pair's, and no data abort, so no syndrome is recorded
+val CheckSPAlignment : unit -> unit
+function CheckSPAlignment () = ()
+
+val IsAligned__1 : forall 'N 'y, 'N >= 0. (bits('N), int('y)) -> bool
+function IsAligned__1 (x, y) = true
+
+val AArch64_SetLSInstructionSyndrome : forall 'Rt ('acq_rel : Bool) ('sign_extend : Bool) ('sixty_four : Bool) 'size.
+  (int('size), bool('sign_extend), int('Rt), bool('sixty_four), bool('acq_rel)) -> unit
+function AArch64_SetLSInstructionSyndrome (size, sign_extend, Rt, sixty_four, acq_rel) = ()
+
+// A prefetch is a hint ScarletNX does not act on
+val Prefetch : (bits(64), bits(5)) -> unit
+function Prefetch (address, prfop) = ()
+
+// A CONSTRAINED UNPREDICTABLE encoding (a load's write-back register or a pair's two registers the same, a
+// store-exclusive's status register one it reads) runs as it is written: its registers are written in the order its
+// Sail writes them, so a load's write-back comes after its loads and a store's data is read before its write-back,
+// which is one of the UNKNOWN values Arm allows and what ScarletNX's emitters always did
+val ConstrainUnpredictable : Unpredictable -> Constraint
+function ConstrainUnpredictable which = Constraint_NONE
+
+// An UNKNOWN value is zero, as sailgen starts an undefined local (the LSE atomics' compare value, which only CAS uses)
+val __UNKNOWN_bits : forall 'n, 'n >= 0. int('n) -> bits('n)
+function __UNKNOWN_bits n = Zeros(n)
+
+// Guest memory is ScarletNX's own: the host's bytes at CPU.mem plus the address, read and written as the host does
+// (llvm.h). An acquire load and a release store are sequentially consistent host atomics, which order both ways, so
+// RCpc's acquire is the stronger one and LOR's limited ordering the full one (cpu.h)
+val GuestMemRead : forall 'size. (bits(64), int('size), bool) -> bits('size * 8)
+val GuestMemWrite : forall 'size. (bits(64), int('size), bool, bits('size * 8)) -> unit
+
+val Mem_read : forall 'size, 'size * 8 >= 0.
+  (bits(64), int('size), AccessDescriptor) -> bits('size * 8)
+function Mem_read (address, size, accdesc) =
+    if accdesc.exclusive then GuestExclusiveValue(address, size)
+    else GuestMemRead(address, size, accdesc.acqsc | accdesc.acqpc)
+
+val Mem_set : forall 'size, 'size * 8 >= 0.
+  (bits(64), int('size), AccessDescriptor, bits('size * 8)) -> unit
+function Mem_set (address, size, accdesc, value_name) =
+    if accdesc.exclusive then GuestStoreExclusive(address, size, value_name)
+    else GuestMemWrite(address, size, accdesc.relsc, value_name)
+
+// The exclusive monitor is cpu.h's, value based: the load-exclusive arms it with the value it reads, and a
+// store-exclusive is a compare-and-swap from that value, which clears it. So the monitor is set by the load itself
+// (GuestLoadExclusive, a pair's too: one access of all its bytes), the exclusive reads that follow take what it read
+// (GuestExclusiveValue), whether the monitor passes is the compare-and-swap's answer, and the status is that store's
+val GuestLoadExclusive : forall 'size. (bits(64), int('size)) -> unit
+val GuestExclusiveValue : forall 'size. (bits(64), int('size)) -> bits('size * 8)
+val GuestStoreExclusive : forall 'size. (bits(64), int('size), bits('size * 8)) -> unit
+val GuestExclusiveStatus : unit -> bits(1)
+
+val AArch64_SetExclusiveMonitors : forall 'size. (bits(64), int('size)) -> unit
+function AArch64_SetExclusiveMonitors (address, size) = GuestLoadExclusive(address, size)
+
+val AArch64_ExclusiveMonitorsPass : forall 'size. (bits(64), int('size)) -> bool
+function AArch64_ExclusiveMonitorsPass (address, size) = true
+
+val ExclusiveMonitorsStatus : unit -> bits(1)
+function ExclusiveMonitorsStatus () = GuestExclusiveStatus()
+
+// The LSE atomics are sequentially consistent host atomics of the access size, whatever their acquire and release
+// bits ask: the old value, and the operation's result stored
+val GuestAtomicAdd : forall 'size. (bits(64), bits('size)) -> bits('size)
+val GuestAtomicAnd : forall 'size. (bits(64), bits('size)) -> bits('size)
+val GuestAtomicXor : forall 'size. (bits(64), bits('size)) -> bits('size)
+val GuestAtomicOr : forall 'size. (bits(64), bits('size)) -> bits('size)
+val GuestAtomicSMax : forall 'size. (bits(64), bits('size)) -> bits('size)
+val GuestAtomicSMin : forall 'size. (bits(64), bits('size)) -> bits('size)
+val GuestAtomicUMax : forall 'size. (bits(64), bits('size)) -> bits('size)
+val GuestAtomicUMin : forall 'size. (bits(64), bits('size)) -> bits('size)
+val GuestAtomicSwap : forall 'size. (bits(64), bits('size)) -> bits('size)
+val GuestCompareSwap : forall 'size. (bits(64), bits('size), bits('size)) -> bits('size)
+
+val MemAtomic : forall 'size, 'size >= 0.
+  (bits(64), bits('size), bits('size), AccessDescriptor) -> bits('size)
+function MemAtomic (address, cmpoperand, operand, accdesc_in) = match accdesc_in.modop {
+  MemAtomicOp_ADD => GuestAtomicAdd(address, operand),
+  MemAtomicOp_BIC => GuestAtomicAnd(address, not_vec(operand)),
+  MemAtomicOp_EOR => GuestAtomicXor(address, operand),
+  MemAtomicOp_ORR => GuestAtomicOr(address, operand),
+  MemAtomicOp_SMAX => GuestAtomicSMax(address, operand),
+  MemAtomicOp_SMIN => GuestAtomicSMin(address, operand),
+  MemAtomicOp_UMAX => GuestAtomicUMax(address, operand),
+  MemAtomicOp_UMIN => GuestAtomicUMin(address, operand),
+  MemAtomicOp_SWP => GuestAtomicSwap(address, operand),
+  MemAtomicOp_CAS => GuestCompareSwap(address, cmpoperand, operand)
+}
+
+// ScarletNX's CPU keeps the 32 SIMD&FP registers as 128 bits each (cpu.h's CPU.v), and the NX has no SVE: sail-arm keeps
+// them in _Z, SVE's registers of up to 2048 bits, which a write zeroes above the vector length. Here they are _V's
+// elements, which the back end loads only as far as an instruction reads (sg__V_read_bits: a scalar's low lane)
+register _V : vector(32, bits(128))
+
+val V_read : forall 'n 'width, 'width in {8, 16, 32, 64, 128}. (int('n), int('width)) -> bits('width)
+function V_read (n, width) = _V[n][width - 1 .. 0]
+
+val V_set : forall 'n 'width, 'width in {8, 16, 32, 64, 128}. (int('n), int('width), bits('width)) -> unit
+function V_set (n, width, value_name) = {
+    _V[n] = ZeroExtend(value_name, 128)
+}
+
+// FPCR as the CPU keeps it (cpu.h's CPU.fpcr): the NX implements none of its trap enables, which read as 0 (sail-arm's
+// __get_FPCR asks each as IMPDEF), so the register is all FPCR_read gives
+register FPCR : bits(64)
+
+val FPCR_read : unit -> bits(64)
+function FPCR_read () = FPCR
+
+// Horizon runs EL0 with CPACR_EL1.FPEN 0b11: floating point and AdvSIMD never trap
+val CheckFPEnabled64 : unit -> unit
+function CheckFPEnabled64 () = ()
+
+val CheckFPAdvSIMDEnabled64 : unit -> unit
+function CheckFPAdvSIMDEnabled64 () = ()
+
+// No FEAT_AFP (Armv8.7's, which a64.profile names nowhere, so HaveAltFP is false): FPCR.NEP is RES0, and a scalar
+// result never merges into the destination's other elements
+val IsMerging : bits(64) -> bool
+function IsMerging fpcr = false
+
+// The A64 instructions run in AArch64 alone: a 32-bit game's code goes through the A32 recompiler
+val UsingAArch32 : unit -> bool
+function UsingAArch32 () = false
+
+// sail-arm declares HaveFP16Ext and leaves its answer to its runtime: the guest's FEAT_FP16
+val HaveFP16Ext : unit -> bool
+function HaveFP16Ext () = IsFeatureImplemented(FEAT_FP16)

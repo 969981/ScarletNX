@@ -2,6 +2,7 @@
    Copyright 2026 the ScarletNX contributors */
 #include "vita/gpu/vk.h"
 #include "common/gpu/vk/device_settings.h"
+#include "common/gpu/vk/gpu_driver_load.h"
 #include "common/gpu/vk/notice.h"
 #include "common/gpu/vk/present_fx.h"
 #include "common/utilities/window_icon.h"
@@ -146,6 +147,11 @@ bool vita_vk_init(const char* title, char* error, size_t error_size) {
     VitaVk* v = &g.vk;
     if (g.up) return true;
     memset(v, 0, sizeof *v);
+    /* the GPU driver the run asked for (gpu_driver, --gpu-driver=), which the window's instance and surface are made
+       through, and Freedreno's variables: the loader the Switch runtime uses (common/gpu/vk/gpu_driver_load.h). A
+       package that does not load ends the run, saying why, as there */
+    SnxGpuDriverRun driver = {.driver = g_settings.gpu_driver, .freedreno = g_settings.freedreno_variables};
+    snx_gpu_driver_use(&driver);
     if (!snx_vk_window_open("scarletnx-vita", title ? title : "ScarletNX Vita", 960, 544, &v->host, error, error_size))
         return false;
     if (v->host.window) snx_window_icon(v->host.window);
@@ -164,6 +170,12 @@ bool vita_vk_init(const char* title, char* error, size_t error_size) {
     snx_vk_device_settings(&request, settings);
     SnxVkDevice device;
     if (!snx_vk_device_make(&request, &device, error, error_size)) {
+        /* a package whose driver lists no device at all: its name and this device's GPU, not the generic line. A device
+           it lists and the renderer refuses has its reason in error already */
+        char said[512];
+        uint32_t listed = 0;
+        vkEnumeratePhysicalDevices(v->host.instance.instance, &listed, NULL);
+        if (!listed && gpu_driver_no_device(said, sizeof said)) snprintf(error, error_size, "%s", said);
         vita_vk_free();
         return false;
     }

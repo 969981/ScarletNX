@@ -194,6 +194,15 @@ static int cs_cb_read(u32 idx, u32 off, u32* out) {
     }
     return 0;
 }
+/* The range constant buffer i binds: only the bytes the shader reads (cbuf_max), zeros after the guest's: reads past
+   the range are zero with robustBufferAccess2, and stay in bounds, of undefined value, with robust buffer access alone.
+   A whole checked step, within the limit (vk_cb_range), so it can pass the guest's bytes by more than the alignment the
+   arena's space check adds to each binding: that check counts this range */
+static u32 cs_cb_range(const CsPipe* p, u32 i) {
+    u32 range = g_cbn[i];
+    if (p->si.cbuf_max[i] && range > p->si.cbuf_max[i]) range = p->si.cbuf_max[i];
+    return vk_cb_range(range);
+}
 /* a constant buffer word for the handles a program loads from memory (vk_memory_handles) */
 static u32 cs_memh_cbuf(void* user, u32 bank, u32 off) {
     (void)user;
@@ -330,9 +339,17 @@ static int arena_fit(u64 need) {
 }
 static u64 arena_alloc(u64 size) {
     u64 al = vk_stage_align(), at = (g_ar_used + al - 1) & ~(al - 1);
+    /* the dispatch's space check made room for every binding (vk_dispatch's need): one past the arena would be
+       written over other memory */
+    if (at + size > g_ar_cap)
+        fatal("vulkan: a compute dispatch's binding of %llu bytes at %llu passes the arena's %llu bytes",
+              (unsigned long long)size, (unsigned long long)at, (unsigned long long)g_ar_cap);
     g_ar_used = at + size;
     return at;
 }
+/* dispatches whose bindings took more of the arena than their space check counted (vk_cs_arena_short) */
+static u64 g_cs_arena_short;
+u64 vk_cs_arena_short(void) { return g_cs_arena_short; }
 
 /* The storage buffers that hold the shared memory of programs that ask for more than the device gives
    (ShaderInfo.shared_spill), a dispatch's blocks' parts one after another: one for the dispatches recorded on the
@@ -956,7 +973,7 @@ static CsPipe* cs_pipe(const u8* code, u32 flow_base, u32 lx, u32 ly, u32 lz, u3
     while (p && (p->key != key || !vk_cb_reads_hold(&p->cbr, cs_cb_read))) p = p->next;
     if (p) return p;
     /* Made with vk_lock let go: the translation and the driver's compile need nothing it guards (the pipeline file's
-       thread makes these with no hold, vk_cs_pipe_load). One took 235 ms in Mario Kart World, and every thread that
+       thread makes these with no hold, vk_cs_pipe_load). One took 235 ms in a racing game, and every thread that
        landed GPU results waited for it. The table, g_cb and the code window are the dispatching thread's alone. Not
        while a constant buffer is still to be read (g_cb_later): a read of it can land results */
     int paused = !g_cb_later && vk_lock_pause();
@@ -1603,6 +1620,8 @@ void vk_dispatch(const DispatchState* d) {
     u64 sa[16];
     u32 ss[16];
     int ng = p->si.ngbuf > 16 ? 16 : p->si.ngbuf;
+    /* the arena's space check: each binding's bytes as the arena takes them below, its range rounded to the device's
+       checked steps, and the alignment before it (arena_alloc) */
     u64 need = 0;
     int tables = 0;
     u32 table_bank = ~0u; /* the bank whose windows tw_base and tw_len hold */
@@ -1621,7 +1640,7 @@ void vk_dispatch(const DispatchState* d) {
             }
             sa[i] = tw_base[w];
             ss[i] = tw_len[w];
-            need += ss[i] + vk_stage_align();
+            need += vk_sb_round(ss[i]) + vk_stage_align();
             tables = 1;
             continue;
         }
@@ -1629,11 +1648,11 @@ void vk_dispatch(const DispatchState* d) {
         /* the address's words: an indirect buffer's are its parent's, which vk_gbuf_desc follows to the pointer */
         for (u32 w = 0; w < (bank ? 2u : 3u); w++) cs_cb_read(bank, off + 4 * w, &v[w]);
         ss[i] = vk_gbuf_desc(ST_CS, p->si.gbuf_cbuf_off[i], v, &sa[i]);
-        need += ss[i] + vk_stage_align();
+        need += vk_sb_round(ss[i]) + vk_stage_align();
     }
-    for (int i = 0; i < 8; i++)
-        if (p->si.cbuf_mask & (1u << i)) need += g_cbn[i] + vk_stage_align();
-    if (p->si.root_max) need += SH_ROOT_BYTES + vk_stage_align();
+    for (u32 i = 0; i < 8; i++)
+        if (p->si.cbuf_mask & (1u << i)) need += cs_cb_range(p, i) + vk_stage_align();
+    if (p->si.root_max) need += vk_cb_range(p->si.root_max) + vk_stage_align();
     /* buffer images: their headers from the compute engine's texture pool, handles from its texture bank */
     for (i = 0; i < p->si.nimg && i < 8; i++) {
         u64 tic_base;
@@ -1741,6 +1760,7 @@ void vk_dispatch(const DispatchState* d) {
             return;
         }
     }
+    const u64 ar_from = g_ar_used; /* where the bindings start in the arena */
 
     VkDescriptorSet set;
     u64 setup_sub;
@@ -1777,12 +1797,7 @@ rebind:
     u32 nw = 0;
     for (int i = 0; i < 8; i++)
         if (p->si.cbuf_mask & (1u << i)) {
-            /* only the bytes the shader reads, zeros after the guest's: reads past the range are zero with
-               robustBufferAccess2, and stay in bounds, of undefined value, with robust buffer access alone */
-            u32 range = g_cbn[i];
-            if (p->si.cbuf_max[i] && range > p->si.cbuf_max[i]) range = p->si.cbuf_max[i];
-            range = vk_cb_range(range); /* a whole checked step, within the limit; the tail is zeroed below */
-            u32 n = g_cbn[i] < range ? g_cbn[i] : range;
+            u32 range = cs_cb_range(p, (u32)i), n = g_cbn[i] < range ? g_cbn[i] : range; /* the tail zeroed below */
             VkBuffer cbuf = g_ar;
             u64 o;
             u8* dst;
@@ -2028,18 +2043,23 @@ rebind:
                     h |= h2;
             }
             u32 tic[8] = {0}, tsc[8] = {0};
+            const u64 tic_at = tic_base + (u64)texture_handle_tic_id(h) * TEXTURE_POOL_ENTRY_BYTES;
             /* a handle from memory the program alone makes (SH_PROBE_NONE) names no header: no texture */
-            if (!(st->flags & SNX_TEX_MEMORY) || st->cbuf_off != SH_PROBE_NONE) {
-                vk_gmem_words(tic_base + (u64)texture_handle_tic_id(h) * TEXTURE_POOL_ENTRY_BYTES, tic, 8);
+            const int headed = !(st->flags & SNX_TEX_MEMORY) || st->cbuf_off != SH_PROBE_NONE;
+            if (headed) {
+                vk_gmem_words(tic_at, tic, 8);
                 vk_gmem_words(tsc_base + (u64)texture_handle_tsc_id(h) * TEXTURE_POOL_ENTRY_BYTES, tsc, 8);
             }
             VkImageViewType want = vk_tex_view_type(st);
             Surf* t = vk_tex_from_tic_guest(tic, st->flags & 1);
+            /* a header that names no texture by itself reads the null texture, a raw load's too, and the dispatch goes
+               on, as a draw's does */
+            const int none = !t && headed && vk_tic_names_none(tic);
             /* a program fetching samples (flags bit 1) reads a multisampled image, others a single-sampled one: an
                image of other samples reads zeros, as a missing texture does */
             int ms = (st->flags & 2) != 0;
             if (t && ms != (t->msaa != 0)) t = NULL;
-            if ((st->flags & 1) && !t) {
+            if ((st->flags & 1) && !t && !none) {
                 LOG_LIMIT(4,
                           "vulkan: a raw surface load's header %08x %08x %08x names no texture of 4-, 8- or 16-byte "
                           "color texels stored as they are: the dispatch is skipped\n",
@@ -2074,6 +2094,12 @@ rebind:
                 cs_abandon_binding(originals);
                 return;
             }
+            if (none && !sampled && vk_null_header_first(tic_at))
+                LOG("vulkan: compute %016llx texture %d (handle %08x) names %s at %llx (word 0 %08x): it reads the "
+                    "null texture, %s, and the dispatch goes on\n",
+                    (unsigned long long)p->key, i, h,
+                    vk_tic_empty(tic) ? "an empty header" : "a header of no Vulkan format", (unsigned long long)tic_at,
+                    tic[0], st->shadow ? "a depth of 1.0 to compare" : "zeros");
             ii[i] = (VkDescriptorImageInfo){smp, v, sampled_layout};
             w[nw++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                              .dstSet = set,
@@ -2259,6 +2285,15 @@ rebind:
         g_cs_skips[CS_SKIP_INPUTS_MOVED]++;
         return;
     }
+    /* the bindings within what the space check counted: more is a binding it missed, which at the arena's end
+       would pass it (arena_alloc) */
+    if (!deferred && g_ar_used > ar_from + need) {
+        g_cs_arena_short++;
+        LOG_LIMIT(4,
+                  "vulkan: a compute dispatch's bindings took %llu bytes of the arena, where its space check counted "
+                  "%llu\n",
+                  (unsigned long long)(g_ar_used - ar_from), (unsigned long long)need);
+    }
     /* the outputs, once every input is read (an input can alias another storage buffer's output) */
     for (int i = 0; i < ng && !deferred; i++)
         if (((p->si.gbuf_wmask >> i) & 1) && sa[i]) {
@@ -2401,7 +2436,7 @@ rebind:
     if (deferred) {
         /* pending from here: the submit copies them where the host reads them (vk_buf_host_barrier). Submitted at
            once, the GPU runs it while the stream goes on, and a reader of its results waits for that submit alone,
-           not for the draws recorded after it: Pokemon Legends Z-A writes command lists with a dispatch and fetches
+           not for the draws recorded after it: one game writes command lists with a dispatch and fetches
            them a little later (a GPFIFO entry with SYNC), once a frame */
         const u64 staged_before = vk_buf_commits_staged();
         vk_uma_writer(p->key);

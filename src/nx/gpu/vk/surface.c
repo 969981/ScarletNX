@@ -850,7 +850,7 @@ static int rt_load_copy(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 off, u32 
         const int scaled = s->sw != s->w || s->sh != s->h;
         VkImage t = scaled ? vk_unscaled_image(s, 1, &tm) : VK_NULL_HANDLE;
         /* no memory for the image of the guest's size: never a copy of that size into the scaled one, which went
-           past its edge and faulted the GPU's copy engine (Xid 39) in Mario Kart World at resolution=0.5 */
+           past its edge and faulted the GPU's copy engine (Xid 39) in a racing game at resolution=0.5 */
         if (scaled && !t) return 0;
         if (!t)
             rec_CmdCopyBufferToImage(cb, buf, s->img, VK_LAYOUT(TRANSFER_DST_OPTIMAL), 1, &c);
@@ -3057,7 +3057,7 @@ static u32 g_oom_target; /* the same of render targets */
 static u64 g_oom_target_bytes;
 u64 vk_mem_trimmed(void) { return g_trimmed; }
 u64 vk_mem_trim_start(u64 budget) { return budget - trim_head(budget); }
-/* The caches' trim takes only what the last presents didn't use, and on a GPU of 2 GB Mario Kart World's working set
+/* The caches' trim takes only what the last presents didn't use, and on a GPU of 2 GB a racing game's working set
    didn't fit: its depth targets found no memory, and most of its draws were skipped. Its terrain textures, bound by
    tiles, are the memory that can give way without a hole: a level coarser, a quarter of the bytes */
 u64 vk_tex_shed(u64 need) {
@@ -3083,7 +3083,7 @@ u64 vk_tex_shed(u64 need) {
    it and the next use loaded it all again. Those the present being recorded uses too, but for one a draw recorded and
    not yet submitted holds: the bind goes before the next submission, which a recorded draw would be in, sampling a
    level with no memory. A submitted draw is safe: the bind waits for the work submitted before it (memory.c). The
-   working set itself has to give way: on a GPU of 2 GB Mario Kart World's frames used more than the budget, and a
+   working set itself has to give way: on a GPU of 2 GB a racing game's frames used more than the budget, and a
    trim that took only what two presents hadn't used freed nothing. The bytes released */
 #define SHED_PER_TRIM 64 /* the textures a trim makes coarser at most: each is a sparse bind */
 static u32 g_shed_at; /* the present a level last gave way (+1) */
@@ -3101,8 +3101,8 @@ static u64 tex_shed_lru(u32 before, u64 want) {
     return freed;
 }
 /* Once a present, the headroom of textures sparse for their levels (texture.c's shed). Memory let go comes back only
-   when the frames that could read it are done, and a request in the meantime finds none: on a GPU of 2 GB Mario Kart
-   World's frames used more than the budget, the trim ran when an allocation was already short, and the sparse blocks
+   when the frames that could read it are done, and a request in the meantime finds none: on a GPU of 2 GB a racing
+   game's frames used more than the budget, the trim ran when an allocation was already short, and the sparse blocks
    of the textures it then loaded found no memory frame after frame. So while the heap's use, less what waits to be
    freed, is past the budget less two of the trim's heads, those textures give up their finest level ahead of the
    requests, the least recently used first. Under a head more below that, and once 300 presents have gone with no level
@@ -3130,7 +3130,7 @@ void vk_tex_refine_frame(void) {
 /* Once a present: the demoted textures (vk_tex_demote) the last two presents used, the most recently used first, moved
    back into the GPU's memory, 16 MB a present at most; where the GPU's memory has no room for one, textures no present
    used in the last 30 go into system memory in its place, the least recently used first. Waiting for room alone, the
-   GPU's memory never had any in Mario Kart World's race, and the textures its frames used stayed in system memory,
+   GPU's memory never had any in a racing game's race, and the textures its frames used stayed in system memory,
    sampled over the bus. The use counted is less what waits to be freed: what a swap lets go is the GPU's again when
    the frame is done, and the move back that finds no memory now is tried again at the next present */
 void vk_tex_promote_frame(void) {
@@ -3347,7 +3347,7 @@ int vk_cache_image_create(const VkImageCreateInfo* ii, VkImage* img, DevMem* mem
     }
     /* one as big of its kind found no memory this present: neither will this one (what was freed meanwhile is released
        when the frame is done). Its draws go without it until the next present. Render targets are counted apart: in
-       Mario Kart World on a GPU of 2 GB, textures of 66 KB to 1.6 MB found none in each present, and its depth targets
+       a racing game on a GPU of 2 GB, textures of 66 KB to 1.6 MB found none in each present, and its depth targets
        of 2 to 8 MB, refused for them, skipped 500,000 draws in a minute and a half where 220 found no memory. So are
        the images its compute programs store to (VK_OWN_WRITTEN), whose loss is a dispatch's results: refused about
        20 times for each that found no memory, and each refusal skipped the dispatch */
@@ -3429,7 +3429,7 @@ static int blit_depth_gather(Surf* source, Surf* destination, i32 x0, i32 y0, i3
 }
 
 /* A 2D blit whose source is a depth target: the game copies the depth buffer's texels as a color surface of their
-   size (Pokemon Legends Z-A blits its D24S8 depth as BGRA8 into another depth buffer, which its lighting tests
+   size (one game blits its D24S8 depth as BGRA8 into another depth buffer, which its lighting tests
    against, and halves it for half-size passes). The texels are copied whole on the console, so here the depth and
    stencil go into a depth target of the source's format at the destination, which the draw that binds it finds.
    Depth targets don't reach guest memory, so a copy through memory would leave it undefined: black lighting. 0 when
@@ -3797,6 +3797,16 @@ static u32 zt_depth_bytes(VkFormat f) { return f == VK_FORMAT_D16_UNORM || f == 
 static int zt_stencil(VkFormat f) {
     return f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D32_SFLOAT_S8_UINT || f == VK_FORMAT_D16_UNORM_S8_UINT;
 }
+/* The bytes a layer of an aspect of s takes in the copies' buffer, rounded up to 4: a depth or stencil copy's buffer
+   offset is a multiple of 4 (VUID-vkCmdCopyImageToBuffer-srcImage-07978, VUID-vkCmdCopyBufferToImage-dstImage-07978),
+   and a layer of the stencil's byte a texel, or of D16's two, ends off it where the texels are odd. The state holds
+   each layer's bytes alone, one after another (zt_put, zt_restore) */
+static u64 zt_layer(const Surf* s, u32 aspect) { return (u64)s->sw * s->sh * (aspect ? 1u : zt_depth_bytes(s->f.vk)); }
+static u64 zt_layer_padded(const Surf* s, u32 aspect) { return (zt_layer(s, aspect) + 3) & ~3ull; }
+/* the copies' bytes of every aspect and layer of s */
+static u64 zt_padded(const Surf* s) {
+    return s->layers * (zt_layer_padded(s, 0) + (zt_stencil(s->f.vk) ? zt_layer_padded(s, 1) : 0));
+}
 /* a multisampled one's samples aren't saved: copies don't reach them */
 static int zt_saved(const Surf* s) {
     return s->is_rt && s->f.depth && !(s->gva >> 63) && s->layout != VK_IMAGE_LAYOUT_UNDEFINED && !s->volume &&
@@ -3809,10 +3819,9 @@ static void zt_drop(void) {
     g_zt = NULL;
     g_nzt = 0;
 }
-/* each aspect of every layer of s copied between its image and buf at at, the depth's then the stencil's: to the
-   buffer (out) or from it */
+/* each aspect of every layer of s copied between its image and buf at at (a multiple of 4), the depth's then the
+   stencil's, each layer zt_layer_padded bytes: to the buffer (out) or from it */
 static void zt_copy(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 at, int out) {
-    u64 dsize = (u64)s->sw * s->sh * zt_depth_bytes(s->f.vk);
     u32 layer, a, aspects = zt_stencil(s->f.vk) ? 2 : 1;
     for (a = 0; a < aspects; a++)
         for (layer = 0; layer < s->layers; layer++) {
@@ -3824,8 +3833,18 @@ static void zt_copy(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 at, int out) 
                 rec_CmdCopyImageToBuffer(cb, s->img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), buf, 1, &c);
             else
                 rec_CmdCopyBufferToImage(cb, buf, s->img, VK_LAYOUT(TRANSFER_DST_OPTIMAL), 1, &c);
-            at += a ? (u64)s->sw * s->sh : dsize;
+            at += zt_layer_padded(s, a);
         }
+}
+/* the layers of the copies' bytes at p, each aspect's in turn, into the state: the bytes of each layer alone */
+static int zt_put(StateIo* io, const Surf* s, const u8* p) {
+    u32 aspects = zt_stencil(s->f.vk) ? 2 : 1;
+    for (u32 a = 0; a < aspects; a++)
+        for (u32 layer = 0; layer < s->layers; layer++) {
+            if (io_put(io, p, zt_layer(s, a))) return -1;
+            p += zt_layer_padded(s, a);
+        }
+    return 0;
 }
 int vk_zt_save(StateIo* io) {
     u64 total = 0, at = 0;
@@ -3839,7 +3858,7 @@ int vk_zt_save(StateIo* io) {
             const Surf* s = g_rows.surf[row];
             if (zt_saved(s)) {
                 n++;
-                total += (u64)s->sw * s->sh * s->layers * (zt_depth_bytes(s->f.vk) + (zt_stencil(s->f.vk) ? 1u : 0u));
+                total += zt_padded(s);
             }
         }
     if (!n) return io_put32(io, 0);
@@ -3867,7 +3886,7 @@ int vk_zt_save(StateIo* io) {
             vk_surf_use(cb, s, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
                         VK_ACCESS_2_TRANSFER_READ_BIT);
             zt_copy(cb, s, buf, at, 1);
-            at += (u64)s->sw * s->sh * s->layers * (zt_depth_bytes(s->f.vk) + (zt_stencil(s->f.vk) ? 1u : 0u));
+            at += zt_padded(s);
         }
         rec_CmdPipelineBarrier2(cb, &di);
     }
@@ -3876,12 +3895,11 @@ int vk_zt_save(StateIo* io) {
     r |= io_put32(io, n);
     for (i = 0, at = 0; i < n && !r; i++) {
         Surf* s = all[i];
-        u64 dsize = (u64)s->sw * s->sh * s->layers * zt_depth_bytes(s->f.vk),
-            ssize = zt_stencil(s->f.vk) ? (u64)s->sw * s->sh * s->layers : 0;
+        u64 dsize = zt_layer(s, 0) * s->layers, ssize = zt_stencil(s->f.vk) ? zt_layer(s, 1) * s->layers : 0;
         r |= io_put64(io, s->gva) | io_put32(io, s->w) | io_put32(io, s->h) | io_put32(io, s->sw) | io_put32(io, s->sh);
         r |= io_put32(io, s->fkey) | io_put32(io, (u32)s->f.vk) | io_put32(io, s->layers) | io_put64(io, dsize) |
-             io_put64(io, ssize) | io_put(io, p + at, dsize + ssize);
-        at += dsize + ssize;
+             io_put64(io, ssize) | zt_put(io, s, p + at);
+        at += zt_padded(s);
     }
     free(all);
     LOG("vulkan: %u depth targets saved (%llu KB)\n", n, (unsigned long long)(total >> 10));
@@ -3917,10 +3935,18 @@ static void zt_restore(Surf* s) {
         u8* to;
         if (z->gva != s->gva || z->w != s->w || z->h != s->h || z->sw != s->sw || z->sh != s->sh ||
             z->fkey != s->fkey || z->vk != (u32)s->f.vk || z->layers != s->layers ||
-            z->dsize != (u64)s->sw * s->sh * s->layers * zt_depth_bytes(s->f.vk))
+            z->dsize != zt_layer(s, 0) * s->layers ||
+            z->ssize != (zt_stencil(s->f.vk) ? zt_layer(s, 1) * s->layers : 0))
             continue;
-        if ((to = vk_stage(z->dsize + z->ssize, 4, &buf, &off)) != NULL) {
-            memcpy(to, z->bytes, (size_t)(z->dsize + z->ssize));
+        if ((to = vk_stage(zt_padded(s), 4, &buf, &off)) != NULL) {
+            /* each layer's bytes where zt_copy reads it */
+            const u8* from = z->bytes;
+            for (u32 a = 0; a < (zt_stencil(s->f.vk) ? 2u : 1u); a++)
+                for (u32 layer = 0; layer < s->layers; layer++) {
+                    memcpy(to, from, (size_t)zt_layer(s, a));
+                    from += zt_layer(s, a);
+                    to += zt_layer_padded(s, a);
+                }
             vk_render_end();
             cb = vk_cmd();
             vk_surf_use(cb, s, VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,

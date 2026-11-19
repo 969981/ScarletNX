@@ -1,5 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
-   Copyright 2026 the ScarletNX contributors */
+   Copyright 2026 the ScarletNX contributors
+   Guest memory's atomics ported from QEMU (target/arm/tcg/translate-a64.c: gen_compare_and_swap,
+   gen_compare_and_swap_pair, do_atomic_ld), through ir_ldst.c's, LGPL-2.1-or-later:
+   Copyright (c) 2013 Alexander Graf <agraf@suse.de> */
 /* sailgen's LLVM back end: what the generated emitters call to build IR, copied at the top of every file sailgen
    writes (gen.c), so the file stands alone. It lowers Sail's builtins and the shared functions the generator does not
    inline (README.md, "Builtins") to the IR the recompiler's emitters have always made, and reads and writes the Sail's
@@ -15,6 +18,8 @@
    field, a rotation, a funnel shift, a byte or bit reversal, or the OR of shifted and masked sources) */
 
 #include "common/cpu/aarch64/cpu.h" /* the CPU structure, where the registers are kept */
+#include "common/cpu/recompiler/llvm/ir_fp.h" /* the floating-point pieces the recompiler's FP emitters share */
+#include "common/cpu/recompiler/llvm/ir_vec.h" /* a SIMD&FP register read and written as lanes */
 #include <stddef.h>
 
 #define SG_W   128 /* the widest bits value: EXTR's concatenation */
@@ -62,13 +67,30 @@ typedef struct {
     int branched, undefined;
     /* the block's last instruction before this one's: a clause that hands the word on (sg_see) has emitted nothing */
     LLVMValueRef start;
+    /* the doublewords of SIMD&FP registers this instruction loaded (sg__V_read_bits): register n's doubleword k, so
+       an element loop over them reads the register as lanes (sg_l_elem) */
+    LLVMValueRef vload[8];
+    unsigned char vload_n[8], vload_k[8];
+    unsigned vload_count;
+    /* the load-exclusive's values, i64 each (two for a pair of doublewords), and the next an exclusive read takes; the
+       store-exclusive's status, an i32 0 or 1 (GuestLoadExclusive, GuestStoreExclusive) */
+    LLVMValueRef exclusive[2], status;
+    unsigned exclusive_count, exclusive_next;
+    /* the instruction's first two plain 4-byte accesses, the load or store and its address each, and whether they are
+       stores, for sg_accesses_combine (more than two: 3) */
+    LLVMValueRef access[2], access_address[2];
+    unsigned access_count, access_stores;
+    /* the last run-time condition a lowered function ran under (sg_fp_when): the condition, the end of the way where it
+       holds, and the empty block of the way where it does not, which both join */
+    LLVMValueRef when_path;
+    LLVMBasicBlockRef when_end, when_skip;
 } SgCtx;
 
 #define SG_B (g->ir->b)
 
 static inline SnxU64 sg_ones(unsigned n) { return n >= 64 ? ~0ull : (1ull << n) - 1; }
 
-static inline void sg_fail(const char* what, long long a, long long b) {
+[[noreturn]] static inline void sg_fail(const char* what, long long a, long long b) {
     fprintf(stderr, "sailgen back end: %s (%lld, %lld)\n", what, a, b);
     abort();
 }
@@ -180,6 +202,25 @@ static inline SgD sg_d_from_s(SgS s) {
     SgD d = sg_d_empty(s.w);
     unsigned i;
     for (i = 0; i < s.w; ++i) d.sel[i] = (unsigned char)((s.v >> i) & 1);
+    return d;
+}
+/* w bits all 0 or all 1, or integer v's bits hi..lo (two's complement), known when it recompiles but over the 64 bits
+   an SgS keeps (a SIMD&FP register's Zeros(128)): a map of constant bits */
+static inline SgD sg_d_fill(long long w, int one) {
+    SgD d = sg_d_empty((unsigned)w);
+    unsigned i;
+    for (i = 0; i < d.w; ++i) d.sel[i] = (unsigned char)(one != 0);
+    return d;
+}
+static inline SgD sg_d_of_int(long long v, long long hi, long long lo) {
+    SgD d;
+    unsigned i;
+    if (lo < 0 || hi < lo) sg_fail("bits of an integer out of it", hi, lo);
+    d = sg_d_empty((unsigned)(hi - lo + 1));
+    for (i = 0; i < d.w; ++i) {
+        long long b = lo + (long long)i;
+        d.sel[i] = (unsigned char)(b >= 63 ? v < 0 : (v >> b) & 1);
+    }
     return d;
 }
 /* the bits of an LLVM integer value: a map of one source, already made */
@@ -514,6 +555,25 @@ static inline int sg_d_low(const SgD* x, unsigned k) {
 /* source k at x's width (sg_d_low's): truncated when it is wider */
 static inline LLVMValueRef sg_d_src(SgCtx* g, const SgD* x, unsigned k) { return sg_cast(g, x->src[k], x->w, 0); }
 
+/* v is NOT of one bit of a value, as sg_d_not makes it of a 1-bit map: xor (trunc (lshr S, p)), true. S, and p in *pos;
+   NULL when it is not */
+static inline LLVMValueRef sg_d_flipped(LLVMValueRef v, unsigned* pos) {
+    LLVMValueRef t, s;
+    if (!LLVMIsAInstruction(v) || LLVMGetInstructionOpcode(v) != LLVMXor || LLVMGetIntTypeWidth(LLVMTypeOf(v)) != 1 ||
+        !LLVMIsAConstantInt(LLVMGetOperand(v, 1)) || !LLVMConstIntGetZExtValue(LLVMGetOperand(v, 1)))
+        return NULL;
+    t = LLVMGetOperand(v, 0);
+    if (!LLVMIsAInstruction(t) || LLVMGetInstructionOpcode(t) != LLVMTrunc) return NULL;
+    s = LLVMGetOperand(t, 0);
+    *pos = 0;
+    if (LLVMIsAInstruction(s) && LLVMGetInstructionOpcode(s) == LLVMLShr && LLVMIsAConstantInt(LLVMGetOperand(s, 1))) {
+        *pos = (unsigned)LLVMConstIntGetZExtValue(LLVMGetOperand(s, 1));
+        s = LLVMGetOperand(s, 0);
+    }
+    return LLVMGetTypeKind(LLVMTypeOf(s)) == LLVMIntegerTypeKind && *pos < LLVMGetIntTypeWidth(LLVMTypeOf(s)) ? s
+                                                                                                              : NULL;
+}
+
 static inline LLVMValueRef sg_d_make(SgCtx* g, SgD* x) {
     unsigned w = x->w, i, k, done[SG_W], run_bit[SG_W];
     LLVMValueRef r = NULL, t;
@@ -521,6 +581,34 @@ static inline LLVMValueRef sg_d_make(SgCtx* g, SgD* x) {
     if (x->nzcv) sg_d_realize(g, x);
     if (sg_d_is_const(x)) return x->value = sg_const(g, w, sg_d_const_word(x, 0), sg_d_const_word(x, 1));
     sg_d_compact(x);
+    { /* a bit that is another value's bit flipped (FPNeg's not_vec([op[N-1]]) @ op[N - 2 .. 0]): that bit, and one xor
+         of the places it flips, as a sign was always flipped */
+        SgD y = *x;
+        SnxU64 flip[2] = {0, 0};
+        int any = 0;
+        for (k = 0; k < x->nsrc; ++k) {
+            unsigned p;
+            int j;
+            LLVMValueRef s;
+            SgD from;
+            if (x->src_w[k] != 1 || x->src_flag[k] || !(s = sg_d_flipped(x->src[k], &p))) continue;
+            from = sg_d_from(g, s);
+            if ((j = sg_d_take_src(&y, &from, 0)) < 0) continue;
+            for (i = 0; i < w; ++i)
+                if (x->sel[i] == 2 + k) {
+                    y.sel[i] = (unsigned char)(2 + j);
+                    y.pos[i] = (unsigned char)p;
+                    flip[i / 64] |= 1ull << (i % 64);
+                    any = 1;
+                }
+        }
+        if (any) {
+            y.value = NULL;
+            sg_d_compact(&y);
+            t = sg_d_make(g, &y);
+            return x->value = LLVMBuildXor(SG_B, t, sg_const(g, w, flip[0], flip[1]), "");
+        }
+    }
     /* a W value zero-extended into an X register: its 32 bits made (a rotation, a reversal, a funnel), then extended */
     if (w == 64) {
         for (i = 32; i < 64 && x->sel[i] == 0; ++i) {}
@@ -755,6 +843,28 @@ static inline LLVMValueRef sg_d_flag_bit(SgCtx* g, const SgD* x, unsigned i) {
     unsigned s = x->sel[i];
     return s < 2 ? ir_i32(g->ir, s) : ir_u32(g->ir, x->src[s - 2]);
 }
+/* select(c, x, y) as one phi, where c is the run-time condition a lowered function last ran under (sg_fp_when), x a
+   phi this block starts with of what it gave where c held and of a constant from the empty block of the other way,
+   and y a constant: what it gave, and y from that block (FCCMP's flags). NULL otherwise */
+static inline LLVMValueRef sg_select_phi(SgCtx* g, LLVMValueRef c, LLVMValueRef x, LLVMValueRef y) {
+    LLVMBasicBlockRef here = LLVMGetInsertBlock(SG_B), blocks[2];
+    LLVMValueRef values[2], phi;
+    unsigned k;
+    if (c != g->when_path || !LLVMIsAPHINode(x) || LLVMGetInstructionParent(x) != here || LLVMCountIncoming(x) != 2 ||
+        !LLVMIsAConstant(y))
+        return NULL;
+    k = LLVMGetIncomingBlock(x, 0) == g->when_skip ? 0 : 1;
+    if (LLVMGetIncomingBlock(x, k) != g->when_skip || LLVMGetIncomingBlock(x, 1 - k) != g->when_end) return NULL;
+    values[0] = LLVMGetIncomingValue(x, 1 - k);
+    blocks[0] = g->when_end;
+    values[1] = y;
+    blocks[1] = g->when_skip;
+    LLVMPositionBuilderBefore(SG_B, LLVMGetFirstInstruction(here));
+    phi = LLVMBuildPhi(SG_B, LLVMTypeOf(x), "");
+    LLVMAddIncoming(phi, values, blocks, 2);
+    LLVMPositionBuilderAtEnd(SG_B, here);
+    return phi;
+}
 static inline SgD sg_d_select(SgCtx* g, LLVMValueRef c, SgD a, SgD b) {
     unsigned i;
     int flags = a.w <= 8;
@@ -765,8 +875,8 @@ static inline SgD sg_d_select(SgCtx* g, LLVMValueRef c, SgD a, SgD b) {
     if (flags) { /* flags (CCMP's NZCV): a select of each, which stays a 0-or-1 source */
         SgD r = sg_d_empty(a.w);
         for (i = 0; i < a.w; ++i) {
-            LLVMValueRef x = sg_d_flag_bit(g, &a, i), y = sg_d_flag_bit(g, &b, i);
-            sg_d_put_any(g, &r, i, sg_d_flag(LLVMBuildSelect(SG_B, c, x, y, ""), NULL), 0, 1);
+            LLVMValueRef x = sg_d_flag_bit(g, &a, i), y = sg_d_flag_bit(g, &b, i), v = sg_select_phi(g, c, x, y);
+            sg_d_put_any(g, &r, i, sg_d_flag(v ? v : LLVMBuildSelect(SG_B, c, x, y, ""), NULL), 0, 1);
         }
         return r;
     }
@@ -1290,6 +1400,44 @@ static inline void sg_flags_flush(SgCtx* g) {
     for (i = 0; i < 4; ++i) v[i] = g->flag[i] ? g->flag[i] : sg_flag(g->ir, i);
     sg_flags_commit(g, v, SNX_IR_FLAGS_SOME, NULL, NULL);
 }
+/* the four flags of v, each a phi of the two ways under the last run-time condition a lowered function ran under
+   (FCCMP's): stored at the end of each way, as an emitter that wrote them on each wrote them, and cached as the phis.
+   0 when they are not that */
+static inline int sg_flags_on_each_way(SgCtx* g, const SgD* v) {
+    LLVMBasicBlockRef here = LLVMGetInsertBlock(SG_B), ways[2];
+    LLVMValueRef f[4];
+    SnxIrFlags* flags;
+    unsigned i, k;
+    if (!g->when_skip) return 0;
+    ways[0] = g->when_end;
+    ways[1] = g->when_skip;
+    for (i = 0; i < 4; ++i) {
+        unsigned s = v->sel[3 - i];
+        if (s < 2 || !v->src_flag[s - 2] || v->pos[3 - i]) return 0;
+        f[i] = v->src[s - 2];
+        if (!LLVMIsAPHINode(f[i]) || LLVMGetInstructionParent(f[i]) != here || LLVMCountIncoming(f[i]) != 2 ||
+            LLVMTypeOf(f[i]) != g->ir->t_i32)
+            return 0;
+        for (k = 0; k < 2; ++k)
+            if (LLVMGetIncomingBlock(f[i], k) != ways[0] && LLVMGetIncomingBlock(f[i], k) != ways[1]) return 0;
+    }
+    for (k = 0; k < 2; ++k) {
+        LLVMPositionBuilderBefore(SG_B, LLVMGetBasicBlockTerminator(ways[k]));
+        for (i = 0; i < 4; ++i) {
+            unsigned j = LLVMGetIncomingBlock(f[i], 0) == ways[k] ? 0 : 1;
+            sg_cpu_store(g->ir, LLVMGetIncomingValue(f[i], j), sg_flag_offsets[i]);
+        }
+    }
+    LLVMPositionBuilderAtEnd(SG_B, here);
+    flags = sg_flags(g->ir);
+    for (i = 0; i < 4; ++i) {
+        flags->value[i] = f[i];
+        g->flag[i] = NULL;
+    }
+    flags->valid = 15;
+    flags->origin = SNX_IR_FLAGS_SOME;
+    return 1;
+}
 static inline SgD sg_PSTATE_read(SgCtx* g, long long field) {
     if (field < 0 || field > 3) sg_fail("a field of PSTATE this back end does not keep", field, 3);
     return sg_d_flag(g->flag[field] ? g->flag[field] : sg_flag(g->ir, (unsigned)field), NULL);
@@ -1315,6 +1463,7 @@ static inline void sg_PSTATE_write(SgCtx* g, long long first, long long count, S
         return;
     }
     if (v.nzcv) sg_d_realize(g, &v);
+    if (count == 4 && sg_flags_on_each_way(g, &v)) return;
     if (count == 4) {
         /* N the top bit of X, Z IsZeroBit(X), C and V 0: a logical result's flags */
         int logic = v.sel[3] >= 2 && v.sel[2] >= 2 && v.sel[1] == 0 && v.sel[0] == 0;
@@ -1341,6 +1490,319 @@ static inline LLVMValueRef sg_condition_origin(SgCtx* g, SgS cond) {
     r = sg_origin_cond(g->ir, (unsigned)(cond.v >> 1));
     if (r && (cond.v & 1)) r = LLVMBuildNot(SG_B, r, "");
     return r;
+}
+
+/* ---- guest memory ----
+   nx.sail's primitives: guest memory is the host's bytes at CPU.mem plus the address (ir.h's ir_rd and ir_wr, which
+   make the access as unaligned and, with volatile_memory, volatile as every other guest access), an acquire load and a
+   release store sequentially consistent host atomics (ir_ldacq, ir_strel), the exclusives cpu.h's value-based monitor
+   through its helpers (ldx, stx, ldxp, stxp), and the LSE atomics host atomics of the access size */
+
+static inline LLVMValueRef sg_address(SgCtx* g, SgD address) {
+    if (address.w != 64) sg_fail("a guest address of other than 64 bits", address.w, 64);
+    return sg_d_make(g, &address);
+}
+static inline void sg_access_size(long long size, long long most) {
+    if (size != 1 && size != 2 && size != 4 && size != 8 && !(size == 16 && most == 16))
+        sg_fail("a guest access of a size this back end does not make", size, most);
+}
+/* a plain 4-byte access just made (its instruction the block's last), for sg_accesses_combine */
+static inline void sg_access_note(SgCtx* g, LLVMValueRef access, LLVMValueRef address, int store) {
+    if (g->access_count < 2) {
+        g->access[g->access_count] = access;
+        g->access_address[g->access_count] = address;
+        g->access_stores |= (unsigned)store << g->access_count;
+    }
+    if (g->access_count < 3) ++g->access_count;
+}
+/* address as base plus a constant: an add of a constant, else itself plus 0 */
+static inline LLVMValueRef sg_address_base(LLVMValueRef address, long long* offset) {
+    *offset = 0;
+    if (LLVMIsAInstruction(address) && LLVMGetInstructionOpcode(address) == LLVMAdd &&
+        LLVMIsAConstantInt(LLVMGetOperand(address, 1))) {
+        *offset = LLVMConstIntGetSExtValue(LLVMGetOperand(address, 1));
+        return LLVMGetOperand(address, 0);
+    }
+    return address;
+}
+/* An instruction's two plain 4-byte accesses of adjacent words, both loads or both stores with nothing in between that
+   touches memory (LDPSW's two loads, STNP's two stores of words, which Arm makes two accesses on any CPU), become one
+   8-byte access as the instruction ends, as ScarletNX's emitters always made a pair of words: a load of both before
+   the first, whose halves take the two loads' place, or a store of both where the second was. A big-endian host's
+   accesses (not one load or store each) stay two */
+static inline void sg_accesses_combine(SgCtx* g) {
+    SnxIr* ir = g->ir;
+    LLVMValueRef first = g->access[0], second = g->access[1], i, base[2];
+    LLVMBasicBlockRef block = LLVMGetInsertBlock(SG_B);
+    long long offset[2];
+    int stores = g->access_stores == 3;
+    if (g->access_count != 2 || (g->access_stores != 0 && !stores)) return;
+    if (stores ? !LLVMIsAStoreInst(first) || !LLVMIsAStoreInst(second)
+               : !LLVMIsALoadInst(first) || !LLVMIsALoadInst(second))
+        return;
+    base[0] = sg_address_base(g->access_address[0], &offset[0]);
+    base[1] = sg_address_base(g->access_address[1], &offset[1]);
+    if (base[0] != base[1] || offset[1] != offset[0] + 4) return;
+    if (LLVMGetInstructionParent(first) != LLVMGetInstructionParent(second)) return;
+    for (i = LLVMGetNextInstruction(first); i && i != second; i = LLVMGetNextInstruction(i))
+        if (LLVMIsALoadInst(i) || LLVMIsAStoreInst(i) || LLVMIsACallInst(i) || LLVMIsAFenceInst(i) ||
+            LLVMIsAAtomicRMWInst(i) || LLVMIsAAtomicCmpXchgInst(i))
+            return;
+    if (!i) return;
+    if (stores) {
+        LLVMValueRef low, high;
+        LLVMPositionBuilderBefore(SG_B, second);
+        low = LLVMBuildZExt(SG_B, LLVMGetOperand(first, 0), ir->t_i64, "");
+        high = LLVMBuildShl(SG_B, LLVMBuildZExt(SG_B, LLVMGetOperand(second, 0), ir->t_i64, ""), ir_i64(ir, 32), "");
+        ir_wr(ir, g->access_address[0], 64, LLVMBuildOr(SG_B, low, high, ""));
+    } else {
+        LLVMValueRef both;
+        LLVMPositionBuilderBefore(SG_B, first);
+        both = ir_rd(ir, g->access_address[0], 64);
+        LLVMReplaceAllUsesWith(first, LLVMBuildTrunc(SG_B, both, ir->t_i32, ""));
+        LLVMReplaceAllUsesWith(second,
+                               LLVMBuildTrunc(SG_B, LLVMBuildLShr(SG_B, both, ir_i64(ir, 32), ""), ir->t_i32, ""));
+    }
+    LLVMInstructionEraseFromParent(first);
+    LLVMInstructionEraseFromParent(second);
+    LLVMPositionBuilderAtEnd(SG_B, block);
+}
+
+/* GuestMemRead(address, size, acquire): size bytes; 16 (a pair of doublewords) are two 64-bit reads */
+static inline SgD sg_GuestMemRead(SgCtx* g, SgD address, long long size, int acquire) {
+    LLVMValueRef a = sg_address(g, address);
+    sg_access_size(size, acquire ? 8 : 16);
+    if (size == 16) {
+        SgD low = sg_d_from(g, ir_rd(g->ir, a, 64));
+        SgD high = sg_d_from(g, ir_rd(g->ir, LLVMBuildAdd(SG_B, a, ir_i64(g->ir, 8), ""), 64));
+        return sg_d_concat(g, high, low);
+    }
+    if (acquire) return sg_d_from(g, ir_ldacq(g->ir, a, 8u * (unsigned)size));
+    {
+        LLVMValueRef v = ir_rd(g->ir, a, 8u * (unsigned)size);
+        if (size == 4) sg_access_note(g, v, a, 0);
+        return sg_d_from(g, v);
+    }
+}
+/* GuestMemWrite(address, size, release, value); 16 bytes are two 64-bit writes */
+static inline void sg_GuestMemWrite(SgCtx* g, SgD address, long long size, int release, SgD value) {
+    LLVMValueRef a = sg_address(g, address), v;
+    sg_access_size(size, release ? 8 : 16);
+    if (value.w != 8u * (unsigned)size) sg_fail("a guest write of a value of another size", size, value.w);
+    if (size == 16) {
+        LLVMValueRef low = sg_d_value(g, sg_d_slice(g, value, 63, 0)),
+                     high = sg_d_value(g, sg_d_slice(g, value, 127, 64));
+        ir_wr(g->ir, a, 64, low);
+        ir_wr(g->ir, LLVMBuildAdd(SG_B, a, ir_i64(g->ir, 8), ""), 64, high);
+        return;
+    }
+    v = sg_d_make(g, &value);
+    if (release)
+        ir_strel(g->ir, a, 8u * (unsigned)size, v);
+    else {
+        ir_wr(g->ir, a, 8u * (unsigned)size, v);
+        if (size == 4) sg_access_note(g, LLVMGetLastInstruction(LLVMGetInsertBlock(SG_B)), a, 1);
+    }
+}
+
+/* the size's log2, as the exclusive helpers take it */
+static inline LLVMValueRef sg_size_log2(SgCtx* g, long long size) {
+    return ir_i32(g->ir, size == 1 ? 0 : size == 2 ? 1 : size == 4 ? 2 : 3);
+}
+/* GuestLoadExclusive(address, size): ldx of 1 to 8 bytes, or ldxp of a pair of doublewords (16), which arm the monitor
+   with what they read; GuestExclusiveValue reads it */
+static inline void sg_GuestLoadExclusive(SgCtx* g, SgD address, long long size) {
+    SnxIr* ir = g->ir;
+    LLVMValueRef a = sg_address(g, address);
+    sg_access_size(size, 16);
+    if (size == 16) {
+        LLVMValueRef first = ir_local(ir, ir->t_i64), second = ir_local(ir, ir->t_i64), args[6];
+        args[0] = ir->c;
+        args[1] = ir->M;
+        args[2] = a;
+        args[3] = sg_size_log2(g, 8);
+        args[4] = first;
+        args[5] = second;
+        ir_call_helper(ir, SNX_IR_LDXP, args, 6);
+        g->exclusive[0] = ir_load(ir, ir->t_i64, first);
+        g->exclusive[1] = ir_load(ir, ir->t_i64, second);
+        g->exclusive_count = 2;
+    } else {
+        LLVMValueRef args[4];
+        args[0] = ir->c;
+        args[1] = ir->M;
+        args[2] = a;
+        args[3] = sg_size_log2(g, size);
+        g->exclusive[0] = ir_call_helper(ir, SNX_IR_LDX, args, 4);
+        g->exclusive_count = 1;
+    }
+    g->exclusive_next = 0;
+}
+/* GuestExclusiveValue(address, size): the next of what the load-exclusive read, its low size bytes */
+static inline SgD sg_GuestExclusiveValue(SgCtx* g, SgD address, long long size) {
+    (void)address;
+    if (g->exclusive_next >= g->exclusive_count) sg_fail("an exclusive read with no load-exclusive before it", size, 0);
+    if (size > 8) sg_fail("an exclusive read of over 8 bytes", size, 8);
+    return sg_d_slice(g, sg_d_from(g, g->exclusive[g->exclusive_next++]), 8 * size - 1, 0);
+}
+/* GuestStoreExclusive(address, size, value): stx of 1 to 8 bytes, or stxp of a pair of doublewords (16, the first the
+   low half); the status GuestExclusiveStatus gives */
+static inline void sg_GuestStoreExclusive(SgCtx* g, SgD address, long long size, SgD value) {
+    SnxIr* ir = g->ir;
+    LLVMValueRef a = sg_address(g, address);
+    sg_access_size(size, 16);
+    if (value.w != 8u * (unsigned)size) sg_fail("a store-exclusive of a value of another size", size, value.w);
+    if (size == 16) {
+        LLVMValueRef args[6];
+        args[0] = ir->c;
+        args[1] = ir->M;
+        args[2] = a;
+        args[3] = sg_size_log2(g, 8);
+        args[4] = sg_d_value(g, sg_d_slice(g, value, 63, 0));
+        args[5] = sg_d_value(g, sg_d_slice(g, value, 127, 64));
+        g->status = ir_call_helper(ir, SNX_IR_STXP, args, 6);
+    } else {
+        LLVMValueRef args[5];
+        args[0] = ir->c;
+        args[1] = ir->M;
+        args[2] = a;
+        args[3] = sg_size_log2(g, size);
+        args[4] = sg_d_value(g, sg_d_zext(g, value, 64));
+        g->status = ir_call_helper(ir, SNX_IR_STX, args, 5);
+    }
+}
+static inline SgD sg_GuestExclusiveStatus(SgCtx* g) {
+    if (!g->status) sg_fail("an exclusive status with no store-exclusive before it", 0, 0);
+    return sg_d_flag(g->status, NULL);
+}
+
+/* the old value of an atomic read-modify-write of operand (iN) at address. Bitwise operations and exchanges commute
+   with the byte order; on a big-endian host the arithmetic ones are a compare-and-swap loop on the guest's value. So
+   are PowerPC64's byte and halfword UMAX and UMIN: its LLVM compares the operand in all 32 bits of its register
+   (cmplw after lbarx or lharx, the operand never zero-extended), which bits above the byte or halfword change */
+static inline LLVMValueRef sg_rmw_value(SgCtx* g, LLVMAtomicRMWBinOp op, LLVMValueRef old, LLVMValueRef operand) {
+    LLVMIntPredicate p;
+    switch (op) {
+        case LLVMAtomicRMWBinOpAdd: return LLVMBuildAdd(SG_B, old, operand, "");
+        case LLVMAtomicRMWBinOpMax: p = LLVMIntSGT; break;
+        case LLVMAtomicRMWBinOpMin: p = LLVMIntSLT; break;
+        case LLVMAtomicRMWBinOpUMax: p = LLVMIntUGT; break;
+        default: p = LLVMIntULT; break;
+    }
+    return LLVMBuildSelect(SG_B, LLVMBuildICmp(SG_B, p, old, operand, ""), old, operand, "");
+}
+static inline SgD sg_guest_rmw(SgCtx* g, LLVMAtomicRMWBinOp op, SgD address, SgD value) {
+    SnxIr* ir = g->ir;
+    LLVMValueRef operand = sg_d_make(g, &value), pointer = ir_mp(ir, sg_address(g, address)), first, old, pair, seen;
+    LLVMTypeRef type = LLVMTypeOf(operand);
+    LLVMBasicBlockRef entry, loop, done;
+    int bitwise = op == LLVMAtomicRMWBinOpXchg || op == LLVMAtomicRMWBinOpAnd || op == LLVMAtomicRMWBinOpOr ||
+                  op == LLVMAtomicRMWBinOpXor;
+    int partword_unsigned =
+        ir->ppc && LLVMGetIntTypeWidth(type) < 32 && (op == LLVMAtomicRMWBinOpUMax || op == LLVMAtomicRMWBinOpUMin);
+    sg_access_size(value.w / 8, 8);
+    if ((!ir->big_endian || bitwise) && !partword_unsigned) {
+        LLVMValueRef rmw = LLVMBuildAtomicRMW(SG_B, op, pointer, ir_guest_order(ir, operand),
+                                              LLVMAtomicOrderingSequentiallyConsistent, 0);
+        return sg_d_from(g, ir_guest_order(ir, ir_tag_guest(ir, rmw)));
+    }
+    first = LLVMBuildLoad2(SG_B, type, pointer, "");
+    LLVMSetOrdering(first, LLVMAtomicOrderingSequentiallyConsistent);
+    LLVMSetAlignment(first, LLVMGetIntTypeWidth(type) / 8);
+    ir_tag_guest(ir, first);
+    entry = LLVMGetInsertBlock(SG_B);
+    loop = ir_block(ir, "rmw");
+    done = ir_block(ir, "rmw_done");
+    LLVMBuildBr(SG_B, loop);
+    LLVMPositionBuilderAtEnd(SG_B, loop);
+    old = LLVMBuildPhi(SG_B, type, "");
+    pair = LLVMBuildAtomicCmpXchg(
+        SG_B, pointer, old, ir_guest_order(ir, sg_rmw_value(g, op, ir_guest_order(ir, old), operand)),
+        LLVMAtomicOrderingSequentiallyConsistent, LLVMAtomicOrderingSequentiallyConsistent, 0);
+    ir_tag_guest(ir, pair);
+    seen = LLVMBuildExtractValue(SG_B, pair, 0, "");
+    LLVMAddIncoming(old, &first, &entry, 1);
+    LLVMAddIncoming(old, &seen, &loop, 1);
+    LLVMBuildCondBr(SG_B, LLVMBuildExtractValue(SG_B, pair, 1, ""), done, loop);
+    LLVMPositionBuilderAtEnd(SG_B, done);
+    return sg_d_from(g, ir_guest_order(ir, old));
+}
+static inline SgD sg_GuestAtomicAdd(SgCtx* g, SgD address, SgD v) {
+    return sg_guest_rmw(g, LLVMAtomicRMWBinOpAdd, address, v);
+}
+static inline SgD sg_GuestAtomicAnd(SgCtx* g, SgD address, SgD v) {
+    return sg_guest_rmw(g, LLVMAtomicRMWBinOpAnd, address, v);
+}
+static inline SgD sg_GuestAtomicXor(SgCtx* g, SgD address, SgD v) {
+    return sg_guest_rmw(g, LLVMAtomicRMWBinOpXor, address, v);
+}
+static inline SgD sg_GuestAtomicOr(SgCtx* g, SgD address, SgD v) {
+    return sg_guest_rmw(g, LLVMAtomicRMWBinOpOr, address, v);
+}
+static inline SgD sg_GuestAtomicSMax(SgCtx* g, SgD address, SgD v) {
+    return sg_guest_rmw(g, LLVMAtomicRMWBinOpMax, address, v);
+}
+static inline SgD sg_GuestAtomicSMin(SgCtx* g, SgD address, SgD v) {
+    return sg_guest_rmw(g, LLVMAtomicRMWBinOpMin, address, v);
+}
+static inline SgD sg_GuestAtomicUMax(SgCtx* g, SgD address, SgD v) {
+    return sg_guest_rmw(g, LLVMAtomicRMWBinOpUMax, address, v);
+}
+static inline SgD sg_GuestAtomicUMin(SgCtx* g, SgD address, SgD v) {
+    return sg_guest_rmw(g, LLVMAtomicRMWBinOpUMin, address, v);
+}
+static inline SgD sg_GuestAtomicSwap(SgCtx* g, SgD address, SgD v) {
+    return sg_guest_rmw(g, LLVMAtomicRMWBinOpXchg, address, v);
+}
+
+/* GuestCompareSwap(address, expected, desired): the old value, desired stored where it equalled expected; seq_cst both
+   ways. Of 16 bytes (CASP's doublewords) through snx_cas128, the exclusives' (cpu.h): the two halves read, the new value
+   desired if they equal expected and else themselves, retried until the compare-and-swap of what was read succeeds, so
+   the old value returned is one the location held */
+static inline SgD sg_GuestCompareSwap(SgCtx* g, SgD address, SgD expected, SgD desired) {
+    SnxIr* ir = g->ir;
+    LLVMValueRef a = sg_address(g, address), lo, hi, equal, args[6], ok, next, e_lo, e_hi, d_lo, d_hi;
+    LLVMTypeRef params[6];
+    LLVMBasicBlockRef loop, done;
+    SgD old;
+    if (expected.w != desired.w) sg_fail("a compare-and-swap of values of two sizes", expected.w, desired.w);
+    if (expected.w != 128) {
+        LLVMValueRef pair;
+        sg_access_size(expected.w / 8, 8);
+        pair = LLVMBuildAtomicCmpXchg(
+            SG_B, ir_mp(ir, a), ir_guest_order(ir, sg_d_make(g, &expected)), ir_guest_order(ir, sg_d_make(g, &desired)),
+            LLVMAtomicOrderingSequentiallyConsistent, LLVMAtomicOrderingSequentiallyConsistent, 0);
+        ir_tag_guest(ir, pair);
+        return sg_d_from(g, ir_guest_order(ir, LLVMBuildExtractValue(SG_B, pair, 0, "")));
+    }
+    e_lo = sg_d_value(g, sg_d_slice(g, expected, 63, 0));
+    e_hi = sg_d_value(g, sg_d_slice(g, expected, 127, 64));
+    d_lo = sg_d_value(g, sg_d_slice(g, desired, 63, 0));
+    d_hi = sg_d_value(g, sg_d_slice(g, desired, 127, 64));
+    loop = ir_block(ir, "cas128");
+    done = ir_block(ir, "cas128_done");
+    next = LLVMBuildAdd(SG_B, a, ir_i64(ir, 8), "");
+    params[0] = ir->t_ptr;
+    params[1] = ir->t_ptr;
+    params[2] = params[3] = params[4] = params[5] = ir->t_i64;
+    LLVMBuildBr(SG_B, loop);
+    LLVMPositionBuilderAtEnd(SG_B, loop);
+    lo = ir_ldacq(ir, a, 64);
+    hi = ir_ldacq(ir, next, 64);
+    equal = LLVMBuildAnd(SG_B, LLVMBuildICmp(SG_B, LLVMIntEQ, lo, e_lo, ""),
+                         LLVMBuildICmp(SG_B, LLVMIntEQ, hi, e_hi, ""), "");
+    /* snx_cas128 takes the doublewords' values, as STXP's (cpu.h), and a big-endian host's puts them in memory order */
+    args[0] = ir->c;
+    args[1] = ir_mp(ir, a);
+    args[2] = lo;
+    args[3] = hi;
+    args[4] = LLVMBuildSelect(SG_B, equal, d_lo, lo, "");
+    args[5] = LLVMBuildSelect(SG_B, equal, d_hi, hi, "");
+    ok = ir_call(ir, ir_extern(ir, "snx_cas128", ir->t_i32, params, 6), args, 6);
+    LLVMBuildCondBr(SG_B, LLVMBuildICmp(SG_B, LLVMIntNE, ok, ir_i32(ir, 0), ""), done, loop);
+    LLVMPositionBuilderAtEnd(SG_B, done);
+    old = sg_d_from(g, hi);
+    return sg_d_concat(g, old, sg_d_from(g, lo));
 }
 
 /* ---- CRC32 and CRC32C ----
@@ -1422,4 +1884,1052 @@ static inline SgD sg_crc32(SgCtx* g, SgD acc_bits, SgD value_bits, long long siz
             SG_B, r, LLVMBuildLoad2(SG_B, ir->t_i32, LLVMBuildInBoundsGEP2(SG_B, type, table, index, 2, ""), ""), "");
     }
     return sg_d_from(g, r);
+}
+
+/* ---- floating point ----
+   The SIMD&FP registers (nx.sail's _V, the CPU's v) through ir.h's vector accessors, whose per-block cache of each
+   register's low lanes every emitter shares; FPCR (nx.sail's, the CPU's fpcr); and the Arm architecture's
+   floating-point functions the Sail calls (a64.roots' lower). Those work on real numbers, so they are lowered here as
+   the recompiler's scalar emitters always made them: the host's IEEE arithmetic behind a guard proving it gives the
+   console's result and FPSR flags, else cpu.h's soft-float helpers (helpers/fp.c: the Arm ARM's FPUnpack,
+   FPProcessNaNs and FPRound), which raise their FPSR flags as FPProcessException does. Each reads FPCR from the value
+   the Sail hands it. Halves always take the helpers. The helper calls are the hand-written scalar emitters'
+   (tests/support/ir_fpu_reference.c), ported from QEMU (target/arm/tcg/translate-a64.c's do_fp3_scalar and its
+   siblings), LGPL-2.1-or-later: Copyright (c) 2013 Alexander Graf <agraf@suse.de>.
+
+   The fast paths: the host's IEEE operations in round to nearest give the helpers' exact result when the result is
+   finite and above the smallest normal, or an exact zero, and under FZ no operand is a denormal (unflushed): then no
+   NaN was processed (a NaN operand gives a NaN), no infinity was an operand (it gives an infinity or a NaN), a
+   denormal operand is the IEEE value it is without FZ and raises nothing, nothing is flushed, tininess (before
+   rounding, as the Arm ARM detects it) can't have occurred, and IXC is the only flag. Many games run with FZ set: a
+   guard of FZ clear would send all of their arithmetic to the helpers. A result above the smallest normal rounds a
+   value above it; a zero is exact for any sum (sums only cancel exactly), and for a product or quotient only with a
+   zero operand. IXC is computed exactly where that is cheap (TwoSum for sums; for singles the double product,
+   quotient remainder or square, all exact; for doubles an FMA residual where the host has FMA, kept to operands whose
+   residual can't underflow), and otherwise the path is taken only once IXC is set: it is sticky, so an inexact result
+   changes nothing then. Compares, FMAX and FMIN, widening and narrowing, the FRINTs and the integer conversions have
+   guards of their own. Nothing reads the host's FP state, so this assumes only that the host thread never flushes
+   denormals (x86's MXCSR.FTZ and DAZ, FPCR.FZ on an AArch64 host), which the runtime never sets. The slow paths call
+   the helpers' snx_fp_host_* forms, which try the host's arithmetic on what these guards refuse (NaNs, infinities,
+   underflows) before the soft-float */
+
+/* FPRoundingMode's answer while recompiling: the mode FPCR holds when the guest runs, beyond FPRounding's members
+   (TIEEVEN to ODD, 0 to 5) */
+#define SG_FP_ROUNDING_FPCR 6
+
+/* _V[n] bits hi..lo, an element's low lane of 8 to 64 bits as ir_ve loads it (once a block), the high doubleword as
+   ir_vd does, else both doublewords */
+static inline LLVMValueRef sg__V_loaded(SgCtx* g, LLVMValueRef v, unsigned n, unsigned k) {
+    if (g->vload_count < 8) {
+        g->vload[g->vload_count] = v;
+        g->vload_n[g->vload_count] = (unsigned char)n;
+        g->vload_k[g->vload_count++] = (unsigned char)k;
+    }
+    return v;
+}
+static inline SgD sg__V_read_bits(SgCtx* g, long long n, long long hi, long long lo) {
+    long long w = hi - lo + 1;
+    SgD whole;
+    if (n < 0 || n > 31 || lo < 0 || hi > 127 || hi < lo) sg_fail("bits of a SIMD&FP register it does not have", n, hi);
+    if (lo == 0 && w == 64) return sg_d_from(g, sg__V_loaded(g, ir_ve(g->ir, (unsigned)n, 3, 0), (unsigned)n, 0));
+    if (lo == 0 && (w == 8 || w == 16 || w == 32))
+        return sg_d_from(g, ir_ve(g->ir, (unsigned)n, w == 8 ? 0 : w == 16 ? 1 : 2, 0));
+    if (lo == 64 && w == 64) return sg_d_from(g, sg__V_loaded(g, ir_vd(g->ir, (unsigned)n, 1), (unsigned)n, 1));
+    whole = sg_d_concat(g, sg_d_from(g, sg__V_loaded(g, ir_vd(g->ir, (unsigned)n, 1), (unsigned)n, 1)),
+                        sg_d_from(g, sg__V_loaded(g, ir_vd(g->ir, (unsigned)n, 0), (unsigned)n, 0)));
+    return sg_d_slice(g, whole, hi, lo);
+}
+/* doubleword k of v is the value the register already holds, read in this block (Vpart_set's other half) */
+static inline int sg__V_holds(SgCtx* g, unsigned n, unsigned k, const SgD* v) {
+    const SnxIrVectorCache* cache = &g->ir->state.vectors;
+    unsigned i;
+    if (k || cache->block != LLVMGetInsertBlock(SG_B) || !((cache->valid[3] >> n) & 1) || v->sel[0] < 2) return 0;
+    for (i = 0; i < 64; ++i)
+        if (v->sel[i] != v->sel[0] || v->pos[i] != i) return 0;
+    return v->src[v->sel[0] - 2] == cache->low[n][3];
+}
+/* the vector whose bits v's low bits are, the rest 0 (an element loop's lanes, sg_d_from_l): NULL when none */
+static inline LLVMValueRef sg_lanes_of(const SgD* v) {
+    unsigned s, w, i;
+    LLVMValueRef src;
+    if (v->sel[0] < 2) return NULL;
+    s = v->sel[0] - 2;
+    src = v->src[s];
+    w = v->src_w[s];
+    if (!LLVMIsABitCastInst(src) || LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(src, 0))) != LLVMVectorTypeKind ||
+        w > v->w)
+        return NULL;
+    for (i = 0; i < v->w; ++i)
+        if (i < w ? v->sel[i] != v->sel[0] || v->pos[i] != i : v->sel[i] != 0) return NULL;
+    return LLVMGetOperand(src, 0);
+}
+/* _V[n] = v, the 128 bits: an element loop's lanes stored as such, the rest zeroed (ir_vec_write); else each
+   doubleword stored (ir_set_vd), but one that holds that value already */
+static inline void sg__V_write(SgCtx* g, long long n, SgD v) {
+    unsigned k;
+    LLVMValueRef lanes;
+    if (n < 0 || n > 31) sg_fail("an element of _V it does not have", n, 31);
+    if (v.w != 128) sg_fail("a SIMD&FP register written with other than 128 bits", n, v.w);
+    if ((lanes = sg_lanes_of(&v)) != NULL) {
+        ir_vec_write(g->ir, (unsigned)n, lanes);
+        return;
+    }
+    for (k = 0; k < 2; ++k) {
+        SgD half = sg_d_slice(g, v, 64 * k + 63, 64 * k);
+        if (!sg__V_holds(g, (unsigned)n, k, &half)) ir_set_vd(g->ir, (unsigned)n, k, sg_d_make(g, &half));
+    }
+}
+
+/* ---- lanes ----
+   An element loop walked as one vector operation (gen.c's lanes): each value it makes per element is an SgL, a vector
+   of count lanes of w bits; an integer's lanes keep its signedness and widen as an exact result needs, and a slice of
+   them narrows back. The IR is the one ir_vec.c builds by hand: a register's lanes are loaded and stored whole
+   (ir_vec_read, ir_vec_write) */
+typedef struct {
+    LLVMValueRef v; /* <count x iw> */
+    unsigned w, count;
+    int is_signed;
+} SgL;
+
+static inline LLVMTypeRef sg_l_type(SgCtx* g, unsigned w, unsigned count) {
+    return LLVMVectorType(LLVMIntTypeInContext(g->ir->ctx, w), count);
+}
+static inline SgL sg_l_of(LLVMValueRef v, int is_signed) {
+    SgL l;
+    l.v = v;
+    l.count = LLVMGetVectorSize(LLVMTypeOf(v));
+    l.w = LLVMGetIntTypeWidth(LLVMGetElementType(LLVMTypeOf(v)));
+    l.is_signed = is_signed;
+    return l;
+}
+/* esize-bit elements of x (its count of them), as lanes: a SIMD&FP register this instruction loaded whole, in its
+   doublewords' order, is loaded as lanes instead (the doublewords' loads are left to die) */
+static inline SgL sg_l_elem(SgCtx* g, SgD x, long long esize, unsigned count) {
+    unsigned i, k, reg = 99;
+    if (esize < 8 || esize > 64 || x.w != (unsigned)esize * count)
+        sg_fail("lanes of other than the whole value", esize, x.w);
+    for (i = 0; i < x.w; ++i) {
+        unsigned s = x.sel[i];
+        if (s < 2 || x.pos[i] != i % 64) break;
+        for (k = 0; k < g->vload_count && g->vload[k] != x.src[s - 2]; ++k) {}
+        if (k == g->vload_count || g->vload_k[k] != i / 64 || (reg != 99 && reg != g->vload_n[k])) break;
+        reg = g->vload_n[k];
+    }
+    if (i == x.w) {
+        unsigned esz = esize == 8 ? 0 : esize == 16 ? 1 : esize == 32 ? 2 : 3;
+        return sg_l_of(ir_vec_read(g->ir, reg, esz, 0, count), 0);
+    }
+    return sg_l_of(LLVMBuildBitCast(SG_B, sg_d_make(g, &x), sg_l_type(g, (unsigned)esize, count), ""), 0);
+}
+/* the lanes as bits, the first lane the lowest: a bitcast, which sg__V_write knows for the lanes it is */
+static inline SgD sg_d_from_l(SgCtx* g, SgL l) {
+    if (!l.v) sg_fail("lanes read before any was set", 0, 0);
+    return sg_d_from(g, LLVMBuildBitCast(SG_B, l.v, LLVMIntTypeInContext(g->ir->ctx, l.w * l.count), ""));
+}
+/* lanes of exactly w bits: an element set from them (Elem_set) */
+static inline SgL sg_l_bits(SgCtx* g, SgL l, long long w) {
+    (void)g;
+    if (l.w != (unsigned)w) sg_fail("an element set from lanes of another width", l.w, w);
+    l.is_signed = 0;
+    return l;
+}
+static inline SgL sg_l_splat(SgCtx* g, LLVMValueRef v, unsigned count, int is_signed) {
+    return sg_l_of(ir_vec_splat(g->ir, v, count), is_signed);
+}
+static inline SgL sg_l_splat_d(SgCtx* g, SgD d, unsigned count) { return sg_l_splat(g, sg_d_make(g, &d), count, 0); }
+static inline SgL sg_l_splat_i(SgCtx* g, SgI i, unsigned count) { return sg_l_splat(g, i.v, count, i.is_signed); }
+static inline SgL sg_l_splat_b(SgCtx* g, LLVMValueRef b, unsigned count) { return sg_l_splat(g, b, count, 0); }
+/* l at w bits, extended by its signedness or cut */
+static inline SgL sg_l_width(SgCtx* g, SgL l, unsigned w) {
+    LLVMTypeRef t = sg_l_type(g, w, l.count);
+    if (w > l.w)
+        l.v = l.is_signed ? LLVMBuildSExt(SG_B, l.v, t, "") : LLVMBuildZExt(SG_B, l.v, t, "");
+    else if (w < l.w)
+        l.v = LLVMBuildTrunc(SG_B, l.v, t, "");
+    l.w = w;
+    return l;
+}
+/* two integers' lanes at one width that holds both exactly, signed when either is */
+static inline void sg_l_common(SgCtx* g, SgL* a, SgL* b, unsigned extra) {
+    unsigned wa = a->w + (!a->is_signed && b->is_signed), wb = b->w + (!b->is_signed && a->is_signed);
+    unsigned w = (wa > wb ? wa : wb) + extra;
+    int s = a->is_signed || b->is_signed;
+    *a = sg_l_width(g, *a, w);
+    *b = sg_l_width(g, *b, w);
+    a->is_signed = b->is_signed = s;
+}
+static inline SgL sg_l_add(SgCtx* g, SgL a, SgL b) { return sg_l_of(LLVMBuildAdd(SG_B, a.v, b.v, ""), 0); }
+static inline SgL sg_l_sub(SgCtx* g, SgL a, SgL b) { return sg_l_of(LLVMBuildSub(SG_B, a.v, b.v, ""), 0); }
+static inline SgL sg_l_and(SgCtx* g, SgL a, SgL b) { return sg_l_of(LLVMBuildAnd(SG_B, a.v, b.v, ""), 0); }
+static inline SgL sg_l_or(SgCtx* g, SgL a, SgL b) { return sg_l_of(LLVMBuildOr(SG_B, a.v, b.v, ""), 0); }
+static inline SgL sg_l_xor(SgCtx* g, SgL a, SgL b) { return sg_l_of(LLVMBuildXor(SG_B, a.v, b.v, ""), 0); }
+static inline SgL sg_l_not(SgCtx* g, SgL a) { return sg_l_of(LLVMBuildNot(SG_B, a.v, ""), 0); }
+/* bits as an integer's lanes (UInt, SInt, asl_Int) */
+static inline SgL sg_l_int(SgCtx* g, SgL a, int is_signed) {
+    (void)g;
+    a.is_signed = is_signed;
+    return a;
+}
+/* + - * of integers: exact, one bit wider (or as wide as both for *) */
+static inline SgL sg_l_iadd(SgCtx* g, SgL a, SgL b) {
+    sg_l_common(g, &a, &b, 1);
+    return sg_l_of(LLVMBuildAdd(SG_B, a.v, b.v, ""), a.is_signed);
+}
+static inline SgL sg_l_isub(SgCtx* g, SgL a, SgL b) {
+    a.is_signed = 1; /* a difference may be below 0 */
+    sg_l_common(g, &a, &b, 1);
+    return sg_l_of(LLVMBuildSub(SG_B, a.v, b.v, ""), 1);
+}
+static inline SgL sg_l_imul(SgCtx* g, SgL a, SgL b) {
+    unsigned w;
+    sg_l_common(g, &a, &b, 0);
+    w = a.w * 2;
+    a = sg_l_width(g, a, w);
+    b = sg_l_width(g, b, w);
+    return sg_l_of(LLVMBuildMul(SG_B, a.v, b.v, ""), a.is_signed);
+}
+/* negate: one bit wider, signed, so it is exact */
+static inline SgL sg_l_neg(SgCtx* g, SgL a) {
+    a = sg_l_width(g, a, a.w + 1);
+    return sg_l_of(LLVMBuildNeg(SG_B, a.v, ""), 1);
+}
+/* Abs: llvm.abs, read unsigned: the most negative lane's magnitude is its own bits that way */
+static inline SgL sg_l_abs(SgCtx* g, SgL a) {
+    LLVMValueRef args[2];
+    if (!a.is_signed) return a;
+    args[0] = a.v;
+    args[1] = LLVMConstInt(g->ir->t_i1, 0, 0);
+    return sg_l_of(sg_intrinsic(g, "llvm.abs", LLVMTypeOf(a.v), args, 2), 0);
+}
+/* the comparisons gen.c numbers L_EQ to L_GE, of bits (== and !=) or of integers: i1 lanes */
+static inline SgL sg_l_cmp(SgCtx* g, unsigned op, SgL a, SgL b) {
+    static const LLVMIntPredicate s[] = {LLVMIntEQ, LLVMIntNE, LLVMIntSLT, LLVMIntSLE, LLVMIntSGT, LLVMIntSGE};
+    static const LLVMIntPredicate u[] = {LLVMIntEQ, LLVMIntNE, LLVMIntULT, LLVMIntULE, LLVMIntUGT, LLVMIntUGE};
+    if (op > 5) sg_fail("a comparison gen.c doesn't number", op, 5);
+    if (a.w != b.w || a.is_signed != b.is_signed) sg_l_common(g, &a, &b, 0);
+    return sg_l_of(LLVMBuildICmp(SG_B, a.is_signed ? s[op] : u[op], a.v, b.v, ""), 0);
+}
+static inline SgL sg_l_is_zero(SgCtx* g, SgL a) {
+    return sg_l_of(LLVMBuildICmp(SG_B, LLVMIntEQ, a.v, LLVMConstNull(LLVMTypeOf(a.v)), ""), 0);
+}
+static inline SgL sg_l_select(SgCtx* g, SgL c, SgL a, SgL b) {
+    if (a.w != b.w || a.is_signed != b.is_signed) sg_l_common(g, &a, &b, 0);
+    return sg_l_of(LLVMBuildSelect(SG_B, c.v, a.v, b.v, ""), a.is_signed);
+}
+static inline SgL sg_l_minmax(SgCtx* g, SgL a, SgL b, int minimum) {
+    SgL c;
+    sg_l_common(g, &a, &b, 0);
+    c = sg_l_cmp(g, minimum ? 2 : 4, a, b);
+    return sg_l_of(LLVMBuildSelect(SG_B, c.v, a.v, b.v, ""), a.is_signed);
+}
+/* bits hi..lo of each lane (of bits, or of an integer, extended by its sign past its width) */
+static inline SgL sg_l_slice(SgCtx* g, SgL a, long long hi, long long lo) {
+    unsigned w = (unsigned)(hi - lo + 1);
+    if (lo < 0 || hi < lo) sg_fail("a slice of lanes out of order", hi, lo);
+    if ((unsigned)hi >= a.w) a = sg_l_width(g, a, (unsigned)hi + 1);
+    if (lo) a.v = LLVMBuildLShr(SG_B, a.v, ir_vec_k(g->ir, LLVMTypeOf(a.v), (SnxU64)lo), "");
+    a.is_signed = 0;
+    return sg_l_width(g, a, w);
+}
+static inline SgL sg_l_ext(SgCtx* g, SgL a, long long w, int is_signed) {
+    a.is_signed = is_signed;
+    a = sg_l_width(g, a, (unsigned)w);
+    a.is_signed = 0;
+    return a;
+}
+
+/* FPCR, as the CPU keeps it: 32 bits, the rest 0 */
+static inline SgD sg_FPCR_read(SgCtx* g) {
+    return sg_d_zext(g, sg_d_from(g, ir_cpu_load(g->ir, g->ir->t_i32, offsetof(CPU, fpcr))), 64);
+}
+/* the 32 bits of FPCR a function was handed: sg_FPCR_read's load itself */
+static inline LLVMValueRef sg_fp_fpcr(SgCtx* g, SgD fpcr) {
+    unsigned i;
+    int low = fpcr.w >= 32 && fpcr.sel[0] >= 2 && fpcr.src_w[fpcr.sel[0] - 2] == 32;
+    for (i = 0; low && i < 32; ++i) low = fpcr.sel[i] == fpcr.sel[0] && fpcr.pos[i] == i;
+    if (low) return fpcr.src[fpcr.sel[0] - 2];
+    return sg_cast(g, sg_d_make(g, &fpcr), 32, 0);
+}
+/* i1: none of FPCR's bits of mask is set */
+static inline LLVMValueRef sg_fp_clear(SgCtx* g, LLVMValueRef fpcr, SnxU32 mask) {
+    return LLVMBuildICmp(SG_B, LLVMIntEQ, LLVMBuildAnd(SG_B, fpcr, ir_i32(g->ir, mask), ""), ir_i32(g->ir, 0), "");
+}
+/* FPCR.RMode as the helpers' rounding mode (0-3) */
+static inline LLVMValueRef sg_fp_rmode(SgCtx* g, LLVMValueRef fpcr) {
+    return LLVMBuildAnd(SG_B, LLVMBuildLShr(SG_B, fpcr, ir_i32(g->ir, 22), ""), ir_i32(g->ir, 3), "");
+}
+
+/* where a lowered function runs: under gen.c's run-time condition (FCCMP's compare only where the condition holds),
+   its own blocks, and an empty one the other way takes (where a state written after both ways can be written on each,
+   sg_PSTATE_write), the result 0 where it did not run */
+typedef struct {
+    LLVMBasicBlockRef from, join;
+    int never;
+} SgWhen;
+static inline int sg_fp_when(SgCtx* g, LLVMValueRef path, SgWhen* w) {
+    LLVMBasicBlockRef run;
+    w->from = w->join = NULL;
+    w->never = path && LLVMIsAConstantInt(path) && !LLVMConstIntGetZExtValue(path);
+    if (!path || LLVMIsAConstantInt(path)) return !w->never;
+    run = ir_block(g->ir, "sg_when");
+    w->from = ir_block(g->ir, "sg_when_skip");
+    w->join = ir_block(g->ir, "sg_when_join");
+    LLVMBuildCondBr(SG_B, path, run, w->from);
+    LLVMPositionBuilderAtEnd(SG_B, w->from);
+    LLVMBuildBr(SG_B, w->join);
+    LLVMPositionBuilderAtEnd(SG_B, run);
+    g->when_path = path;
+    g->when_skip = w->from;
+    return 1;
+}
+/* the end of the way that ran: to the join, where the builder goes */
+static inline LLVMBasicBlockRef sg_fp_when_join(SgCtx* g, SgWhen* w) {
+    LLVMBasicBlockRef end = LLVMGetInsertBlock(SG_B);
+    LLVMBuildBr(SG_B, w->join);
+    LLVMPositionBuilderAtEnd(SG_B, w->join);
+    g->when_end = end;
+    return end;
+}
+static inline LLVMValueRef sg_fp_when_end(SgCtx* g, SgWhen* w, LLVMValueRef r, LLVMTypeRef type) {
+    LLVMValueRef phi, values[2];
+    LLVMBasicBlockRef blocks[2];
+    if (w->never) return LLVMConstNull(type);
+    if (!w->join) return r;
+    blocks[0] = sg_fp_when_join(g, w);
+    phi = LLVMBuildPhi(SG_B, type, "");
+    values[0] = r;
+    values[1] = LLVMConstNull(type);
+    blocks[1] = w->from;
+    LLVMAddIncoming(phi, values, blocks, 2);
+    return phi;
+}
+
+static inline LLVMTypeRef sg_fp_type(SnxIr* ir, unsigned bits) {
+    return bits == 16   ? LLVMHalfTypeInContext(ir->ctx)
+           : bits == 32 ? LLVMFloatTypeInContext(ir->ctx)
+                        : LLVMDoubleTypeInContext(ir->ctx);
+}
+static inline LLVMValueRef sg_fp_kint(SnxIr* ir, unsigned bits, SnxU64 v) {
+    return LLVMConstInt(ir_int_type(ir, bits), v, 0);
+}
+static inline LLVMValueRef sg_fp_kfloat(SnxIr* ir, unsigned bits, double v) {
+    return LLVMConstReal(sg_fp_type(ir, bits), v);
+}
+static inline LLVMValueRef sg_fp_to_width(SnxIr* ir, LLVMValueRef bits, unsigned width) {
+    return ir_cast(ir, bits, ir_int_type(ir, width), 0);
+}
+
+/* ---- the helpers (cpu.h): integer arithmetic on IEEE encodings, taking FPCR and returning the flags raised ---- */
+
+static inline LLVMValueRef sg_fp_call_binary(SnxIr* ir, LLVMValueRef fpcr, LLVMValueRef a, LLVMValueRef b,
+                                             unsigned width, unsigned op) {
+    LLVMValueRef operands[4];
+    operands[0] = u64_of(ir, a);
+    operands[1] = u64_of(ir, b);
+    operands[2] = ir_i32(ir, width);
+    operands[3] = ir_i32(ir, op);
+    return sg_fp_to_width(ir, ir_fp_reply_call_fpcr(ir, "snx_fp_host_binary", operands, 4, 1, fpcr), width);
+}
+static inline LLVMValueRef sg_fp_call_fma(SnxIr* ir, LLVMValueRef fpcr, LLVMValueRef add, LLVMValueRef a,
+                                          LLVMValueRef b, unsigned width) {
+    LLVMValueRef operands[4];
+    operands[0] = u64_of(ir, add);
+    operands[1] = u64_of(ir, a);
+    operands[2] = u64_of(ir, b);
+    operands[3] = ir_i32(ir, width);
+    return sg_fp_to_width(ir, ir_fp_reply_call_fpcr(ir, "snx_fp_host_fma", operands, 4, 0, fpcr), width);
+}
+static inline LLVMValueRef sg_fp_call_unary(SnxIr* ir, LLVMValueRef fpcr, LLVMValueRef a, unsigned width, unsigned op) {
+    LLVMValueRef operands[3];
+    operands[0] = u64_of(ir, a);
+    operands[1] = ir_i32(ir, width);
+    operands[2] = ir_i32(ir, op);
+    return sg_fp_to_width(ir, ir_fp_reply_call_fpcr(ir, "snx_fp_host_unary", operands, 3, 0, fpcr), width);
+}
+static inline LLVMValueRef sg_fp_call_minmax(SnxIr* ir, LLVMValueRef fpcr, LLVMValueRef a, LLVMValueRef b,
+                                             unsigned width, unsigned minimum, unsigned numeric) {
+    LLVMValueRef operands[5];
+    operands[0] = u64_of(ir, a);
+    operands[1] = u64_of(ir, b);
+    operands[2] = ir_i32(ir, width);
+    operands[3] = ir_i32(ir, minimum);
+    operands[4] = ir_i32(ir, numeric);
+    return sg_fp_to_width(ir, ir_fp_reply_call_fpcr(ir, "snx_fp_host_minmax", operands, 5, 0, fpcr), width);
+}
+/* the NZCV nibble (i32) */
+static inline LLVMValueRef sg_fp_call_compare(SnxIr* ir, LLVMValueRef fpcr, LLVMValueRef a, LLVMValueRef b,
+                                              unsigned width, unsigned signal) {
+    LLVMValueRef operands[4];
+    operands[0] = u64_of(ir, a);
+    operands[1] = u64_of(ir, b);
+    operands[2] = ir_i32(ir, width);
+    operands[3] = ir_i32(ir, signal);
+    return ir_cast(ir, ir_fp_reply_call_fpcr(ir, "snx_fp_host_compare", operands, 4, 0, fpcr), ir->t_i32, 0);
+}
+/* rm: an i32, FPCR's mode or the encoding's */
+static inline LLVMValueRef sg_fp_call_convert(SnxIr* ir, LLVMValueRef fpcr, LLVMValueRef a, unsigned from, unsigned to,
+                                              LLVMValueRef rm) {
+    LLVMValueRef operands[4];
+    operands[0] = u64_of(ir, a);
+    operands[1] = ir_i32(ir, from);
+    operands[2] = ir_i32(ir, to);
+    operands[3] = rm;
+    return sg_fp_to_width(ir, ir_fp_reply_call_fpcr(ir, "snx_fp_convert", operands, 4, 0, fpcr), to);
+}
+static inline LLVMValueRef sg_fp_call_round(SnxIr* ir, LLVMValueRef fpcr, LLVMValueRef a, unsigned width,
+                                            LLVMValueRef rm, unsigned exact) {
+    LLVMValueRef operands[4];
+    operands[0] = u64_of(ir, a);
+    operands[1] = ir_i32(ir, width);
+    operands[2] = rm;
+    operands[3] = ir_i32(ir, exact);
+    return sg_fp_to_width(ir, ir_fp_reply_call_fpcr(ir, "snx_fp_round", operands, 4, 0, fpcr), width);
+}
+static inline LLVMValueRef sg_fp_call_round_int(SnxIr* ir, LLVMValueRef fpcr, LLVMValueRef a, unsigned width,
+                                                LLVMValueRef rm, unsigned intsize) {
+    LLVMValueRef operands[4];
+    operands[0] = u64_of(ir, a);
+    operands[1] = ir_i32(ir, width);
+    operands[2] = rm;
+    operands[3] = ir_i32(ir, intsize);
+    return sg_fp_to_width(ir, ir_fp_reply_call_fpcr(ir, "snx_fp_round_int", operands, 4, 0, fpcr), width);
+}
+/* the integer (i64, masked to its width) */
+static inline LLVMValueRef sg_fp_call_to_int(SnxIr* ir, LLVMValueRef fpcr, LLVMValueRef a, unsigned width,
+                                             unsigned integer, unsigned uns, unsigned fbits, unsigned rm) {
+    LLVMValueRef operands[6];
+    operands[0] = u64_of(ir, a);
+    operands[1] = ir_i32(ir, width);
+    operands[2] = ir_i32(ir, integer);
+    operands[3] = ir_i32(ir, uns);
+    operands[4] = ir_i32(ir, fbits);
+    operands[5] = ir_i32(ir, rm);
+    return ir_fp_reply_call_fpcr(ir, "snx_fp_to_int", operands, 6, 0, fpcr);
+}
+static inline LLVMValueRef sg_fp_call_from_int(SnxIr* ir, LLVMValueRef fpcr, LLVMValueRef v, unsigned integer,
+                                               unsigned width, unsigned uns, unsigned fbits) {
+    LLVMValueRef operands[5];
+    operands[0] = u64_of(ir, v);
+    operands[1] = ir_i32(ir, integer);
+    operands[2] = ir_i32(ir, width);
+    operands[3] = ir_i32(ir, uns);
+    operands[4] = ir_i32(ir, fbits);
+    return sg_fp_to_width(ir, ir_fp_reply_call_fpcr(ir, "snx_fp_from_int", operands, 5, 0, fpcr), width);
+}
+
+/* ---- the fast paths' guards ---- */
+
+static inline SnxU64 sg_fp_inf(unsigned width) {
+    return width == 16 ? 0x7C00u : width == 32 ? 0x7F800000u : 0x7FF0000000000000ull;
+}
+static inline SnxU64 sg_fp_min_normal(unsigned width) {
+    return width == 16 ? 0x0400u : width == 32 ? 0x00800000u : 0x0010000000000000ull;
+}
+/* doubles whose FMA residuals (products of two ulps at least 2^-1074 apart from the operand's) stay representable */
+#define SG_FP_RESIDUAL_FLOOR 0x03F0000000000000ull /* 2^-960 */
+
+static inline LLVMValueRef sg_fp_magnitude(SnxIr* ir, unsigned width, LLVMValueRef bits) {
+    return LLVMBuildAnd(ir->b, bits, sg_fp_kint(ir, width, ~sign_mask(width) & (width == 32 ? 0xFFFFFFFFu : ~0ull)),
+                        "");
+}
+static inline LLVMValueRef sg_fp_is_zero(SnxIr* ir, unsigned width, LLVMValueRef bits) {
+    return LLVMBuildICmp(ir->b, LLVMIntEQ, sg_fp_magnitude(ir, width, bits), sg_fp_kint(ir, width, 0), "");
+}
+static inline LLVMValueRef sg_fp_is_nan(SnxIr* ir, unsigned width, LLVMValueRef bits) {
+    return LLVMBuildICmp(ir->b, LLVMIntUGT, sg_fp_magnitude(ir, width, bits), sg_fp_kint(ir, width, sg_fp_inf(width)),
+                         "");
+}
+static inline LLVMValueRef sg_fp_is_denormal(SnxIr* ir, unsigned width, LLVMValueRef bits) {
+    LLVMValueRef m = sg_fp_magnitude(ir, width, bits);
+    return both(ir, LLVMBuildICmp(ir->b, LLVMIntNE, m, sg_fp_kint(ir, width, 0), ""),
+                LLVMBuildICmp(ir->b, LLVMIntULT, m, sg_fp_kint(ir, width, sg_fp_min_normal(width)), ""));
+}
+/* lo <= |bits| < hi */
+static inline LLVMValueRef sg_fp_magnitude_in(SnxIr* ir, unsigned width, LLVMValueRef bits, SnxU64 lo, SnxU64 hi) {
+    LLVMValueRef offset = LLVMBuildSub(ir->b, sg_fp_magnitude(ir, width, bits), sg_fp_kint(ir, width, lo), "");
+    return LLVMBuildICmp(ir->b, LLVMIntULT, offset, sg_fp_kint(ir, width, hi - lo), "");
+}
+/* finite and above the smallest normal */
+static inline LLVMValueRef sg_fp_roomy(SnxIr* ir, unsigned width, LLVMValueRef bits) {
+    return sg_fp_magnitude_in(ir, width, bits, sg_fp_min_normal(width) + 1, sg_fp_inf(width));
+}
+/* a denormal operand is fine unless FPCR.FZ flushes it (which raises IDC) */
+static inline LLVMValueRef sg_fp_unflushed(SgCtx* g, LLVMValueRef fpcr, unsigned width, LLVMValueRef bits) {
+    return either(g->ir, sg_fp_clear(g, fpcr, FPCR_FZ), LLVMBuildNot(SG_B, sg_fp_is_denormal(g->ir, width, bits), ""));
+}
+static inline LLVMValueRef sg_fp_as_float(SnxIr* ir, LLVMValueRef bits, unsigned width) {
+    return LLVMBuildBitCast(ir->b, bits, sg_fp_type(ir, width), "");
+}
+static inline LLVMValueRef sg_fp_as_bits(SnxIr* ir, LLVMValueRef f, unsigned width) {
+    return LLVMBuildBitCast(ir->b, f, ir_int_type(ir, width), "");
+}
+static inline LLVMValueRef sg_fp_widen(SnxIr* ir, LLVMValueRef f) {
+    return LLVMBuildFPExt(ir->b, f, LLVMDoubleTypeInContext(ir->ctx), "");
+}
+
+/* A value from the host where ok holds, from the helpers otherwise: sg_fp_split branches (positioning at the slow block
+   for the caller's helper call), sg_fp_split_end joins them. The fast block sets IXC when inexact (NULL: never) */
+typedef struct {
+    LLVMBasicBlockRef fast_end, clear_end, join;
+    LLVMValueRef fast;
+} SgFpSplit;
+typedef struct {
+    LLVMValueRef a, b, add, result;
+    unsigned width;
+} SgFpResidual;
+static inline void sg_fp_split_fma(SnxIr* ir, LLVMValueRef ok, LLVMValueRef fast, LLVMValueRef inexact,
+                                   const SgFpResidual* residual, SgFpSplit* s) {
+    LLVMBasicBlockRef on = ir_block(ir, "fp_fast"), off = ir_block(ir, "fp_slow");
+    s->join = ir_block(ir, "fp_join");
+    s->clear_end = NULL;
+    s->fast = fast;
+    if (residual) {
+        LLVMBasicBlockRef check = ir_block(ir, "fp_fma_check"), clear = ir_block(ir, "fp_ixc");
+        LLVMBasicBlockRef checked = ir_block(ir, "fp_residual_valid");
+        LLVMValueRef valid;
+        ir_likely(ir, LLVMBuildCondBr(ir->b, both(ir, ok, ixc_set(ir)), on, check));
+        LLVMPositionBuilderAtEnd(ir->b, on);
+        s->fast_end = on;
+        LLVMBuildBr(ir->b, s->join);
+        LLVMPositionBuilderAtEnd(ir->b, check);
+        LLVMBuildCondBr(ir->b, ok, clear, off);
+        LLVMPositionBuilderAtEnd(ir->b, clear);
+        inexact = ir_fp_fma_error(ir, sg_fp_as_float(ir, residual->a, residual->width),
+                                  sg_fp_as_float(ir, residual->b, residual->width),
+                                  sg_fp_as_float(ir, residual->add, residual->width),
+                                  sg_fp_as_float(ir, residual->result, residual->width), residual->width, &valid);
+        LLVMBuildCondBr(ir->b, valid, checked, off);
+        LLVMPositionBuilderAtEnd(ir->b, checked);
+        ir_fp_raise_ixc(ir, inexact);
+        s->clear_end = checked;
+        LLVMBuildBr(ir->b, s->join);
+        LLVMPositionBuilderAtEnd(ir->b, off);
+        return;
+    }
+    ir_likely(ir, LLVMBuildCondBr(ir->b, ok, on, off));
+    LLVMPositionBuilderAtEnd(ir->b, on);
+    /* only while IXC is clear: it is sticky, and LLVM sinks the inexactness test into that block */
+    if (inexact) {
+        LLVMBasicBlockRef clear = ir_block(ir, "fp_ixc"), done = ir_block(ir, "fp_ixc_done");
+        ir_unlikely(ir, LLVMBuildCondBr(ir->b, LLVMBuildNot(ir->b, ixc_set(ir), ""), clear, done));
+        LLVMPositionBuilderAtEnd(ir->b, clear);
+        ir_fp_raise_ixc(ir, inexact);
+        LLVMBuildBr(ir->b, done);
+        LLVMPositionBuilderAtEnd(ir->b, done);
+    }
+    s->fast_end = LLVMGetInsertBlock(ir->b);
+    LLVMBuildBr(ir->b, s->join);
+    LLVMPositionBuilderAtEnd(ir->b, off);
+}
+static inline void sg_fp_split(SnxIr* ir, LLVMValueRef ok, LLVMValueRef fast, LLVMValueRef inexact, SgFpSplit* s) {
+    sg_fp_split_fma(ir, ok, fast, inexact, NULL, s);
+}
+static inline LLVMValueRef sg_fp_split_end(SnxIr* ir, SgFpSplit* s, LLVMValueRef slow) {
+    LLVMBasicBlockRef slow_end = LLVMGetInsertBlock(ir->b), blocks[3];
+    LLVMValueRef values[3], phi;
+    LLVMBuildBr(ir->b, s->join);
+    LLVMPositionBuilderAtEnd(ir->b, s->join);
+    phi = LLVMBuildPhi(ir->b, LLVMTypeOf(slow), "");
+    values[0] = s->fast;
+    values[1] = slow;
+    blocks[0] = s->fast_end;
+    blocks[1] = slow_end;
+    values[2] = s->fast;
+    blocks[2] = s->clear_end;
+    LLVMAddIncoming(phi, values, blocks, s->clear_end ? 3 : 2);
+    return phi;
+}
+
+/* a op b, op SNX_FP_ADD, SUB, MUL or DIV, for singles and doubles: the host's result, with *ok and *inexact */
+static inline LLVMValueRef sg_fp_fast_binary(SgCtx* g, LLVMValueRef fpcr, unsigned op, unsigned width, LLVMValueRef a,
+                                             LLVMValueRef b, LLVMValueRef* ok, LLVMValueRef* inexact) {
+    SnxIr* ir = g->ir;
+    LLVMValueRef fa = sg_fp_as_float(ir, a, width), fb = sg_fp_as_float(ir, b, width), r, rb, exact_zero, cut = NULL;
+    *inexact = NULL;
+    switch (op) {
+        case SNX_FP_ADD:
+        case SNX_FP_SUB: { /* TwoSum: the rounding error of fa + fb, exactly */
+            LLVMValueRef t, va, vb;
+            if (op == SNX_FP_SUB) fb = LLVMBuildFNeg(SG_B, fb, "");
+            r = LLVMBuildFAdd(SG_B, fa, fb, "");
+            t = LLVMBuildFSub(SG_B, r, fa, "");
+            va = LLVMBuildFSub(SG_B, fa, LLVMBuildFSub(SG_B, r, t, ""), "");
+            vb = LLVMBuildFSub(SG_B, fb, t, "");
+            *inexact = float_ne(ir, LLVMBuildFAdd(SG_B, va, vb, ""), sg_fp_kfloat(ir, width, 0.0));
+            rb = sg_fp_as_bits(ir, r, width);
+            exact_zero = sg_fp_is_zero(ir, width, rb);
+            break;
+        }
+        case SNX_FP_MUL:
+            r = LLVMBuildFMul(SG_B, fa, fb, "");
+            rb = sg_fp_as_bits(ir, r, width);
+            exact_zero = both(ir, sg_fp_is_zero(ir, width, rb),
+                              either(ir, sg_fp_is_zero(ir, width, a), sg_fp_is_zero(ir, width, b)));
+            if (width == 32)
+                *inexact =
+                    float_ne(ir, LLVMBuildFMul(SG_B, sg_fp_widen(ir, fa), sg_fp_widen(ir, fb), ""), sg_fp_widen(ir, r));
+            else if (host_fma_scalar(ir)) {
+                *inexact = float_ne(ir, fma3(ir, fa, fb, LLVMBuildFNeg(SG_B, r, "")), sg_fp_kfloat(ir, 64, 0.0));
+                cut = either(ir, exact_zero, sg_fp_magnitude_in(ir, 64, rb, SG_FP_RESIDUAL_FLOOR, sg_fp_inf(64)));
+            }
+            break;
+        default: /* SNX_FP_DIV */
+            r = LLVMBuildFDiv(SG_B, fa, fb, "");
+            rb = sg_fp_as_bits(ir, r, width);
+            exact_zero = both(ir, sg_fp_is_zero(ir, width, rb), sg_fp_is_zero(ir, width, a));
+            if (width == 32) {
+                LLVMValueRef product = LLVMBuildFMul(SG_B, sg_fp_widen(ir, r), sg_fp_widen(ir, fb), "");
+                *inexact =
+                    float_ne(ir, LLVMBuildFSub(SG_B, sg_fp_widen(ir, fa), product, ""), sg_fp_kfloat(ir, 64, 0.0));
+            } else if (host_fma_scalar(ir)) {
+                *inexact = float_ne(ir, fma3(ir, LLVMBuildFNeg(SG_B, r, ""), fb, fa), sg_fp_kfloat(ir, 64, 0.0));
+                cut = either(ir, sg_fp_is_zero(ir, 64, a),
+                             sg_fp_magnitude_in(ir, 64, a, SG_FP_RESIDUAL_FLOOR, sg_fp_inf(64)));
+            }
+            /* a zero divided by an infinity is an exact zero, though its residual (0 * inf) is a NaN */
+            if (*inexact) *inexact = both(ir, *inexact, LLVMBuildNot(SG_B, exact_zero, ""));
+            break;
+    }
+    *ok = both(ir,
+               both(ir, sg_fp_clear(g, fpcr, FPCR_RMODE),
+                    both(ir, sg_fp_unflushed(g, fpcr, width, a), sg_fp_unflushed(g, fpcr, width, b))),
+               either(ir, sg_fp_roomy(ir, width, rb), exact_zero));
+    if (cut) *ok = both(ir, *ok, cut);
+    if (!*inexact) *ok = both(ir, *ok, ixc_set(ir));
+    return rb;
+}
+
+/* the square root, for singles and doubles on hosts with the instruction */
+static inline LLVMValueRef sg_fp_fast_sqrt(SgCtx* g, LLVMValueRef fpcr, unsigned width, LLVMValueRef a,
+                                           LLVMValueRef* ok, LLVMValueRef* inexact) {
+    SnxIr* ir = g->ir;
+    LLVMValueRef fa = sg_fp_as_float(ir, a, width), r = ir_intrinsic(ir, "llvm.sqrt", LLVMTypeOf(fa), &fa, 1);
+    LLVMValueRef rb = sg_fp_as_bits(ir, r, width), zero = sg_fp_is_zero(ir, width, a);
+    *inexact = NULL;
+    *ok = both(ir, both(ir, sg_fp_clear(g, fpcr, FPCR_RMODE), sg_fp_unflushed(g, fpcr, width, a)),
+               either(ir, sg_fp_roomy(ir, width, rb), zero));
+    if (width == 32)
+        *inexact = float_ne(ir, sg_fp_widen(ir, fa), LLVMBuildFMul(SG_B, sg_fp_widen(ir, r), sg_fp_widen(ir, r), ""));
+    else if (host_fma_scalar(ir)) {
+        *inexact = float_ne(ir, fma3(ir, LLVMBuildFNeg(SG_B, r, ""), r, fa), sg_fp_kfloat(ir, 64, 0.0));
+        *ok = both(ir, *ok, either(ir, zero, sg_fp_magnitude_in(ir, 64, a, SG_FP_RESIDUAL_FLOOR, sg_fp_inf(64))));
+    } else
+        *ok = both(ir, *ok, ixc_set(ir));
+    return rb;
+}
+
+/* add + n * m rounded once, with an exact residual checked only while IXC is clear */
+static inline LLVMValueRef sg_fp_fast_fma(SgCtx* g, LLVMValueRef fpcr, unsigned width, LLVMValueRef add, LLVMValueRef n,
+                                          LLVMValueRef m, LLVMValueRef* ok, SgFpResidual* residual) {
+    SnxIr* ir = g->ir;
+    LLVMValueRef a = sg_fp_as_float(ir, n, width), b = sg_fp_as_float(ir, m, width), d = sg_fp_as_float(ir, add, width);
+    LLVMValueRef value = fma3(ir, a, b, d), r = sg_fp_as_bits(ir, value, width);
+    LLVMValueRef zero_product = either(ir, sg_fp_is_zero(ir, width, n), sg_fp_is_zero(ir, width, m));
+    LLVMValueRef result = either(ir, sg_fp_roomy(ir, width, r), both(ir, sg_fp_is_zero(ir, width, r), zero_product));
+    LLVMValueRef operands = both(ir, sg_fp_unflushed(g, fpcr, width, add),
+                                 both(ir, sg_fp_unflushed(g, fpcr, width, n), sg_fp_unflushed(g, fpcr, width, m)));
+    LLVMValueRef control = sg_fp_clear(g, fpcr, FPCR_RMODE);
+    /* at O0 the path stays the sticky one: no residual block for SROA to leave its FP temporaries in */
+    if (!ir->promote) control = both(ir, control, ixc_set(ir));
+    *ok = both(ir, control, both(ir, operands, result));
+    /* the raw operands already live across the helper branch: their FP views are made again only in the cold
+       residual block, so O0 spills no second set of FP temporaries on the sticky path */
+    residual->a = n;
+    residual->b = m;
+    residual->add = add;
+    residual->result = r;
+    residual->width = width;
+    return r;
+}
+
+/* without FPSR's flags (snx_ir_fpsr_flags): the host's result wherever it is not a NaN, in round to nearest without
+   FZ (infinities, denormals and zeros are the IEEE values the console gives there too), and where the exact guard
+   holds, as under FZ */
+static inline void sg_fp_relax(SgCtx* g, LLVMValueRef fpcr, unsigned width, LLVMValueRef value, LLVMValueRef* ok,
+                               LLVMValueRef* inexact) {
+    if (snx_ir_fpsr_exact()) return;
+    *ok = either(g->ir, *ok,
+                 both(g->ir, sg_fp_clear(g, fpcr, FPCR_RMODE | FPCR_FZ),
+                      LLVMBuildNot(SG_B, sg_fp_is_nan(g->ir, width, value), "")));
+    if (inexact) *inexact = NULL;
+}
+
+/* ---- the lowered functions ---- */
+
+/* FPAdd, FPSub, FPMul, FPDiv */
+static inline SgD sg_fp_binary(SgCtx* g, LLVMValueRef path, SgD a, SgD b, SgD fpcr_bits, unsigned op) {
+    SnxIr* ir = g->ir;
+    unsigned width = a.w;
+    LLVMValueRef n = sg_d_make(g, &a), m = sg_d_make(g, &b), fpcr = sg_fp_fpcr(g, fpcr_bits), r = NULL;
+    SgWhen w;
+    if (sg_fp_when(g, path, &w)) {
+        if (width != 16) {
+            LLVMValueRef ok, inexact, fast = sg_fp_fast_binary(g, fpcr, op, width, n, m, &ok, &inexact);
+            SgFpSplit s;
+            sg_fp_relax(g, fpcr, width, fast, &ok, &inexact);
+            sg_fp_split(ir, ok, fast, inexact, &s);
+            r = sg_fp_split_end(ir, &s, sg_fp_call_binary(ir, fpcr, n, m, width, op));
+        } else
+            r = sg_fp_call_binary(ir, fpcr, n, m, width, op);
+    }
+    return sg_d_from(g, sg_fp_when_end(g, &w, r, ir_int_type(ir, width)));
+}
+static inline SgD sg_FPAdd(SgCtx* g, LLVMValueRef path, SgD a, SgD b, SgD fpcr) {
+    return sg_fp_binary(g, path, a, b, fpcr, SNX_FP_ADD);
+}
+static inline SgD sg_FPSub(SgCtx* g, LLVMValueRef path, SgD a, SgD b, SgD fpcr) {
+    return sg_fp_binary(g, path, a, b, fpcr, SNX_FP_SUB);
+}
+static inline SgD sg_FPMul(SgCtx* g, LLVMValueRef path, SgD a, SgD b, SgD fpcr) {
+    return sg_fp_binary(g, path, a, b, fpcr, SNX_FP_MUL);
+}
+static inline SgD sg_FPDiv(SgCtx* g, LLVMValueRef path, SgD a, SgD b, SgD fpcr) {
+    return sg_fp_binary(g, path, a, b, fpcr, SNX_FP_DIV);
+}
+
+/* FPMax, FPMin and the Num forms. Without a NaN, and without a denormal FPCR.FZ flushes, they give the larger or
+   smaller operand unchanged, and of equal ones their AND (max: +0 over -0) or OR (min), raising nothing */
+static inline SgD sg_fp_minmax(SgCtx* g, LLVMValueRef path, SgD a, SgD b, SgD fpcr_bits, unsigned minimum,
+                               unsigned numeric) {
+    SnxIr* ir = g->ir;
+    unsigned width = a.w;
+    LLVMValueRef n = sg_d_make(g, &a), m = sg_d_make(g, &b), fpcr = sg_fp_fpcr(g, fpcr_bits), r = NULL;
+    SgWhen w;
+    if (sg_fp_when(g, path, &w)) {
+        if (width != 16) {
+            LLVMValueRef fn = sg_fp_as_float(ir, n, width), fm = sg_fp_as_float(ir, m, width), ok, fast;
+            LLVMRealPredicate wins = minimum ? LLVMRealOLT : LLVMRealOGT;
+            SgFpSplit s;
+            ok = both(ir, LLVMBuildNot(SG_B, either(ir, sg_fp_is_nan(ir, width, n), sg_fp_is_nan(ir, width, m)), ""),
+                      both(ir, sg_fp_unflushed(g, fpcr, width, n), sg_fp_unflushed(g, fpcr, width, m)));
+            fast = minimum ? LLVMBuildOr(SG_B, n, m, "") : LLVMBuildAnd(SG_B, n, m, "");
+            fast = LLVMBuildSelect(SG_B, LLVMBuildFCmp(SG_B, wins, fm, fn, ""), m, fast, "");
+            fast = LLVMBuildSelect(SG_B, LLVMBuildFCmp(SG_B, wins, fn, fm, ""), n, fast, "");
+            sg_fp_split(ir, ok, fast, NULL, &s);
+            r = sg_fp_split_end(ir, &s, sg_fp_call_minmax(ir, fpcr, n, m, width, minimum, numeric));
+        } else
+            r = sg_fp_call_minmax(ir, fpcr, n, m, width, minimum, numeric);
+    }
+    return sg_d_from(g, sg_fp_when_end(g, &w, r, ir_int_type(ir, width)));
+}
+static inline SgD sg_FPMax(SgCtx* g, LLVMValueRef path, SgD a, SgD b, SgD fpcr) {
+    return sg_fp_minmax(g, path, a, b, fpcr, 0, 0);
+}
+static inline SgD sg_FPMin(SgCtx* g, LLVMValueRef path, SgD a, SgD b, SgD fpcr) {
+    return sg_fp_minmax(g, path, a, b, fpcr, 1, 0);
+}
+static inline SgD sg_FPMaxNum(SgCtx* g, LLVMValueRef path, SgD a, SgD b, SgD fpcr) {
+    return sg_fp_minmax(g, path, a, b, fpcr, 0, 1);
+}
+static inline SgD sg_FPMinNum(SgCtx* g, LLVMValueRef path, SgD a, SgD b, SgD fpcr) {
+    return sg_fp_minmax(g, path, a, b, fpcr, 1, 1);
+}
+
+/* FPMulAdd(addend, op1, op2): addend + op1 * op2 fused. The Sail negates an operand first (FPNeg) where the
+   instruction says, so a NaN among them comes out with its sign flipped */
+static inline SgD sg_FPMulAdd(SgCtx* g, LLVMValueRef path, SgD addend, SgD a, SgD b, SgD fpcr_bits) {
+    SnxIr* ir = g->ir;
+    unsigned width = a.w;
+    LLVMValueRef add = sg_d_make(g, &addend), n = sg_d_make(g, &a), m = sg_d_make(g, &b);
+    LLVMValueRef fpcr = sg_fp_fpcr(g, fpcr_bits), r = NULL;
+    SgWhen w;
+    if (sg_fp_when(g, path, &w)) {
+        if (width != 16 && host_fma_scalar(ir)) {
+            SgFpResidual residual;
+            SgFpSplit s;
+            LLVMValueRef ok, fast = sg_fp_fast_fma(g, fpcr, width, add, n, m, &ok, &residual);
+            sg_fp_relax(g, fpcr, width, fast, &ok, NULL);
+            sg_fp_split_fma(ir, ok, fast, NULL, ir->promote && snx_ir_fpsr_exact() ? &residual : NULL, &s);
+            r = sg_fp_split_end(ir, &s, sg_fp_call_fma(ir, fpcr, add, n, m, width));
+        } else
+            r = sg_fp_call_fma(ir, fpcr, add, n, m, width);
+    }
+    return sg_d_from(g, sg_fp_when_end(g, &w, r, ir_int_type(ir, width)));
+}
+
+static inline SgD sg_FPSqrt(SgCtx* g, LLVMValueRef path, SgD a, SgD fpcr_bits) {
+    SnxIr* ir = g->ir;
+    unsigned width = a.w;
+    LLVMValueRef n = sg_d_make(g, &a), fpcr = sg_fp_fpcr(g, fpcr_bits), r = NULL;
+    SgWhen w;
+    if (sg_fp_when(g, path, &w)) {
+        if (width != 16 && host_sqrt(ir)) {
+            LLVMValueRef ok, inexact, fast = sg_fp_fast_sqrt(g, fpcr, width, n, &ok, &inexact);
+            SgFpSplit s;
+            sg_fp_relax(g, fpcr, width, fast, &ok, &inexact);
+            sg_fp_split(ir, ok, fast, inexact, &s);
+            r = sg_fp_split_end(ir, &s, sg_fp_call_unary(ir, fpcr, n, width, SNX_FP_SQRT));
+        } else
+            r = sg_fp_call_unary(ir, fpcr, n, width, SNX_FP_SQRT);
+    }
+    return sg_d_from(g, sg_fp_when_end(g, &w, r, ir_int_type(ir, width)));
+}
+
+/* FPRoundingMode(fpcr): the mode FPCR holds when the guest runs, which the functions below read from their FPCR */
+static inline int sg_FPRoundingMode(SgCtx* g, LLVMValueRef path, SgD fpcr) {
+    (void)g;
+    (void)path;
+    (void)fpcr;
+    return SG_FP_ROUNDING_FPCR;
+}
+/* a rounding the Sail hands a lowered function: 0-4 (FPRounding's TIEEVEN to TIEAWAY), or -1 for FPCR's mode */
+static inline int sg_fp_rounding(int rounding) {
+    if (rounding == SG_FP_ROUNDING_FPCR) return -1;
+    if (rounding < 0 || rounding > 4) sg_fail("a floating-point rounding the helpers do not take", rounding, 4);
+    return rounding;
+}
+
+/* FPRoundInt: FRINTN, P, M, Z, A (the encoding's mode), X and I (FPCR's; exact, FRINTX's IXC). The host's rounding
+   (host_rint) gives the modes exactly for all but a NaN or a flushed denormal, and raises nothing; FRINTX's IXC is a
+   value rounding changed */
+static inline SgD sg_FPRoundInt(SgCtx* g, LLVMValueRef path, SgD a, SgD fpcr_bits, int rounding, int exact) {
+    SnxIr* ir = g->ir;
+    unsigned width = a.w;
+    int rm = sg_fp_rounding(rounding);
+    LLVMValueRef n = sg_d_make(g, &a), fpcr = sg_fp_fpcr(g, fpcr_bits), r = NULL;
+    SgWhen w;
+    if (sg_fp_when(g, path, &w)) {
+        LLVMValueRef mode = rm < 0 ? sg_fp_rmode(g, fpcr) : ir_i32(ir, (SnxU32)rm);
+        if (width != 16 && (rm < 0 ? host_round_dynamic(ir) : host_round_mode(ir, (unsigned)rm))) {
+            LLVMValueRef value = sg_fp_as_float(ir, n, width), ok;
+            LLVMValueRef rounded =
+                rm < 0 ? ir_fp_round_value_in(ir, value, 5, sg_fp_rmode(g, fpcr)) : host_rint(ir, value, (unsigned)rm);
+            SgFpSplit s;
+            ok = both(ir, LLVMBuildNot(SG_B, sg_fp_is_nan(ir, width, n), ""), sg_fp_unflushed(g, fpcr, width, n));
+            sg_fp_split(ir, ok, sg_fp_as_bits(ir, rounded, width),
+                        exact && snx_ir_fpsr_exact() ? float_ne(ir, value, rounded) : NULL, &s);
+            r = sg_fp_split_end(ir, &s, sg_fp_call_round(ir, fpcr, n, width, mode, (unsigned)exact));
+        } else
+            r = sg_fp_call_round(ir, fpcr, n, width, mode, (unsigned)exact);
+    }
+    return sg_d_from(g, sg_fp_when_end(g, &w, r, ir_int_type(ir, width)));
+}
+
+/* FPRoundIntN: FRINT32Z, FRINT32X, FRINT64Z, FRINT64X */
+static inline SgD sg_FPRoundIntN(SgCtx* g, LLVMValueRef path, SgD a, SgD fpcr_bits, int rounding, long long intsize) {
+    SnxIr* ir = g->ir;
+    unsigned width = a.w;
+    int rm = sg_fp_rounding(rounding);
+    LLVMValueRef n = sg_d_make(g, &a), fpcr = sg_fp_fpcr(g, fpcr_bits), r = NULL;
+    SgWhen w;
+    if (sg_fp_when(g, path, &w)) {
+        LLVMValueRef mode = rm < 0 ? sg_fp_rmode(g, fpcr) : ir_i32(ir, (SnxU32)rm);
+        r = sg_fp_call_round_int(ir, fpcr, n, width, mode, (unsigned)intsize);
+    }
+    return sg_d_from(g, sg_fp_when_end(g, &w, r, ir_int_type(ir, width)));
+}
+
+/* FPConvert: FCVT between precisions, rounded per FPCR. A single widened to a double is exact unless it is a NaN or
+   FPCR.FZ flushes it; a double narrowed in round to nearest is the host's when it isn't a NaN and the single is
+   finite and above the smallest normal, or the double was a zero */
+static inline SgD sg_FPConvert__1(SgCtx* g, LLVMValueRef path, SgD op, SgD fpcr_bits, long long to_bits) {
+    SnxIr* ir = g->ir;
+    unsigned from = op.w, to = (unsigned)to_bits;
+    LLVMValueRef n = sg_d_make(g, &op), fpcr = sg_fp_fpcr(g, fpcr_bits), r = NULL;
+    SgWhen w;
+    if (to != 16 && to != 32 && to != 64) sg_fail("a conversion to a float of this width", to_bits, 0);
+    if (sg_fp_when(g, path, &w)) {
+        SgFpSplit s;
+        if (from == 16 && (to == 32 || to == 64) && ir->features->x86 && ir->features->f16c) {
+            /* Half inputs to conversions are not flushed by FZ16. AHP and NaNs retain the exact helper. */
+            LLVMValueRef ok = both(ir, sg_fp_clear(g, fpcr, 1u << 26), LLVMBuildNot(SG_B, sg_fp_is_nan(ir, 16, n), ""));
+            LLVMValueRef value = LLVMBuildFPExt(SG_B, sg_fp_as_float(ir, n, 16), sg_fp_type(ir, to), "");
+            sg_fp_split(ir, ok, sg_fp_as_bits(ir, value, to), NULL, &s);
+            r = sg_fp_split_end(ir, &s, sg_fp_call_convert(ir, fpcr, n, from, to, sg_fp_rmode(g, fpcr)));
+        } else if (from == 32 && to == 16 && ir->features->x86 && ir->features->f16c) {
+            LLVMValueRef value = sg_fp_as_float(ir, n, 32),
+                         narrow = LLVMBuildFPTrunc(SG_B, value, sg_fp_type(ir, 16), "");
+            LLVMValueRef bits = sg_fp_as_bits(ir, narrow, 16);
+            LLVMValueRef ok = both(ir, sg_fp_clear(g, fpcr, FPCR_RMODE | (1u << 26)),
+                                   both(ir, sg_fp_unflushed(g, fpcr, 32, n),
+                                        either(ir, sg_fp_roomy(ir, 16, bits), sg_fp_is_zero(ir, 32, n))));
+            sg_fp_split(ir, ok, bits, float_ne(ir, value, LLVMBuildFPExt(SG_B, narrow, sg_fp_type(ir, 32), "")), &s);
+            r = sg_fp_split_end(ir, &s, sg_fp_call_convert(ir, fpcr, n, from, to, sg_fp_rmode(g, fpcr)));
+        } else if (from == 32 && to == 64) {
+            LLVMValueRef ok =
+                both(ir, LLVMBuildNot(SG_B, sg_fp_is_nan(ir, 32, n), ""), sg_fp_unflushed(g, fpcr, 32, n));
+            LLVMValueRef fast = sg_fp_as_bits(ir, sg_fp_widen(ir, sg_fp_as_float(ir, n, 32)), 64);
+            sg_fp_split(ir, ok, fast, NULL, &s);
+            r = sg_fp_split_end(ir, &s, sg_fp_call_convert(ir, fpcr, n, from, to, sg_fp_rmode(g, fpcr)));
+        } else if (from == 64 && to == 32) {
+            LLVMValueRef fn = sg_fp_as_float(ir, n, 64), narrow = LLVMBuildFPTrunc(SG_B, fn, sg_fp_type(ir, 32), "");
+            LLVMValueRef fast = sg_fp_as_bits(ir, narrow, 32), ok;
+            ok = both(ir, both(ir, sg_fp_clear(g, fpcr, FPCR_RMODE), LLVMBuildNot(SG_B, sg_fp_is_nan(ir, 64, n), "")),
+                      either(ir, sg_fp_roomy(ir, 32, fast), sg_fp_is_zero(ir, 64, n)));
+            sg_fp_split(ir, ok, fast, float_ne(ir, sg_fp_widen(ir, narrow), fn), &s);
+            r = sg_fp_split_end(ir, &s, sg_fp_call_convert(ir, fpcr, n, from, to, sg_fp_rmode(g, fpcr)));
+        } else
+            r = sg_fp_call_convert(ir, fpcr, n, from, to, sg_fp_rmode(g, fpcr));
+    }
+    return sg_d_from(g, sg_fp_when_end(g, &w, r, ir_int_type(ir, to)));
+}
+
+/* FPCompare: the NZCV nibble of FCMP or FCMPE (signal), bits(4). Without a NaN, and without a denormal FPCR.FZ
+   flushes, it raises nothing and orders as the host does: N for less, ZC for equal, C for greater */
+static inline SgD sg_FPCompare(SgCtx* g, LLVMValueRef path, SgD a, SgD b, int signal, SgD fpcr_bits) {
+    SnxIr* ir = g->ir;
+    unsigned width = a.w;
+    LLVMValueRef n = sg_d_make(g, &a), m = sg_d_make(g, &b), fpcr = sg_fp_fpcr(g, fpcr_bits), r = NULL;
+    SgWhen w;
+    if (sg_fp_when(g, path, &w)) {
+        if (width == 16)
+            r = sg_fp_call_compare(ir, fpcr, n, m, width, (unsigned)signal);
+        else {
+            LLVMValueRef fa = sg_fp_as_float(ir, n, width), fb = sg_fp_as_float(ir, m, width), ok, fast;
+            SgFpSplit s;
+            ok = both(ir, sg_fp_unflushed(g, fpcr, width, n), sg_fp_unflushed(g, fpcr, width, m));
+            ok = both(ir, LLVMBuildFCmp(SG_B, LLVMRealORD, fa, fb, ""), ok);
+            fast =
+                LLVMBuildSelect(SG_B, LLVMBuildFCmp(SG_B, LLVMRealOEQ, fa, fb, ""), ir_i32(ir, 6), ir_i32(ir, 2), "");
+            fast = LLVMBuildSelect(SG_B, LLVMBuildFCmp(SG_B, LLVMRealOLT, fa, fb, ""), ir_i32(ir, 8), fast, "");
+            sg_fp_split(ir, ok, fast, NULL, &s);
+            r = sg_fp_split_end(ir, &s, sg_fp_call_compare(ir, fpcr, n, m, width, (unsigned)signal));
+        }
+    }
+    { /* each flag a 0-or-1 source, as ir_flags_set_nzcv takes them apart, where the compare ran: under a run-time
+         condition a phi each, which the select of FCCMP's flags makes one phi of what ran and its nzcv */
+        SgD nzcv = sg_d_empty(4);
+        LLVMValueRef flag[4];
+        unsigned k;
+        for (k = 4; k-- > 0;) {
+            LLVMValueRef bit;
+            if (w.never) {
+                flag[k] = ir_i32(ir, 0);
+                continue;
+            }
+            bit = k ? LLVMBuildLShr(SG_B, r, ir_i32(ir, k), "") : r;
+            flag[k] = LLVMBuildAnd(SG_B, bit, ir_i32(ir, 1), "");
+        }
+        if (w.join) {
+            LLVMBasicBlockRef blocks[2];
+            LLVMValueRef values[2];
+            blocks[0] = sg_fp_when_join(g, &w);
+            blocks[1] = w.from;
+            values[1] = ir_i32(ir, 0);
+            for (k = 4; k-- > 0;) {
+                values[0] = flag[k];
+                flag[k] = LLVMBuildPhi(SG_B, ir->t_i32, "");
+                LLVMAddIncoming(flag[k], values, blocks, 2);
+            }
+        }
+        for (k = 0; k < 4; ++k) sg_d_put_any(g, &nzcv, k, sg_d_flag(flag[k], NULL), 0, 1);
+        return nzcv;
+    }
+}
+
+/* FixedToFP: SCVTF and UCVTF from Wn or Xn, fixed point with fbits fraction bits, in FPCR's mode. Exact on the host
+   when the integer's magnitude fits the significand, whatever the mode (the scaling by a power of two is exact: the
+   result is at least 2^-64); otherwise once IXC is set, in round to nearest */
+static inline SgD sg_FixedToFP(SgCtx* g, LLVMValueRef path, SgD op, long long fbits_in, int uns, SgD fpcr_bits,
+                               int rounding, long long width_in) {
+    SnxIr* ir = g->ir;
+    unsigned width = (unsigned)width_in, integer = op.w, fbits = (unsigned)fbits_in;
+    unsigned precision = width == 32 ? 24 : 53;
+    LLVMValueRef v = sg_d_make(g, &op), fpcr = sg_fp_fpcr(g, fpcr_bits), r = NULL;
+    SgWhen w;
+    if (sg_fp_rounding(rounding) >= 0)
+        sg_fail("FixedToFP in a mode of its own: the helper rounds as FPCR says", rounding, 0);
+    if (sg_fp_when(g, path, &w)) {
+        if (width != 16) {
+            LLVMTypeRef type = sg_fp_type(ir, width);
+            LLVMValueRef f, ok, fast;
+            SgFpSplit s;
+            if (integer <= precision)
+                ok = LLVMConstInt(ir->t_i1, 1, 0);
+            else if (uns)
+                ok = LLVMBuildICmp(SG_B, LLVMIntULT, v, sg_fp_kint(ir, integer, (SnxU64)1 << precision), "");
+            else
+                ok = LLVMBuildICmp(SG_B, LLVMIntULT,
+                                   LLVMBuildAdd(SG_B, v, sg_fp_kint(ir, integer, (SnxU64)1 << precision), ""),
+                                   sg_fp_kint(ir, integer, (SnxU64)1 << (precision + 1)), "");
+            /* an unsigned value that fits converts as a signed one, unless the host converts unsigned values itself:
+               LLVM's sum of two exact halves on x86 before AVX-512 is -0 for 0 when the host rounds toward minus
+               infinity */
+            if (uns && integer > precision && !host_unsigned_to_float(ir, integer, 0))
+                f = LLVMBuildSelect(SG_B, ok, LLVMBuildSIToFP(SG_B, v, type, ""), LLVMBuildUIToFP(SG_B, v, type, ""),
+                                    "");
+            else
+                f = uns ? LLVMBuildUIToFP(SG_B, v, type, "") : LLVMBuildSIToFP(SG_B, v, type, "");
+            if (fbits)
+                f = LLVMBuildFMul(SG_B, f, sg_fp_kfloat(ir, width, 1.0 / (double)((SnxU64)1 << (fbits - 1)) / 2.0), "");
+            fast = sg_fp_as_bits(ir, f, width);
+            ok = either(ir, ok, both(ir, sg_fp_clear(g, fpcr, FPCR_RMODE), ixc_set(ir)));
+            sg_fp_split(ir, ok, fast, NULL, &s);
+            r = sg_fp_split_end(ir, &s, sg_fp_call_from_int(ir, fpcr, v, integer, width, (unsigned)uns, fbits));
+        } else
+            r = sg_fp_call_from_int(ir, fpcr, v, integer, width, (unsigned)uns, fbits);
+    }
+    return sg_d_from(g, sg_fp_when_end(g, &w, r, ir_int_type(ir, width)));
+}
+
+/* FPToFixed: FCVT[NPMZA][SU] to Wd or Xd, fixed point with fbits fraction bits, in the encoding's mode. On the host
+   when the scaled value (exact: a product by a power of two that overflows only out of range) rounds to an integer in
+   range and no denormal is flushed; IXC when rounding changed it. Toward zero is the conversion's own rounding, the
+   other modes need the host's rounding (host_rint) */
+static inline SgD sg_FPToFixed(SgCtx* g, LLVMValueRef path, SgD op, long long fbits_in, int uns, SgD fpcr_bits,
+                               int rounding, long long integer_in) {
+    SnxIr* ir = g->ir;
+    unsigned width = op.w, integer = (unsigned)integer_in, fbits = (unsigned)fbits_in;
+    unsigned precision = width == 32 ? 24 : 53;
+    int rm_in = sg_fp_rounding(rounding);
+    unsigned rm = (unsigned)rm_in;
+    LLVMValueRef n = sg_d_make(g, &op), fpcr = sg_fp_fpcr(g, fpcr_bits), r = NULL;
+    SgWhen w;
+    if (rm_in < 0) sg_fail("FPToFixed in FPCR's mode: the helper takes the encoding's", rounding, 0);
+    if (integer != 32 && integer != 64) sg_fail("a conversion to an integer of this width", integer_in, 0);
+    if (sg_fp_when(g, path, &w)) {
+        if (width != 16 && (rm == 3 || host_round_mode(ir, rm))) {
+            LLVMTypeRef type = ir_int_type(ir, integer);
+            LLVMValueRef f = sg_fp_as_float(ir, n, width), low, high, ok, fast, rounded, inexact;
+            SgFpSplit s;
+            double top = (double)((SnxU64)1 << (integer - 1)) * (uns ? 2.0 : 1.0);
+            if (fbits)
+                f = LLVMBuildFMul(SG_B, f, sg_fp_kfloat(ir, width, (double)((SnxU64)1 << (fbits - 1)) * 2.0), "");
+            rounded = rm == 3 ? f : host_rint(ir, f, rm);
+            /* the lowest integer in range less one, where the format holds it (trunc of anything above it is in
+               range), else the lowest integer itself */
+            if (uns)
+                low = LLVMBuildFCmp(SG_B, LLVMRealOGT, rounded, sg_fp_kfloat(ir, width, -1.0), "");
+            else if (integer < precision)
+                low = LLVMBuildFCmp(SG_B, LLVMRealOGT, rounded, sg_fp_kfloat(ir, width, -top - 1.0), "");
+            else
+                low = LLVMBuildFCmp(SG_B, LLVMRealOGE, rounded, sg_fp_kfloat(ir, width, -top), "");
+            high = LLVMBuildFCmp(SG_B, LLVMRealOLT, rounded, sg_fp_kfloat(ir, width, top), "");
+            ok = both(ir, both(ir, low, high), sg_fp_unflushed(g, fpcr, width, n));
+            fast = uns ? LLVMBuildFPToUI(SG_B, rounded, type, "") : LLVMBuildFPToSI(SG_B, rounded, type, "");
+            if (rm == 3)
+                rounded = uns ? LLVMBuildUIToFP(SG_B, fast, LLVMTypeOf(f), "")
+                              : LLVMBuildSIToFP(SG_B, fast, LLVMTypeOf(f), "");
+            inexact = float_ne(ir, rounded, f);
+            sg_fp_split(ir, ok, ir_cast(ir, fast, ir->t_i64, 0), inexact, &s);
+            r = sg_fp_split_end(ir, &s, sg_fp_call_to_int(ir, fpcr, n, width, integer, (unsigned)uns, fbits, rm));
+        } else
+            r = sg_fp_call_to_int(ir, fpcr, n, width, integer, (unsigned)uns, fbits, rm);
+    }
+    r = sg_fp_when_end(g, &w, r, ir->t_i64);
+    return sg_d_from(g, integer < 64 ? LLVMBuildTrunc(SG_B, r, ir_int_type(ir, integer), "") : r);
+}
+
+/* FPToFixedJS: FJCVTZS's Wd, and whether the conversion was exact, Z of the NZCV 0Z00 it sets */
+static inline void sg_FPToFixedJS(SgCtx* g, LLVMValueRef path, SgD op, SgD fpcr_bits, int is64, long long n,
+                                  SgD* result, SgD* z) {
+    SnxIr* ir = g->ir;
+    LLVMValueRef operand = sg_d_make(g, &op), fpcr = sg_fp_fpcr(g, fpcr_bits), r = NULL;
+    SgD reply;
+    SgWhen w;
+    if (!is64 || n != 32 || op.w != 64) sg_fail("FPToFixedJS other than a double to 32 bits", n, op.w);
+    if (sg_fp_when(g, path, &w)) r = ir_fp_reply_call_fpcr(ir, "snx_fp_jcvt", &operand, 1, 0, fpcr);
+    reply = sg_d_from(g, sg_fp_when_end(g, &w, r, ir->t_i64));
+    *result = sg_d_slice(g, reply, 31, 0);
+    *z = sg_d_slice(g, reply, 32, 32);
+}
+
+/* FPConvertBF: BFCVT, a single to a BFloat16 (FEAT_BF16) in FPCR's mode */
+static inline SgD sg_FPConvertBF__1(SgCtx* g, LLVMValueRef path, SgD op, SgD fpcr_bits) {
+    SnxIr* ir = g->ir;
+    LLVMValueRef operand = sg_d_make(g, &op), fpcr = sg_fp_fpcr(g, fpcr_bits), r = NULL;
+    SgWhen w;
+    if (sg_fp_when(g, path, &w))
+        r = sg_fp_to_width(ir, ir_fp_reply_call_fpcr(ir, "snx_fp_bfcvt", &operand, 1, 0, fpcr), 16);
+    return sg_d_from(g, sg_fp_when_end(g, &w, r, ir->t_i16));
 }
