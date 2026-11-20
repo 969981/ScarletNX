@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <stdalign.h>  /* alignof is a macro in C11/C17, not a built-in C keyword */
 
 typedef uint8_t u8;
 typedef uint16_t u16;
