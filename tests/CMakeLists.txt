@@ -1321,15 +1321,17 @@ add_test(NAME sailgen_extract COMMAND "${CMAKE_COMMAND}" -E compare_files --igno
          "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/extract_expected.sail" "${CMAKE_CURRENT_BINARY_DIR}/sailgen/extract.sail")
 add_test(NAME sailgen_refused
          COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused.roots"
+                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                  --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h" -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused.inc"
                  "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused.sail")
 set_tests_properties(sailgen_refused PROPERTIES PASS_REGULAR_EXPRESSION
-    "refused.sail:4: error: a throw of other than Error_Undefined\\(\\), Error_See\\(\\) or Error_ConstrainedUnpredictable\\(\\)")
+    "refused.sail:4: error: a throw of other than Error_Undefined\\(\\), Error_See\\(\\), Error_Unpredictable\\(\\) or Error_ConstrainedUnpredictable\\(\\)")
 # a register, or a struct register's field, the back end does not keep: refused at the line that reads it, naming
 # what the back end lacks
 foreach(case IN ITEMS register field)
     add_test(NAME sailgen_refused_${case}
              COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_${case}.roots"
+                     --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                      --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
                      -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused_${case}.inc"
                      "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_${case}.sail")
@@ -1355,6 +1357,7 @@ set_tests_properties(sailgen_refused_mention_field PROPERTIES PASS_REGULAR_EXPRE
 foreach(case IN ITEMS see pin)
     add_test(NAME sailgen_refused_${case}
              COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_${case}.roots"
+                     --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                      --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
                      -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused_${case}.inc"
                      "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_${case}.sail")
@@ -1363,9 +1366,20 @@ set_tests_properties(sailgen_refused_see PROPERTIES PASS_REGULAR_EXPRESSION
     "refused_see.sail:7: error: a throw of Error_See under a condition known only at run time")
 set_tests_properties(sailgen_refused_pin PROPERTIES PASS_REGULAR_EXPRESSION
     "refused_pin.sail:14: error: PSTATE.EL written, which the let PSTATE_EL holds fixed")
+# an UNPREDICTABLE encoding is what a system's overlay says its cores do with it (UnpredictableEncoding()): without one,
+# refused at the throw
+add_test(NAME sailgen_refused_unpredictable
+         COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_unpredictable.roots"
+                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
+                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
+                 -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused_unpredictable.inc"
+                 "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_unpredictable.sail")
+set_tests_properties(sailgen_refused_unpredictable PROPERTIES PASS_REGULAR_EXPRESSION
+    "refused_unpredictable.sail:4: error: an UNPREDICTABLE encoding, and no UnpredictableEncoding\\(\\) of an overlay")
 # a struct's field may take a value known when the recompiler runs, not one known only when the guest runs
 add_test(NAME sailgen_refused_struct
          COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_struct.roots"
+                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                  --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
                  -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused_struct.inc"
                  "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_struct.sail")
@@ -1380,6 +1394,38 @@ add_test(NAME sailgen_refused_action
                  "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_action.sail")
 set_tests_properties(sailgen_refused_action PROPERTIES PASS_REGULAR_EXPRESSION
     "refused_action.sail:8: error: Peek gives an integer: the back end's functions give nothing, bits, a bool, an enum or a tuple of bits")
+# a function that calls itself on each half of its bits is read as the sum of the bits' elements, and only so: one
+# that joins the halves' results by other than +, gives other than their sum, or that sum under a condition alone,
+# halves other than each half, gives other than the element for one element or writes a register where it joins them
+# is refused, naming it and why
+foreach(case IN ITEMS op more some sides base state)
+    add_test(NAME sailgen_refused_halves_${case}
+             COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_halves_${case}.roots"
+                     --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
+                     --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
+                     -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused_halves_${case}.inc"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/halves.sail")
+endforeach()
+set_tests_properties(sailgen_refused_halves_op PROPERTIES PASS_REGULAR_EXPRESSION
+    "halves.sail:91: error: Fold joins what it gives for each half of its bits other than by \\+ of the two")
+set_tests_properties(sailgen_refused_halves_more PROPERTIES PASS_REGULAR_EXPRESSION
+    "halves.sail:97: error: Fold gives other than the \\+ of what it gives for each half of its bits")
+set_tests_properties(sailgen_refused_halves_some PROPERTIES PASS_REGULAR_EXPRESSION
+    "halves.sail:122: error: Some gives other than the \\+ of what it gives for each half of its bits")
+set_tests_properties(sailgen_refused_halves_sides PROPERTIES PASS_REGULAR_EXPRESSION
+    "halves.sail:103: error: Lower calls itself: sailgen reads a function that gives its bits where they are one element wide")
+set_tests_properties(sailgen_refused_halves_base PROPERTIES PASS_REGULAR_EXPRESSION
+    "halves.sail:109: error: Base calls itself: sailgen reads a function that gives its bits where they are one element wide")
+set_tests_properties(sailgen_refused_halves_state PROPERTIES PASS_REGULAR_EXPRESSION
+    "halves.sail:62: error: the register GPR written where a function that calls itself joins what it gives for each half")
+add_test(NAME sailgen_halves
+         COMMAND "${CMAKE_COMMAND}" "-DSAILGEN=$<TARGET_FILE:snx-sailgen>"
+                 "-DCORE=${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
+                 "-DBACKEND=${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
+                 "-DDIR=${CMAKE_CURRENT_SOURCE_DIR}/sailgen"
+                 "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/sailgen/halves.inc"
+                 -P "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/halves_check.cmake")
+set_tests_properties(sailgen_halves PROPERTIES PASS_REGULAR_EXPRESSION "sailgen_halves: sum=reduce")
 # a function the back end lowers: --extract copies its val and the types it names, not its Sail; called under a
 # run-time condition by a back end function that takes none, it is refused with its line
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sailgen/lower.sail"
@@ -1393,6 +1439,7 @@ add_test(NAME sailgen_extract_lower COMMAND "${CMAKE_COMMAND}" -E compare_files 
          "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/lower_expected.sail" "${CMAKE_CURRENT_BINARY_DIR}/sailgen/lower.sail")
 add_test(NAME sailgen_refused_path
          COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_path.roots"
+                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                  --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
                  -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused_path.inc"
                  "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_path.sail")
@@ -1402,19 +1449,31 @@ set_tests_properties(sailgen_refused_path PROPERTIES PASS_REGULAR_EXPRESSION
 # element to the next, or whose element is read after it, stays a loop of elements
 add_test(NAME sailgen_lanes
          COMMAND "${CMAKE_COMMAND}" "-DSAILGEN=$<TARGET_FILE:snx-sailgen>"
-                 "-DBACKEND=${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h" "-DDIR=${CMAKE_CURRENT_SOURCE_DIR}/sailgen"
+                 "-DCORE=${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
+                 "-DBACKEND=${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
+                 "-DDIR=${CMAKE_CURRENT_SOURCE_DIR}/sailgen"
                  "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/sailgen/lanes.inc"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/lanes_check.cmake")
 set_tests_properties(sailgen_lanes PROPERTIES PASS_REGULAR_EXPRESSION
-    "sailgen_lanes: lanes=lanes carried=loop last=loop")
+    "sailgen_lanes: lanes=lanes carried=loop last=loop pairs=lanes fold=lanes start=loop fixed=lanes free=loop")
 # and the A64 subsets of src/common/cpu/aarch64/sail/ generate whole, with the NX's fixups
 add_test(NAME sailgen_a64
          COMMAND snx-sailgen --generate "${PROJECT_SOURCE_DIR}/src/common/cpu/aarch64/sail/a64.roots"
+                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                  --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
                  --profile "${PROJECT_SOURCE_DIR}/src/common/cpu/aarch64/decode/a64.profile"
                  -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/a64_sail.inc"
                  "${PROJECT_SOURCE_DIR}/src/common/cpu/aarch64/sail/a64.sail"
                  --overlay "${PROJECT_SOURCE_DIR}/src/common/cpu/aarch64/sail/nx.sail")
+# and the AArch32 ones of src/common/cpu/arm/sail/, with the architectures' profile and fixups
+add_test(NAME sailgen_a32
+         COMMAND snx-sailgen --generate "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/sail/a32.roots"
+                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
+                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm_arm.h"
+                 --profile "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/sail/a32.profile"
+                 -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/a32_sail.inc"
+                 "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/sail/a32.sail"
+                 --overlay "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/sail/arm.sail")
 
 
 # The QEMU reference (tests/qemu_ref/): hand-checked cases, the ported cases and the decoder's UNDEF sets under
@@ -2678,9 +2737,6 @@ snx_test_target(snx-test-driver c23)
 target_compile_definitions(snx-test-driver PRIVATE SNX_TRACY_VERSION="${SNX_TRACY_VERSION}")
 target_link_libraries(snx-test-driver PRIVATE snx_test_common snx_setup snx_lz4 OpenSSL::Crypto snx_demangle snx_nx_module)
 set_target_properties(snx-test-driver PROPERTIES LINKER_LANGUAGE CXX)
-if(APPLE) # driver/setup.c's weak snx_menu_language, as snx_driver has it: ld64 wants it named
-    target_link_options(snx-test-driver PRIVATE "LINKER:-U,_snx_menu_language")
-endif()
 add_test(NAME driver_workflow COMMAND snx-test-driver)
 set_tests_properties(driver_workflow PROPERTIES TIMEOUT 60)
 # the same driver as an app's child, which names the game it made ready (SNX_DRIVER_READY, the Android and iOS
@@ -2696,9 +2752,6 @@ if(NOT WIN32)
     target_link_libraries(snx-test-driver-ready PRIVATE snx_test_common snx_setup snx_lz4 OpenSSL::Crypto snx_demangle
                                                         snx_nx_module)
     set_target_properties(snx-test-driver-ready PROPERTIES LINKER_LANGUAGE CXX)
-    if(APPLE)
-        target_link_options(snx-test-driver-ready PRIVATE "LINKER:-U,_snx_menu_language")
-    endif()
     add_test(NAME driver_ready COMMAND snx-test-driver-ready)
     set_tests_properties(driver_ready PROPERTIES TIMEOUT 60)
 endif()
@@ -2986,7 +3039,8 @@ if(NOT SNX_TOOLS_ONLY)
     add_test(NAME guest_textures COMMAND snx-test-guest-textures)
     # the BC7 cache of ASTC levels (gpu/vk/bc7_cache.c), without a GPU: every input that changes a level's blocks
     # changes its key, records come back as written and from the file in a later run, another version or a damaged
-    # record starts the file over or drops the record, a record cut short is cut off, and the bound starts it over
+    # record starts the file over or drops the record, a record cut short is cut off, and the bound starts it over; a
+    # read a held disk keeps (an interposed pread) does not hold the recording thread
     add_executable(snx-test-bc7-cache bc7_cache.c tracy_stubs.c)
     snx_test_target(snx-test-bc7-cache gnu23)
     target_link_libraries(snx-test-bc7-cache PRIVATE snx_nx_flags snx_xxhash scarletnx-common scarletnx-platform)
@@ -3195,6 +3249,20 @@ if(NOT WIN32)
     foreach(part 1 2 3)
         add_test(NAME llvm_sail_ir_${part} COMMAND snx-test-llvm-sail-ir --part ${part}/3)
         set_tests_properties(llvm_sail_ir_${part} PROPERTIES TIMEOUT 600)
+    endforeach()
+    # the T16 emitters sailgen generates from the Sail against the ones written by hand they replaced
+    # (snx_thumb_llvm_block_t16_reference): the same optimized IR halfword by halfword on every profile and memory mode,
+    # alone and in an IT block, and the same results run here. Each part takes a sixteenth of its third, spread over
+    # every field: the whole (--every 1) takes 45 minutes on 4 threads
+    add_executable(snx-test-arm-sail-ir arm_sail_ir.c)
+    snx_test_target(snx-test-arm-sail-ir gnu23)
+    target_link_libraries(snx-test-arm-sail-ir PRIVATE snx_llvm snx_arm_llvm snx_driver ${CMAKE_DL_LIBS})
+    foreach(part 1 2 3)
+        add_test(NAME arm_sail_ir_${part} COMMAND snx-test-arm-sail-ir --part ${part}/3 --every 16)
+        set_tests_properties(arm_sail_ir_${part} PROPERTIES TIMEOUT 900)
+        # and the A32 data processing and branches, against llvm.c's (snx_arm_llvm_block_reference)
+        add_test(NAME arm_sail_ir_a32_${part} COMMAND snx-test-arm-sail-ir --a32 --part ${part}/3 --every 16)
+        set_tests_properties(arm_sail_ir_a32_${part} PROPERTIES TIMEOUT 900)
     endforeach()
     # snx_ir_object's check of the symbols an object names (llvm_object_symbols.c)
     add_executable(snx-test-llvm-object-symbols llvm_object_symbols.c)
@@ -4518,6 +4586,10 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     add_executable(snx-test-vk-gpuprof-setting vk_gpuprof_setting.c)
     snx_test_target(snx-test-vk-gpuprof-setting c23)
     add_test(NAME vk_gpuprof_setting COMMAND snx-test-vk-gpuprof-setting)
+    # the time between two of a queue's timestamps, the later read first and the counter's wrap (gpuprof_time.h)
+    add_executable(snx-test-vk-gpuprof-time vk_gpuprof_time.c)
+    snx_test_target(snx-test-vk-gpuprof-time c23)
+    add_test(NAME vk_gpuprof_time COMMAND snx-test-vk-gpuprof-time)
     add_executable(snx-test-vk-descriptor-key vk_descriptor_key.c)
     snx_test_target(snx-test-vk-descriptor-key gnu23)
     target_link_libraries(snx-test-vk-descriptor-key PRIVATE Vulkan::Headers)
