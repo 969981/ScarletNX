@@ -4,6 +4,8 @@ option(SNX_TEST_SANITIZERS
        "Build the native regression tests, and the in-tree libraries they exercise, with ASan and UBSan (a test build: \
 the runtime links those libraries too, and isn't deployed)" OFF)
 option(SNX_TEST_VULKAN "Run offscreen Vulkan integration tests (requires a Vulkan 1.3 ICD, e.g. lavapipe)" OFF)
+option(SNX_TEST_ONLINE_LIVE
+       "Ask each WFC service's DNS server over the internet (online_presets_live, ctest -L network)" OFF)
 option(SNX_TEST_ARM_AOT "Build asset-free static ARM11/checked-memory witnesses (requires native LLVM SDK)" OFF)
 option(SNX_TEST_VP9_VECTORS
        "Run NVDEC's VP9 jobs on libvpx's test vectors (configure downloads 32 files from the WebM project)" OFF)
@@ -45,10 +47,10 @@ endfunction()
 if(SNX_TEST_SANITIZERS)
     cmake_language(DEFER DIRECTORY "${PROJECT_SOURCE_DIR}" CALL snx_test_sanitize
         # the common code: the platform layer, network, filesystems, LZ4, ZBIC and xxHash, the Vulkan setup the
-        # frontends share, the launcher's HTTPS and the roots it carries, the zip reader of VPKs and APKs, the glTF
-        # reader of a Mii's parts
+        # frontends share, the GL layer's state, the launcher's HTTPS and the roots it carries, the zip reader of VPKs
+        # and APKs, the glTF reader of a Mii's parts, the DS's and the 3DS's online services
         scarletnx-common scarletnx-platform scarletnx-net scarletnx-ldn scarletnx-filesystem snx_demangle snx_lz4
-        snx_zbic snx_xxhash snx_vk_common snx_https snx_cacert snx_zip snx_cgltf
+        snx_zbic snx_xxhash snx_vk_common snx_gl snx_https snx_cacert snx_zip snx_cgltf snx_online
         snx-logscan
         # the recompiler, its backends and what they take of the common code
         snx_recompiler_base snx_llvm snx_arm_llvm snx_arm_decode scarletnx-recompiler scarletnx-recompiler-shared
@@ -933,6 +935,16 @@ add_executable(snx-test-cas128 cas128.c)
 snx_test_target(snx-test-cas128 gnu23)
 target_link_libraries(snx-test-cas128 PRIVATE scarletnx-common Threads::Threads)
 add_test(NAME cas128 COMMAND snx-test-cas128)
+# cas128.c's branch for a big-endian host with no instruction of its own (s390x), which none of these builds compiles:
+# its syntax, where this compiler takes the target (the header alone tells)
+execute_process(COMMAND "${CMAKE_C_COMPILER}" --target=s390x-linux-gnu -std=gnu23 -ffreestanding -fsyntax-only
+                        "-I${PROJECT_SOURCE_DIR}/src" -x c "${PROJECT_SOURCE_DIR}/src/common/runtime/interface.h"
+                RESULT_VARIABLE snx_s390x_syntax OUTPUT_QUIET ERROR_QUIET)
+if(snx_s390x_syntax EQUAL 0)
+    add_test(NAME cas128_big_endian_syntax
+             COMMAND "${CMAKE_C_COMPILER}" --target=s390x-linux-gnu -std=gnu23 -ffreestanding -fsyntax-only -Werror
+                     "-I${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/src/common/runtime/cas128.c")
+endif()
 # the drivers' common options (common/utilities/cli.h): their forms, older names, refusals and help
 add_executable(snx-test-cli cli.c)
 snx_test_target(snx-test-cli c23)
@@ -1175,6 +1187,10 @@ add_test(NAME llvm_vfp_minmax COMMAND snx-test-llvm-vfp-minmax)
 if(Python3_Interpreter_FOUND)
     add_test(NAME llvm_half_order_math COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/llvm_perf/half_order_math.py")
+    # llvm_perf/run.sh's NZCV harness takes the flag emitters out of ir_state.c by their signatures: that it still
+    # finds each one, where the harness itself (a JIT over the system's libLLVM) is run by hand
+    add_test(NAME llvm_perf_nzcv_source COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/llvm_perf/test_nzcv.py" "${CMAKE_CURRENT_BINARY_DIR}/llvm_perf_nzcv.c")
 endif()
 
 add_executable(snx-test-llvm-round llvm_round.c llvm_steps.c
@@ -1420,6 +1436,31 @@ else()
 endif()
 set_tests_properties(qemu_ref_selftest PROPERTIES SKIP_RETURN_CODE 77)
 
+# The online services (src/common/online): the WFC presets and the DS's slot, DNS queries and replies, the resolver
+# against a DNS server of its own on 127.0.0.1, NASC's form and reply, and the 3DS console's files, which online_ctr
+# writes in a folder of the build tree it empties first
+if(TARGET snx_online)
+    set(snx_online_ctr_folder "${CMAKE_CURRENT_BINARY_DIR}/online_ctr_console")
+    foreach(part wfc dns resolve nasc ctr)
+        add_executable(snx-test-online-${part} online_${part}.c)
+        snx_test_target(snx-test-online-${part} c23)
+        target_link_libraries(snx-test-online-${part} PRIVATE snx_online)
+        add_test(NAME online_${part}
+            COMMAND snx-test-online-${part} $<$<STREQUAL:${part},ctr>:${snx_online_ctr_folder}>)
+        set_tests_properties(online_${part} PROPERTIES TIMEOUT 30)
+    endforeach()
+    add_test(NAME online_ctr_folder COMMAND "${CMAKE_COMMAND}" -E rm -rf "${snx_online_ctr_folder}")
+    set_tests_properties(online_ctr_folder PROPERTIES FIXTURES_SETUP snx_online_ctr_folder)
+    set_tests_properties(online_ctr PROPERTIES FIXTURES_REQUIRED snx_online_ctr_folder)
+    if(SNX_TEST_ONLINE_LIVE) # the internet: how a service that stopped answering is found, not a gate
+        add_executable(snx-test-online-presets-live online_presets_live.c)
+        snx_test_target(snx-test-online-presets-live c23)
+        target_link_libraries(snx-test-online-presets-live PRIVATE snx_online)
+        add_test(NAME online_presets_live COMMAND snx-test-online-presets-live)
+        set_tests_properties(online_presets_live PROPERTIES LABELS "external;network" TIMEOUT 120)
+    endif()
+endif()
+
 # The emulated network stack over the host's loopback (src/common/network)
 add_executable(snx-test-network-stack network_stack.c)
 snx_test_target(snx-test-network-stack gnu23)
@@ -1485,6 +1526,64 @@ snx_test_target(snx-test-gl-census gnu23)
 target_link_libraries(snx-test-gl-census PRIVATE scarletnx-common)
 target_include_directories(snx-test-gl-census PRIVATE "${PROJECT_SOURCE_DIR}/src")
 add_test(NAME gl_census COMMAND snx-test-gl-census "${CMAKE_CURRENT_BINARY_DIR}/gl_census.tsv")
+# the shared GL layer's state machine (src/common/gpu/gl/gl_state.c), with no GPU: contexts, the fixed state, GL's
+# errors and clamps, and a save state's copy saved, loaded and refused
+add_executable(snx-test-gl-state gl_state.c)
+snx_test_target(snx-test-gl-state c23)
+target_link_libraries(snx-test-gl-state PRIVATE snx_gl)
+add_test(NAME gl_state COMMAND snx-test-gl-state)
+# the shared GL layer's shaders and programs (src/common/gpu/gl/gl_program.c), with no GPU: compiled, linked, their
+# uniforms and locations, GL's errors, deletes, a program pipeline, the arena, and a save state's copy loaded and refused
+add_executable(snx-test-gl-program gl_program.c)
+snx_test_target(snx-test-gl-program c23)
+target_link_libraries(snx-test-gl-program PRIVATE snx_gl)
+add_test(NAME gl_program COMMAND snx-test-gl-program)
+# the shared GL layer's buffers and vertex arrays (src/common/gpu/gl/gl_object.c), with no GPU: their bytes in the
+# platform's memory, maps, what the platform hears, vertex arrays, and a save state's copy loaded and refused
+add_executable(snx-test-gl-object gl_object.c)
+snx_test_target(snx-test-gl-object c23)
+target_link_libraries(snx-test-gl-object PRIVATE snx_gl)
+add_test(NAME gl_object COMMAND snx-test-gl-object)
+# the shared GL layer's textures and samplers (src/common/gpu/gl/gl_texture.c), with no GPU: their storage, texels kept
+# in the platform's memory by GL's unpack state, parameters, sampler objects, what the platform hears, and a save state
+add_executable(snx-test-gl-texture gl_texture.c)
+snx_test_target(snx-test-gl-texture c23)
+target_link_libraries(snx-test-gl-texture PRIVATE snx_gl)
+add_test(NAME gl_texture COMMAND snx-test-gl-texture)
+# the shared GL layer's framebuffers and renderbuffers (src/common/gpu/gl/gl_framebuffer.c), with no GPU: bindings,
+# storage, attachments and completeness, the window's parameters, what the platform hears, and a save state
+add_executable(snx-test-gl-framebuffer gl_framebuffer.c)
+snx_test_target(snx-test-gl-framebuffer c23)
+target_link_libraries(snx-test-gl-framebuffer PRIVATE snx_gl)
+add_test(NAME gl_framebuffer COMMAND snx-test-gl-framebuffer)
+# the shared GL layer's sync objects (src/common/gpu/gl/gl_sync.c), with no GPU: fences of a platform's serials, waits,
+# their parameters, GL's errors, and a save state's fences signaled
+add_executable(snx-test-gl-sync gl_sync.c)
+snx_test_target(snx-test-gl-sync c23)
+target_link_libraries(snx-test-gl-sync PRIVATE snx_gl)
+add_test(NAME gl_sync COMMAND snx-test-gl-sync)
+# the console's GL programs as the renderer's host programs (src/nx/gpu/gl/gl_host_program.c), with no GPU: a program
+# linked in the console's layout described as a translation's ShaderInfo
+add_executable(snx-test-gl-host-program gl_host_program.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/gl/gl_host_program.c")
+snx_test_target(snx-test-gl-host-program gnu23)
+target_link_libraries(snx-test-gl-host-program PRIVATE snx_gl scarletnx-common)
+target_include_directories(snx-test-gl-host-program PRIVATE "${PROJECT_SOURCE_DIR}/src")
+add_test(NAME gl_host_program COMMAND snx-test-gl-host-program)
+# the console's GL layer (src/nx/gpu/gl/) over a stubbed GL driver module, guest memory and renderer: the slots taken,
+# EGL, glClear and the draws as the renderer's, eglSwapBuffers's present, a function without a handler
+add_executable(snx-test-gl-layer gl_layer.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/gl/gl_loader.c"
+               "${PROJECT_SOURCE_DIR}/src/nx/gpu/gl/gl_egl.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/gl/gl_calls.c"
+               "${PROJECT_SOURCE_DIR}/src/nx/gpu/gl/gl_program_calls.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/gl/gl_object_calls.c"
+               "${PROJECT_SOURCE_DIR}/src/nx/gpu/gl/gl_host_program.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_tex.c"
+               "${PROJECT_SOURCE_DIR}/src/nx/gpu/gl/gl_texture_calls.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/gl/gl_framebuffer_calls.c"
+               "${PROJECT_SOURCE_DIR}/src/nx/gpu/gl/gl_sync_calls.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/gl/gl_draw.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_tic.c"
+               "${PROJECT_SOURCE_DIR}/src/nx/gpu/draw_state.c"
+               "${PROJECT_SOURCE_DIR}/src/nx/gpu/gl/gl_host_nx.c" "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/version.c")
+snx_test_target(snx-test-gl-layer gnu23)
+target_link_libraries(snx-test-gl-layer PRIVATE snx_gl scarletnx-common)
+target_include_directories(snx-test-gl-layer PRIVATE "${PROJECT_SOURCE_DIR}/src")
+snx_hookgen(snx-test-gl-layer SPEC "${PROJECT_SOURCE_DIR}/src/nx/gpu/gl/gl.hook" PREFIX gl NAME gpu/gl/gl.hook)
+add_test(NAME gl_layer COMMAND snx-test-gl-layer)
 # native_cond_var (src/nx/hle/hook/family.c, hook.c) over tests/hook/states.hook: the cond_var family's hooks at 1, the
 # game's own wait at 0, and save states refused while the host's wait runs, by a message naming the setting's value
 add_executable(snx-test-hook-states hook_states.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/version.c"
@@ -2679,6 +2778,15 @@ if(WIN32) # a scenario's crash says where it was (one ended 0xC0000005 on Window
 endif()
 add_test(NAME extraction_native COMMAND snx-test-extract)
 
+# scarletnx --pack: synthetic encrypted NCAs packed into an NSP and an XCI of plain ones (hac_synth.h, as above)
+add_executable(snx-test-pack pack.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/driver/pack.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/runtime/driver/fabricate.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/driver/container.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/runtime/driver/extract.c" "${PROJECT_SOURCE_DIR}/src/nx/loader/loader.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/loader/match.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/driver/game_name.c")
+snx_test_target(snx-test-pack gnu23)
+target_link_libraries(snx-test-pack PRIVATE snx_test_common hactool_internals snx_lz4 OpenSSL::Crypto snx_nx_module)
+add_test(NAME pack_plain COMMAND snx-test-pack)
+
 add_executable(snx-test-loader loader_test.c "${PROJECT_SOURCE_DIR}/src/nx/loader/loader.c"
     "${PROJECT_SOURCE_DIR}/src/nx/loader/match.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/driver/game_name.c")
 snx_test_target(snx-test-loader c23)
@@ -3750,6 +3858,11 @@ if(TARGET snx_vita_usse)
     snx_test_target(snx-test-vita-usse-cube gnu23)
     target_link_libraries(snx-test-vita-usse-cube PRIVATE snx_vita_usse)
     add_test(NAME vita_usse_cube COMMAND snx-test-vita-usse-cube)
+    # a program whose counts and indices name more than it holds is refused, nothing read or written outside it
+    add_executable(snx-test-vita-usse-bounds vita_usse_bounds.c)
+    snx_test_target(snx-test-vita-usse-bounds gnu23)
+    target_link_libraries(snx-test-vita-usse-bounds PRIVATE snx_vita_usse)
+    add_test(NAME vita_usse_bounds COMMAND snx-test-vita-usse-bounds)
 endif()
 # the texture conversion shader's GLSL run on the CPU against the CPU's conversions and ETC2 and BCn decoders: no GPU
 # needed

@@ -1756,18 +1756,14 @@ static bool choose_device(SnxVkChoice* c, void* user) {
             "after the program's\n", names);
     }
     f12.vulkanMemoryModel = f12.vulkanMemoryModelDeviceScope = g_spirv_translate.hmma_coop != 0;
-    /* HMMA off the matrix unit: pairs of lanes on RADV with subgroups of 32 (an RX 6700 XT's HMMA bench ran 9.7%
-       faster), and A and B through shared memory where the driver loops for a shuffle whose index differs between
-       lanes, which no feature or property tells, so the table does */
+    /* HMMA off the matrix unit, by the rules: pairs of lanes on RADV with subgroups of 32 (an RX 6700 XT's HMMA bench
+       ran 9.7% faster), and A and B through shared memory where the driver loops for a shuffle whose index differs
+       between lanes, which no feature or property tells, so the table does. hmma_mode settles the way before the
+       first translation (vk_hmma_pick), Auto by the bench, keeping the rules' where it cannot run */
     int compute_subgroups = (g_vk_subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
-    shader_hmma_choose(compute_subgroups, p12.driverID == VK_DRIVER_ID_MESA_RADV && g_vk.has_cs_warp32,
-                       vk_ban("OpGroupNonUniformShuffle", compute_subgroups, ban_say) != 0,
-                       (int)g_vk.props.limits.maxComputeSharedMemorySize);
-    if (compute_subgroups) {
-        char way[256];
-        shader_hmma_way(way, sizeof way);
-        LOG("vulkan: an SM86 compute program's HMMA: %s\n", way);
-    }
+    g_vk.hmma_rule = shader_hmma_rule(compute_subgroups, p12.driverID == VK_DRIVER_ID_MESA_RADV && g_vk.has_cs_warp32,
+                                      vk_ban("OpGroupNonUniformShuffle", compute_subgroups, ban_say) != 0);
+    shader_hmma_take(g_vk.hmma_rule, (int)g_vk.props.limits.maxComputeSharedMemorySize);
     /* shaderDenormPreserveFloat16 is the device's word that it can keep f16 subnormals: without it an SM86 program
        packs those by hand (sm86_translate.c's pack_half), as Turnip on an Adreno 610 flushed them to zero */
     if (vk_ban("shaderDenormPreserveFloat16", p12.shaderDenormPreserveFloat16, ban_say))
@@ -2468,30 +2464,37 @@ static int create_device(void) {
         : second                               ? " (a second queue)"
                                                : " (the graphics queue)");
     /* A draw that writes a target it samples at its own pixel gets the value from before the draw on the console.
-       In place, a later primitive of the draw can read what an earlier one wrote. On NVIDIA's GPUs with fragment
-       shader interlock, a capture in an interlock at the program's start saves the old pixel (vk/predraw.c). On the
-       others with dynamic rendering local read, the renderer draws the draw two times in one pass (render.c
-       predraw_run). Without both, the draw stays in place: a copy of the target before each such draw costs too much
-       (5 ms a frame outdoors on a desktop GPU).
+       In place, a later primitive of the draw can read what an earlier one wrote. On NVIDIA's and AMD's GPUs with
+       fragment shader interlock, a capture in an interlock at the program's start saves the old pixel
+       (vk/predraw.c). On the others with dynamic rendering local read, the renderer draws the draw two times in one
+       pass (render.c predraw_run). Without both, the draw stays in place: a copy of the target before each such draw
+       costs too much (5 ms a frame outdoors on a desktop GPU).
 
        Each feedback draw drawn two times takes one by-region barrier, which a GPU that renders in tiles keeps in its
        tile memory with the save attachment. Measured in one game's room of G-buffer blend draws, GPU busy and
        G-buffer pass a frame:
          RTX 4090:          in place (specks) 8.1 / 2.00 ms, interlock 8.45 / 2.28 ms, two draws 9.2 / 3.23 ms
          AMD's iGPU (26.10.1): in place (specks) 47.5 / 13.1 ms, interlock 59.1 / 27.7 ms, two draws 55.3 / 18.4 ms
-       AMD's interlock waits on more than the fragments that overlap, and costs more there than the barriers */
-    int nvidia = g_vk.props.vendorID == 0x10DE;
-    int interlock = nvidia && g_vk.has_feedback && g_vk.has_fragment_interlock && g_vk.feat.fragmentStoresAndAtomics;
-    g_vk.feedback_mode = interlock             ? VK_FEEDBACK_INTERLOCK
-                         : g_vk.has_local_read ? VK_FEEDBACK_PREDRAW
-                                               : VK_FEEDBACK_IN_PLACE;
+       On that iGPU, with AMD's own driver, the interlock waits on more than the fragments that overlap, and costs
+       more than the barriers. A desktop GPU that waits on its CPU measured the other way: in an open-world game's
+       870 feedback draws of 7100 a frame, the renderer's thread busy and the GPU's queue busy a frame:
+         RX 6700 XT (RADV 26.2): interlock 34.8 / 4.8 ms, two draws 39.6 / 12.2 ms
+       A draw drawn two times is set up three times on the CPU (the draw that finds it, the save draw, the guest's).
+       So AMD's GPUs take the interlock as NVIDIA's do; a device it serves worse gets the two draws back with
+       VK_EXT_fragment_shader_interlock's setting off */
+    const int theirs = g_vk.props.vendorID == 0x10DE || g_vk.props.vendorID == 0x1002;
+    g_vk.feedback_mode = vk_feedback_choice(g_vk.props.vendorID, g_vk.has_feedback, g_vk.has_fragment_interlock,
+                                            g_vk.feat.fragmentStoresAndAtomics, g_vk.has_local_read);
     LOG("vulkan: a draw that samples a target it writes at its own pixel %s (vendor %04x%s, fragment shader interlock "
         "%s, dynamic rendering local read %s)\n",
         g_vk.feedback_mode == VK_FEEDBACK_INTERLOCK ? "reads the pixel as it was before the draw, from a capture in "
                                                       "a fragment interlock"
         : g_vk.feedback_mode == VK_FEEDBACK_PREDRAW ? "is drawn two times, the first saving the target"
                                                     : "reads the target in place",
-        g_vk.props.vendorID, nvidia ? ", NVIDIA: interlock where it has it" : ", not NVIDIA: two draws where it can",
+        g_vk.props.vendorID,
+        g_vk.feedback_mode == VK_FEEDBACK_INTERLOCK ? ", NVIDIA's or AMD's: the interlock"
+        : theirs ? ", NVIDIA's or AMD's without all the interlock's capture needs: two draws where it can"
+                 : ", neither NVIDIA's nor AMD's: two draws where it can",
         g_vk.has_fragment_interlock ? "yes" : "no", g_vk.has_local_read ? "yes" : "no");
     if (g_vk.has_feedback)
         LOG("vulkan: draws sample the color targets they render to in place (attachment feedback loops, %s, %s)\n",
@@ -2646,6 +2649,10 @@ static int hdr_surface(u32 space, VkSurfaceFormatKHR* fmt) {
     return found;
 }
 
+void vk_swapchain_failure(char* out, size_t size, const char* device, const char* driver, VkResult r) {
+    snprintf(out, size, "the swapchain could not be made on %s (%s): %s (%d)", device,
+             driver[0] ? driver : "its driver", snx_vk_result_str(r), (int)r);
+}
 int vk_swapchain_create(int kind) {
     if (g_opt_headless) return 0; /* no WSI calls, even on a resize/recreate path */
     VkSurfaceCapabilitiesKHR caps;
@@ -2764,7 +2771,12 @@ int vk_swapchain_create(int kind) {
     pm_lock(&g_vk.sc_lock); /* until the new swapchain is g_vk's: the old one is retired from here */
     cr = vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &sc);
     if (cr != VK_SUCCESS) { /* tried again on each present while it fails: said a few times */
-        WARN_LIMIT(4, "vulkan: the swapchain could not be made: %s (%d)\n", snx_vk_result_str(cr), (int)cr);
+        char said[sizeof g_vk.start_failure];
+        vk_swapchain_failure(said, sizeof said, g_vk.props.deviceName, g_vk.driver_name, cr);
+        WARN_LIMIT(4, "vulkan: %s\n", said);
+        /* the first one, at the start, is why the run cannot start (renderer_failed) */
+        if (!g_vk.swapchain && !old && !g_vk.start_failure[0])
+            snprintf(g_vk.start_failure, sizeof g_vk.start_failure, "%s", said);
         if (cr == VK_ERROR_SURFACE_LOST_KHR) g_vk.sc_lost = 1;
         if (old) swapchain_retire();
         pm_unlock(&g_vk.sc_lock);
@@ -2894,7 +2906,8 @@ int vk_init(void) {
     if (!create_instance()) return 0;
     backend_vk_check(); /* the instance opened the driver: the one asked for, or the run ends */
     if (!g_opt_headless && !backend_vk_surface(g_vk.instance, &g_vk.surface)) {
-        WARN("vulkan: the window backend could not create a surface\n");
+        snprintf(g_vk.start_failure, sizeof g_vk.start_failure, "the window backend could not create a Vulkan surface");
+        WARN("vulkan: %s\n", g_vk.start_failure);
         return 0;
     }
     if (!create_device()) return start_failed();

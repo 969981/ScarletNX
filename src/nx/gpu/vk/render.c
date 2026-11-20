@@ -37,6 +37,7 @@
 #include "nx/gpu/texture/descriptor.h"
 #include "nx/gpu/vk/draw_texture.h"
 #include "nx/gpu/vk/draw_texture_shader.h"
+#include "nx/gpu/vk/host_program.h"
 #include "nx/gpu/vk/lookup_ways.h"
 #include "nx/gpu/vk/pending_pages.h"
 #include "nx/gpu/vk/tess_passthrough.h"
@@ -1391,6 +1392,19 @@ static void memo_miss_log(u64 presents) {
         LOG("vulkan: draw_state_check=1: %llu textures kept over a target differed from those resolved again\n",
             (unsigned long long)d[MEMO_OVER_DIFFERS]);
 }
+/* fs_key's answers a present (VkDrawCounts.fs) */
+static void fs_count_log(const VkDrawCounts* n, const VkDrawCounts* w, u64 presents) {
+    double d[VK_FS_N];
+    for (int i = 0; i < VK_FS_N; i++) d[i] = (double)(n->fs[i] - w->fs[i]) / (double)presents;
+    LOG("vulkan: fragment keys a present: %.1f the draw before's, made again for %.1f none kept, %.1f another program "
+        "or state, %.1f other pools, %.1f a GPU write, %.1f a "
+        "result added, %.1f a storage image added, %.1f a target taken, %.1f the surface table, %.1f an epoch, %.1f a "
+        "present, %.1f other handles, %.1f a texture not quiet; not kept for %.1f programs with images and %.1f "
+        "textures the memo doesn't keep\n",
+        d[VK_FS_KEPT], d[VK_FS_NONE], d[VK_FS_PROGRAM], d[VK_FS_POOLS], d[VK_FS_GPU], d[VK_FS_RESULTS], d[VK_FS_IMAGES],
+        d[VK_FS_TAKE], d[VK_FS_SURFACES], d[VK_FS_EPOCH], d[VK_FS_PRESENT], d[VK_FS_HANDLES], d[VK_FS_QUIET],
+        d[VK_FS_UNKEPT_IMAGES], d[VK_FS_UNKEPT_TEXTURES]);
+}
 void vk_render_stats_log(void) {
     const VkDrawCounts* n = &g_stats.n;
     const VkDrawCounts* w = &g_stats.was;
@@ -1403,6 +1417,7 @@ void vk_render_stats_log(void) {
     u32 epoch = vk_ww_epoch();
     if (!presents) presents = 1;
     memo_miss_log(presents);
+    fs_count_log(n, w, presents);
     LOG("vulkan: draw states in the last %llu presents: %llu draws, %llu kept an earlier draw's (%llu the last "
         "draw's, %llu one from the table), %llu found one that a later check made again; %llu kept in the table "
         "(%llu putting another out), %llu groups hashed. A present: %.1f submissions (%.1f periodic), %.1f write "
@@ -1452,6 +1467,14 @@ void vk_render_stats_log(void) {
         g_stats.heap_buffer_hits = h.buffer_hits;
         g_stats.heap_image_calls = h.image_driver_calls;
         g_stats.heap_image_hits = h.image_hits;
+    }
+    {
+        double k[4][2], d = (double)(g_vk_drawn - g_stats.drawn);
+        for (int b = 0; b < 4; b++)
+            for (int j = 0; j < 2; j++) k[b][j] = (double)(n->inl[b][j] - w->inl[b][j]) / (double)presents;
+        LOG("vulkan: inline blocks a present (%.1f draws), kept and staged again: bank 0 to its base vertex words %.1f "
+            "and %.1f, bank 0 before them %.1f and %.1f, bank 2 %.1f and %.1f, the root tables %.1f and %.1f\n",
+            d / (double)presents, k[0][0], k[0][1], k[1][0], k[1][1], k[2][0], k[2][1], k[3][0], k[3][1]);
     }
     LOG("vulkan: constant buffers copied from the CPU in the last %llu presents: %.1f KB a present\n",
         (unsigned long long)presents, (double)g_cb_copied_bytes / 1024.0 / (double)presents);
@@ -2023,8 +2046,10 @@ static void rt_int_targets(const DsTargets* tg, u32* rm, u32* rs) {
    of one game's draws read other handle words than the draw before, and a sixth run another program. The key
    holds for most of the rest. Only where each slot's texture is one the memo keeps, not over a target (whose target's
    draws move none of these stamps), and each texture is quiet in this present and epoch, as vk_tex_recheck's quiet
-   check asks (a texture that isn't takes a full check at each lookup). Not while compute results are pending
-   (vk_tex_recheck orders the texture after them) nor with draw_state_check=1 */
+   check asks (a texture that isn't takes a full check at each lookup). A compute result pending over a slot's texture
+   or headers is one added since the key was made, which moves the results added (the stamp tex_resolve keeps a
+   texture by, pending_pages.c's count_add): those made the key land the results over them first. With
+   draw_state_check=1 the key is made again in full and compared (fs_key_check) */
 typedef struct {
     const DsState* ds;
     const VkSh* s0;
@@ -2056,6 +2081,19 @@ static int fs_last_keepable(const TexRes* res, int nt) {
     }
     return 1;
 }
+static void draw_differs(const char* what);
+/* draw_state_check=1: the last draw's key, which this draw would have kept, against the one made again in full: the
+   same variant and, slot by slot, the same headers and texture, or the difference is counted and warned of */
+static void fs_key_check(const FsLast* kept, const TexRes* res, int nt, const FsKey* fk) {
+    const FsKey* k = &kept->fk;
+    int same = k->tm == fk->tm && k->ts == fk->ts && k->dm == fk->dm && k->rect == fk->rect && k->rm == fk->rm &&
+               k->rs == fk->rs && k->df == fk->df && k->unfed == fk->unfed && k->minmax == fk->minmax &&
+               k->queried == fk->queried && !memcmp(k->query, fk->query, sizeof k->query);
+    for (int i = 0; i < nt && same; i++)
+        same = kept->res[i].t == res[i].t && !memcmp(kept->res[i].tic, res[i].tic, sizeof res[i].tic) &&
+               !memcmp(kept->res[i].tsc, res[i].tsc, sizeof res[i].tsc);
+    if (!same) draw_differs("fragment key or texture kept from the draw before");
+}
 /* resolves the textures of s0, the fragment program, into res (SH_MAXTEX entries, for stage_set), and fills fk with
    the variant they and the targets (rt_int, rt_sint) key. last_out: the generic outputs the stage before rasterization
    writes */
@@ -2071,15 +2109,29 @@ static void fs_key(const DsState* ds, const VkSh* s0, TexRes* res, u32 last_out,
               adds = atomic_load_explicit(&g_pend_any.adds, memory_order_relaxed) + vk_uma_writes(),
               img_adds = vk_gfx_image_adds(), take = vk_rt_take_gen();
     const u32 surf_epoch = atomic_load_explicit(&g_vk_surf_epoch, memory_order_relaxed), ww_epoch = vk_ww_epoch();
-    if (g_fs_last.valid && !atomic_load_explicit(&g_cs_any, memory_order_relaxed) && !g_settings.draw_state_check &&
-        g_fs_last.ds == ds && g_fs_last.s0 == s0 && g_fs_last.nt == nt && g_fs_last.last_out == last_out &&
-        g_fs_last.rt_int == rt_int && g_fs_last.rt_sint == rt_sint && g_fs_last.tex_pool == b->tex_pool &&
-        g_fs_last.smp_pool == b->smp_pool && g_fs_last.tex_max == b->tex_max && g_fs_last.smp_max == b->smp_max &&
-        g_fs_last.smp_mode == b->smp_mode && g_fs_last.tex_bank == b->tex_bank && g_fs_last.gw == gw &&
-        g_fs_last.adds == adds && g_fs_last.img_adds == img_adds && g_fs_last.take == take &&
-        g_fs_last.surf_epoch == surf_epoch && g_fs_last.ww_epoch == ww_epoch && g_fs_last.present == g_vk_present &&
-        !memcmp(g_fs_last.handles, handles, (size_t)nt * sizeof *handles) &&
-        fs_last_holds(g_fs_last.res, nt, ww_epoch)) {
+    const int why = !g_fs_last.valid ? VK_FS_NONE
+                    : g_fs_last.ds != ds || g_fs_last.s0 != s0 || g_fs_last.nt != nt ||
+                            g_fs_last.last_out != last_out || g_fs_last.rt_int != rt_int || g_fs_last.rt_sint != rt_sint
+                        ? VK_FS_PROGRAM
+                    : g_fs_last.tex_pool != b->tex_pool || g_fs_last.smp_pool != b->smp_pool ||
+                            g_fs_last.tex_max != b->tex_max || g_fs_last.smp_max != b->smp_max ||
+                            g_fs_last.smp_mode != b->smp_mode || g_fs_last.tex_bank != b->tex_bank
+                        ? VK_FS_POOLS
+                    : g_fs_last.gw != gw                                               ? VK_FS_GPU
+                    : g_fs_last.adds != adds                                           ? VK_FS_RESULTS
+                    : g_fs_last.img_adds != img_adds                                   ? VK_FS_IMAGES
+                    : g_fs_last.take != take                                           ? VK_FS_TAKE
+                    : g_fs_last.surf_epoch != surf_epoch                               ? VK_FS_SURFACES
+                    : g_fs_last.ww_epoch != ww_epoch                                   ? VK_FS_EPOCH
+                    : g_fs_last.present != g_vk_present                                ? VK_FS_PRESENT
+                    : memcmp(g_fs_last.handles, handles, (size_t)nt * sizeof *handles) ? VK_FS_HANDLES
+                    : !fs_last_holds(g_fs_last.res, nt, ww_epoch)                      ? VK_FS_QUIET
+                                                                                       : VK_FS_KEPT;
+    g_stats.n.fs[why]++;
+    const int check = why == VK_FS_KEPT && g_settings.draw_state_check;
+    FsLast kept;
+    if (check) kept = g_fs_last;
+    if (why == VK_FS_KEPT && !check) {
         for (int i = 0; i < nt; i++) {
             res[i] = g_fs_last.res[i];
             /* a target read whole is noted read on each draw, as tex_resolve's hit does. Not a crop of one (a copy
@@ -2146,9 +2198,13 @@ static void fs_key(const DsState* ds, const VkSh* s0, TexRes* res, u32 last_out,
     u32 signed_images;
     fk->rm |= image_variant(ds, 4, s0, &signed_images) << 8;
     fk->rs |= signed_images << 8;
-    g_fs_last = (FsLast){0};
+    if (check) fs_key_check(&kept, res, nt, fk);
+    g_fs_last.valid = 0; /* all a reader asks before the rest, which the next key kept writes whole */
     /* image_variant reads the image bindings, which the key doesn't hold: a program with images is keyed each draw */
-    if (s0->si.nimg || !fs_last_keepable(res, nt)) return;
+    if (s0->si.nimg || !fs_last_keepable(res, nt)) {
+        g_stats.n.fs[s0->si.nimg ? VK_FS_UNKEPT_IMAGES : VK_FS_UNKEPT_TEXTURES]++;
+        return;
+    }
     g_fs_last.ds = ds;
     g_fs_last.s0 = s0;
     g_fs_last.nt = nt;
@@ -2412,7 +2468,6 @@ VkSampler vk_tex_bind_sampler(const u32* tsc, const u32* tic, const ShTex* st, i
     return vk_sampler(tc, raise, num != 0);
 }
 
-static void draw_differs(const char* what);
 /* the way of g_tex_memo that x's headers were kept in, while it still keeps them: NULL for none */
 static TexMemo* tex_memo_of(const TexRes* x) {
     if (!x->memo || x->memo > TEX_MEMO_WAYS << TEX_MEMO_SET_BITS) return NULL;
@@ -2579,22 +2634,28 @@ static int cb_kept(const CbEntry* e, u64 a, u32 sz, int adds, u32 epoch) {
     return a && e->a == a && e->epoch == epoch && e->sz >= sz && (!adds || e->adds == cb_adds()) &&
            !gpu_mem_dirty_since(e->gw, a, sz) && cb_lives(e);
 }
+/* VkDrawCounts.inl's row of a lookup of sz bytes of the inline block in */
+static int inline_kind(DsCbBlock in, u32 sz) {
+    return in.size != DS_INLINE_BANK0 ? 2 : sz > SH_CB0_BASE_VERTEX ? 0 : 1;
+}
 /* the first sz bytes of the root tables an Ounce program reads (DsInline.root), staged once while their generation
-   holds: every graphics stage reads the same tables */
+   holds (DsState.root_gen): every graphics stage reads the same tables */
 static int root_get(const DsState* ds, u32 sz, VkBuffer* buf, u64* off) {
     CbEntry* e = &g_cb.root;
-    if (e->in == ds->inl.root && e->gen == ds->gen[DS_INLINE] && e->sz >= sz && cb_lives(e)) {
+    if (e->in == ds->inl.root && e->gen == ds->root_gen && e->sz >= sz && cb_lives(e)) {
         *buf = e->buf;
         *off = e->off;
+        g_stats.n.inl[3][0]++;
         if (g_settings.draw_state_check) cb_check(e, 0, ds->inl.root, e->sz);
         return 1;
     }
     u8* p = vk_stage(sz, vk_stage_align(), buf, off);
     if (!p) return 0;
     memcpy(p, ds->inl.root, sz);
-    *e = (CbEntry){.sz = sz, .buf = *buf, .off = *off, .in = ds->inl.root, .gen = ds->gen[DS_INLINE]};
+    *e = (CbEntry){.sz = sz, .buf = *buf, .off = *off, .in = ds->inl.root, .gen = ds->root_gen};
     cb_life(e, CB_FRAME);
     cb_check_note(e, 0, ds->inl.root, sz, 0);
+    g_stats.n.inl[3][1]++;
     return 1;
 }
 /* constant buffer i of a stage, at an offset that is a multiple of align: 16 for a bank bound through a window
@@ -2604,11 +2665,14 @@ static int cb_get(const DsState* ds, int stage, int i, u32 sz, u64 align, VkBuff
     int check = g_settings.draw_state_check != 0;
     DsCbBlock in = ds_cb_inline(ds, stage, (u32)i);
     if (in.bytes) {
+        /* staged again only when this block changed (DsState.inl_gen), not when another inline block did */
+        const u64 gen = ds_cb_inline_gen(ds, stage, (u32)i);
         CbEntry* e = &g_cb.slot[stage][i];
-        if (e->in == in.bytes && e->gen == ds->gen[DS_INLINE] && e->sz >= sz && cb_lives(e)) {
+        if (e->in == in.bytes && e->gen == gen && e->sz >= sz && cb_lives(e)) {
             *buf = e->buf;
             *off = e->off;
             g_stats.n.cb[VK_CB_INLINE_KEPT]++;
+            g_stats.n.inl[inline_kind(in, sz)][0]++;
             if (check) cb_check(e, 0, in.bytes, e->sz < in.size ? e->sz : in.size);
             return 1;
         }
@@ -2617,10 +2681,11 @@ static int cb_get(const DsState* ds, int stage, int i, u32 sz, u64 align, VkBuff
         u32 n = sz < in.size ? sz : in.size;
         memcpy(p, in.bytes, n);
         memset(p + n, 0, sz - n); /* past the block: zeros, as an unbound buffer reads */
-        *e = (CbEntry){.in = in.bytes, .gen = ds->gen[DS_INLINE], .sz = sz, .buf = *buf, .off = *off};
+        *e = (CbEntry){.in = in.bytes, .gen = gen, .sz = sz, .buf = *buf, .off = *off};
         cb_life(e, CB_FRAME);
         cb_check_note(e, 0, in.bytes, n, 0);
         g_stats.n.cb[VK_CB_INLINE_STAGED]++;
+        g_stats.n.inl[inline_kind(in, sz)][1]++;
         return 1;
     }
     u64 a = ds->bind.cb_addr[stage][i];
@@ -3214,7 +3279,10 @@ static void table_ssbo_windows(const DsState* ds, const VkSh* sh, int stage, u32
 /* the global memory each stage of the draw reads or writes, sh[] by stage (vertex, the tessellation stages, geometry,
    fragment) */
 static void draw_storage_read(const DsState* ds, VkDrawStorage* draw, VkSh* const sh[VK_DRAW_STAGES]) {
-    memset(draw, 0, sizeof *draw);
+    /* the counts, the maps and the fetch records here, each buffer as its stage counts it below: the buffers past a
+       stage's count are never read. With draw_state_check=1 they hold a pattern, so a reader past a count shows */
+    if (g_settings.draw_state_check) memset(draw, 0xA5, sizeof *draw);
+    memset(draw, 0, offsetof(VkDrawStorage, b));
     for (int s = 0; s < VK_DRAW_STAGES; s++) {
         if (!sh[s]) continue;
         int stage = s;
@@ -3226,6 +3294,7 @@ static void draw_storage_read(const DsState* ds, VkDrawStorage* draw, VkSh* cons
         u32 tw_len[SH_GBUF_TABLE_MAX];
         for (int i = 0; i < draw->n[s]; i++) {
             VkDrawGbuf* b = &draw->b[s][i];
+            *b = (VkDrawGbuf){0};
             u32 v[3] = {0, 0, 0}, desc = sh[s]->si.gbuf_cbuf_off[i];
             b->writable = (sh[s]->si.gbuf_wmask >> i) & 1;
             if (SH_GBUF_TABLE_SSBO(desc)) { /* a window of a pointer table in memory, its base in SNX_VKB_MBASE */
@@ -4648,11 +4717,38 @@ static int mesh_shaders(const DsState* ds, DrawShaders* o) {
     rt_int_targets(&ds->tgt, &o->rt_int, &o->rt_sint);
     return 1;
 }
+/* the shaders of a draw of host programs (DS_HOST_PROGRAM): the vertex and fragment modules as they were given,
+   nothing between them and no variant of either, which their GLSL decided. 0 when the draw is skipped (said once) */
+static int host_shaders(const DsState* ds, u32 topology, DrawShaders* o) {
+    const DsPrograms* p = &ds->prog;
+    int fs_on = p->on >> 5 & 1;
+    *o = (DrawShaders){.topology = topology,
+                       .window_xy = !ds->vp.transform_on,
+                       .attr_int = ds->vfmt.is_int,
+                       .attr_sint = ds->vfmt.is_sint};
+    if ((p->on & 0x1d) || p->xfb_on || vk_viewport_swizzle_key(&ds->vp)) {
+        LOG_LIMIT(4,
+                  "vulkan: a draw of host programs with program slots %#x on, capture %u and a viewport swizzle "
+                  "(%#x) skipped: host programs take a vertex and a fragment stage, nothing more\n",
+                  (unsigned)p->on, (unsigned)p->xfb_on, (unsigned)vk_viewport_swizzle_key(&ds->vp));
+        return 0;
+    }
+    o->vs = vk_host_shader(p->code[1], ST_VS);
+    o->fs0 = fs_on ? vk_host_shader(p->code[5], ST_FS) : NULL;
+    if (!o->vs || (fs_on && !o->fs0)) {
+        LOG_LIMIT(4, "vulkan: a draw skipped: its programs %llx and %llx aren't host programs the renderer was given\n",
+                  (unsigned long long)p->code[1], (unsigned long long)p->code[5]);
+        return 0;
+    }
+    rt_int_targets(&ds->tgt, &o->rt_int, &o->rt_sint);
+    return 1;
+}
 /* the shaders of the programs, the vertex format and the targets of ds for a draw of topology: 0 when the draw is
    skipped */
 static int draw_shaders(const DsState* ds, u32 topology, int mesh, DrawShaders* o) {
     const DsPrograms* p = &ds->prog;
     if (mesh) return mesh_shaders(ds, o);
+    if (vk_host_programs(p)) return host_shaders(ds, topology, o);
     o->mesh = 0;
     o->prim = 0;
     const DsVertexFormat* vf = &ds->vfmt;
@@ -4780,7 +4876,9 @@ static int draw_shaders(const DsState* ds, u32 topology, int mesh, DrawShaders* 
    draw takes the position pass, and so does a quad draw the device can do no better for */
 static u32 draw_varying(const DsState* ds, const DrawShaders* sh, int per_vertex) {
     const VkSh *vs = sh->vs, *fs = sh->fs0;
-    if (g_vk.driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY || sh->mesh || sh->tcs || sh->tes || sh->gs || !fs) return 0;
+    if (g_vk.driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY || sh->mesh || sh->tcs || sh->tes || sh->gs || !fs ||
+        vk_host_programs(&ds->prog)) /* a host program interpolates as its GLSL asks, as the device does */
+        return 0;
     if (vs->si.writes_viewport || sh->window_xy || sh->swizzle || sh->topology < 4 || sh->topology > 9 ||
         ds->rkey.polygon != DS_POLYGON_FILL)
         return 0;
@@ -6109,9 +6207,10 @@ retry:
         if (kept && memcmp(&fk, &ke->fkey, sizeof fk)) kept = 0;
         if (kept) fs = ke->fs;
         if (!kept || check) {
-            VkSh* made = texture ? vk_draw_texture_fragment((u32)fk.tm, (u32)fk.ts, fk.rm, fk.rs,
-                                                            fk.advanced_blend, fk.advanced_mask)
-                                 : fs_variant(ds, ds->prog.code[5], sh.fs0, &fk);
+            VkSh* made = texture ? vk_draw_texture_fragment((u32)fk.tm, (u32)fk.ts, fk.rm, fk.rs, fk.advanced_blend,
+                                                            fk.advanced_mask)
+                         : vk_host_programs(&ds->prog) ? sh.fs0 /* its GLSL decided what it does */
+                                                       : fs_variant(ds, ds->prog.code[5], sh.fs0, &fk);
             if (kept && made != fs) {
                 draw_differs("fragment shader");
                 kept = 0;
@@ -6481,7 +6580,9 @@ retry:
     int zt_ro = 0;
     u32 fb = 0;
     u64 scaled[2] = {0};
-    DrawImages images = {0};
+    DrawImages images; /* read below its count alone (a pattern past it with draw_state_check=1, as the storage) */
+    if (g_settings.draw_state_check) memset(&images, 0xA5, sizeof images);
+    images.n = images.sampled_general = 0;
     for (u32 i = 0; i < VK_DRAW_STAGES; i++)
         if (staged[i] && staged[i]->si.nimg) images.sampled_general = 1;
     /* transform feedback without the extension: the buffers the vertex program stores into */

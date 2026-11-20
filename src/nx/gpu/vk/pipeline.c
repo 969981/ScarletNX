@@ -959,6 +959,8 @@ void vk_pipeline_init(void) {
         g_vk_ftz = SH_FTZ_EMULATE;
         WARN("vulkan: FP32 denormal flush mode unavailable; graphics shaders use per-instruction FTZ fallback\n");
     }
+    /* the way of HMMA, which the pipeline file's key holds, settled before the reading thread translates any */
+    vk_hmma_pick(g_pipeline.cache_dir, g_pipeline.driver_tag);
     pf_start_load();
 }
 
@@ -2018,6 +2020,17 @@ static void pipe_note(const char* what, u64 h, const VkShaderModule modules[5], 
     stages_text(modules, stages, sizeof stages);
     vk_pipe_key_text(k, state, sizeof state);
     plat_thread_note("%s %016llx%s; %s", what, (unsigned long long)h, stages, state);
+}
+void vk_so_note(VkShaderModule mod, VkShaderStageFlagBits stage) {
+    VkShaderModule modules[5] = {0};
+    char stages[320];
+    modules[stage == VK_SHADER_STAGE_VERTEX_BIT                    ? 0
+            : stage == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT    ? 1
+            : stage == VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT ? 2
+            : stage == VK_SHADER_STAGE_GEOMETRY_BIT                ? 3
+                                                                   : 4] = mod;
+    stages_text(modules, stages, sizeof stages);
+    plat_thread_note("making a shader object%s", stages);
 }
 static void slow_say(const char* what, const VkShaderModule modules[5], u64 ns, int hit) {
     char stages[320];

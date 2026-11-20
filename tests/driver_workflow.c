@@ -8,6 +8,7 @@
 #include "nx/runtime/driver/driver.h"
 #include "nx/runtime/driver/extract.h"
 #include "nx/runtime/driver/game_name.h"
+#include "nx/runtime/driver/pack.h"
 #include "nx/runtime/driver/recompile.h"
 #include "snx_settings.h"
 #include <signal.h>
@@ -276,6 +277,20 @@ int snx_dump_modules_of_dump(const char* dump, const SnxPaths* paths, const char
     dumped_into = snx_strdup(outdir);
     dumped_repo = paths->repo ? snx_strdup(paths->repo) : NULL;
     return strstr(dump, "unreadable") ? -1 : 0; /* a dump it cannot read: -1, said */
+}
+/* pack.c's --pack: its arguments after --pack, and the data folder it finds the keys in */
+static char *packed_args, *packed_repo;
+int snx_pack(int argc, char** argv, const SnxPaths* paths) {
+    free(packed_args);
+    free(packed_repo);
+    packed_args = snx_strdup("");
+    for (int i = 0; i < argc; ++i) {
+        char* more = snx_format("%s%s%s", packed_args, i ? "|" : "", argv[i]);
+        free(packed_args);
+        packed_args = more;
+    }
+    packed_repo = paths && paths->repo ? snx_strdup(paths->repo) : NULL;
+    return strstr(packed_args, "fails") ? 1 : 0;
 }
 /* recompile.c's: a setting of the recompile, from the generated tables */
 const IniOpt* snx_recompile_setting(const char* key) {
@@ -771,8 +786,23 @@ static void write_extracted(const char* folder) {
     free(romfs);
 }
 #endif
+/* what a removal left, a path a line: on Windows, a file some process still holds open */
+static void say_left(const char* path) {
+    char** names;
+    size_t n;
+    fprintf(stderr, "driver_workflow: %s is still there\n", path);
+    if (!snx_is_dir(path) || snx_is_link(path) || snx_list_dir(path, &names, &n)) return;
+    for (size_t i = 0; i < n; ++i) {
+        char* p = snx_path_join(path, names[i]);
+        say_left(p);
+        free(p);
+    }
+    snx_free_strings(names, n);
+}
 static void reset(const char* repo, const char* dump) {
-    CHECK(!snx_remove_tree(repo));
+    int left = snx_remove_tree(repo);
+    if (left) say_left(repo);
+    CHECK(!left);
     CHECK(!snx_mkdirs(repo));
     CHECK(!snx_write_file(dump, "synthetic", 9));
     set_env("SNX_WORKFLOW_FAIL", "");
@@ -925,6 +955,20 @@ int main(int argc, char** argv) {
         free(given);
         puts("PASS --dump-modules reads an XCI or NSP in place with the data folder's keys or --data's, an extracted "
              "program through the loader, and refuses what it does not take");
+    }
+    { /* --pack: its arguments go to pack.c as given, --data among them, with the data folder a run uses for the keys;
+         its status is the run's */
+        char program[] = "scarletnx", flag[] = "--pack", folder[] = "Game NCAs", xci[] = "--xci", data[] = "--data";
+        char dir[] = "some data", fails[] = "fails";
+        char* args[] = {program, flag, folder, xci, data, dir, NULL};
+        char* failing[] = {program, flag, fails, NULL};
+        CHECK(snx_driver(6, args) == 0 && packed_args && !strcmp(packed_args, "Game NCAs|--xci|--data|some data"));
+        CHECK(packed_repo && packed_repo[0]);
+        CHECK(snx_driver(3, failing) == 1 && !strcmp(packed_args, "fails"));
+        free(packed_args);
+        free(packed_repo);
+        packed_args = packed_repo = NULL;
+        puts("PASS --pack hands its arguments to pack.c with the data folder's keys, its status the run's");
     }
     keys = snx_path_join(root, "provided prod.keys");
     title_keys = snx_path_join(root, "provided title.keys");

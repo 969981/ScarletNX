@@ -228,6 +228,9 @@ typedef struct {
        sizes and compute among requiredSubgroupSizeStages): those of the programs that use other lanes' values do
        (compute.c's cs_make) */
     int has_cs_warp32;
+    /* the way an SM86 HMMA takes off the matrix unit by the device's rules (shader_hmma_rule), which hmma_mode's Auto
+       keeps where its bench cannot run (hmma_pick.c) */
+    int hmma_rule;
     VkShaderStageFlags mesh_stages;
     u32 mesh_groups_max; /* the most workgroups a mesh draw launches: maxTaskWorkGroupCount[0], with maxMesh...'s */
     /* maxMeshOutputMemorySize and the granules that sm86_mesh_output_bytes counts vertices and primitives in */
@@ -321,6 +324,8 @@ typedef enum { VK_CLOCK_NONE, VK_CLOCK_WAIT, VK_CLOCK_WAIT2, VK_CLOCK_GOOGLE } V
 int vk_init(void);
 /* why vk_init found no device it runs on, with each device's Vulkan version; "" when it did not say */
 const char* vk_start_failure(void);
+/* why a swapchain could not be made, into out: the device, its driver ("" for its driver) and r with its number */
+void vk_swapchain_failure(char* out, size_t size, const char* device, const char* driver, VkResult r);
 /* how many of the extensions a Vulkan 1.2 device runs the renderer with (1.3's, device.c) e lacks, their names in out
    (size bytes, may be 0) comma separated */
 u32 vk_1_2_missing(const SnxVkExtensions* e, char* out, size_t size);
@@ -1274,9 +1279,16 @@ typedef struct Surf {
     /* textures: an image with sparse residency, memory bound only for the levels that guest memory maps
        (gpu/vk/texture.c tex_bind). mem is VK_NULL_HANDLE, and bytes counts the memory bound now */
     u8 sparse;
-    /* textures: its image is in system memory (texture.c vk_tex_demote), bytes 0 while it is: sys_bytes its size */
+    /* its image is in system memory (texture.c vk_tex_demote, a render target's surface.c rt_demote), bytes 0 while it
+       is: sys_bytes its size */
     u8 demoted;
     u64 sys_bytes;
+    /* render targets the caches would have let go with pixels memory lacks, kept (surface.c rt_aside): the guest's
+       memory as of then, its write-tracking clock (aside_wseen, 0 without tracking: aside_hash its bytes' hash), so
+       that its next use loads memory again where the guest wrote it since, as a target made after an eviction would */
+    u8 aside;
+    u32 aside_wseen;
+    u64 aside_hash;
     /* textures sparse for their levels (shed): its finest levels in system memory, the GPU's own having no room
        (vk_tex_coarser with texture_sysmem) */
     u8 sys_levels;
@@ -1572,6 +1584,20 @@ void vk_tex_sysmem_stats(u64* out, u64* back, u64* bytes);
 u64 vk_mirror_system(void); /* mirror.c: its granules that took system memory so far */
 /* surface.c: once a present, the demoted textures the last presents used moved back while the GPU's memory has room */
 void vk_tex_promote_frame(void);
+/* surface.c: render targets whose pixels exist only on the GPU, moved into system memory where the caches would let
+   them go (rt_demote). Once a present, those used lately go back while the GPU's memory has room, and the oldest go
+   while the system heap they went to is short */
+void vk_rt_sys_frame(void);
+typedef struct {
+    u64 out, back; /* moved there and back so far */
+    u64 n, bytes;  /* there now, and their bytes */
+    /* targets that went with pixels memory lacks so far: none could move, or the system heap was short */
+    u64 lost, lost_bytes;
+    /* targets kept so far where the caches would have let them go, and those of them loaded again at their next use,
+       as the guest had written their memory meanwhile */
+    u64 kept, reloads;
+} VkRtSysStats;
+void vk_rt_sys_stats(VkRtSysStats* st);
 /* surface.c: once a present, shed textures used lately a level finer while the heap has room */
 void vk_tex_refine_frame(void);
 /* texture.c: the shed textures made, their bytes as made whole, and the levels shed and taken back so far */
@@ -2295,7 +2321,8 @@ int vk_pages_move_end(void* owner, DevMem a, DevMem to);
 int vk_buf_move(VkCommandBuffer cb, u32 i, DevMem from, u64* bytes);
 /* surface.c: render target s's image made again in a run of another block and copied there on cb, with its attachment
    view, in the layout it had; the old image and its views go when the frames in flight are done. 1 with *bytes, 0
-   when no run held it, -1 when it cannot move now (a storage result of it still lands) */
+   when no run held it, -1 when it cannot move now (a storage result of it still lands, or its image is in system
+   memory, which no block being emptied holds) */
 int vk_rt_move(VkCommandBuffer cb, Surf* s, u64* bytes);
 /* the encoder's blocks a frame: 3.3 ms of an RX 6700 XT, which encodes 10 million a second (docs/layers/gpu/astc.md), a tenth of
    a frame at 30 fps */
@@ -2469,7 +2496,6 @@ typedef struct {
    stages, geometry, fragment (ST_VS to ST_FS), then an Ounce's task and mesh stages (DS_TASK, DS_MESH) */
 #define VK_DRAW_STAGES DS_GFX_STAGES
 typedef struct {
-    VkDrawGbuf b[VK_DRAW_STAGES][16];
     int n[VK_DRAW_STAGES];
     VkBuffer map_buf[VK_DRAW_STAGES];
     u64 map_off[VK_DRAW_STAGES], map_size[VK_DRAW_STAGES];
@@ -2478,6 +2504,9 @@ typedef struct {
        the draw's vertex streams */
     u32 attr[32][4];
     u32 divisor[32];
+    /* last: a draw clears what is above and the n[stage] buffers each stage has (render.c's draw_storage_read), not
+       the 5 KiB of all of them. Nothing reads a stage's buffers past its count */
+    VkDrawGbuf b[VK_DRAW_STAGES][16];
 } VkDrawStorage;
 /* whether any stage of the draw reads or writes global memory */
 static inline int vk_draw_storage_any(const VkDrawStorage* draw) {
@@ -2770,6 +2799,10 @@ void vk_cb_fold_switch(int on);
 /* ftz_probe.c: 1 when the device flushes FP32 subnormals in FADD, FMUL and FFMA as the console's FTZ does, in a module
    that declares no denormal mode (it runs a compute shader and waits for it: at the renderer's start only) */
 int vk_ftz_native(void);
+/* hmma_pick.c: the way an SM86 compute program's HMMA takes off the matrix unit, by hmma_mode: Auto's from the file
+   the HMMA bench keeps in cache_dir for the driver (driver_tag), or from the bench, which it runs and waits for where
+   the file is not this driver's (at the renderer's start only, before any translation) */
+void vk_hmma_pick(const char* cache_dir, const char* driver_tag);
 extern VkShaderStageFlags g_vk_subgroup_stages;
 /* by set, shader_vk_set(stage): [0] without the indexed texture arrays, [1] with them. A set holding 512 array
    descriptors cost the driver twice the time to bind (one game's 6,700 draws a frame), so only an indexed shader's has
@@ -3160,6 +3193,26 @@ extern u64 g_vk_draw_kept, g_vk_draw_checked;
 enum { VK_CB_INLINE_KEPT, VK_CB_INLINE_STAGED, VK_CB_KEPT, VK_CB_KEPT_CHECKED, VK_CB_COPIED, VK_CB_CACHE, VK_CB_PENDING,
        VK_CB_PAST_SUBMIT, VK_CB_N };
 enum { VK_TEX_KEPT, VK_TEX_RESOLVED, VK_TEX_PAST, VK_TEX_VIEW_KEPT, VK_TEX_SAMPLER_KEPT, VK_TEX_N };
+/* A draw's fragment key (render.c's fs_key): the draw before's, or made again for the first of these that held it
+   back, in the order fs_key asks them; then the keys made again that weren't kept for the next draw, and why */
+enum {
+    VK_FS_KEPT,
+    VK_FS_NONE,    /* the draw before kept none */
+    VK_FS_PROGRAM, /* another draw state or program, its slots, the outputs before it or the targets' integer outputs */
+    VK_FS_POOLS,   /* the pools, their limits, the sampler mode or the texture bank */
+    VK_FS_GPU,     /* a GPU-side write */
+    VK_FS_RESULTS, /* a result added, or a write in place */
+    VK_FS_IMAGES,  /* a storage image added */
+    VK_FS_TAKE,    /* a target taken */
+    VK_FS_SURFACES,        /* the surface table */
+    VK_FS_EPOCH,           /* a write tracking epoch */
+    VK_FS_PRESENT,         /* a present */
+    VK_FS_HANDLES,         /* other handle words */
+    VK_FS_QUIET,           /* a slot's target undefined, or its texture not quiet now */
+    VK_FS_UNKEPT_IMAGES,   /* not kept: the program has images, which image_variant reads each draw */
+    VK_FS_UNKEPT_TEXTURES, /* not kept: a slot's texture isn't one the texture memo keeps, or is over a target */
+    VK_FS_N
+};
 typedef struct {
     u64 lookups; /* draws that looked for a kept state */
     u64 last;    /* of them, those that took the last draw's */
@@ -3171,7 +3224,10 @@ typedef struct {
     u64 differs; /* the differences draw_state_check=1 found */
     u64 epochs;  /* write tracking epochs with draws */
     u64 sets_last; /* descriptor sets a stage took again from its last one, with no hash or lookup */
-    u64 cb[VK_CB_N], tex[VK_TEX_N];
+    u64 cb[VK_CB_N], tex[VK_TEX_N], fs[VK_FS_N];
+    u64 inl[4][2]; /* the inline blocks' lookups (render.c's cb_get, root_get), each kept or staged again: bank 0 copies
+                      that reach its base vertex and base instance words (SH_CB0_BASE_VERTEX), bank 0 copies that end
+                      before them, bank 2, the root tables */
 } VkDrawCounts;
 void vk_draw_counts(VkDrawCounts* c);
 void vk_render_stats_log(void); /* the counts of the last 600 presents in the log (each 600 presents) */
@@ -3183,6 +3239,44 @@ extern u64 g_vk_targets_kept;
    through a copy instead (gpu/vk/render.c); the times a target's pixels were copied into a copy of it, for those draws
    and for textures that read a target as another size or format (gpu/vk/texture.c) */
 extern u64 g_vk_fb_draws, g_vk_fb_barriers, g_vk_fb_restarts, g_vk_rt_copies, g_vk_rt_copy_writes;
+/* Why a render target's pixels were copied into another image: a texture reads its bytes as another color format of
+   the same texel size, a corner of it, or both (texture.c rt_crop); a draw samples the target it renders to where no
+   feedback loop takes it (vk_rt_snapshot); a program that counts texels reads a scaled target at the guest's size
+   (rt_guest); a target taking an address starts from the pixels of the one in another format that it parks there
+   (surface.c rt_take_pixels). Which of them a view of the target could replace, and what each costs a frame in copies
+   and in rendering passes ended, decides whether targets take other formats' views */
+enum {
+    VK_RT_COPY_FORMAT,
+    VK_RT_COPY_CROP,
+    VK_RT_COPY_FORMAT_CROP,
+    VK_RT_COPY_FEEDBACK,
+    VK_RT_COPY_GUEST,
+    VK_RT_COPY_TAKE,
+    VK_RT_COPY_N
+};
+#define VK_RT_COPY_PAIRS 8
+typedef struct {
+    u64 written[VK_RT_COPY_N]; /* copies whose pixels were copied (a copy reused as it is counts nothing) */
+    u64 ended[VK_RT_COPY_N];   /* of those, the ones whose barriers ended a rendering pass with work in it */
+    u64 bytes[VK_RT_COPY_N];   /* their texels' bytes, every sample and layer */
+    /* copies made after another with no draw or dispatch recorded between them (one draw's textures), and of those the
+       ones that ended a pass: one pass ended for several copies is already the case where this is 0 */
+    u64 again, again_ended;
+    u64 presents;         /* presents counted in (vk_tex_frame) */
+    u64 most, most_ended; /* the most copies, and passes they ended, of one present */
+    /* the formats the copies that read another one went between (from the target's, to the copy's), the first
+       VK_RT_COPY_PAIRS seen with their counts, and the copies of the pairs past them */
+    struct {
+        u32 from, to; /* VkFormat */
+        u64 n;
+    } pair[VK_RT_COPY_PAIRS];
+    u64 pairs_past;
+} VkRtCopyCounts;
+/* a copy for why (VK_RT_COPY_*) written: ended, its barriers ended a pass with work in it (vk_render_begun before them
+   and not after); bytes its texels'; from and to the formats it went between */
+void vk_rt_copy_count(int why, int ended, u64 bytes, VkFormat from, VkFormat to);
+void vk_rt_copy_counts(VkRtCopyCounts* out); /* since the last stats line */
+void vk_rt_copy_log(void);                   /* a stats line of them, a present, then counted again from 0 */
 /* statistics: the guest's full barriers not recorded, as no command came after the one before them in the submission
    (renderer.c vkr_method_barrier) */
 extern u64 g_vk_barriers_merged;
@@ -3194,6 +3288,12 @@ extern u64 g_vk_barriers_in_pass;
 #define VK_FEEDBACK_IN_PLACE  0
 #define VK_FEEDBACK_PREDRAW   1
 #define VK_FEEDBACK_INTERLOCK 2
+/* The mode a device takes: the capture on NVIDIA's and AMD's GPUs (vendor) that have the fragment interlock with
+   attachment feedback loops and fragment stores, the two draws on the others with dynamic rendering local read */
+static inline int vk_feedback_choice(u32 vendor, int feedback, int interlock, int stores, int local_read) {
+    const int capture = (vendor == 0x10DE || vendor == 0x1002) && feedback && interlock && stores;
+    return capture ? VK_FEEDBACK_INTERLOCK : local_read ? VK_FEEDBACK_PREDRAW : VK_FEEDBACK_IN_PLACE;
+}
 extern u64 g_vk_predraws;        /* feedback draws drawn two times (render.c predraw_run) */
 extern u64 g_vk_predraw_refused; /* and those that stayed in place, which the log says why of */
 void vk_predraw_report(void);   /* logs the counts of each reason (render.c) */

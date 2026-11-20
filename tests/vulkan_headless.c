@@ -7,7 +7,12 @@
 #include "nx/runtime/cli.h"
 #include "nx/runtime/ini.h"
 #include "nx/runtime/options.h"
+#include "common/gpu/gl/gl_program.h"
+#include "common/gpu/gl/gl_state.h"
+#include "glslc/glslc.h"
+#include "nx/gpu/gl/gl_host_program.h"
 #include "nx/gpu/maxwell/draw_state.h"
+#include "nx/gpu/vk/host_program.h"
 #include "nx/gpu/guest_textures.h"
 #include "nx/gpu/renderer.h"
 #include "common/gpu/vk/vk_common.h"
@@ -5315,10 +5320,49 @@ static int check_resident_texture_in_flight(void) {
     g_settings.astc_mode = had;
     return failed;
 }
+/* copies of the CPU's bytes one after another with no draw between them (a game's load through the GL layer, 256 MiB
+   in copies of 512 KiB) under a 64 MiB budget: their staging comes free as the submissions that read it end, so the
+   rings stay far below what the copies took in all; the last copy's bytes land */
+static int check_snapshot_uploads(void) {
+    enum { LINE = 4096, LINES = 128, COPIES = 512 };
+    GpuDmaOp o = {0};
+    u8* bytes = malloc((size_t)LINE * LINES);
+    u64 before, most = 0, saved_budget;
+    CHECK(bytes);
+    vk_finish();
+    vk_frame_next();
+    saved_budget = vk_mem_budget_cap(64u << 20);
+    before = vk_ring_bytes();
+    o.width = o.line_in = o.line_out = LINE;
+    o.lines = LINES;
+    o.src = pitch_side(0, LINE);
+    o.dst = pitch_side(DMA_GA + 0x80000, LINE);
+    o.snap = bytes;
+    for (u32 k = 0; k < COPIES; k++) {
+        u64 now;
+        memset(bytes, (int)(k & 0xff), (size_t)LINE * LINES);
+        CHECK(g_renderer->dma_copy(&o));
+        now = vk_ring_bytes();
+        if (now > most) most = now;
+    }
+    vk_finish();
+    vk_mem_budget_cap(saved_budget);
+    printf("%u copies of %u KiB of the CPU's bytes, no draw between them, a 64 MiB budget: rings %llu MiB at most, "
+           "%llu before\n",
+           (unsigned)COPIES, (unsigned)(LINE * LINES >> 10), (unsigned long long)(most >> 20),
+           (unsigned long long)(before >> 20));
+    CHECK(most - before < (u64)COPIES * LINE * LINES / 2);
+    guest_done(DMA_A + 0x80000, (u64)LINE * LINES);
+    CHECK(GP(DMA_A + 0x80000)[0] == (u8)((COPIES - 1) & 0xff) &&
+          GP(DMA_A + 0x80000)[LINE * LINES - 1] == (u8)((COPIES - 1) & 0xff));
+    free(bytes);
+    return 0;
+}
 static int check_dma(void) {
     GpuDmaOp o;
     gmmu_map(DMA_GA, DMA_A, DMA_SPAN);
     gmmu_map(DMA_GB, DMA_B, DMA_SPAN);
+    CHECK(!check_snapshot_uploads());
     /* a one-dimensional copy */
     memset(&o, 0, sizeof o);
     o.width = o.line_in = o.line_out = 1001;
@@ -7313,6 +7357,8 @@ static void results_copied(u64 cpu, u64 len) { vk_own_cpu_touched(cpu, len); }
 #include "vulkan_shader_windows.inc"
 #include "vulkan_shared_clamp.inc"
 #include "vulkan_compute_arena.inc"
+#include "vulkan_rt_aside.inc"
+#include "vulkan_so_note.inc"
 #include "vulkan_index_draws.inc"
 #include "vulkan_polygon_lines.inc"
 #include "vulkan_pass_breaks.inc"
@@ -7408,6 +7454,106 @@ static int check_pipeline_stats_compute(void) {
 #include "vulkan_astc_later.inc"
 #include "vulkan_astc_kind.inc"
 
+/* hmma_mode at the renderer's start (vk/hmma_pick.c), on this device: 1 to 5 take that way; Auto with no file of the
+   bench's times it, keeps the way it picks in hmma.<driver>.txt and takes it, a file of its key is read and not timed
+   again (a way written over by hand is the one taken), and one of another key times it again. A device without
+   subgroup operations in compute (lavapipe) runs no way of HMMA's that reads other lanes, and writes no file */
+static int check_hmma_pick(void) {
+    int pairs_was = g_spirv_translate.hmma_pairs, stage_was = g_spirv_translate.hmma_stage,
+        astat_was = g_spirv_translate.hmma_astat, sm86_was = g_shader_sm86, mode_was = g_settings.hmma_mode;
+    int shared = (int)g_vk.props.limits.maxComputeSharedMemorySize;
+    char* dir = snx_temp_dir(NULL);
+    CHECK(dir);
+    char path[1024];
+    snx_vk_driver_path(path, sizeof path, dir, "hmma", "test", ".txt");
+    g_shader_sm86 = 1;
+    for (int way = SH_HMMA_GATHER; way < SH_HMMA_WAYS && (g_vk_subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT); way++) {
+        g_settings.hmma_mode = way;
+        vk_hmma_pick(dir, "test");
+        CHECK(g_spirv_translate.hmma_pairs == (way == SH_HMMA_PAIRS) &&
+              g_spirv_translate.hmma_astat == (way == SH_HMMA_ASTAT || way == SH_HMMA_ASTAT_STAGED) &&
+              g_spirv_translate.hmma_stage == (way == SH_HMMA_STAGED || way == SH_HMMA_ASTAT_STAGED ? shared : 0));
+    }
+    g_settings.hmma_mode = SH_HMMA_AUTO;
+    vk_hmma_pick(dir, "test");
+    size_t size = 0;
+    char* text = (char*)snx_read_file(path, &size);
+    if (!(g_vk_subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT)) {
+        CHECK(!text);
+    } else {
+        CHECK(text && size);
+        char* z = realloc(text, size + 1);
+        CHECK(z);
+        text = z;
+        text[size] = 0;
+        printf("hmma pick: the bench's file on %s:\n%s", g_vk.props.deviceName, text);
+        char* key = strstr(text, "\nkey ");
+        char* way = strstr(text, "\nway ");
+        CHECK(key && way && strstr(text, "\nus gather="));
+        /* the file's way taken as it is: written over with another, the next start takes that one, timing nothing */
+        char* end = strchr(way + 1, '\n');
+        CHECK(end);
+        int now = g_spirv_translate.hmma_astat   ? (g_spirv_translate.hmma_stage ? SH_HMMA_ASTAT_STAGED : SH_HMMA_ASTAT)
+                  : g_spirv_translate.hmma_stage ? SH_HMMA_STAGED
+                  : g_spirv_translate.hmma_pairs ? SH_HMMA_PAIRS
+                                                 : SH_HMMA_GATHER;
+        CHECK(!strncmp(way + 5, g_shader_hmma_names[now], (size_t)(end - way - 5)));
+        int other = now == SH_HMMA_STAGED ? SH_HMMA_GATHER : SH_HMMA_STAGED;
+        char* edited = snx_format("%.*s\nway %s%s", (int)(way - text), text, g_shader_hmma_names[other], end);
+        CHECK(edited && !snx_write_file(path, edited, strlen(edited)));
+        vk_hmma_pick(dir, "test");
+        CHECK(g_spirv_translate.hmma_stage == (other == SH_HMMA_STAGED ? shared : 0) && !g_spirv_translate.hmma_pairs &&
+              !g_spirv_translate.hmma_astat);
+        free(edited);
+        /* another key: timed again, and written with its own */
+        edited = snx_format("%.*s\nkey another%s", (int)(key - text), text, strchr(key + 1, '\n'));
+        CHECK(edited && !snx_write_file(path, edited, strlen(edited)));
+        vk_hmma_pick(dir, "test");
+        free(text);
+        text = (char*)snx_read_file(path, &size);
+        CHECK(text && size && !strstr(text, "\nkey another"));
+        free(edited);
+    }
+    free(text);
+    remove(path);
+    snx_remove_tree(dir);
+    free(dir);
+    g_shader_sm86 = sm86_was, g_settings.hmma_mode = mode_was;
+    g_spirv_translate.hmma_pairs = pairs_was, g_spirv_translate.hmma_stage = stage_was,
+    g_spirv_translate.hmma_astat = astat_was;
+    return 0;
+}
+
+/* --bench-hmma-pick=N: hmma_mode's Auto at N starts of an Ounce game with no file of the bench's, each timed whole, as
+   it holds the renderer's start back. The first start of a run whose driver keeps no shaders of earlier runs
+   (MESA_SHADER_CACHE_DISABLE=true on Mesa) is a new driver build's; later ones make their pipelines from the driver's
+   cache */
+static int bench_hmma_pick(u32 starts) {
+    if (!(g_vk_subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT)) {
+        printf("HMMA pick bench: %s has no subgroup operations in compute, so no way of HMMA's runs there\n",
+               g_vk.props.deviceName);
+        return 77;
+    }
+    int sm86_was = g_shader_sm86, mode_was = g_settings.hmma_mode;
+    g_shader_sm86 = 1, g_settings.hmma_mode = SH_HMMA_AUTO;
+    printf("HMMA pick bench device: %s, driver version %08x\n", g_vk.props.deviceName,
+           (unsigned)g_vk.props.driverVersion);
+    for (u32 k = 0; k < starts; k++) {
+        char* dir = snx_temp_dir(NULL);
+        CHECK(dir);
+        u64 t0 = plat_ns();
+        vk_hmma_pick(dir, "bench");
+        double ms = (double)(plat_ns() - t0) / 1e6;
+        char way[256];
+        shader_hmma_way(way, sizeof way);
+        printf("HMMA_PICK start %u of %u: %.1f ms, %s\n", k + 1, starts, ms, way);
+        CHECK(!snx_remove_tree(dir));
+        free(dir);
+    }
+    g_shader_sm86 = sm86_was, g_settings.hmma_mode = mode_was;
+    return 0;
+}
+
 /* The file of earlier runs' pipelines keeps SPIR-V translated with the HMMA forms its key names: each form a run can
    choose (the device's matrix unit, the B gather by pairs of lanes, the hmma_f16 setting's half sums, A and B through
    shared memory) changes the part of the key past the guest part, so a run that chose another form translates its
@@ -7457,6 +7603,7 @@ static int check_hmma_file_key(void) {
 #include "vulkan_nvn_copy_conversions.inc"
 #include "vulkan_nvn_xfb.inc"
 #include "vulkan_nvn_state.inc"
+#include "vulkan_host_program.inc"
 #include "vulkan_maxwell_fixed.inc"
 #include "vulkan_nvn_events.inc"
 #include "vulkan_nvn_subroutines.inc"
@@ -7613,6 +7760,15 @@ static int check_vk12_way(void) {
     CHECK(vk_api_setting("auto", &cap, why, sizeof why) && cap == 0);
     CHECK(vk_api_setting("1.2", &cap, why, sizeof why) && cap == VK_API_VERSION_1_2);
     CHECK(!vk_api_setting("1.3", &cap, why, sizeof why) && !strcmp(why, "vk_api=1.3 is not auto or 1.2"));
+    /* a swapchain the driver could not make, said with the device, its driver and the result's name and number */
+    {
+        char said[300];
+        vk_swapchain_failure(said, sizeof said, "Mali-G720 MC7", "panvk", VK_ERROR_INVALID_EXTERNAL_HANDLE);
+        CHECK(!strcmp(said, "the swapchain could not be made on Mali-G720 MC7 (panvk): "
+                            "VK_ERROR_INVALID_EXTERNAL_HANDLE (-1000072003)"));
+        vk_swapchain_failure(said, sizeof said, "Mali-G720 MC7", "", VK_ERROR_SURFACE_LOST_KHR);
+        CHECK(strstr(said, "(its driver): VK_ERROR_SURFACE_LOST_KHR (-1000000000)") != NULL);
+    }
     CHECK(!g_vk.api_cap == !strcmp(g_settings.vulkan_api, "auto"));
     if (g_vk.api_cap) {
         CHECK(!strcmp(g_settings.vulkan_api, "1.2"));
@@ -7743,7 +7899,7 @@ static int run_headless(int argc, char** argv) {
     u32 benchmark_sets = 0, benchmark_count = 16, benchmark_images = 0, benchmark_indexed = 0;
     u32 benchmark_sparse = 0, benchmark_storage = 0, benchmark_image = 0;
     u32 benchmark_buffer = 0, benchmark_stage = 0;
-    u32 benchmark_passes = 0;
+    u32 benchmark_passes = 0, benchmark_hmma = 0;
     const char* pipeline_probe = NULL;
     int pipeline_probe_disable = 0;
     /* a game's .ini, opened as a run opens it, before the settings given here go over its values: a copy of it, which
@@ -7836,15 +7992,25 @@ static int run_headless(int argc, char** argv) {
             benchmark_passes = (u32)strtoul(argv[i] + 20, NULL, 10);
             continue;
         }
+        if (!strncmp(argv[i], "--bench-hmma-pick=", 18)) {
+            char* end;
+            unsigned long n = strtoul(argv[i] + 18, &end, 10);
+            if (*end || !n || n > 64) {
+                fprintf(stderr, "snx-test-vulkan: %s is not a count of starts from 1 to 64\n", argv[i]);
+                return 2;
+            }
+            benchmark_hmma = (u32)n;
+            continue;
+        }
         if (settings_arg(argv[i], key, sizeof key)) o = setting_row(key);
         if (!o) {
             fprintf(stderr,
                     "snx-test-vulkan: %s is not an option it takes: -H, --KEY=VALUE of the runtime's settings, "
                     "--bench-descriptors=N, --descriptor-images=N, --descriptor-indexed=N, --descriptor-count=N, "
                     "--bench-sparse-volume, --bench-sparse-texture, --bench-storage-lookup, --bench-storage-image, "
-                    "--bench-storage-buffer, --bench-stage-memory, --bench-pass-breaks=N, --nvn-draw-bench=N, "
-                    "--bench-indexed-map=N, --pipeline-probe=FILE, --pipeline-probe-disable-opt=0|1, "
-                    "--settings-ini=FILE\n",
+                    "--bench-storage-buffer, --bench-stage-memory, --bench-pass-breaks=N, --bench-hmma-pick=N, "
+                    "--nvn-draw-bench=N, --bench-indexed-map=N, --pipeline-probe=FILE, "
+                    "--pipeline-probe-disable-opt=0|1, --settings-ini=FILE\n",
                     argv[i]);
             return 2;
         }
@@ -8013,6 +8179,15 @@ static int run_headless(int argc, char** argv) {
     }
     if (benchmark_sets) {
         int result = bench_descriptors(benchmark_sets, benchmark_count, benchmark_images, benchmark_indexed);
+        vk_pipeline_quiesce();
+        CHECK(!snx_remove_tree(root));
+        free(root);
+        free(shot);
+        free(ppm);
+        return result;
+    }
+    if (benchmark_hmma) {
+        int result = bench_hmma_pick(benchmark_hmma);
         vk_pipeline_quiesce();
         CHECK(!snx_remove_tree(root));
         free(root);
@@ -8504,6 +8679,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_nvn_stencil_masks());
     CHECK(!check_nvn_xfb());
     CHECK(!check_nvn_fixed_state());
+    CHECK(!check_host_program());
     CHECK(!check_maxwell_point_size());
     CHECK(!check_maxwell_depth_bounds());
     CHECK(!check_maxwell_depth_range());
@@ -8581,6 +8757,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_vertex_input_layouts());
     CHECK(!check_vertex_input_file_key());
     CHECK(!check_hmma_file_key());
+    CHECK(!check_hmma_pick());
     CHECK(!check_targetless_stores());
     CHECK(!check_deko_vertex_storage());
     CHECK(!check_storage_image_keep());
@@ -8623,6 +8800,8 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_dma_owners());
     CHECK(!check_dma_bands());
     CHECK(!check_rt_superseded());
+    CHECK(!check_rt_aside());
+    CHECK(!check_so_note());
     CHECK(!check_dma_bands_frames());
     CHECK(!check_flush_parts());
     CHECK(!check_publish_bands());
@@ -8710,6 +8889,17 @@ static int run_headless(int argc, char** argv) {
           snx_vk_pipeline_workers(0, 64) == 12);
     CHECK(snx_vk_pipeline_workers(5, 12) == 5 && snx_vk_pipeline_workers(32, 4) == 32 &&
           snx_vk_pipeline_workers(1, 64) == 1);
+    /* how a draw reads a target it writes at its own pixel: the interlock's capture on NVIDIA's and AMD's GPUs that
+       have all it needs, else two draws with dynamic rendering local read, else in place */
+    CHECK(vk_feedback_choice(0x10DE, 1, 1, 1, 1) == VK_FEEDBACK_INTERLOCK &&
+          vk_feedback_choice(0x1002, 1, 1, 1, 1) == VK_FEEDBACK_INTERLOCK &&
+          vk_feedback_choice(0x1002, 1, 1, 1, 0) == VK_FEEDBACK_INTERLOCK);
+    CHECK(vk_feedback_choice(0x8086, 1, 1, 1, 1) == VK_FEEDBACK_PREDRAW &&
+          vk_feedback_choice(0x1002, 1, 0, 1, 1) == VK_FEEDBACK_PREDRAW &&
+          vk_feedback_choice(0x1002, 0, 1, 1, 1) == VK_FEEDBACK_PREDRAW &&
+          vk_feedback_choice(0x10DE, 1, 1, 0, 1) == VK_FEEDBACK_PREDRAW);
+    CHECK(vk_feedback_choice(0x8086, 1, 1, 1, 0) == VK_FEEDBACK_IN_PLACE &&
+          vk_feedback_choice(0x1002, 1, 0, 1, 0) == VK_FEEDBACK_IN_PLACE);
 #if defined(__linux__)
     if (vk_rec_threaded()) { /* the workers started with the first draws': two at the main thread's nice, the rest low */
         int n = snx_vk_pipeline_workers(g_settings.pipeline_threads, plat_cpu_count()), low, normal, other;
