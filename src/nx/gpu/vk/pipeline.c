@@ -17,6 +17,7 @@
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
 #include "common/gpu/vk/vk_common.h"
+#include "common/gpu/vk/extension_bans.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/shader/advanced_blend_spirv.h"
 #include "nx/gpu/vk/descriptors.h"
@@ -144,8 +145,7 @@ static struct {
     /* The caches live in shader_cache/ of the game's cache folder (g_cachedir), wherever the runtime was started
        from */
     char cache_dir[1100], pcache_path[1200];
-    /* the BC7 cache's file while it is still to open (vk_pipeline_bc7_cache), empty once opened */
-    char bc7_cache[1200];
+    int bc7_cache;                      /* the BC7 cache is still to open (vk_pipeline_bc7_cache) */
     char driver_tag[SNX_VK_DRIVER_TAG]; /* the driver's, whose files of the cache these are (snx_vk_driver_tag) */
     _Atomic int
         pcache_dirty;        /* pipelines made since the cache was last written (atomic: it is saved outside vk_lock) */
@@ -293,9 +293,9 @@ static struct {
                 .plib = {.lock = PMUTEX_INIT}};
 static void pcache_note(void);
 void vk_pipeline_bc7_cache(void) {
-    if (!g_pipeline.bc7_cache[0]) return;
-    vk_astc_cache_open(g_pipeline.bc7_cache);
-    g_pipeline.bc7_cache[0] = 0;
+    if (!g_pipeline.bc7_cache) return;
+    vk_astc_cache_open();
+    g_pipeline.bc7_cache = 0;
 }
 #if defined(SNX_TRACY)
 /* the stages' names, for the shader translate zone's text */
@@ -727,10 +727,11 @@ void vk_pipeline_init(void) {
     /* the vertex and fragment programs' constant buffers through windows of the staging ring, their offsets in push
        constants past the 128 bytes every layout had (cb_windows.h) */
     {
+        char ban[1200] = "", line[2048];
+        if (g_vk.cb_windows_ban) vk_ban_why(g_vk.cb_windows_ban, ban, sizeof ban);
         const SnxVkCbWindowDevice wd = {g_vk.props.limits.maxPushConstantsSize, g_vk.props.limits.maxUniformBufferRange,
                                         g_spirv_translate.uniform_cbufs, g_vk.has_descriptor_heap_support,
-                                        g_vk.driver_id == VK_DRIVER_ID_MESA_LLVMPIPE};
-        char line[512];
+                                        ban[0] ? ban : NULL};
         g_spirv_translate.cb_windows =
             snx_vk_cb_windows_say(line, sizeof line, &wd, SH_PUSH_BYTES_WINDOWS, g_settings.constant_buffer_windows);
         LOG("%s\n", line);
@@ -916,11 +917,19 @@ void vk_pipeline_init(void) {
     if (!g_vk_playout) fatal("vulkan: cannot create shader pipeline layout");
     snprintf(g_pipeline.cache_dir, sizeof g_pipeline.cache_dir, "%sshader_cache", g_cachedir);
     plat_mkdir(g_pipeline.cache_dir);
-    /* the BC7 blocks of earlier ASTC encodes, where ASTC textures are held as BC7 (astc.c): opened now, or by
+    /* the BC7 blocks of earlier ASTC encodes, where ASTC textures are held as BC7 (astc.c): started now, or by
        astc_mode's Auto once it holds them as BC7 (vk_astc_auto_present) */
-    snprintf(g_pipeline.bc7_cache, sizeof g_pipeline.bc7_cache, "%s/%s.vkbc7", g_pipeline.cache_dir, g_exename);
-    snx_path_native(g_pipeline.bc7_cache);
+    g_pipeline.bc7_cache = 1;
     if (vk_astc_bc7()) vk_pipeline_bc7_cache();
+    { /* the files earlier versions kept that cache in: said once a run, and left where they are */
+        char old[1400];
+        snprintf(old, sizeof old, "%s/%s.vkbc7", g_pipeline.cache_dir, g_exename);
+        snx_path_native(old);
+        vk_bc7_cache_old_file(old);
+        snprintf(old, sizeof old, "%s/%s.vkbc7.idx", g_pipeline.cache_dir, g_exename);
+        snx_path_native(old);
+        vk_bc7_cache_old_file(old);
+    }
     /* each driver's files apart: a game run with the system's driver, then a package's (gpu_driver), then the
        system's again keeps the first one's */
     snx_vk_driver_tag(g_pipeline.driver_tag, sizeof g_pipeline.driver_tag, g_vk.driver_id, g_vk.props.vendorID,
@@ -1880,6 +1889,21 @@ static void* pipe_tail(PipeInfo* o, int robust) {
         snx_vk_compile_leave(entered_);                                                                                \
     } while (0)
 static void pipe_note(const char* what, u64 h, const VkShaderModule modules[5], const PipeKey* k);
+/* gi, a pipeline, a part or a link, made of descriptor heaps (PipeKey.heaps). The driver reads the flags of a chained
+   VkPipelineCreateFlags2CreateInfo (flags2) in place of gi->flags, so flags2 is gi->flags with the heaps' bit for the
+   descriptor buffers' one: a pipeline of heaps is made with the flags it has with sets (a cached link's
+   FAIL_ON_PIPELINE_COMPILE_REQUIRED, the statistics', the shading rate's). The stages' mappings take the place of a
+   layout */
+static void pipe_heaps(VkGraphicsPipelineCreateInfo* gi, VkPipelineCreateFlags2CreateInfo* flags2) {
+    *flags2 = (VkPipelineCreateFlags2CreateInfo){
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
+        .pNext = gi->pNext,
+        .flags = ((VkPipelineCreateFlags2)gi->flags & ~VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT) |
+                 VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT};
+    gi->pNext = flags2;
+    gi->flags = 0;
+    gi->layout = VK_NULL_HANDLE;
+}
 static VkPipeline pipe_create(const Pipe* e, int* hit) {
     PipeInfo o;
     pipe_info(&e->k, e->fs, &o);
@@ -1906,18 +1930,8 @@ static VkPipeline pipe_create(const Pipe* e, int* hit) {
                                        .pColorBlendState = &o.cb,
                                        .pDynamicState = &dy,
                                        .layout = e->layout};
-    /* descriptor heaps (k->heaps): the stages' mappings take the place of a layout, and the flags go in flags2 */
-    VkPipelineCreateFlags2CreateInfo flags2 = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
-        .pNext = gi.pNext,
-        .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT |
-                 (e->k.feedback ? VK_PIPELINE_CREATE_2_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT : 0) |
-                 (VkPipelineCreateFlags2)vk_vrs_pipeline_flags() | (VkPipelineCreateFlags2)vk_pipeline_stats_flags()};
-    if (e->k.heaps) {
-        gi.pNext = &flags2;
-        gi.flags = 0;
-        gi.layout = VK_NULL_HANDLE;
-    }
+    VkPipelineCreateFlags2CreateInfo flags2;
+    if (e->k.heaps) pipe_heaps(&gi, &flags2);
     VkPipeline p = VK_NULL_HANDLE;
     const VkShaderModule modules[5] = {e->k.vs, e->k.tcs, e->k.tes, e->k.gs, e->fs};
     pipe_note("making the graphics pipeline", e->h, modules, &e->k);
@@ -2135,20 +2149,10 @@ static VkPipeline lib_create(const PipeLib* l, int* hit) {
         gi.pMultisampleState = &o.ms;
         break;
     }
-    /* descriptor heaps: every part has the flag (the link's parts agree), the stage parts their stages' mappings
-       (pipe_info), and none a layout, as pipe_make's whole pipeline */
-    VkPipelineCreateFlags2CreateInfo flags2 = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
-                                               .pNext = gi.pNext,
-                                               .flags = VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR |
-                                                        VK_PIPELINE_CREATE_2_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT |
-                                                        VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT |
-                                                        (gi.flags & feedback ? VK_PIPELINE_CREATE_2_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT
-                                                                             : 0)};
-    if (l->src.heaps) {
-        gi.pNext = &flags2;
-        gi.flags = 0;
-        gi.layout = VK_NULL_HANDLE;
-    }
+    /* descriptor heaps: every part has the heaps' flag (the link's parts agree), the stage parts their stages' mappings
+       (pipe_info) */
+    VkPipelineCreateFlags2CreateInfo flags2;
+    if (l->src.heaps) pipe_heaps(&gi, &flags2);
     VkPipeline p = VK_NULL_HANDLE;
     const u32 i = l->part == VK_PART_VI ? 0 : l->part == VK_PART_PR ? 1 : l->part == VK_PART_FS ? 2 : 3;
     const VkShaderModule modules[5] = {i == 1 ? l->src.vs : VK_NULL_HANDLE, i == 1 ? l->src.tcs : VK_NULL_HANDLE,
@@ -2233,18 +2237,9 @@ static VkPipeline gpl_link(const Pipe* e, int mode, int* hit) {
                  (mode == GPL_CACHED ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0) |
                  vk_vrs_pipeline_flags() | vk_pipeline_stats_flags(),
         .layout = e->layout};
-    /* descriptor heaps: the flag as the parts have it, and no layout; the mappings are the stage parts' */
-    VkPipelineCreateFlags2CreateInfo flags2 = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
-        .pNext = gi.pNext,
-        .flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT |
-                 (e->k.feedback ? VK_PIPELINE_CREATE_2_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT : 0) |
-                 (lto ? VK_PIPELINE_CREATE_2_LINK_TIME_OPTIMIZATION_BIT_EXT : 0)};
-    if (e->k.heaps) {
-        gi.pNext = &flags2;
-        gi.flags = 0;
-        gi.layout = VK_NULL_HANDLE;
-    }
+    /* descriptor heaps: the heaps' flag as the parts have it; the mappings are the stage parts' */
+    VkPipelineCreateFlags2CreateInfo flags2;
+    if (e->k.heaps) pipe_heaps(&gi, &flags2);
     VkPipeline p = VK_NULL_HANDLE;
     const VkShaderModule modules[5] = {e->k.vs, e->k.tcs, e->k.tes, e->k.gs, e->fs};
     pipe_note(mode == GPL_CACHED ? "taking the optimized graphics pipeline from the pipeline cache"
@@ -3640,6 +3635,7 @@ void vk_pipeline_prepare(RendererPrepare* p) {
 
 /* the reading thread (arg non-NULL), or vk_pipeline_init's when there is none, which doesn't run the pass: the
    shipped file first, whose records the main file's PF_SHIPREFs name, then the main file, then the pass */
+void vk_pipeline_file_save(void) { pf_save(&g_pipeline.pf.file); }
 static void pf_load(void* arg) {
     PfLoad load = {pf_load_shader, pf_load_pipe, pf_load_shipref, pf_load_source, NULL, 0, pf_load_cspipe};
     char key[1024];
@@ -3651,7 +3647,7 @@ static void pf_load(void* arg) {
     pf_key(key, sizeof key, &guest);
     g_pipeline.pf.ship.max = SHIP_MAX;
     g_pipeline.pf.ship.pack = g_settings.compress_prepared_shaders ? PF_PACK_SHADERS : 0;
-    g_pipeline.pf.file.pack = g_settings.compress_shader_cache ? PF_PACK_UNITS : 0;
+    g_pipeline.pf.file.pack = PF_PACK_UNITS;
     {
         FILE* there = fopen(g_pipeline.pf.path, "rb");
         if (there)

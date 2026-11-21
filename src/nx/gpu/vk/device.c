@@ -811,6 +811,11 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     /* a binding's stride as dynamic state, core in Vulkan 1.3, unless a driver is banned from it (MoltenVK's fails every
        pipeline that lists it): pipeline.c puts the stride in the pipeline then */
     g_vk.has_dynamic_stride = !vk_ban("VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE", 1, ban_say);
+    /* the rings the CPU fills in cached host memory by default (cmd.c's stage_cached) */
+    g_vk.stage_cached = vk_prefer("VK_MEMORY_PROPERTY_HOST_CACHED_BIT", 1, ban_say) != 0;
+    /* the constant buffers' windows of the staging ring, whose offsets take 224 bytes of push constants a stage
+       (pipeline.c, cb_windows.h) */
+    g_vk.cb_windows_ban = vk_ban_find("maxPushConstantsSize");
     g_vk_preserve_infnan64 = p12.shaderSignedZeroInfNanPreserveFloat64 != 0;
     g_vk.has_minmax_swizzle = p12.filterMinmaxImageComponentMapping != 0;
     /* 32 bit alone: a device whose denorm modes can't differ per width would need 16 and 64 bit declared too. A driver
@@ -1071,6 +1076,11 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         has_hdr_metadata = !g_opt_headless && snx_vk_choice_has(c, VK_EXT_HDR_METADATA_EXTENSION_NAME);
     }
     /* guest memory the GPU reads in place (uma.c) */
+    /* a driver that takes every import's pages again at each submission (uma.c's vk_uma_imports_dear): said where
+       uma_copies leaves the choice to the line */
+    static const char imports_key[] = "VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT";
+    g_vk.imports_dear =
+        (g_settings.guest_buffers_copied ? vk_ban_find(imports_key) : vk_ban(imports_key, 1, ban_say)) != 0;
     int uma_with = vk_uma_choose(has_host_import, has_ahb, has_placed && has_map2, has_dmabuf);
     if (uma_with == VK_UMA_WITH_HOST) snx_vk_choice_enable(c, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (uma_with == VK_UMA_WITH_AHB) snx_vk_choice_enable(c, "VK_ANDROID_external_memory_android_hardware_buffer");
@@ -1426,16 +1436,15 @@ static bool choose_device(SnxVkChoice* c, void* user) {
             has_list_restart ? "VK_EXT_primitive_topology_list_restart without its list feature"
                              : "no VK_EXT_primitive_topology_list_restart");
     g_vk.has_barycentric = has_barycentric && qbarycentric.fragmentShaderBarycentric;
-    /* NVIDIA's compiler of its Unix driver (libnvidia-gpucomp) deadlocked with pipelines made on several threads at
-       once (snx_vk_compile_serial). The Windows driver has its own compiler: there the lock made each fast link wait
-       behind a part's compile or a background optimized link, 1.2 to 1.7 ms a link where 0.02 ms is the link's own */
-#ifdef _WIN32
-    snx_vk_compile_serial(0);
-#else
-    snx_vk_compile_serial(p12.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY);
-#endif
-    if (p12.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY)
-        LOG("vulkan: fragment inputs are the driver's interpolation (NVIDIA's keeps the console's precision)\n");
+    /* pipelines made one at a time where a driver's compiler can't take several threads at once: the extension bans'
+       off lines on vkCreateGraphicsPipelines. Elsewhere the lock would make each fast link wait behind a part's
+       compile or a background optimized link, 1.2 to 1.7 ms a link where 0.02 ms is the link's own */
+    snx_vk_compile_serial(vk_ban("vkCreateGraphicsPipelines", 1, ban_say) != 0);
+    /* the drivers whose own interpolation of a clipped primitive's inputs is the console's take no varying pass
+       (render.c's draw_varying): the extension bans' prefer lines on Location */
+    g_vk.host_varying = vk_prefer("Location", 1, ban_say) != 0;
+    if (g_vk.host_varying)
+        LOG("vulkan: fragment inputs are the driver's interpolation, which keeps the console's precision\n");
     else if (g_vk.has_barycentric)
         LOG("vulkan: an unculled quad draw's fragment inputs are interpolated from its vertices' values "
             "(VK_KHR_fragment_shader_barycentric), another draw's position inputs read from the fragment's place\n");
@@ -1807,13 +1816,15 @@ static bool choose_device(SnxVkChoice* c, void* user) {
             "after the program's\n", names);
     }
     f12.vulkanMemoryModel = f12.vulkanMemoryModelDeviceScope = g_spirv_translate.hmma_coop != 0;
-    /* HMMA off the matrix unit, by the rules: pairs of lanes on RADV with subgroups of 32 (an RX 6700 XT's HMMA bench
-       ran 9.7% faster), and A and B through shared memory where the driver loops for a shuffle whose index differs
-       between lanes, which no feature or property tells, so the table does. hmma_mode settles the way before the
-       first translation (vk_hmma_pick), Auto by the bench, keeping the rules' where it cannot run */
+    /* HMMA off the matrix unit, by the rules: pairs of lanes with subgroups of 32 where the extension bans prefer
+       them (OpGroupNonUniformShuffleXor), and A and B through shared memory where the driver loops for a shuffle
+       whose index differs between lanes, which no feature or property tells, so the table does. hmma_mode settles
+       the way before the first translation (vk_hmma_pick), Auto by the bench, keeping the rules' where it cannot
+       run */
     int compute_subgroups = (g_vk_subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
-    g_vk.hmma_rule = shader_hmma_rule(compute_subgroups, p12.driverID == VK_DRIVER_ID_MESA_RADV && g_vk.has_cs_warp32,
-                                      vk_ban("OpGroupNonUniformShuffle", compute_subgroups, ban_say) != 0);
+    g_vk.hmma_rule =
+        shader_hmma_rule(compute_subgroups, vk_prefer("OpGroupNonUniformShuffleXor", g_vk.has_cs_warp32, ban_say) != 0,
+                         vk_ban("OpGroupNonUniformShuffle", compute_subgroups, ban_say) != 0);
     shader_hmma_take(g_vk.hmma_rule, (int)g_vk.props.limits.maxComputeSharedMemorySize);
     /* shaderDenormPreserveFloat16 is the device's word that it can keep f16 subnormals: without it an SM86 program
        packs those by hand (sm86_translate.c's pack_half), as Turnip on an Adreno 610 flushed them to zero */
@@ -2519,37 +2530,26 @@ static int create_device(void) {
         : second                               ? " (a second queue)"
                                                : " (the graphics queue)");
     /* A draw that writes a target it samples at its own pixel gets the value from before the draw on the console.
-       In place, a later primitive of the draw can read what an earlier one wrote. On NVIDIA's and AMD's GPUs with
-       fragment shader interlock, a capture in an interlock at the program's start saves the old pixel
-       (vk/predraw.c). On the others with dynamic rendering local read, the renderer draws the draw two times in one
-       pass (render.c predraw_run). Without both, the draw stays in place: a copy of the target before each such draw
-       costs too much (5 ms a frame outdoors on a desktop GPU).
-
-       Each feedback draw drawn two times takes one by-region barrier, which a GPU that renders in tiles keeps in its
-       tile memory with the save attachment. Measured in one game's room of G-buffer blend draws, GPU busy and
-       G-buffer pass a frame:
-         RTX 4090:          in place (specks) 8.1 / 2.00 ms, interlock 8.45 / 2.28 ms, two draws 9.2 / 3.23 ms
-         AMD's iGPU (26.10.1): in place (specks) 47.5 / 13.1 ms, interlock 59.1 / 27.7 ms, two draws 55.3 / 18.4 ms
-       On that iGPU, with AMD's own driver, the interlock waits on more than the fragments that overlap, and costs
-       more than the barriers. A desktop GPU that waits on its CPU measured the other way: in an open-world game's
-       870 feedback draws of 7100 a frame, the renderer's thread busy and the GPU's queue busy a frame:
-         RX 6700 XT (RADV 26.2): interlock 34.8 / 4.8 ms, two draws 39.6 / 12.2 ms
-       A draw drawn two times is set up three times on the CPU (the draw that finds it, the save draw, the guest's).
-       So AMD's GPUs take the interlock as NVIDIA's do; a device it serves worse gets the two draws back with
-       VK_EXT_fragment_shader_interlock's setting off */
-    const int theirs = g_vk.props.vendorID == 0x10DE || g_vk.props.vendorID == 0x1002;
-    g_vk.feedback_mode = vk_feedback_choice(g_vk.props.vendorID, g_vk.has_feedback, g_vk.has_fragment_interlock,
+       In place, a later primitive of the draw can read what an earlier one wrote. With fragment shader interlock, a
+       capture in an interlock at the program's start saves the old pixel (vk/predraw.c): the drivers that take it
+       are the extension bans' prefer lines on VK_FEEDBACK_CAPTURE, each with its measure, as on some the interlock
+       waits on more than the fragments that overlap. On the others with dynamic rendering local read, the renderer
+       draws the draw two times in one pass (render.c predraw_run), set up three times on the CPU (the draw that
+       finds it, the save draw, the guest's), with one by-region barrier. Without both, the draw stays in place: a
+       copy of the target before each such draw costs too much (5 ms a frame outdoors on a desktop GPU) */
+    const int prefer = vk_prefer(VK_FEEDBACK_CAPTURE, g_vk.has_fragment_interlock, ban_say) != 0;
+    g_vk.feedback_mode = vk_feedback_choice(prefer, g_vk.has_feedback, g_vk.has_fragment_interlock,
                                             g_vk.feat.fragmentStoresAndAtomics, g_vk.has_local_read);
-    LOG("vulkan: a draw that samples a target it writes at its own pixel %s (vendor %04x%s, fragment shader interlock "
-        "%s, dynamic rendering local read %s)\n",
+    LOG("vulkan: a draw that samples a target it writes at its own pixel %s (%s, fragment shader interlock %s, "
+        "dynamic rendering local read %s)\n",
         g_vk.feedback_mode == VK_FEEDBACK_INTERLOCK ? "reads the pixel as it was before the draw, from a capture in "
                                                       "a fragment interlock"
         : g_vk.feedback_mode == VK_FEEDBACK_PREDRAW ? "is drawn two times, the first saving the target"
                                                     : "reads the target in place",
-        g_vk.props.vendorID,
-        g_vk.feedback_mode == VK_FEEDBACK_INTERLOCK ? ", NVIDIA's or AMD's: the interlock"
-        : theirs ? ", NVIDIA's or AMD's without all the interlock's capture needs: two draws where it can"
-                 : ", neither NVIDIA's nor AMD's: two draws where it can",
+        g_vk.feedback_mode == VK_FEEDBACK_INTERLOCK ? "the extension bans prefer the interlock on this driver"
+        : prefer ? "the extension bans prefer the interlock on this driver, without all the capture needs here: two "
+                   "draws where it can"
+                 : "no prefer line of the extension bans on " VK_FEEDBACK_CAPTURE " holds here: two draws where it can",
         g_vk.has_fragment_interlock ? "yes" : "no", g_vk.has_local_read ? "yes" : "no");
     if (g_vk.has_feedback)
         LOG("vulkan: draws sample the color targets they render to in place (attachment feedback loops, %s, %s)\n",

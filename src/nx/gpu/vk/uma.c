@@ -97,6 +97,7 @@
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/descriptor_heaps.h"
 #include "nx/gpu/vk/pending_pages.h"
+#include "nx/gpu/vk/uma_pages.h"
 #include "nx/gpu/renderer.h"
 #include "common/gpu/vk/vk_common.h"
 #include "nx/hle/services/nvdrv.h"
@@ -318,21 +319,12 @@ int vk_uma(void) { return g_vk.mem_path == VK_MEM_PATH_UMA; }
    each frame for them (8.5 frames a second on a Radeon 890M). Its vertex and index ranges held about 120 MB of those
    imports and its constant buffers about 40 MB; copied as on a discrete GPU, 90 MB stayed and the map ran at 14.9.
    What stays imported are the pages written in place and the dispatches' storage ranges, 16 MiB windows that are far
-   dearer copied (5 frames a second). AMD's driver on Windows has no amdgpu user pointers. uma_copies overrides it */
-/* a driver that takes every import's pages again at each submission */
-static int driver_imports_dear(u32 driver_id) {
-    switch (driver_id) {
-        case VK_DRIVER_ID_MESA_RADV:
-        case VK_DRIVER_ID_AMD_OPEN_SOURCE: return 1;
-#if defined(__linux__)
-        case VK_DRIVER_ID_AMD_PROPRIETARY: return 1;
-#endif
-        default: return 0;
-    }
-}
+   dearer copied (5 frames a second). The drivers that take every import's pages again at each submission are the
+   extension bans' off lines on VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT (g_vk.imports_dear). uma_copies
+   overrides it */
 int vk_uma_imports_dear(void) {
     if (g_settings.guest_buffers_copied) return g_settings.guest_buffers_copied == 2; /* uma_copies */
-    return driver_imports_dear(g_vk.driver_id);
+    return g_vk.imports_dear;
 }
 u64 vk_uma_bound(void) { return g_uma.bound; }
 
@@ -408,13 +400,10 @@ static int rg_blk(const Rgn* r, u64 cpu, u64 len) {
     if (!r->nblk) return 0;
     const _Atomic u64 *f = rg_front(r), *pd = rg_pend(r);
     u64 p0 = (cpu - r->cpu) >> 12, p1 = (cpu + len - 1 - r->cpu) >> 12;
-    for (u64 wi = p0 >> 6; wi <= p1 >> 6; wi++) {
-        u64 a = wi << 6 > p0 ? p0 & 63 : 0, b = (wi << 6) + 63 < p1 ? 63 : p1 & 63;
-        u64 mask = (~0ull << a) & (~0ull >> (63 - b));
+    for (u64 wi = p0 >> 6; wi <= p1 >> 6; wi++)
         if ((atomic_load_explicit(&f[wi], memory_order_relaxed) | atomic_load_explicit(&pd[wi], memory_order_relaxed)) &
-            mask)
+            vk_uma_word_mask(wi, p0, p1))
             return 1;
-    }
     return 0;
 }
 /* word wi of r's front or pend bits becomes now (bits, 1 for front): nblk follows, and bgen moves for a bit gained */
@@ -705,11 +694,7 @@ static int dmabuf_importable(void) {
 int vk_uma_choose(int has_import, int has_ahb, int has_placed, int has_dmabuf) {
     int want = g_settings.guest_memory, how = g_settings.guest_memory_in_place, with;
     g_vk.mem_model = mem_model();
-    /* the driver's, before the device is made (g_vk.driver_id comes after) */
-    VkPhysicalDeviceDriverProperties dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
-    VkPhysicalDeviceProperties2 pp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dp};
-    vkGetPhysicalDeviceProperties2(g_vk.phys, &pp);
-    int dear = g_settings.guest_buffers_copied ? g_settings.guest_buffers_copied == 2 : driver_imports_dear(dp.driverID);
+    int dear = vk_uma_imports_dear();
     /* a region holds whole windows: a dma-buf that can't hold one is none */
     u64 dmabuf_max = has_dmabuf && g_vk.mem_model == VK_MEM_UMA ? plat_dmabuf_limit() : 0;
     int can_dmabuf = dmabuf_max >= UMA_WINDOW && dmabuf_importable();

@@ -840,14 +840,16 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
             }
             stats_frame(now_ns, &gpu);
         }
-        { /* the caches of earlier runs found empty, said over the game once: the frames to come wait for the work */
+        { /* the shader cache of earlier runs found empty, and the BC7 cache, which starts empty in every run where
+             it runs: said over the game once, as the frames to come wait for the work */
             static int cold_said;
             if (!cold_said) {
-                const int shaders = vk_pipeline_cache_cold(), textures = vk_bc7_cache_cold();
+                const int shaders = vk_pipeline_cache_cold(), textures = vk_bc7_cache_max() != 0;
                 if ((cold_said = overlay_cold_cache(shaders, textures)))
                     LOG("vulkan: %s%s%s: \"%s\" over the game\n",
                         shaders ? "the shader cache started empty (no shader or pipeline of an earlier run)" : "",
-                        shaders && textures ? ", and " : "", textures ? "the BC7 cache started empty" : "",
+                        shaders && textures ? ", and " : "",
+                        textures ? "the BC7 cache starts empty, as in every run" : "",
                         overlay_cold_cache_words(shaders, textures));
             }
         }
@@ -861,6 +863,7 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
         vk_buf_frame();
         vk_own_trim(); /* before the caches' trim: what it lands is room the trim then need not make */
         vk_bl_scratch_trim();
+        vk_mem_release_run();
         vk_mem_trim(0, 0);
         vk_astc_auto_present(); /* after the trim: Exact again for astc_mode's Auto where the room is back */
         if (g_vk_present % 600 == 0) {
@@ -901,6 +904,7 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
                 disp_was = g_vk_dispatches;
             }
             vk_render_stats_log();
+            if (g_settings.draw_run_stats) vk_rec_runs_log();
             gmmu_alias_log();
             if (g_vk_depth_apart_draws) {
                 static u64 apart_was, moved_was;
@@ -984,27 +988,24 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
                         (unsigned long long)waits, (unsigned long long)wait_ms, (unsigned long long)behind_ms,
                         (unsigned long long)max_ms, opt_workers);
                 }
-                u64 bc7_levels, bc7_hits, bc7_bytes, bc7_rgba8, cache_reads, cache_stored, cache_restarts, cache_file;
+                u64 bc7_levels, bc7_hits, bc7_bytes, bc7_rgba8;
+                VkBc7CacheStats cache;
                 vk_astc_stats(&bc7_levels, &bc7_hits, &bc7_bytes, &bc7_rgba8);
-                vk_bc7_cache_stats(&cache_reads, &cache_stored, &cache_restarts, &cache_file);
+                vk_bc7_cache_stats(&cache);
                 if (bc7_levels)
                     LOG("vulkan: %llu ASTC texture levels or regions uploaded straight to BC7, %llu MB where RGBA8 "
                         "takes %llu MB; %llu encoder dispatches in all\n",
                         (unsigned long long)bc7_levels, (unsigned long long)(bc7_bytes >> 20),
                         (unsigned long long)(bc7_rgba8 >> 20), (unsigned long long)vk_astc_dispatches());
-                if (cache_file)
-                    LOG("vulkan: the BC7 cache gave %llu levels, %llu more were copied from textures that held them, "
-                        "and it took %llu new; its file holds %llu MB (started over %llu times at %llu MB)\n",
+                if (cache.levels)
+                    LOG("vulkan: the BC7 cache gave %llu levels, and %llu more were copied from textures that held "
+                        "them; of %llu levels met it holds %llu MB (%llu at most): it kept %llu encodes, let %llu go "
+                        "for levels used more, did not keep %llu, and freed %llu MB at low memory words\n",
                         (unsigned long long)bc7_hits, (unsigned long long)vk_astc_bc7_copies(),
-                        (unsigned long long)cache_stored, (unsigned long long)(cache_file >> 20),
-                        (unsigned long long)cache_restarts, (unsigned long long)(vk_bc7_cache_max() >> 20));
-                u64 cache_late, cache_skipped, cache_unkept;
-                vk_bc7_cache_late(&cache_late, &cache_skipped, &cache_unkept);
-                if (cache_late || cache_skipped || cache_unkept)
-                    LOG("vulkan: the BC7 cache on a slow disk: %llu reads came too late and %llu were not tried, their "
-                        "levels encoded instead; %llu new levels were not kept\n",
-                        (unsigned long long)cache_late, (unsigned long long)cache_skipped,
-                        (unsigned long long)cache_unkept);
+                        (unsigned long long)cache.levels, (unsigned long long)(cache.bytes >> 20),
+                        (unsigned long long)(vk_bc7_cache_max() >> 20), (unsigned long long)cache.stored,
+                        (unsigned long long)cache.evicted, (unsigned long long)cache.refused,
+                        (unsigned long long)(cache.released >> 20));
                 VkLaterStats later;
                 vk_tex_later_stats(&later);
                 if (later.made || later.waiting || later.restarted || later.went_hot)
@@ -1537,6 +1538,12 @@ static void vkr_reset(void) {
     g_vk.shader_generation++; /* the shaders found at guest addresses: the code there is the state's */
     vk_unlock();
 }
+/* renderer.h's save: before an exit the shaders and pipelines the session made, which nothing wrote while the game ran
+   (pipeline_file.h), then the driver's pipeline cache as at its quiet times */
+static void vk_save(int at_exit) {
+    if (at_exit) vk_pipeline_file_save();
+    vk_pipeline_save(at_exit);
+}
 const Renderer vk_renderer = {
     .name = "Vulkan",
     .start = vkr_start,
@@ -1583,6 +1590,7 @@ const Renderer vk_renderer = {
     .report_stall = vk_report_stall,
     .memory_text = vk_memory_text,
     .memory_blocks = vk_memory_blocks,
+    .memory_release = vk_mem_release_ask,
     .idle = vkr_idle,
     .reset = vkr_reset,
     .flush_targets = vkr_flush_targets,
@@ -1600,7 +1608,7 @@ const Renderer vk_renderer = {
     .capture = vk_renderdoc_capture,
     .thumbnail = vkr_thumbnail,
     .refresh = vkr_refresh,
-    .save = vk_pipeline_save,
+    .save = vk_save,
     .release_window = vk_window_release,
     .prepare = vk_pipeline_prepare,
     .step_effect = vk_present_quad_effects_step,

@@ -953,6 +953,68 @@ static int check_gpuprof_small_pool(void) {
     return 0;
 }
 
+/* vk_gpu_profile's fill (gpuprof_gap.h): the GPU idle while the next submission held recorded commands. A copy of 32
+   MiB recorded, then 20 ms with the GPU idle before it goes: that idle held the copy, so it counts, up to the copy's own
+   GPU time. Then 20 ms idle before anything is recorded, and the copy recorded and submitted at once: the idle held
+   nothing, and only the moment between the command buffer's begin and its submit counts. The first is four times the
+   second at least: a copy's GPU time against a few microseconds of the CPU's (on RADV, 0.21 ms against 0.011). The
+   frames after them read the times back (frame_recycle) */
+static int gpuprof_fill_case(VkBuffer from, VkBuffer to, u64 size, int record_first, u64* fill, u64* busy) {
+    VkBufferCopy copy = {0, 0, size};
+    u64 subs0, fill0, subs, after;
+    vk_finish();
+    vk_frame_next();
+    vk_gpuprof_fill_totals(&subs0, &fill0);
+    *busy = vk_gpuprof_busy_ns();
+    if (record_first) rec_CmdCopyBuffer(vk_cmd(), from, to, 1, &copy);
+    plat_sleep_ns(20000000);
+    if (!record_first) rec_CmdCopyBuffer(vk_cmd(), from, to, 1, &copy);
+    vk_submit_recorded();
+    for (u32 i = 0; i <= VK_FRAMES; i++) {
+        vk_cmd();
+        vk_frame_next();
+    }
+    vk_finish();
+    vk_frame_next();
+    vk_gpuprof_fill_totals(&subs, &after);
+    *fill = after - fill0;
+    *busy = vk_gpuprof_busy_ns() - *busy;
+    return subs > subs0;
+}
+static int check_gpuprof_fill(void) {
+    const u64 size = 32ull << 20;
+    VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                              .size = size,
+                              .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    DevMemWant aci = {.at = DM_DEVICE};
+    DevMemInfo info;
+    VkBuffer buf[2];
+    DevMem mem[2];
+    u64 held, empty, held_busy, empty_busy;
+    if (!vk_gpuprof_timed()) {
+        printf("SKIP gpu profile fill: the graphics queue writes no timestamps (timestampValidBits %u)\n",
+               g_vk.gfx_timestamp_bits);
+        return 0;
+    }
+    for (int i = 0; i < 2; i++) CHECK(vk_buffer_create(&bci, &aci, &buf[i], &mem[i], &info) == VK_SUCCESS);
+    int placed = gpuprof_fill_case(buf[0], buf[1], size, 1, &held, &held_busy);
+    placed &= gpuprof_fill_case(buf[0], buf[1], size, 0, &empty, &empty_busy);
+    vk_finish();
+    for (int i = 0; i < 2; i++) vk_devmem_buffer_destroy(buf[i], mem[i]);
+    if (!placed) {
+        printf("SKIP gpu profile fill: no submission placed on the CPU's clock (calibrated timestamps: host %d, "
+               "monotonic %d)\n",
+               g_vk.has_calibrated_host, g_vk.has_calibrated_mono);
+        return 0;
+    }
+    printf("gpu profile fill: 20 ms idle with a 32 MiB copy recorded counts %.3f ms of the copy's %.3f ms; 20 ms idle "
+           "before it was recorded counts %.3f ms of its %.3f ms\n",
+           (double)held / 1e6, (double)held_busy / 1e6, (double)empty / 1e6, (double)empty_busy / 1e6);
+    CHECK(held && held <= held_busy && held >= 4 * empty);
+    return 0;
+}
+
 /* a frame that uploads little: 64 bytes through vk_stage and 64 through vk_stage_upload, 16 of each copied into rb */
 static int staging_light_frame(VkBuffer rb) {
     for (int upload = 0; upload < 2; upload++) {
@@ -7503,6 +7565,7 @@ static int check_pipeline_stats_compute(void) {
 #include "vulkan_cross_stage_alias.inc"
 #include "vulkan_draw_texture.inc"
 #include "vulkan_lone_lane.inc"
+#include "vulkan_memory_release.inc"
 #include "vulkan_descriptor_heaps.inc"
 #include "vulkan_cb_address.inc"
 #include "vulkan_descriptor_memo.inc"
@@ -7710,6 +7773,7 @@ static int check_hmma_file_key(void) {
 #include "vulkan_capture_cap.inc"
 #include "vulkan_trim.inc"
 #include "vulkan_owned_page_reads.inc"
+#include "vulkan_writeback_sweep.inc"
 
 /* key's row among the settings the runtime applies itself (options.c's), or NULL */
 static const IniOpt* setting_row(const char* key) {
@@ -8373,6 +8437,8 @@ static int run_headless(int argc, char** argv) {
             result = check_targetless_stores();
         else if (!strcmp(name, "owned_page_reads"))
             result = check_owned_page_reads();
+        else if (!strcmp(name, "memory_release"))
+            result = check_memory_release();
         else if (!strcmp(name, "cross_stage_blend"))
             result = check_cross_stage_blend_snapshots();
         else if (!strcmp(name, "txd_uniform"))
@@ -8411,6 +8477,8 @@ static int run_headless(int argc, char** argv) {
             result = check_poll_kick();
         else if (!strcmp(name, "descriptor_heaps"))
             result = check_descriptor_heaps();
+        else if (!strcmp(name, "heap_pipeline_flags"))
+            result = check_heap_pipeline_flags();
         else if (!strcmp(name, "cb_address"))
             result = check_cb_address();
         else if (!strcmp(name, "indirect_dispatch"))
@@ -8570,6 +8638,7 @@ static int run_headless(int argc, char** argv) {
     }
     if (getenv("SNX_TEST_GPUPROF_POOL_ONLY")) { /* a smaller pool than the profile asks for, alone */
         CHECK(!check_gpuprof_small_pool());
+        CHECK(!check_gpuprof_fill());
         printf("PASS headless Vulkan profile pool only: %u validation messages\n", g_vk_validation_messages);
         return 0;
     }
@@ -8821,6 +8890,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_texture_quiet_present());
     CHECK(!check_memo_over_target());
     CHECK(!check_descriptor_heaps());
+    CHECK(!check_heap_pipeline_flags());
     CHECK(!check_cb_address());
     CHECK(!check_descriptor_memo());
     CHECK(!check_fragment_barrier_backend());
@@ -8846,6 +8916,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_fragment_flow_lod());
     CHECK(!check_fragment_quad());
     CHECK(!check_owned_page_reads());
+    CHECK(!check_memory_release());
     CHECK(!check_frag_coord_origin());
     CHECK(!check_varying_passes());
     CHECK(!check_sm86_perspective_fold());
@@ -8901,6 +8972,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_so_note());
     CHECK(!check_dma_bands_frames());
     CHECK(!check_flush_parts());
+    CHECK(!check_writeback_sweep());
     CHECK(!check_publish_bands());
     CHECK(!check_vic_bands());
     CHECK(!check_publish_padding());
@@ -8986,17 +9058,17 @@ static int run_headless(int argc, char** argv) {
           snx_vk_pipeline_workers(0, 64) == 12);
     CHECK(snx_vk_pipeline_workers(5, 12) == 5 && snx_vk_pipeline_workers(32, 4) == 32 &&
           snx_vk_pipeline_workers(1, 64) == 1);
-    /* how a draw reads a target it writes at its own pixel: the interlock's capture on NVIDIA's and AMD's GPUs that
-       have all it needs, else two draws with dynamic rendering local read, else in place */
-    CHECK(vk_feedback_choice(0x10DE, 1, 1, 1, 1) == VK_FEEDBACK_INTERLOCK &&
-          vk_feedback_choice(0x1002, 1, 1, 1, 1) == VK_FEEDBACK_INTERLOCK &&
-          vk_feedback_choice(0x1002, 1, 1, 1, 0) == VK_FEEDBACK_INTERLOCK);
-    CHECK(vk_feedback_choice(0x8086, 1, 1, 1, 1) == VK_FEEDBACK_PREDRAW &&
-          vk_feedback_choice(0x1002, 1, 0, 1, 1) == VK_FEEDBACK_PREDRAW &&
-          vk_feedback_choice(0x1002, 0, 1, 1, 1) == VK_FEEDBACK_PREDRAW &&
-          vk_feedback_choice(0x10DE, 1, 1, 0, 1) == VK_FEEDBACK_PREDRAW);
-    CHECK(vk_feedback_choice(0x8086, 1, 1, 1, 0) == VK_FEEDBACK_IN_PLACE &&
-          vk_feedback_choice(0x1002, 1, 0, 1, 0) == VK_FEEDBACK_IN_PLACE);
+    /* how a draw reads a target it writes at its own pixel: the interlock's capture where a prefer line of the
+       extension bans holds for the driver and the device has all it needs, else two draws with dynamic rendering
+       local read, else in place */
+    CHECK(vk_feedback_choice(1, 1, 1, 1, 1) == VK_FEEDBACK_INTERLOCK &&
+          vk_feedback_choice(1, 1, 1, 1, 0) == VK_FEEDBACK_INTERLOCK);
+    CHECK(vk_feedback_choice(0, 1, 1, 1, 1) == VK_FEEDBACK_PREDRAW &&
+          vk_feedback_choice(1, 1, 0, 1, 1) == VK_FEEDBACK_PREDRAW &&
+          vk_feedback_choice(1, 0, 1, 1, 1) == VK_FEEDBACK_PREDRAW &&
+          vk_feedback_choice(1, 1, 1, 0, 1) == VK_FEEDBACK_PREDRAW);
+    CHECK(vk_feedback_choice(0, 1, 1, 1, 0) == VK_FEEDBACK_IN_PLACE &&
+          vk_feedback_choice(1, 1, 0, 1, 0) == VK_FEEDBACK_IN_PLACE);
 #if defined(__linux__)
     if (vk_rec_threaded()) { /* the workers started with the first draws': two at the main thread's nice, the rest low */
         int n = snx_vk_pipeline_workers(g_settings.pipeline_threads, plat_cpu_count()), low, normal, other;

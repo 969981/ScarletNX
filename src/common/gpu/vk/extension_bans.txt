@@ -7,7 +7,9 @@
 # says which, on which device, driver and version, and why. A "warn" line is only said: a ban another project lifted,
 # one not proven for the way this renderer uses the feature on a driver that runs here, or a part it has no way
 # around. On NVIDIA's, AMD's and Intel's own drivers, which nobody here runs, another project's ban is off until a
-# tester's run shows the renderer does without it. Compiled in
+# tester's run shows the renderer does without it. A "prefer" line is the other way round: the way its key names is
+# taken on the drivers listed and on no other (vk_prefer), where a measure or the console's result showed that driver
+# to do better with it; no driver or vendor is compared in the code. Compiled in
 # (cmake/vk_extension_bans.cmake); tests/vk_extension_bans.c reads it, and "snx-test-vk-bans --devices" lists the lines
 # that hold for this machine's drivers. docs/layers/gpu/driver-quirks.md shows every line by driver, beside the quirks
 # the code works around by itself: "scripts/check-docs.py --bans" writes those rows from this file after a change to
@@ -22,7 +24,7 @@
 #             dynamic state, format or call (shaderFloat16, VK_DYNAMIC_STATE_CULL_MODE, an extension's feature as
 #             VK_EXT_extended_dynamic_state3.extendedDynamicState3ColorBlendEquation), turned off where the renderer
 #             asks for it (vk_ban). The log names an "off" line that holds and nothing asked for
-#   action    off or warn
+#   action    off, warn or prefer
 #   driver    one of the names below (VkDriverId), or * for each driver (its versions are * then)
 #   versions  * for all of them, or bounds in the driver's own numbering: < V, <= V, >= V, > V, or a lower bound then an
 #             upper one (>= 512.676 < 512.680). NVIDIA's are A.B.C[.D] (580.119.02); Intel's Windows driver gives the
@@ -31,13 +33,15 @@
 #             .99), Qualcomm's 512.800.48, Arm's r48p0 as 48.0.0, AMD's 2.0.302
 #   system    any, or a list of linux, android, windows, macos, ios, freebsd, openbsd, netbsd
 #   devices   *, or a list of the GPUs' deviceID (VkPhysicalDeviceProperties): 0x6020200 is an Adreno 622
-#   breaks    what goes wrong, as it reads after the driver and its versions: "NVIDIA's driver before 580.119.02 ..."
+#   breaks    what goes wrong, as it reads after the driver and its versions: "NVIDIA's driver before 580.119.02 ...";
+#             on a prefer line, what the driver does better with the way than without
 #   source    where it is known from: a commit, a file and line at a commit, an issue
 #   retest    the case that tests it again: headless:ARGS (tests/vulkan_headless.c given ARGS), amberlith:SUITE[: CASE],
 #             or new:headless: or new:amberlith: and the case still to be written (edenprobe: and new:edenprobe:,
 #             Amberlith's name before 1.0.0, are still read)
 #   checked   never, or the date we last tested it and what we saw: 2026-11-04 broken on 512.800.48
-#   override  -, or the setting that turns it on anyway (KEY=VALUE), which the code owning that setting applies
+#   override  -, or the setting that goes over the line (KEY=VALUE), which the code owning that setting applies: it
+#             turns an off line's key on anyway, and a prefer line's way off
 #
 # Drivers: amd-proprietary amdvlk radv nvidia intel-windows anv powervr qualcomm mali swiftshader ggp broadcom lavapipe
 # moltenvk coreavi juice verisilicon turnip v3dv panvk samsung venus dozen nvk powervr-mesa honeykrisp vulkansc
@@ -72,6 +76,10 @@ shaderFloat16 | off | amd-proprietary | * | any | * | gets FP16 math wrong from 
 shaderDenormPreserveFloat16 | off | nvidia | * | any | * | lets a DenormPreserve for 16 bits keep 32-bit denormals too, over a DenormFlushToZero for 32 bits | vkd3d-proton device.c:10180 | new:headless:one shader declaring both, its FP32 subnormals read back | never | -
 shaderInt64 | warn | qualcomm | * | any | * | has 64-bit integers and atomics turned off by Eden, which gives no reason | Eden PR 2732 (b389a72697, 2025-10-14); Eden's driver bug list:32 | new:amberlith:64-bit integer arithmetic in a shader | never | -
 
+# Fragment inputs (render.c's draw_varying: a draw's position generic is read from the fragment's own place, and an
+# unculled quad's inputs from its vertices' values, on every driver but those below, whose own interpolation is taken)
+Location | prefer | nvidia | * | any | * | interpolates the inputs of a huge primitive it clips with the position's precision, as the console does, where AMD's, Intel's and Arm's GPUs lose a generic that holds the position by more than a pixel: it needs no varying pass, which cost two games 4 and 7 points of GPU time on every draw | Eden PR 4575 (position_varying_pass.cpp, vk_pipeline_cache.cpp); ScarletNX 153da38c63 (2026-11-10) | headless: | never | -
+
 # Integer to float conversion (shader.h's g_spirv_translate.i2f_nearest: I2F.F32 of a 32-bit integer converts its two
 # halves, each exact, and adds them)
 OpConvertSToF | off | turnip | * | any | * | truncates a 32-bit signed integer it converts to a float, where the console rounds to nearest even (seen on an Adreno 610) | edenprobe's intmath suite on an Adreno 610 phone (2026-11-11) | amberlith:intmath: a signed integer converts to the nearest float, ties to even | 2026-11-11 broken on 26.2.99 (Adreno 610) | -
@@ -94,12 +102,34 @@ VK_SHADER_STAGE_GEOMETRY_BIT | off | turnip | * | any | * | lists the geometry s
 # being such shuffles; SHFL and the other warp instructions keep them)
 OpGroupNonUniformShuffle | off | turnip | * | any | * | compiles a shuffle whose index differs between invocations into a loop, a hardware shuffle for each distinct index, as many as 32 for an HMMA's gather: an Adreno 610 ran the HMMA bench 35 times faster staged through shared memory (684.9 ms a dispatch to 19.6), where Qualcomm's driver on an Adreno 830 and RADV ran it 5.4 and 2.2 times slower so; no feature or property says it | Mesa's src/freedreno/ir3/ir3_lower_subgroups.c (make_shuffle_uniform, main of 2026-11-04: every Adreno with shfl); ScarletNX #2037 | new:headless:an HMMA program's dispatch timed gathered and staged, as shader_sm86_gpu's SNX_HMMA_BENCH does | 2026-11-13 a loop on 26.2.99 (Adreno 610) | -
 
+# HMMA's B words shared by pairs of lanes (device.c: the rule's way on the drivers below, on a device with subgroups of
+# 32 a pipeline can require; hmma_mode's Auto times each way at a GPU's first start and keeps the rule's where its
+# bench cannot run)
+OpGroupNonUniformShuffleXor | prefer | radv | * | any | * | compiles a shuffle at an xor of 4 into a move between lanes, where a shuffle at any other index goes through shared memory: an HMMA whose lanes 4 apart share B's words ran the HMMA bench 9.7% faster than the gather (RX 6700 XT) | ScarletNX ac161bd6a7 (2026-11-13) | new:headless:the HMMA bench timed by pairs and by the gather | 2026-11-13 faster on an RX 6700 XT | hmma_mode=1
+
+# Feedback draws (nx/gpu/vk/device.c's feedback_mode: a draw that samples a target it writes at its own pixel reads the
+# pixel as it was before the draw from a capture in a fragment interlock, on the drivers below whose device has
+# attachment feedback loops and fragment stores too; every other driver draws it two times, or in place without dynamic
+# rendering local read). #2580 takes the reports of a scene or a device the interlock serves worse
+VK_EXT_fragment_shader_interlock.fragmentShaderPixelInterlock | prefer | nvidia | * | any | * | runs a feedback draw's capture in an interlock faster than the draw drawn two times: one game's room of G-buffer blend draws took 8.45 ms of GPU a frame and 2.28 for the G-buffer pass with it, 9.2 and 3.23 drawn two times (RTX 4090) | ScarletNX 242c613fe7 (2026-11-13) | new:headless:a frame of feedback draws timed with the capture and drawn two times | 2026-11-13 faster on an RTX 4090 | vk_ext_fragment_shader_interlock=off
+VK_EXT_fragment_shader_interlock.fragmentShaderPixelInterlock | prefer | nvk | * | any | * | takes the capture as NVIDIA's own driver does, by the GPU and with no measure of its own | ScarletNX 242c613fe7 (2026-11-13), which chose by the GPU's vendor | new:headless:a frame of feedback draws timed with the capture and drawn two times | never | vk_ext_fragment_shader_interlock=off
+VK_EXT_fragment_shader_interlock.fragmentShaderPixelInterlock | prefer | radv | * | any | * | runs a feedback draw's capture in an interlock faster than the draw drawn two times, which is set up three times on the CPU: an open-world game's 870 feedback draws of 7100 a frame kept the renderer's thread busy 34.8 ms a frame and the GPU's queue 4.8 with it, 39.6 and 12.2 drawn two times (RX 6700 XT, 26.2) | ScarletNX f8769fa014 (2026-11-20), #2580 | new:headless:a frame of feedback draws timed with the capture and drawn two times | 2026-11-19 faster on 26.2.6 (RX 6700 XT) | vk_ext_fragment_shader_interlock=off
+VK_EXT_fragment_shader_interlock.fragmentShaderPixelInterlock | prefer | amdvlk | * | any | * | takes the capture as RADV does, by the GPU and with no measure of its own | ScarletNX f8769fa014 (2026-11-20), which chose by the GPU's vendor; #2580 | new:headless:a frame of feedback draws timed with the capture and drawn two times | never | vk_ext_fragment_shader_interlock=off
+VK_EXT_fragment_shader_interlock.fragmentShaderPixelInterlock | prefer | amd-proprietary | * | any | * | takes the capture as RADV does, by the GPU; on an integrated GPU (26.10.1) its interlock waits on more than the fragments that overlap, and one game's room of G-buffer blend draws ran slower with it: 59.1 ms of GPU a frame and 27.7 for the G-buffer pass, 55.3 and 18.4 drawn two times | ScarletNX 242c613fe7 (2026-11-13), f8769fa014 (2026-11-20), which chose by the GPU's vendor; #2580 | new:headless:a frame of feedback draws timed with the capture and drawn two times | 2026-11-13 slower on 26.10.1 (an integrated GPU) | vk_ext_fragment_shader_interlock=off
+
 # Descriptors (without heaps, graphics descriptors use buffers or sets)
 VK_EXT_descriptor_heap | off | amd-proprietary | * | any | * | crashes a game at start with descriptor heaps (Adrenalin 26.7.1 on an RX 7900 XTX) | DXVK 076922bd24 (2026-09-19), issue 5837 | headless:--vk-descriptors-mode=3 | never | -
 VK_EXT_descriptor_heap | off | nvidia | < 595.84.0 | any | * | runs descriptor heaps slower than its later drivers do | DXVK dxvk_device_info.cpp:506 (b5fadf8e5a, 2026-06-18) | new:headless:--bench-descriptors under vk_descriptors_mode=3 against vk_descriptors_mode=1 | never | -
 
+# Constant buffers as windows of the staging ring (pipeline.c, cb_windows.h: their offsets go in push constants past
+# the 128 bytes every layout had, 224 a stage; off binds each constant buffer by itself)
+maxPushConstantsSize | off | lavapipe | * | any | * | hands its linear rasterizer the push constants of every stage a draw binds as one buffer, which the rasterizer copies into a stack array that holds 256 bytes' worth: the 224 bytes each of a vertex and a fragment program whose constant buffers are windows smash its stack, unless LP_PERF=no_rast_linear turns that rasterizer off (Mesa 26.2.6) | #2461; ScarletNX a48a365a2d (2026-11-18) | headless: | 2026-11-18 broken on 26.2.6 | vk_cb_windows=1
+
 # Mesh draws (device.c's mesh_choose: without VK_EXT_mesh_shader an Ounce game's mesh draws are skipped)
 VK_EXT_mesh_shader | off | nvidia | * | any | * | faulted the GPU in most menu runs of an Ounce game with its mesh draws on an RTX 2080: Xid 31 and 109, then a lost device, and 2 of 7 runs still hung once both mesh stages saw the sets of both | ScarletNX 0002310032 and 62f2ec0570 (2026-11-05), docs/platforms/nx/ounce.md#draws | headless:--vk-ext-mesh-shader=on | 2026-11-05 broken on 615.78.08 (RTX 2080) | -
+
+# Pipelines made on several threads at once (vk_common.c's snx_vk_compile_serial: off makes them one at a time)
+vkCreateGraphicsPipelines | off | nvidia | * | linux, android, macos, ios, freebsd, openbsd, netbsd | * | deadlocks in the compiler of its Unix driver (libnvidia-gpucomp) with pipelines made on several threads at once: one thread waits in a pthread_once whose initializer, on another, waits for a mutex (580.178.04 on FreeBSD, a GT 1030). The Windows driver has its own compiler, where one at a time made each fast link wait 1.2 to 1.7 ms behind a compile | ScarletNX 0aae8f9410 (2026-11-14) | new:headless:pipelines made from eight threads at once | 2026-11-14 broken on 580.178.04 (FreeBSD, a GT 1030) | -
 
 # Pipeline libraries (gpu/vk/pipeline_parts.c: a new pipeline links the parts of its shaders)
 VK_EXT_graphics_pipeline_library | off | nvidia | < 531.0.0 | any | * | draws transient glitches with pipeline libraries | ANGLE vk_renderer.cpp:6928, anglebug 42266655 | new:amberlith:the graphics suites with pipeline libraries on | never | -
@@ -133,10 +163,21 @@ VK_EXT_blend_operation_advanced | off | qualcomm | * | any | 0x6020200,0x7000201
 VK_EXT_custom_border_color | warn | qualcomm | * | any | * | crashed creating samplers with custom border colours in a game (2023); Eden lifted the ban | yuzu b2aeb50229 (2023-04-01); lifted in Eden PR 3042 (f7f6a4cde4, 2025-11-21) | new:amberlith:samplers with custom border colours of every format | never | -
 VK_EXT_custom_border_color | warn | turnip | * | any | * | crashed creating samplers with custom border colours in a game (2023); Eden lifted the ban | yuzu b2aeb50229 (2023-04-01); lifted in Eden PR 3042 (f7f6a4cde4, 2025-11-21) | new:amberlith:samplers with custom border colours of every format | never | -
 
+# Guest memory imported by its host pointer (uma.c's vk_uma_imports_dear: off copies vertices, indices and constant
+# buffers, and moves guest memory into dma-bufs where the system has them; a dispatch's storage ranges and what the GPU
+# writes stay imported)
+VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT | off | radv | * | any | * | lists every buffer the device holds in each submission, and amdgpu looks up the pages of every user-pointer buffer in the list again: one game's battle map held about 90 imports, 270 MB, and its 380 submissions a present cost 0.2 ms each, 70% of a core (8.5 frames a second on a Radeon 890M, 14.9 with vertices and constant buffers copied) | ScarletNX 5e226ae990 (2026-11-14) | headless: | 2026-11-14 slower on a Radeon 890M | uma_copies=1
+VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT | off | amdvlk | * | any | * | runs on amdgpu, which looks up the pages of every user-pointer buffer of a submission again at each one, as RADV's line measured | ScarletNX 5e226ae990 (2026-11-14) | headless: | never | uma_copies=1
+VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT | off | amd-proprietary | * | linux | * | runs on amdgpu there, which looks up the pages of every user-pointer buffer of a submission again at each one, as RADV's line measured; its Windows driver has no amdgpu user pointers | ScarletNX 5e226ae990 (2026-11-14) | headless: | never | uma_copies=1
+
 # Block formats (format.c: native_astc=1, the default, samples ASTC as the game's blocks where the device has it, and
 # 0 decodes it on the GPU)
 textureCompressionASTC_LDR | warn | turnip | * | any | * | decodes an illegal or HDR ASTC block as transparent black where the specification says opaque magenta, and sRGB ASTC texels up to 2 steps off (seen on an Adreno 610); native_astc=0 decodes them as the specification says but for a step of sRGB | #1655 | amberlith:astc: an illegal block is the error colour | 2026-11-11 broken on 26.2.99 (Adreno 610) | -
 textureCompressionASTC_LDR | warn | panvk | * | any | * | decodes an illegal or HDR ASTC block as transparent black where the specification says opaque magenta (seen on a Mali-G76); native_astc=0 decodes them as the specification says | #1898 | amberlith:astc: an illegal block is the error colour | 2026-11-12 broken on 26.99.99 (Mali-G76 MC4) | -
+
+# The rings the CPU fills (cmd.c's stage_cached: uploads, uniforms and vertices that change go to cached host memory on
+# the drivers below, and elsewhere to memory for writes in order, which a driver can map write-combined)
+VK_MEMORY_PROPERTY_HOST_CACHED_BIT | prefer | anv | * | any | * | keeps its cached and its uncached memory types over the same system memory, so the cached one costs the GPU nothing and spares the CPU the half-filled lines that a ring's many small copies leave in write-combined memory | ScarletNX 82069fa2c4 (2026-11-12) | new:headless:the staging rings' small copies timed in cached and in sequential memory | never | vk_stage_memory=1
 
 # Core parts the renderer has no way around: said so a report from such a driver starts from them
 timelineSemaphore | warn | qualcomm | * | any | * | does not run timeline semaphores properly on all of its drivers | yuzu 1462db4694 (2023-07-03) | new:headless:timeline waits and signals across the two queues | never | -

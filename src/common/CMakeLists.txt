@@ -138,11 +138,11 @@ endif()
 
 # The DS's and the 3DS's online services through their communities' replacements (online/, its README.md): the WFC
 # services and the DS firmware's connection slot, a DNS resolver, NASC's login on Pretendo Network and the 3DS
-# console's files. Strict C99 on the host's own sockets
+# console's files. Strict ISO C23 on the host's own sockets
 if(SNX_BUILD_NDS OR SNX_BUILD_3DS OR BUILD_TESTING)
     add_library(snx_online STATIC online/wfc.c online/dns.c online/resolve.c online/socket.c online/nasc.c
         online/ctr.c online/hosts.c)
-    set_target_properties(snx_online PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
+    set_target_properties(snx_online PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
         POSITION_INDEPENDENT_CODE ON)
     target_compile_options(snx_online PRIVATE -pedantic-errors -Wall -Wextra -Werror=missing-prototypes)
     if(WIN32)
@@ -214,9 +214,9 @@ if(TARGET Vulkan::Headers AND TARGET SDL3::SDL3)
                    DEFINES NIS_OUTPUT_RGBA8)
     snx_glsl_spirv(snx_vk_common SOURCE gpu/vk/fx/sgsr1.vert NAME fx_sgsr_vert_spv HEADER common/gpu/vk/fx_spv.h)
     snx_glsl_spirv(snx_vk_common SOURCE gpu/vk/fx/sgsr1.frag NAME fx_sgsr_frag_spv HEADER common/gpu/vk/fx_spv.h)
-    # SMAA's area texture, which tools/areatexgen writes (cmake/areatex.cmake)
+    # SMAA's area and search textures, which tools/areatexgen writes (cmake/areatex.cmake)
     include("${PROJECT_SOURCE_DIR}/cmake/areatex.cmake")
-    target_sources(snx_vk_common PRIVATE "${snx_areatex_h}")
+    target_sources(snx_vk_common PRIVATE "${snx_areatex_h}" "${snx_searchtex_h}")
     # a notice's band drawn in a window's rendering (gpu/vk/notice.c), over the effects' fullscreen triangle
     snx_glsl_spirv(snx_vk_common SOURCE gpu/vk/notice.frag NAME notice_frag_spv HEADER common/gpu/vk/notice_spv.h)
     # The GPU driver a run asks for (gpu/vk/gpu_driver_load.h), which the window's instance and surface are made through:

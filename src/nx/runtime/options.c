@@ -978,6 +978,27 @@ static void astc_bc_old(void) {
     }
 }
 
+/* compress_shader_cache, deprecated: the shader cache is written when the game closes, always packed. Its value
+   chooses nothing, and the line says so with it */
+static void compress_shader_cache_old(void) {
+    const char* old = ini_deprecated_value("compress_shader_cache");
+    if (old)
+        WARN("settings: compress_shader_cache=%s, deprecated, chooses nothing: the shaders and pipelines a session "
+             "makes are held in memory and written when the game closes, packed with zstd at its highest level "
+             "(docs/user/deprecations.md)\n",
+             old);
+}
+
+/* bc7_cache_gb, deprecated with the BC7 cache's file: its value bounds nothing, and the line says what does */
+static void bc7_cache_gb_old(void) {
+    const char* old = ini_deprecated_value("bc7_cache_gb");
+    if (old)
+        WARN("settings: bc7_cache_gb=%s, deprecated, bounds nothing: the BC7 cache has no file now, and holds the "
+             "ASTC levels used most in memory, up to an eighth of the machine's, from 64 MB to 2048 MB "
+             "(docs/user/deprecations.md)\n",
+             old);
+}
+
 int options_vk_descriptors_old(const char* old, int given) {
     char* end;
     long v = strtol(old, &end, 10);
@@ -1121,6 +1142,8 @@ void ini_open(const char* path) {
     }
     memory_fit_old();
     astc_bc_old();
+    bc7_cache_gb_old();
+    compress_shader_cache_old();
     vk_descriptors_old();
     n = pending_take(taken);
     say_deprecated();

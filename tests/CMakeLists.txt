@@ -83,7 +83,7 @@ if(SNX_TEST_SANITIZERS)
         snx-shaderc
         # GLSL ES into SPIR-V
         snx_glslc snx-glslc-cli snx-test-glslc-lex snx-test-glslc-parse snx-test-glslc-emit snx-test-glslc-fuzz
-        # the code generators, which tests run on files they refuse, and the one of SMAA's area texture
+        # the code generators, which tests run on files they refuse, and the one of SMAA's textures
         snx-swipc snx-svcgen snx-hookgen snx-settingsgen snx-uigen snx-decodetree snx-vkcmdgen snx-sailgen
         snx-areatexgen)
 endif()
@@ -477,6 +477,14 @@ if(TARGET snx_ctr_board)
     # two targets over one depth buffer at the scale: the second takes the first's depth, not the 1x reload
     add_test(NAME 3ds_vk_draw_scaled_shared_depth COMMAND snx-test-3ds-vk-draw --scaled-shared-depth)
     set_tests_properties(3ds_vk_draw_scaled_shared_depth PROPERTIES SKIP_RETURN_CODE 77)
+    # a display transfer of a scaled target into a destination target: the destination keeps the render scale, and a
+    # target at the same scale samples it. At scale 1 the destination is the transfer's own result
+    add_test(NAME 3ds_vk_draw_scaled_transfer_into_target COMMAND snx-test-3ds-vk-draw --scaled-transfer-into-target)
+    set_tests_properties(3ds_vk_draw_scaled_transfer_into_target PROPERTIES SKIP_RETURN_CODE 77)
+    # a display transfer into a destination over a scaled target's first rows, and no row it reads: the copy is kept,
+    # and a draw into the target after it is checked the same way
+    add_test(NAME 3ds_vk_draw_scaled_transfer_overlap COMMAND snx-test-3ds-vk-draw --scaled-transfer-overlap)
+    set_tests_properties(3ds_vk_draw_scaled_transfer_overlap PROPERTIES SKIP_RETURN_CODE 77)
     # the screens laid out at the console's proportions whatever each render scale: a top screen at 2x above a bottom
     # one at 1x, and a press on the bottom screen's pixel (160, 220) landing on it
     add_test(NAME 3ds_vk_draw_scaled_layout COMMAND snx-test-3ds-vk-draw --scaled-layout)
@@ -506,11 +514,19 @@ if(TARGET snx_ctr_board)
         add_test(NAME 3ds_vk_draw_scaled_shared_depth_validation
                  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_vk_validation.py"
                      $<TARGET_FILE:snx-test-3ds-vk-draw> --scaled-shared-depth)
+        add_test(NAME 3ds_vk_draw_scaled_transfer_into_target_validation
+                 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_vk_validation.py"
+                     $<TARGET_FILE:snx-test-3ds-vk-draw> --scaled-transfer-into-target)
+        add_test(NAME 3ds_vk_draw_scaled_transfer_overlap_validation
+                 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_vk_validation.py"
+                     $<TARGET_FILE:snx-test-3ds-vk-draw> --scaled-transfer-overlap)
         set_tests_properties(3ds_vk_draw_scaled_transfer_validation 3ds_vk_draw_scaled_rotating_validation
                              3ds_vk_draw_scaled_verify_validation PROPERTIES SKIP_RETURN_CODE 77)
         set_tests_properties(3ds_vk_draw_scaled_texture_from_target_validation
                              3ds_vk_draw_scaled_texture_from_depth_validation
-                             3ds_vk_draw_scaled_shared_depth_validation PROPERTIES SKIP_RETURN_CODE 77)
+                             3ds_vk_draw_scaled_shared_depth_validation
+                             3ds_vk_draw_scaled_transfer_into_target_validation
+                             3ds_vk_draw_scaled_transfer_overlap_validation PROPERTIES SKIP_RETURN_CODE 77)
         # the window's rendering, with the screens drawn by a copy and through the effects, under Khronos validation
         foreach(snx_mode scaled-layout scaled-layout-effects)
             string(REPLACE "-" "_" snx_name "${snx_mode}")
@@ -634,7 +650,7 @@ if(TARGET snx_ctr_board)
     target_link_libraries(snx-test-3ds-windows PRIVATE snx_ctr_gpu)
     # the one window's screen layouts: the rectangles for each, the pure geometry the presenter uses
     add_executable(snx-test-3ds-layouts 3ds_layouts.c)
-    snx_test_target(snx-test-3ds-layouts 11)
+    snx_test_target(snx-test-3ds-layouts gnu23)
     target_link_libraries(snx-test-3ds-layouts PRIVATE snx_ctr_gpu)
     add_test(NAME 3ds_layouts COMMAND snx-test-3ds-layouts)
     add_test(NAME 3ds_windows COMMAND snx-test-3ds-windows "${CMAKE_CURRENT_BINARY_DIR}/window-frames")
@@ -3078,9 +3094,9 @@ if(NOT SNX_TOOLS_ONLY)
     target_link_libraries(snx-test-guest-textures PRIVATE scarletnx-platform) # the registry's PMutex
     add_test(NAME guest_textures COMMAND snx-test-guest-textures)
     # the BC7 cache of ASTC levels (gpu/vk/bc7_cache.c), without a GPU: every input that changes a level's blocks
-    # changes its key, records come back as written and from the file in a later run, another version or a damaged
-    # record starts the file over or drops the record, a record cut short is cut off, and the bound starts it over; a
-    # read a held disk keeps (an interposed pread) does not hold the recording thread
+    # changes its key, blocks come back as stored while it holds them, past its bound it keeps the levels used most,
+    # a low memory word frees what no recent present used, and a hit queued for the recording thread is copied from
+    # blocks that are still there
     add_executable(snx-test-bc7-cache bc7_cache.c tracy_stubs.c)
     snx_test_target(snx-test-bc7-cache gnu23)
     target_link_libraries(snx-test-bc7-cache PRIVATE snx_nx_flags snx_xxhash scarletnx-common scarletnx-platform)
@@ -4523,12 +4539,14 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
                          --registry "${snx_vk_commands_registry}")
             endif()
         endif()
-        # tools/areatexgen: SMAA's area texture as the distribution's AreaTex.h has it, byte for byte, in the header it
-        # writes and in the one the build wrote
+        # tools/areatexgen: SMAA's area and search textures as the distribution's AreaTex.h and SearchTex.h have them,
+        # byte for byte, in the headers it writes and in the ones the build wrote
         if(TARGET snx-areatexgen)
             get_property(snx_areatex_h GLOBAL PROPERTY snx_areatex_h)
+            get_property(snx_searchtex_h GLOBAL PROPERTY snx_searchtex_h)
             add_test(NAME areatexgen COMMAND "${CMAKE_COMMAND}" "-DAREATEXGEN=$<TARGET_FILE:snx-areatexgen>"
-                     "-DBUILT=${snx_areatex_h}" "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/areatexgen-test"
+                     "-DBUILT_AREA=${snx_areatex_h}" "-DBUILT_SEARCH=${snx_searchtex_h}"
+                     "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/areatexgen-test"
                      -P "${CMAKE_CURRENT_SOURCE_DIR}/areatexgen.cmake")
         endif()
         # its output where iOS compiles it: a default-if SNX_IOS value, which needs common.h. Not on Apple hosts, whose
@@ -4553,7 +4571,7 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     # the GPU mirror's bookkeeping on the CPU (gpu/vk/mirror.c), with no device
     add_executable(snx-test-mirror-landing mirror_landing.c tracy_stubs.c
                    "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/pending_pages.c")
-    snx_test_target(snx-test-mirror-landing 23)
+    snx_test_target(snx-test-mirror-landing gnu23)
     target_link_libraries(snx-test-mirror-landing PRIVATE snx_nx_flags)
     add_test(NAME mirror_landing COMMAND snx-test-mirror-landing)
     add_executable(snx-test-vulkan-backing vulkan_backing.c)
@@ -4630,6 +4648,10 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     add_executable(snx-test-vk-uma-budget vk_uma_budget.c)
     snx_test_target(snx-test-vk-uma-budget c23)
     add_test(NAME vk_uma_budget COMMAND snx-test-vk-uma-budget)
+    # a range of pages as the bits it takes of each word of the page model's tables (gpu/vk/uma_pages.h)
+    add_executable(snx-test-vk-uma-pages vk_uma_pages.c)
+    snx_test_target(snx-test-vk-uma-pages c23)
+    add_test(NAME vk_uma_pages COMMAND snx-test-vk-uma-pages)
     # vk_gpu_profile as a device runs it: 0 on a portability driver (src/nx/gpu/vk/gpuprof_setting.h)
     add_executable(snx-test-vk-gpuprof-setting vk_gpuprof_setting.c)
     snx_test_target(snx-test-vk-gpuprof-setting c23)
@@ -4638,6 +4660,10 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     add_executable(snx-test-vk-gpuprof-time vk_gpuprof_time.c)
     snx_test_target(snx-test-vk-gpuprof-time c23)
     add_test(NAME vk_gpuprof_time COMMAND snx-test-vk-gpuprof-time)
+    # a gap of the graphics queue split as vk_gpu_profile reports it (src/nx/gpu/vk/gpuprof_gap.h)
+    add_executable(snx-test-vk-gpuprof-gap vk_gpuprof_gap.c)
+    snx_test_target(snx-test-vk-gpuprof-gap c23)
+    add_test(NAME vk_gpuprof_gap COMMAND snx-test-vk-gpuprof-gap)
     add_executable(snx-test-vk-descriptor-key vk_descriptor_key.c)
     snx_test_target(snx-test-vk-descriptor-key gnu23)
     target_link_libraries(snx-test-vk-descriptor-key PRIVATE Vulkan::Headers)
@@ -4722,7 +4748,7 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     # the trim of the caches (gpu/vk/surface.c vk_mem_trim) over stubs of the rest of the renderer: when it takes the
     # render targets that later ones drew all over, where the driver moves memory by priority and where it does not
     add_executable(snx-test-vk-mem-trim vk_mem_trim.c)
-    snx_test_target(snx-test-vk-mem-trim 23)
+    snx_test_target(snx-test-vk-mem-trim gnu23)
     target_compile_definitions(snx-test-vk-mem-trim PRIVATE VK_NO_PROTOTYPES)
     target_include_directories(snx-test-vk-mem-trim PRIVATE "${volk_SOURCE_DIR}" "${renderdoc_app_SOURCE_DIR}")
     target_link_libraries(snx-test-vk-mem-trim PRIVATE Vulkan::Headers)

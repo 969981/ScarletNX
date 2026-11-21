@@ -1948,6 +1948,21 @@ msgstr "%s está fora do alcance do app Arquivos, que só mostra os Documentos d
 
 #: src/gui/main.c
 #, c-format
+msgid "Delete the old caches of %s? %s of BC7 cache files (.vkbc7) an earlier version left in %s. This version does not use them, and the game does not make them again; the caches it uses, its saves, settings and dump stay."
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "Could not delete %s: %s"
+msgstr "Não foi possível excluir %s: %s"
+
+#: src/gui/main.c
+#, c-format
+msgid "Deleted the old caches of %s: %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
 msgid "%s has no cache to delete: no %s, no %s"
 msgstr "%s não tem cache para excluir: nem %s, nem %s"
 
@@ -1959,11 +1974,6 @@ msgstr "Excluir os caches de %s? O cache de shaders, %s (%s), e o cache de códi
 #: src/gui/main.c
 msgid "none"
 msgstr "nenhuma"
-
-#: src/gui/main.c
-#, c-format
-msgid "Could not delete %s: %s"
-msgstr "Não foi possível excluir %s: %s"
 
 #: src/gui/main.c
 #, c-format
@@ -2030,6 +2040,10 @@ msgstr ""
 #: src/gui/main.c
 msgid "Clean Cache"
 msgstr "Limpar cache"
+
+#: src/gui/main.c
+msgid "Delete Old Caches"
+msgstr ""
 
 #: src/gui/main.c
 msgid "Save States"
@@ -7094,6 +7108,18 @@ msgstr "direto na pasta do save"
 #: src/common/utilities/setup.c
 msgid "the save's last commit in its 0/, the copy the game works in in its 1/: Move Old Files moves them"
 msgstr "o último commit do save na 0/ dele, a cópia em que o jogo trabalha na 1/: Move Old Files os move"
+
+#: src/common/utilities/setup.c
+msgid "The BC7 cache"
+msgstr "O cache BC7"
+
+#: src/common/utilities/setup.c
+msgid "shader_cache/<id>.vkbc7 and <id>.vkbc7.idx, a file each game kept"
+msgstr "shader_cache/<id>.vkbc7 e <id>.vkbc7.idx, um arquivo que cada jogo mantinha"
+
+#: src/common/utilities/setup.c
+msgid "in memory while the game runs: a game's Delete Old Caches deletes the old files"
+msgstr "na memória enquanto o jogo roda: o Delete Old Caches de um jogo apaga os arquivos antigos"
 
 #: src/nx/runtime/ini.c
 msgid "macOS only"
