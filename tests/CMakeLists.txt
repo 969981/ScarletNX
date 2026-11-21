@@ -2354,6 +2354,7 @@ if(TARGET SDL3::SDL3) # F1's and the Shortcuts pages name the runtime's keys as 
     add_executable(snx-test-overlay overlay.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/overlay.c"
         "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/fatal_screen.c"
         "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/prepare_screen.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/wait_screen.c"
         "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/vpad.c"
         "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ui.c"
         "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/stats.c"
@@ -2367,6 +2368,13 @@ if(TARGET SDL3::SDL3) # F1's and the Shortcuts pages name the runtime's keys as 
     target_include_directories(snx-test-overlay PRIVATE "${PROJECT_BINARY_DIR}/generated")
     add_test(NAME overlay COMMAND snx-test-overlay)
 endif()
+
+# the screens the player waits on (runtime/platform/wait_screen.c): the game closing's from half a second into its
+# save, a close that stops it and the log's line with the MiB not saved, its row's MiB and seconds; a save state's box
+# from 0.3 s into its load
+add_executable(snx-test-wait-screen wait_screen.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/wait_screen.c")
+snx_test_target(snx-test-wait-screen gnu23)
+add_test(NAME wait_screen COMMAND snx-test-wait-screen)
 
 add_executable(snx-test-vpad vpad.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/vpad.c"
     "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ui.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/stats.c"
@@ -4499,6 +4507,18 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     # the SM86 frontend (gpu/shader/sm86.h): the decoder on words made by NAK's encoding rules, the search for
     # programs, and small translations, which spirv-val checks (shader_sm86_test.py, which passes it
     # each module as an argument: cmd.exe refused the quoted command system() gave it)
+    # sail/sm86.sail run on values against sm86_eval (cmake/sailgen.cmake's EVAL)
+    add_executable(snx-test-shader-sail-sm86 shader_sail_sm86.c)
+    snx_test_target(snx-test-shader-sail-sm86 gnu23)
+    target_link_libraries(snx-test-shader-sail-sm86 PRIVATE snx_shader)
+    include("${PROJECT_SOURCE_DIR}/cmake/sailgen.cmake")
+    snx_sailgen_gpu(snx-test-shader-sail-sm86 sm86 EVAL)
+    add_test(NAME shader_sail_sm86 COMMAND snx-test-shader-sail-sm86)
+    # sail/lut3.sail is what tools/lut3gen.py writes (the shortest program of each truth table of three inputs)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME shader_lut3_current COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/lut3gen.py"
+                 "${PROJECT_SOURCE_DIR}/src/nx/gpu/shader/sail/lut3.sail" --check)
+    endif()
     add_executable(snx-test-shader-sm86 shader_sm86.c support/spv_eval.c)
     snx_test_target(snx-test-shader-sm86 gnu23)
     target_link_libraries(snx-test-shader-sm86 PRIVATE snx_shader)
