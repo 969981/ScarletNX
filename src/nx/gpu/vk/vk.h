@@ -418,6 +418,9 @@ u64 vk_image_resident_need(VkImage img, const u8* want, const u64* keys, u32 n);
 /* the sparse binds made since the last submission, to the graphics queue in one batch before it (cmd.c's submit). 1
    when the submission has to wait for one, which *wait then holds */
 int vk_sparse_flush(VkSemaphoreSubmitInfo* wait);
+/* the sparse binds a present, and the submissions that waited for one (vk_sparse_flush): the counters for the
+   "submitted, not started" idle of the GPU profile, reset by gpuprof.c's report */
+extern u64 g_vk_sparse_binds, g_vk_sparse_waits;
 /* one range of a sparse buffer bound to memory (or, bind's memory VK_NULL_HANDLE, let go of) in the same batch as
    the images' binds: it goes to the queue ahead of the next submission, which waits for it, so nothing waits for a
    fence. gone: the memory the range had (VK_NULL_HANDLE none), size bytes, freed once the batch is done. readers:
@@ -794,9 +797,6 @@ void vk_defer_call(void (*fn)(void*), void* arg); /* fn(arg) then */
 /* the submission being recorded (a number that grows at every submit: what a submit may have changed, results landed,
    is checked against it), and the frame (grows at vk_frame_next: frame f's work is done once f + VK_FRAMES started) */
 u64 vk_submit_number(void);
-/* the thread that follows the graphics timeline for the submit rule (cmd.c), 0 before it starts: its waits on the
-   timeline are what it is for, not the GPU thread's waits for the GPU */
-u32 vk_timeline_tid(void);
 /* iOS takes the GPU from an app in the background: a submit then loses the device ("Insufficient Permission (to submit
    GPU work from background)"). Holds the caller until the app is shown again, or the game is leaving. Returns at once
    everywhere else */
@@ -3104,6 +3104,18 @@ extern VkSemaphore g_vk_csem;  /* timeline semaphore the compute queue signals *
 u64 vk_compute_submitted(void);
 void vk_compute_after_gfx(u64 value);
 extern u64 g_vk_cs_wait_value; /* the value graphics work waits for before reading compute results */
+/* cmd.c: the submissions that waited for compute results and for ASTC uploads (the "submitted, not started" idle) */
+extern u64 g_vk_cs_waits, g_vk_astc_waits;
+/* record.c: where a submission's time goes on the recording thread (reset by gpuprof.c's report) */
+extern u64 g_submit_end_ns, g_submit_queue_ns, g_submit_uploads, g_submit_count;
+/* record.c: the submission's dwell in the ring before the recorder runs it, and the ring backlog (vk_rec_behind) when
+   the GPU thread made it: where the "submitted, not started" idle goes (reset by gpuprof.c's report) */
+extern u64 g_submit_dwell_ns, g_submit_backlog, g_submit_backlog_max;
+/* record.c: log and reset the command kinds the recording thread drained (the "submitted, not started" idle). count:
+   the recording thread counts them until the next report (the GPU profile is on) */
+void vk_rec_command_report(double presents, int count);
+extern u64 g_barrier_merged; /* barriers that shared a vkCmdPipelineBarrier2 with an earlier one */
+extern _Atomic u64 g_desc_merged; /* descriptor writes that shared a vkUpdateDescriptorSets with an earlier one */
 extern u64 g_vk_dispatches, g_vk_cs_batches;
 extern _Atomic u64 g_vk_cs_wait_ns; /* statistics */
 extern u64 g_vk_cs_cpu_reads; /* dispatches kept on the compute queue because the CPU reads what they write */

@@ -623,7 +623,8 @@ setting Async pipelines
     default 0
     words Off|On
     help 1 = what a new shader draws is skipped while its pipeline is made, instead of the game waiting for it: no
-    help pause where a new shader first appears, and the things it draws show up a few frames late
+    help pause where a new shader first appears, and the things it draws show up a few frames late. An Ounce game runs
+    help On unless you pick Off in its settings, the launcher or the command line
 setting Pipeline libraries
     key pipeline_libraries
     int 0 1
@@ -1145,7 +1146,8 @@ setting Emulated cores
     words Off|On
     help On = a guest thread runs only while it holds one of the console's cores, one thread per core at a time, in
     help priority order. Off = every guest thread runs as soon as the host schedules it (svcGetCurrentProcessorNumber
-    help still answers the thread's core)
+    help still answers the thread's core). An Ounce game runs Off unless you pick On in its
+    help settings, the launcher or the command line
 setting Log size limit
     key log_max
     int 1 1024
@@ -1580,8 +1582,9 @@ setting Guest memory
     help docs/layers/gpu/ownership.md). 1 = copied into the renderer's buffers when they change, and back. 2 = read and written
     help where they are in guest memory (VK_EXT_external_memory_host; on Android without it, guest memory moves into
     help AHardwareBuffers), as the console's GPU does: for a GPU that shares system memory. On a discrete GPU it goes
-    help across the bus, which is slow, but it shows that the path is correct. 0 = 2 on a GPU that shares system memory,
-    help but never the moves into AHardwareBuffers (unless uma_memory=2), else 1. A 3DS game takes it too, for the
+    help across the bus. 0 = 2 on a GPU that shares system memory, but never the moves into AHardwareBuffers (unless
+    help uma_memory=2), and on a discrete GPU whose host imports cost every submission (amdgpu's) through Linux's
+    help dma-bufs (uma_memory), else 1. A 3DS game takes it too, for the
     help board's RAM: 1 = the GPU works on a copy of it in its own memory, 2 = on the RAM in place
     help (docs/platforms/3ds/README.md)
 setting Guest memory in place
@@ -1605,7 +1608,8 @@ setting Guest buffers copied
     words Auto|In place|Copied
     help Where guest memory is read in place (vk_memory), whether vertices, indices and constant buffers are read there
     help too. 0 = copied on a driver that takes every import's pages again at each submission (amdgpu's: RADV, AMDVLK,
-    help AMD's on Linux), where each import costs every submission, and read in place elsewhere. 1 = read in place.
+    help AMD's on Linux), where each import costs every submission, but read in place on a discrete GPU, which takes
+    help guest memory through dma-bufs only, and read in place elsewhere. 1 = read in place.
     help 2 = copied. A dispatch's storage ranges and what the GPU writes stay in place either way
 setting Buffer copy stats
     key vk_buffer_stats
@@ -1777,6 +1781,13 @@ setting Vulkan allocation cap
     startup
     help The largest Vulkan allocation in MiB, below the device's own (larger images in pieces with sparse binding),
     help to test the pieces on a driver that takes anything (lavapipe). 0 = the default
+setting Submit every
+    key vk_submit_every
+    int 0 65536
+    default 512
+    help The draws, dispatches and copy bands that a submission holds at most: what was recorded goes to the GPU after
+    help this much work, so the GPU starts on a frame while the rest of it is recorded (Eden's renderer submits every
+    help 4096 draws). 0 = a submission only where the GPU's results are needed (a present, a wait, a readback)
 setting Vulkan memory budget
     key vk_budget_mb
     int 0 INT_MAX

@@ -97,13 +97,9 @@ typedef struct {
     u32 coop_gen[256];               /* the writes each register took, which the matrices are held against */
     u32 stage_slots;                 /* hmma's A and B staged a warp each (g_spirv_translate.hmma_stage, Workgroup) */
     u32 warp_base;                   /* warp_read's index high bits, made once a block (coop_flow forgets it) */
-    u32 push, push_ptr; /* a vertex program's push constant vec4: the base instance, the depth fix (vk/render.c) */
-    /* with cb_windows, a vertex or fragment program's one push block (unified_push): the members of push and
-       scaled_push, then the three uvec4 of its constant buffers' window offsets from member cbw_member */
-    u32 cbw_member, cbw_u32_ptr;
-    /* with tex_table: the push member of the words' window offsets (SH_PUSH_TEX_WORDS), the words' uniform buffer,
-       the samplers' table, and each kind of image's table (table_kind) */
-    u32 tw_member, tex_words, tex_words_ptr, table_samplers;
+    u32 push, push_ptr; /* a compute dispatch's push constant vec4 (push_component): a task program's first workgroup */
+    /* with tex_table: the words' uniform buffer, the samplers' table, and each kind of image's table (table_kind) */
+    u32 tex_words, tex_words_ptr, table_samplers;
     u32 table_kinds, table_kind_key[32], table_kind_var[32], table_kind_sampled[32];
     u32 tex_images[SH_MAXTEX]; /* a table slot's image table, 0 for a slot of its own variable */
     u32 centroid_mask;  /* the inputs decorated Centroid */
@@ -117,9 +113,11 @@ typedef struct {
     /* a vertex or geometry program's ClipDistance output, 8 planes (clip_var) */
     u32 clip;
     int passthrough;
-    /* a fragment program at a resolution scale: SNX_VKB_RS's vec4 (scale_component) and the fragment stage's push
-       constants, whose uvec4s mark the textures bound to scaled render targets (scaled_slot) */
-    u32 scale, scale_ptr, scaled_push;
+    /* a fragment program at a resolution scale: SNX_VKB_RS's vec4 (scale_component) */
+    u32 scale, scale_ptr;
+    /* a graphics stage's per-draw block (SNX_VKB_DRAW, draw_component) and the push constant word 0 that says where it
+       starts (draw_at) */
+    u32 draw, draw_ptr, draw_at, draw_at_ptr;
     u32 tex[SH_MAXTEX], tex_sampled[SH_MAXTEX];
     /* an indexed slot's arrays on SNX_VKB_TEXARRAY and SNX_VKB_TEXDEPTH, by kind (its tex[] is the element of the
        instruction being written), and SNX_VKB_TEXMAP and SNX_VKB_TEXFUNCS */
@@ -634,32 +632,31 @@ static u32 float_fma(Ctx* c, u32 mode, u32 x, u32 y, u32 z) {
 static int cb_windowed(const Ctx* c) {
     return g_spirv_translate.cb_windows && (c->stage == ST_VS || c->stage == ST_FS);
 }
-static void unified_push(Ctx* c) {
-    if (c->push) return;
-    const int fs = c->stage == ST_FS;
-    u32 members[8], offsets[8], n = 0;
-    members[n] = c->t_v4f, offsets[n++] = 0;
-    if (fs) {
-        members[n] = c->t_v4f, offsets[n++] = 16;
-        members[n] = c->t_v4u, offsets[n++] = 32;
-        members[n] = c->t_v4u, offsets[n++] = 96;
+/* where the draw's per-draw block (SNX_VKB_DRAW) starts in its window, in 16-byte units: the push constant word 0 that
+   the renderer gives a graphics program */
+static u32 draw_at(Ctx* c) {
+    if (!c->draw_at) {
+        c->draw_at = spv_emit_push_vec4(&c->e, c->t_v4u, c->t_u32, 0, 0, &c->draw_at_ptr);
+        add_interface(c, c->draw_at);
     }
-    c->cbw_member = n;
-    for (u32 k = 0; k < 3; k++)
-        members[n] = c->t_v4u, offsets[n++] = (fs ? SH_PUSH_CB_WINDOW_FS : SH_PUSH_CB_WINDOW) + 16 * k;
-    if (g_spirv_translate.tex_table) {
-        c->tw_member = n;
-        members[n] = c->t_v4u, offsets[n++] = SH_PUSH_TEX_WORDS;
-    }
-    u32 block = spv_emit_type_struct(&c->e, members, offsets, n);
-    spv_emit_decorate(&c->e, block, SPV_DECORATION_BLOCK, NULL, 0);
-    c->push = c->scaled_push = spv_emit_variable(&c->e, SPV_STORAGE_PUSH_CONSTANT, block);
-    c->push_ptr = spv_emit_type_pointer(&c->e, SPV_STORAGE_PUSH_CONSTANT, c->t_f32);
-    c->cbw_u32_ptr = spv_emit_type_pointer(&c->e, SPV_STORAGE_PUSH_CONSTANT, c->t_u32);
-    add_interface(c, c->push);
+    return spv_emit_push_component_f32(&c->e, c->draw_at_ptr, c->draw_at, c->zero, c->zero, c->t_u32);
 }
+/* word k of a graphics stage's per-draw block (SNX_VKB_DRAW) at draw_at: its float bits, as the renderer's pc[] holds
+   them (callers that read a u32 word bitcast it with to_u). The program declares the whole window (SNX_DRAW_WINDOW) */
+static u32 draw_component(Ctx* c, u32 k) {
+    if (!c->draw) {
+        c->draw = spv_emit_readonly_vec4_array(&c->e, c->t_v4f, c->t_f32, c->t_u32, (u32)shader_vk_set(c->stage),
+                                               SNX_VKB_DRAW, SNX_DRAW_WINDOW / 16, &c->draw_ptr);
+        add_interface(c, c->draw);
+    }
+    return spv_emit_uniform_component(&c->e, c->draw_ptr, c->draw, c->zero,
+                                      spv_emit_iadd_u32(&c->e, c->t_u32, draw_at(c), cu(c, k / 4)), cu(c, k & 3),
+                                      c->t_f32);
+}
+/* word k of the draw's pc[]: a graphics stage reads it in its per-draw block. A compute program, and a task program of
+   the compute-task path (a compute dispatch), read their own push constants, which the dispatch pushes */
 static u32 push_component(Ctx* c, u32 k) {
-    if (cb_windowed(c)) unified_push(c);
+    if (c->stage != ST_CS && !(c->stage == ST_TS && c->payload_buf)) return draw_component(c, k);
     if (!c->push) {
         c->push = spv_emit_push_vec4(&c->e, c->t_v4f, c->t_f32, 0, 0, &c->push_ptr);
         add_interface(c, c->push);
@@ -669,11 +666,11 @@ static u32 push_component(Ctx* c, u32 k) {
 /* element plus the bank's window offset in 16-byte units (a 16-bit field, two banks a word), with cb_windows */
 static u32 cbuf_window(Ctx* c, u32 bank, u32 element) {
     if (!cb_windowed(c) || bank >= 18 || bank >= g_spirv_translate.uniform_cbufs) return element;
-    unified_push(c);
     c->si->cb_window = 1;
     const u32 word = bank / 2;
-    u32 packed = spv_emit_push_component_f32(&c->e, c->cbw_u32_ptr, c->push, cu(c, c->cbw_member + word / 4),
-                                             cu(c, word & 3), c->t_u32);
+    u32 packed;
+    /* a vertex program's window offsets are in its per-draw block, the fragment stage's at its own offsets there */
+    packed = to_u(c, draw_component(c, (c->stage == ST_VS ? SH_PUSH_CB_WINDOW : SH_PUSH_CB_WINDOW_FS) / 4 + word));
     if (bank & 1) packed = spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, packed, cu(c, 16));
     return spv_emit_iadd_u32(&c->e, c->t_u32, element,
                              spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, packed, cu(c, 0xFFFF)));
@@ -829,17 +826,7 @@ static u32 scale_component(Ctx* c, u32 k) {
    push constant offset 16 (vk/render.c: x the slots 0 to 31, y 32 to 63), as a bool. With own, whether that target
    has the size of the one the draw renders to as well (render.c's own_size): its bit in the uvec4 at offset 96 */
 static u32 scaled_slot(Ctx* c, int slot, int own) {
-    if (cb_windowed(c)) unified_push(c); /* members 2 and 3 there too */
-    if (!c->scaled_push) {
-        const u32 members[3] = {c->t_v4f, c->t_v4u, c->t_v4u}, offsets[3] = {16, 32, 96};
-        u32 block = spv_emit_type_struct(&c->e, members, offsets, 3);
-        spv_emit_decorate(&c->e, block, SPV_DECORATION_BLOCK, NULL, 0);
-        c->scaled_push = spv_emit_variable(&c->e, SPV_STORAGE_PUSH_CONSTANT, block);
-        add_interface(c, c->scaled_push);
-    }
-    u32 bits = spv_emit_push_component_f32(&c->e, spv_emit_type_pointer(&c->e, SPV_STORAGE_PUSH_CONSTANT, c->t_u32),
-                                           c->scaled_push, cu(c, (cb_windowed(c) ? 1u : 0u) + (own ? 2u : 1u)),
-                                           cu(c, slot >= 32), c->t_u32);
+    u32 bits = to_u(c, draw_component(c, (own ? 24 : 8) + (slot >= 32)));
     u32 bit = spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32,
                               spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, bits, cu(c, (u32)slot & 31)),
                               cu(c, 1));
@@ -2959,9 +2946,8 @@ static u32 record_word(Ctx* c, u32 k) {
                                                    SNX_VKB_TEXWORDS, 4096, &c->tex_words_ptr);
         add_interface(c, c->tex_words);
     }
-    unified_push(c);
-    u32 base = spv_emit_push_component_f32(&c->e, c->cbw_u32_ptr, c->push, cu(c, c->tw_member),
-                                           cu(c, c->stage == ST_FS), c->t_u32);
+    /* a vertex program's word window is in its per-draw block, the fragment stage's at its own offset there */
+    u32 base = to_u(c, draw_component(c, (c->stage == ST_VS ? SH_PUSH_TEX_WORDS : SH_PUSH_TEX_WORDS + 4) / 4));
     u32 index = spv_emit_iadd_u32(
         &c->e, c->t_u32, spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, base, cu(c, 2)), cu(c, k));
     return uniform_word(c, c->tex_words_ptr, c->tex_words, index);
@@ -6794,6 +6780,11 @@ u32* sm86_to_spirv_ftz(const u8* code, u32 bytes, int stage, const u32* sph, Sha
                 spv_emit_execution_mode(e, fn, SPV_MODE_INVOCATIONS, 1, invocations ? invocations : 1);
             }
             if (stage == ST_FS) spv_emit_fragment_origin_upper_left(e, fn);
+            /* the depth and stencil tests before the program where its key asks for them (DsPrograms.early_z), as
+               spirv_translate.c gives Maxwell's: without them a fragment the tests reject still runs the program's
+               image and memory stores */
+            if (stage == ST_FS && si->early_fragment_tests)
+                spv_emit_execution_mode(e, fn, SPV_MODE_EARLY_FRAGMENT_TESTS, 0, 0);
             if (stage == ST_FS && c->depth) spv_emit_fragment_depth_replacing(e, fn);
             if (stage == ST_CS) {
                 u32 x = si->cs_local[0] ? si->cs_local[0] : 1, y = si->cs_local[1] ? si->cs_local[1] : 1,
