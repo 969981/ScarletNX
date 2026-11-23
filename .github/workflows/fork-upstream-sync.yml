@@ -62,10 +62,27 @@ jobs:
           patch="$RUNNER_TEMP/scarletnx-upstream.patch"
           # Preserve fork-specific tests that validate this branch's customized workflow.
           # Sync upstream source but never silently overwrite local build policy.
+          # The fork's CPU header was manually reconciled against upstream with two
+          # reviewed C11 fixes. Re-applying the historical diff via --3way would
+          # conflict even though all upstream changes are present. Skip only if
+          # the exact current file equals upstream plus those two known fixes.
+          extra_excludes=()
+          header=src/common/cpu/aarch64/cpu.h
+          if git diff --name-only "$previous" "$upstream_sha" -- "$header" | grep -q .; then
+            candidate="$RUNNER_TEMP/scarletnx-expected-cpu.h"
+            git show "$upstream_sha:$header" | sed \
+              -e '/^#include <stdatomic.h>$/a #include <stdalign.h>  /* alignof is a macro in C11/C17, not a built-in C keyword */' \
+              -e 's/^static_assert(/_Static_assert(/' > "$candidate"
+            if cmp -s "$header" "$candidate"; then
+              extra_excludes+=(":(exclude)$header")
+              echo "Verified the CPU header is already reconciled; preserving its C11 fixes."
+            fi
+          fi
           git diff --binary "$previous" "$upstream_sha" -- . \
             ':(exclude).github/workflows/**' \
             ':(exclude)tests/build_caches_test.py' \
-            ':(exclude)tests/fail_fast_test.py' > "$patch"
+            ':(exclude)tests/fail_fast_test.py' \
+            "${extra_excludes[@]}" > "$patch"
           source_changed=false
           if [ -s "$patch" ]; then
             git apply --3way --index "$patch"
