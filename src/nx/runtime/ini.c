@@ -3,6 +3,7 @@
 /* the .ini's settings tables (ini.h): finding a key, reading a value into its variable, and writing it back */
 #include "nx/runtime/ini.h"
 #include "common/utilities/common.h" /* SNX_IOS */
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -154,6 +155,28 @@ void ini_format(const IniOpt* o, char* out, size_t n) {
         snprintf(out, n, "%s", (const char*)o->var);
 }
 
+int ini_at_default(const IniOpt* o) {
+    if (o->type == INI_TEXT) return !strcmp((const char*)o->var, o->def ? o->def : "");
+    if (!o->def) return atomic_load_explicit((_Atomic const int*)o->var, memory_order_relaxed) == INT_MIN;
+    double def = strtod(o->def, NULL);
+    if (o->type == INI_INT) return atomic_load_explicit((_Atomic const int*)o->var, memory_order_relaxed) == (int)def;
+    return atomic_load_explicit((_Atomic const float*)o->var, memory_order_relaxed) == (float)def;
+}
+
+size_t ini_perf_keys(const IniOpt* table, const char* skip, char* out, size_t n) {
+    size_t at = 0;
+    if (n) out[0] = 0;
+    for (; table->key; ++table) {
+        size_t len = strlen(table->key);
+        if (!(table->flags & INI_PERF) || ini_at_default(table) || (skip && !strcmp(table->key, skip))) continue;
+        if (at && at < n) snprintf(out + at, n - at, ",");
+        at += at ? 1 : 0;
+        if (at < n) snprintf(out + at, n - at, "%s", table->key);
+        at += len;
+    }
+    return at;
+}
+
 int ini_changed(const IniOpt* table, int flags, char* out, size_t n) {
     size_t at = 0;
     int count = 0;
@@ -161,23 +184,11 @@ int ini_changed(const IniOpt* table, int flags, char* out, size_t n) {
     for (; table->key; ++table) {
         char value[64];
         const char* shown = value;
-        int same;
-        if (!table->def) continue;
-        if (table->type == INI_TEXT) {
+        if (!table->def || ini_at_default(table)) continue;
+        if (table->type == INI_TEXT)
             shown = (const char*)table->var;
-            same = !strcmp(shown, table->def);
-        } else {
-            double def = strtod(table->def, NULL);
-            if (table->type == INI_INT)
-                same = atomic_load_explicit((_Atomic const int*)table->var, memory_order_relaxed) == (int)def;
-            else {
-                float f;
-                f = atomic_load_explicit((_Atomic const float*)table->var, memory_order_relaxed);
-                same = f == (float)def;
-            }
+        else
             ini_format(table, value, sizeof value);
-        }
-        if (same) continue;
         if (at < n) {
             if (table->type == INI_TEXT && (flags & INI_CHANGED_NO_TEXT))
                 at += (size_t)snprintf(out + at, n - at, "%s%s", count ? ", " : "", table->key);
@@ -276,13 +287,16 @@ const char* ini_only_words(int flags) {
         case INI_ONLY_LINUX: return SNX_TR_NOOP("Linux and Android only");
         case INI_ONLY_ARM64_LINUX: return SNX_TR_NOOP("arm64 Linux and Android only");
         case INI_ONLY_NONE: return SNX_TR_NOOP("Not offered");
+        case INI_ONLY_APPLE: return SNX_TR_NOOP("macOS and iOS only");
         default: return NULL;
     }
 }
 /* whether this system is one of those only names */
 static int only_here(int only) {
 #if defined(__APPLE__) && !defined(SNX_IOS)
-    return only == INI_ONLY_MACOS;
+    return only == INI_ONLY_MACOS || only == INI_ONLY_APPLE;
+#elif defined(__APPLE__)
+    return only == INI_ONLY_APPLE;
 #elif defined(_WIN32)
     return only == INI_ONLY_WINDOWS;
 #elif defined(__linux__)
@@ -380,6 +394,9 @@ static const struct {
                       {"user", "now user_uid, the uid of the user it named"},
                       {"memory_fit", "now memory_fit_mode, whose 0 is Auto (memory_fit's 1) and 1 Off"},
                       {"astc_bc", "now astc_mode, whose 0 is Auto (astc_bc's 1), 1 Exact (RGBA8) and 2 BC7"},
+                      {"write_tracking_hot",
+                       "now write_tracking_hot_pages, whose 2 is Auto (write_tracking_hot's 0, its "
+                       "default) and 1 On"},
                       {"controls_opacity", "the on-screen controls are opaque"},
                       {"controls_alpha", "the on-screen controls are opaque"},
                       {"controls_skin", "the on-screen controls are white shapes, with no skin"},

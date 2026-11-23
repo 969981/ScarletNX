@@ -68,6 +68,9 @@ typedef struct {
     /* types and constants */
     u32 t_void, t_bool, t_u32, t_i32, t_f32, t_v2f, t_v3f, t_v4f, t_v4u, t_v3u, t_v2u;
     u32 t_u64_; /* made with the Int64 capability when an instruction needs it (u64_type) */
+    u32 t_u16; /* narrow LDSM shared loads (hmma_narrow_lds) */
+    u8 narrow_unsafe; /* a shared atomic or sub-word shared store the u16 view cannot mirror */
+    u32 shared16, shared16_ptr, shared16_words; /* the u16 view of shared memory, kept in sync by its stores */
     u32 zero, true_v, false_v, glsl;
     /* the program's state: Function variables, made at the start */
     u32 reg[256], ureg[64], pred[8], upred[8];
@@ -1626,13 +1629,28 @@ static u32 table_ssbo_id(Ctx* c, u32 key) {
 }
 /* where two keys meet (a predicated write over the register's key, or two paths): an indirect key against another
    key takes neither, and the address is then compared with each at run time (global_dynamic), which the two are
-   candidates of. Two constant buffer keys keep track_globals's own rules */
+   candidates of. Two constant buffer keys keep track_globals's own rules, but where two paths meet and a value from
+   memory reaches the register on either side the access is compared at run time anyway, and the two are its
+   candidates too (track_candidates) */
 static void track_conflict(Ctx* c, u32 a, u32 b) {
     for (u32 k = 0; k < 2; k++) {
         u32 key = k ? b : a, seen = 0;
         if (!key) continue;
         for (u32 j = 0; j < c->ndyn_keys; j++) seen |= c->dyn_keys[j] == key - 1;
         if (!seen && c->ndyn_keys < 16) c->dyn_keys[c->ndyn_keys++] = key - 1;
+    }
+}
+/* the keys of two constant buffer words whose paths meet where a value from memory reaches the register:
+   global_dynamic's candidates, each that can hold a buffer's address (a storage buffer descriptor of cbuf 0, or a bare
+   16-byte aligned address in a program's own cbuf, as shader_gbuf_tag and shader_gbuf_tag_any take them). Any other
+   word an add took as a base takes no buffer slot */
+static void track_candidates(Ctx* c, u32 a, u32 b) {
+    for (u32 k = 0; k < 2; k++) {
+        u32 key = k ? b : a;
+        if (!key) continue;
+        u32 bank = SH_GBUF_BANK(key - 1), off = SH_GBUF_OFFSET(key - 1);
+        if ((off & 15) || bank >= 18 || (bank == 0 && !shader_gbuf_sized(c->stage, off))) continue;
+        track_conflict(c, key, 0);
     }
 }
 /* the key of a register source of a global access or an ALU instruction (0 for none) */
@@ -1918,7 +1936,8 @@ static void track_meet(Ctx* c, u32* key, u8* exact, u8* dyn, u8* tab, u8* tabx, 
             if (key_indirect(key[r]) || key_indirect(key2[r])) {
                 track_conflict(c, key[r], key2[r]);
                 dyn[r] = 1;
-            }
+            } else if (dyn[r] || dyn2[r])
+                track_candidates(c, key[r], key2[r]);
             key[r] = 0, exact[r] = 0;
         } else
             exact[r] &= exact2[r];
@@ -2057,6 +2076,20 @@ static u32 shared_var(Ctx* c) {
             u32 array = spv_emit_type_array_u32(&c->e, c->t_u32, c->shared_words);
             c->shared = spv_emit_workgroup_variable(&c->e, spv_emit_type_workgroup_pointer(&c->e, array));
             c->shared_ptr = spv_emit_type_workgroup_pointer(&c->e, c->t_u32);
+            /* The narrow LDSM reads its halves through a second, u16-typed workgroup array. Logical SPIR-V cannot
+               bit-cast a Workgroup pointer, so the two views are separate variables and every 32-bit shared store
+               also writes its two halves here (shared16_store), as LDSM.T's reads use this view. */
+            if (g_spirv_translate.hmma_narrow_lds && !c->narrow_unsafe) {
+                if (!c->t_u16) {
+                    c->t_u16 = spv_emit_type_int(&c->e, 16, 0);
+                    spv_emit_capability(&c->e, SPV_CAPABILITY_INT16);
+                }
+                c->shared16_words = 2 * c->shared_words;
+                u32 array16 = spv_emit_type_array(&c->e, c->t_u16, c->shared16_words);
+                c->shared16 = spv_emit_workgroup_variable(&c->e, spv_emit_type_workgroup_pointer(&c->e, array16));
+                c->shared16_ptr = spv_emit_type_workgroup_pointer(&c->e, c->t_u16);
+                add_interface(c, c->shared16);
+            }
         }
         add_interface(c, c->shared);
     }
@@ -2229,6 +2262,25 @@ static void mem_ptrs(Ctx* c, u32 buffer, u32 address, u32 n, u32 ptrs[4]) {
                       ? gbuf_pointer(c, buffer, index[k], c->t_u32)
                       : spv_emit_storage_access_u32(&c->e, c->gbuf_ptr, buffer, c->zero, index[k]);
 }
+/* With hmma_narrow_lds, a 32-bit shared store also writes its two halves to the u16 view that LDSM.T reads. The
+   u16 array is a separate workgroup variable, so there is no pointer aliasing in the module. */
+static void shared16_store(Ctx* c, u32 address, u32 value) {
+    if (!c->shared16) return;
+    u32 index = spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, address, cu(c, 2));
+    u32 base = spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, index, cu(c, 1));
+    for (u32 k = 0; k < 2; k++) {
+        u32 idx = k ? spv_emit_iadd_u32(&c->e, c->t_u32, base, cu(c, 1)) : base;
+        idx = SPV_EXT(&c->e, c->t_u32, SPV_GLSL_U_MIN, cu(c, c->shared16_words - 1), idx);
+        u32 ptr = spv_emit_function_element_pointer(&c->e, c->shared16_ptr, c->shared16, idx);
+        u32 half = spv_emit_int_convert(
+            &c->e, c->t_u16,
+            spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32,
+                            spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, value, cu(c, 16 * k)),
+                            cu(c, 0xffff)),
+            0);
+        spv_emit_store_nonprivate(&c->e, ptr, half);
+    }
+}
 /* a load of mem_type (NAK's MemType) into registers dst on */
 static void mem_load(Ctx* c, u32 buffer, u32 address, u32 type, u32 dst, int uniform_dst) {
     u32 words = mem_words(type), ptrs[4];
@@ -2285,7 +2337,12 @@ static void mem_store(Ctx* c, u32 buffer, u32 address, u32 type, u32 data) {
     }
     u32 words = mem_words(type), ptrs[4];
     mem_ptrs(c, buffer, address, words, ptrs);
-    for (u32 k = 0; k < words; k++) mem_word_store(c, buffer, ptrs[k], rd(c, data >= SM86_RZ ? data : data + k));
+    for (u32 k = 0; k < words; k++) {
+        u32 v = rd(c, data >= SM86_RZ ? data : data + k);
+        mem_word_store(c, buffer, ptrs[k], v);
+        if (!buffer && g_spirv_translate.hmma_narrow_lds)
+            shared16_store(c, spv_emit_iadd_u32(&c->e, c->t_u32, address, cu(c, 4 * k)), v);
+    }
 }
 
 /* RED.ADD.F32 and ATOMG.ADD.F32 (NAK's AtomType F32, .FTZ.RN): a float atomic add to the word of a global buffer at
@@ -4408,6 +4465,16 @@ static void hmma(Ctx* c, const Sm86Insn* in, const u32* ldsm_a, const u32* ldsm_
 }
 /* a 16-bit element of shared memory at the byte address, in the low half */
 static u32 shared_u16(Ctx* c, u32 address) {
+    if (g_spirv_translate.hmma_narrow_lds && c->shared16) {
+        /* A narrow shared load: read the half at the byte address directly from the u16 view instead of loading its
+           whole u32 word and shifting and masking it (Google's mixed-input trick). RADV lowers this u16 OpLoad to
+           ds_read_u16, and the load's zero extension puts the half where the fragment wants it with no shift or mask. */
+        u32 index = spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, address, cu(c, 1));
+        index = SPV_EXT(&c->e, c->t_u32, SPV_GLSL_U_MIN, cu(c, c->shared16_words - 1), index);
+        u32 ptr = spv_emit_function_element_pointer(&c->e, c->shared16_ptr, c->shared16, index);
+        return spv_emit_int_convert(&c->e, c->t_u32,
+                                    spv_emit_load_nonprivate(&c->e, c->t_u16, ptr), 0);
+    }
     u32 word = spv_emit_load_nonprivate(&c->e, c->t_u32, mem_ptr(c, 0, address, 0));
     u32 shift = spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32,
                                 spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, address, cu(c, 2)), cu(c, 3));
@@ -5703,6 +5770,16 @@ static Sm86Insn* inline_calls(Ctx* c, Sm86Insn* insn, u32* count) {
     for (u32 i = 0, copies = 0; i < n; i++) {
         if (out[i].op != SM86_CALL) continue;
         u32 entry = sm86_branch_target(&out[i], i), end = entry;
+        /* ptxas leaves a loop with @P CALL.REL.NOINC to the code after the loop's back edge, an unconditional BRA
+           backwards right after the CALL: the loop's exit, a branch. The search below for the RETs up to the next BRA
+           to itself goes on past the program's last EXIT into the functions after it, and took such an exit for a
+           call of everything from there on: copied for each exit, the copies' own exits copied again, a vertex
+           program of 19,584 instructions went past 65,536 and a compute program past 64 copies */
+        if (entry == i + 2 && i + 1 < n && out[i + 1].op == SM86_BRA && sm86_always(&out[i + 1]) &&
+            sm86_branch_target(&out[i + 1], i + 1) <= i) {
+            out[i] = make_bra(&out[i], i, entry);
+            continue;
+        }
         while (end < n &&
                !(out[end].op == SM86_BRA && sm86_always(&out[end]) && sm86_branch_target(&out[end], end) == end))
             end++;
@@ -5711,7 +5788,7 @@ static Sm86Insn* inline_calls(Ctx* c, Sm86Insn* insn, u32* count) {
             free(out);
             return NULL;
         }
-        /* ptxas also leaves a loop with @P CALL.REL.NOINC to the code after it, which no RET ends: a branch */
+        /* and a CALL to code that no RET ends before the next BRA to itself: a branch too */
         int returns = 0;
         for (u32 k = entry; k <= end; k++) returns |= insn[k].op == SM86_RET;
         if (!returns) {
@@ -6573,6 +6650,16 @@ u32* sm86_to_spirv_ftz(const u8* code, u32 bytes, int stage, const u32* sph, Sha
         spv_emit_shader_capability(e);
         /* hmma_coop's matrices, which SPV_KHR_cooperative_matrix allows in a module of the Vulkan memory model only */
         c->coop = coop_wanted(c);
+        /* the u16 view is written only by 32-bit shared stores: a program with a shared atomic or a sub-word
+           shared store cannot keep it coherent, so such a program takes the general LDSM path */
+        if (g_spirv_translate.hmma_narrow_lds)
+            for (u32 i = 0; i < n && !c->narrow_unsafe; i++) {
+                const Sm86Insn* q = &insn[i];
+                if (q->op == SM86_ATOMS || q->op == SM86_ATOMS_NOU || q->op == SM86_ATOMS_CAS ||
+                    q->op == SM86_ATOMS_POPC_INC ||
+                    ((q->op == SM86_STS || q->op == SM86_STS_NOU) && sm86_field(q, 73, 3) < 4))
+                    c->narrow_unsafe = 1;
+            }
         if (c->coop) {
             e->vulkan_memory_model = 1;
             spv_emit_capability(e, SPV_CAPABILITY_VULKAN_MEMORY_MODEL);

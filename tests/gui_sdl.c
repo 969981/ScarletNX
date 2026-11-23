@@ -1781,6 +1781,102 @@ static bool games_lists(const App* app, const char* shown) {
 /* Games' View box (V): Recent Games and Dumps, on by default, and Sort, by title; each changed by Enter, Left, Right
    or a click, kept in app.ini at once and Games listed again by it; an app.ini without them (an older version's) has
    the defaults, iOS's off; a word it does not know named with the one it keeps */
+/* the presses of a player who goes on while Games is read: Tab, then a pad's R1 (RB, Tab's button) and their
+   releases, pushed on SDL's queue from SDL's timer thread, after which the listing is done */
+static const Uint32 pressed_during[] = {SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP, SDL_EVENT_GAMEPAD_BUTTON_DOWN,
+                                        SDL_EVENT_GAMEPAD_BUTTON_UP};
+static Uint32 SDLCALL press_during(void* listing, SDL_TimerID id, Uint32 interval) {
+    (void)id;
+    (void)interval;
+    for (size_t i = 0; i < sizeof pressed_during / sizeof *pressed_during; ++i) {
+        SDL_Event e = {0};
+        e.type = pressed_during[i];
+        if (i < 2)
+            e.key.key = SDLK_TAB;
+        else
+            e.gbutton.button = SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER;
+        assert(SDL_PushEvent(&e));
+    }
+    SDL_SetAtomicInt(&((GamesListing*)listing)->done, 1);
+    return 0;
+}
+/* the pixels of color in the box of side pixels square centred at cx, cy of the viewport */
+static int colour_around(App* app, float cx, float cy, int side, SDL_Color color) {
+    SDL_Surface* image = read_px(app, (int)cx - side / 2, (int)cy - side / 2, side, side);
+    int n = 0;
+    assert(image);
+    for (int y = 0; y < image->h; ++y)
+        for (int x = 0; x < image->w; ++x) {
+            Uint8 r, g, b, a;
+            assert(SDL_ReadSurfacePixel(image, x, y, &r, &g, &b, &a));
+            n += r == color.r && g == color.g && b == color.b;
+        }
+    SDL_DestroySurface(image);
+    return n;
+}
+/* Games' loading line's ring where the theme's [run] ring puts the loading screen's: at the window's right on the
+   line's row, left of the words (which then start three columns on), past the words and the dots' whole width, or
+   none; its inner circle in the soft colour there and nowhere else of the three */
+static void games_loading_ring(App* app) {
+    const GuiRing was = app->theme.ring;
+    const float cw = (float)cell_w(app), ch = (float)cell_h(app), r = 7.0f * letters(app);
+    const int side = (int)(2 * r) + 4;
+    GuiGamesBoxes g;
+    int width, height;
+    area(app, &width, &height);
+    app->games_loading = true;
+    for (int ring = GUI_RING_NONE; ring <= GUI_RING_NEAR_TEXT; ++ring) {
+        float cy, at[3];
+        int text_x, text_y;
+        app->theme.ring = (GuiRing)ring;
+        render(app);
+        games_boxes(app, &g);
+        cy = (float)(g.place.list.y + cell_h(app)) + ch / 2;
+        at[0] = (float)g.place.list.x + 2 * cw;                                            /* left */
+        at[1] = (float)width - 2 * cw;                                                     /* right */
+        at[2] = (float)g.place.list.x + cw * (float)(1 + strlen("Loading games") + 4) + r; /* near the text */
+        assert(find_text(app, "Loading games", rgb(app->theme.ink), 1, &text_x, &text_y));
+        assert((float)text_x == (float)g.place.list.x + cw * (ring == GUI_RING_LEFT ? 4 : 1) &&
+               (float)text_y == cy - ch / 2);
+        for (int k = 0; k < 3; ++k) {
+            const int want = (ring == GUI_RING_LEFT && k == 0) || (ring == GUI_RING_RIGHT && k == 1) ||
+                             (ring == GUI_RING_NEAR_TEXT && k == 2);
+            const int n = colour_around(app, at[k], cy, side, rgb(app->theme.soft));
+            if ((n > 0) != want) fprintf(stderr, "ring %d place %d: %d soft pixels\n", ring, k, n);
+            assert((n > 0) == want);
+        }
+    }
+    app->theme.ring = was;
+    app->games_loading = false;
+    render(app);
+}
+/* Games while its list is read (list_games, on a thread of its own): past GUI_LISTING_SHOWN_MS its loading line where
+   the list goes, in ink, the list's rows not drawn, and the list back once read. What the player presses while it is
+   read stays on SDL's queue, every press with its release in their order, for the loop to take once the list is there
+   (a tab key or a pad's R1 then is a tab that changes) */
+static void games_listing(App* app) {
+    GamesListing l = {.app = app};
+    SDL_Event got;
+    size_t k = 0;
+    app->games_loading = true;
+    render(app);
+    shows(app, "Loading games", rgb(app->theme.ink));
+    hides(app, "Recent Games", rgb(app->theme.soft));
+    games_loading_ring(app);
+    app->games_loading = false;
+    render(app);
+    hides(app, "Loading games", rgb(app->theme.ink));
+    shows(app, "Recent Games", rgb(app->theme.soft));
+    SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+    assert(SDL_AddTimer(50, press_during, &l));
+    listing_wait(app, &l, 0); /* its loading line drawn meanwhile */
+    assert(!app->games_loading);
+    while (SDL_PollEvent(&got))
+        if (got.type == SDL_EVENT_KEY_DOWN || got.type == SDL_EVENT_KEY_UP ||
+            got.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || got.type == SDL_EVENT_GAMEPAD_BUTTON_UP)
+            assert(k < sizeof pressed_during / sizeof *pressed_during && got.type == pressed_during[k++]);
+    assert(k == sizeof pressed_during / sizeof *pressed_during);
+}
 static void view_box(App* app, const char* temporary) {
     char *was_games = app->games_dir, *was_data = app->data_dir, *was_app = app->app_file;
     char* was_recent_file = app->recent_file;
@@ -1818,6 +1914,8 @@ static void view_box(App* app, const char* temporary) {
     go_tab(app, GUI_TAB_GAMES);
     assert(recent_on(app) && dumps_on(app) && app->browser.head == 1 && games_lists(app, "Dumps") &&
            games_lists(app, "beta dump.nsp") && games_lists(app, "gamma.cia") && games_lists(app, "alpha game"));
+    assert(!app->games_loading); /* the list read: its loading line gone */
+    games_listing(app);
     render(app);
     shows(app, "Recent Games", rgb(app->theme.soft));
     shows(app, "dumps", rgb(app->theme.soft)); /* the side box's folders, dumps/ with them, wrapped at a slash */
@@ -2152,6 +2250,61 @@ static GuiRect grid_model(const UiFlow* f, const bool* label, size_t r, int* lin
         c = label[i] ? f->cols : c + 1;
     }
     return gui_rect(0, 0, 0, 0);
+}
+/* Games' icons read from their files GUI_ICONS_A_FRAME a frame at most (render), the rest showing the loading mark
+   until a later frame reads them, so a page of icons does not hold one frame; outside a frame one is read at once */
+static void icons_a_frame(App* app, const char* temporary) {
+    char *was_games = app->games_dir, *was_data = app->data_dir, *was_app = app->app_file,
+         *was_recent_file = app->recent_file;
+    GuiRecent was_recent = app->recent;
+    int was_folders = app->folder_count, read = 0;
+    char *root = snx_path_join(temporary, "icons a frame"), *games[GUI_ICONS_A_FRAME + 3];
+    const int n = GUI_ICONS_A_FRAME + 3;
+    IconJpeg jpeg = {{0}, 0};
+    app->data_dir = root;
+    app->games_dir = snx_path_join(root, "recompiled");
+    app->app_file = snx_path_join(root, "app.ini");
+    app->recent_file = NULL;
+    app->folder_count = 0;
+    app->recent = (GuiRecent){0};
+    assert(!snx_splash_jpeg("wimsy-fuddles", 32, 90, icon_jpeg_write, &jpeg));
+    for (int i = 0; i < n; ++i) { /* game a, game b... each with its icon */
+        char name[16], *icon;
+        snprintf(name, sizeof name, "game %c", 'a' + i);
+        games[i] = folder_game_in(app->games_dir, name);
+        icon = snx_format("%s/%s/%s_data/icon.jpg", app->games_dir, name, name);
+        assert(!snx_write_file(icon, jpeg.data, (size_t)jpeg.size));
+        free(icon);
+    }
+    app->options[GUI_OPTION_VIEW] = 1; /* Grid: a tile each, its icon over its name */
+    layout(app);
+    go_tab(app, GUI_TAB_GAMES);
+    assert(games_listed(app) == (size_t)n);
+    render(app);
+    for (int i = 0; i < GUI_ICONS; ++i) read += app->icons[i].path && app->icons[i].texture;
+    assert(read == GUI_ICONS_A_FRAME && !app->icons_spent);
+    render(app); /* the rest */
+    read = 0;
+    for (int i = 0; i < GUI_ICONS; ++i) read += app->icons[i].path && app->icons[i].texture;
+    assert(read == n);
+    icons_free(app);
+    assert(game_icon(app, games[0]) && game_icon(app, games[n - 1])); /* outside a frame: at once */
+    games_defaults(app);
+    app->recent = was_recent;
+    app->recent_file = was_recent_file;
+    app->folder_count = was_folders;
+    free(app->games_dir);
+    free(app->app_file);
+    app->games_dir = was_games;
+    app->data_dir = was_data;
+    app->app_file = was_app;
+    layout(app);
+    go_tab(app, GUI_TAB_MENU);
+    app->games_stamp = stamp_now(app);
+    app->message[0] = 0;
+    assert(!snx_remove_tree(root));
+    for (int i = 0; i < n; ++i) free(games[i]);
+    free(root);
 }
 /* View's Grid: Games' rows as tiles, as many a line as fit, "Recent Games" and the groups' headings each on a line of
    its own; the arrows go to the tile beside, above or under the focus, PgUp and PgDn by the lines that show, the
@@ -4486,13 +4639,23 @@ static void recompile_queue(App* app) {
         games_place(app, &p);
         tab = tab_rect(app, p.tabs, GUI_TAB_RECOMPILE);
         app->clock = 2 * app->theme.blink_ms * 50;
-        render(app);
-        assert(
-            same_colour(pixel(app, (float)(tab.x + app->scale), (float)(tab.y + tab.h / 2)), rgb(app->theme.failure)));
-        app->clock += app->theme.blink_ms;
-        render(app);
-        assert(
-            !same_colour(pixel(app, (float)(tab.x + app->scale), (float)(tab.y + tab.h / 2)), rgb(app->theme.failure)));
+        for (int lit = 1; lit >= 0; --lit) {
+            render(app);
+            SDL_Color got = pixel(app, (float)(tab.x + app->scale), (float)(tab.y + tab.h / 2));
+            SDL_Color want = rgb(app->theme.failure);
+            char label[64];
+            tab_label(app, GUI_TAB_RECOMPILE, label, sizeof label);
+            if (same_colour(got, want) != (lit == 1))
+                fprintf(stderr,
+                        "gui_sdl: the Compile tab at clock %llu (blink %u ms) reads \"%s\" and is %d,%d,%d at its "
+                        "left edge, %d,%d of %d,%d %dx%d, shown tab %d, Games loading %d: the failure colour %d,%d,%d "
+                        "%s\n",
+                        (unsigned long long)app->clock, (unsigned)app->theme.blink_ms, label, got.r, got.g, got.b,
+                        (int)(tab.x + app->scale), tab.y + tab.h / 2, tab.x, tab.y, tab.w, tab.h, tab_shown(app),
+                        (int)app->games_loading, want.r, want.g, want.b, lit ? "wanted" : "not wanted");
+            assert(same_colour(got, want) == (lit == 1));
+            app->clock += app->theme.blink_ms;
+        }
         app->clock = 0;
     }
     /* the log holds the queue's recompiles since one started with no line of an ended one left, the failure's among
@@ -5782,6 +5945,92 @@ static void check_play_args(App* app, const char* root) {
     app->menu.selected = was;
     puts("the game activity's arguments name each console's driver, its folder and its settings alone");
 }
+/* A PLAY's title ID (play_asked, Android's org.scarletnx.action.PLAY): the game whose folder it names (title_game), the
+   row of Games that Play plays (title_row), and the one in focus (game_box_title); each one it does not start said
+   with that ID: one that is no title ID, one no game has, one waiting for the setup's end and then taken, a run on the
+   screen and a box over it */
+static void play_asked_said(App* app, const char* temporary) {
+    char *was_games = app->games_dir, *was_recent_file = app->recent_file;
+    int was_folders = app->folder_count;
+    GuiRecent was_recent = app->recent;
+    char *root = snx_path_join(temporary, "play asked"), id[17], *game, *other, *folder, *beside, *named;
+    int row;
+    app->games_dir = snx_path_join(root, "recompiled");
+    app->recent_file = NULL;
+    app->folder_count = 0;
+    app->recent = (GuiRecent){0};
+    game = folder_game_in(app->games_dir, "0100ABCD00010000");
+    other = folder_game_in(app->games_dir, "alpha game");
+    folder = snx_dirname(game);
+    beside = snx_path_join(folder, "another program");
+    assert(!snx_write_file(beside, "game", 4));
+    /* its program, its folder or another file of it: the game its folder's name says */
+    {
+        const char* paths[] = {game, folder, beside};
+        for (size_t i = 0; i < sizeof paths / sizeof *paths; ++i) {
+            named = title_game(paths[i], id);
+            assert(named && snx_same_file(named, game) && !strcmp(id, "0100ABCD00010000"));
+            free(named);
+        }
+    }
+    named = title_game(other, id); /* a folder no title ID names */
+    assert(!named && !id[0]);
+    assert(!title_game(NULL, id) && !id[0]);
+    app->menu.view = GUI_LOAD_NONE;
+    play_asked(app, "0100abcd00010000"); /* as snx_title_text writes one: capitals */
+    assert(!strcmp(app->message, "0100abcd00010000 is not a title ID: 16 hex digits in capitals"));
+    assert(app->menu.view == GUI_LOAD_NONE);
+    play_asked(app, "0100ABCD00020000"); /* Games shows, saying no game has it */
+    assert(app->menu.view == GUI_LOAD_GAMES &&
+           !strcmp(app->message, "No recompiled game has the title ID 0100ABCD00020000"));
+    row = title_row(app, "0100ABCD00010000");
+    assert(row >= 0 && snx_same_file(app->games.paths[row], game) && title_row(app, "0100ABCD00020000") < 0);
+    /* in focus, its box's Add to Home Screen (Android) is that game's; a game whose folder no title ID names has none */
+    app->browser.page = 0;
+    app->browser.selected = app->browser.head + (size_t)row;
+    named = game_box_title(app, id);
+    assert(named && snx_same_file(named, game) && !strcmp(id, "0100ABCD00010000"));
+    free(named);
+    for (size_t i = 0; i < app->games.count; ++i)
+        if (!strcmp(app->games.shown[i], "alpha game")) app->browser.selected = app->browser.head + i;
+    named = game_box_title(app, id);
+    assert(!named && !id[0] && games_play_focus(app));
+    /* the setup's pages first: the ID waits, said, and is taken once they end */
+    app->setup_on = true;
+    play_asked(app, "0100ABCD00020000");
+    assert(!strcmp(app->play_held, "0100ABCD00020000") &&
+           !strcmp(app->message, "0100ABCD00020000 plays once the setup ends"));
+    app->message[0] = 0;
+    play_held_take(app);
+    assert(!strcmp(app->play_held, "0100ABCD00020000") && !app->message[0]);
+    app->setup_on = false;
+    play_held_take(app);
+    assert(!app->play_held[0] && !strcmp(app->message, "No recompiled game has the title ID 0100ABCD00020000"));
+    /* what keeps Play from starting a game keeps it too */
+    app->menu.running = true;
+    play_asked(app, "0100ABCD00010000");
+    assert(!strcmp(app->message, "0100ABCD00010000 did not start: a run is on the screen"));
+    app->menu.running = false;
+    app->help_shown = true;
+    play_asked(app, "0100ABCD00010000");
+    assert(!strcmp(app->message, "0100ABCD00010000 did not start: a box is open on the screen"));
+    app->help_shown = false;
+    app->recent = was_recent;
+    app->recent_file = was_recent_file;
+    app->folder_count = was_folders;
+    free(app->games_dir);
+    app->games_dir = was_games;
+    go_tab(app, GUI_TAB_MENU);
+    app->games_stamp = stamp_now(app);
+    app->message[0] = 0;
+    assert(!snx_remove_tree(root));
+    free(beside);
+    free(folder);
+    free(other);
+    free(game);
+    free(root);
+    puts("a PLAY's title ID finds the game its folder names, and what it does not start is said with the ID");
+}
 
 int main(int argc, char** argv) {
 #ifdef _WIN32
@@ -6288,6 +6537,33 @@ int main(int argc, char** argv) {
             read = SDL_RenderReadPixels(app.renderer, &view);
             rgba = read ? SDL_ConvertSurface(read, SDL_PIXELFORMAT_RGBA32) : NULL;
             assert(rgba);
+            assert(!memcmp(rgba->pixels, green, 4));
+            SDL_DestroySurface(rgba);
+            SDL_DestroySurface(read);
+            /* and one freed while a later viewport and clip are set, as Games' rows read their icons inside the list's
+               box: the draws listed before them are made as they were listed, not cut to that box (Windows' Compile
+               tab, drawn so, showed nothing) */
+            once = SDL_CreateTexture(app.renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, 2, 2);
+            assert(once && SDL_UpdateTexture(once, NULL, green, 8));
+            assert(SDL_SetRenderDrawColor(app.renderer, 255, 0, 0, 255) &&
+                   SDL_RenderFillRect(app.renderer, &at)); /* red */
+            gui_drawn_begin(app.renderer);
+            assert(SDL_RenderTexture(app.renderer, once, NULL, &at));
+            {
+                SDL_Rect box = {view.x + 40, view.y + 40, 20, 20}, cut = {2, 2, 8, 8};
+                assert(SDL_SetRenderViewport(app.renderer, &box) && SDL_SetRenderClipRect(app.renderer, &cut));
+            }
+            SDL_DestroyTexture(once);
+            assert(SDL_RenderPresent(app.renderer));
+            assert(SDL_SetRenderClipRect(app.renderer, NULL) && SDL_SetRenderViewport(app.renderer, NULL));
+            read = SDL_RenderReadPixels(app.renderer, &view);
+            rgba = read ? SDL_ConvertSurface(read, SDL_PIXELFORMAT_RGBA32) : NULL;
+            assert(rgba);
+            if (memcmp(rgba->pixels, green, 4))
+                fprintf(stderr,
+                        "gui_sdl: a draw listed before a viewport and a clip, then a flush: %u,%u,%u at its place, "
+                        "not green\n",
+                        ((Uint8*)rgba->pixels)[0], ((Uint8*)rgba->pixels)[1], ((Uint8*)rgba->pixels)[2]);
             assert(!memcmp(rgba->pixels, green, 4));
             SDL_DestroySurface(rgba);
             SDL_DestroySurface(read);
@@ -10621,6 +10897,7 @@ int main(int argc, char** argv) {
 
     view_box(&app, temporary);
     grid_view(&app, temporary);
+    icons_a_frame(&app, temporary);
     /* 3DS: its own driver for drops, CIA browser and recents, with no Switch
        flags or direct execution, even when another item is hovered. */
     {
@@ -17069,6 +17346,7 @@ int main(int argc, char** argv) {
     missing_consoles(&app, temporary);
     locate_titles(&app, temporary);
     recompile_queue(&app);
+    play_asked_said(&app, temporary);
 #ifdef SNX_XDG /* the last of the test: SDL keeps the picker it found from then on */
     pickers_asked(&app, temporary, self);
 #endif

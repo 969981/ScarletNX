@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 /* The trim of the renderer's caches (gpu/vk/surface.c vk_mem_trim) and the render targets that later ones drew all
-   over (rt_superseded). Such a target holds no one's pixels, and a trim takes it before anything else. Where the
+   over (rt_superseded), and the textures that took targets' pixels where later targets drew all over
+   (tex_superseded). Such a target holds no one's pixels, and a trim takes it before anything else. Where the
    driver moves memory by priority (g_vk.has_pageable), a trim for headroom leaves it for a second and eight presents,
    as the sweep every 30 presents does: targets have the highest priority, and the driver moves textures first. A trim
-   for an allocation (force), or one where the driver does not move memory, takes it after two presents. A target
-   whose pixels exist only on the GPU and can't move into system memory stays for its age and goes under the
+   for an allocation (force), or one where the driver does not move memory, takes it after two presents, and so does
+   one while the heap itself is at its budget, though the caches count room in the free space inside the blocks. A
+   target whose pixels exist only on the GPU and can't move into system memory stays for its age and goes under the
    pressure; one set aside reads its memory again where its bytes changed; targets in system memory go while the
    system heap is short (surface.c rt_give_way, rt_aside, vk_rt_sys_frame). A parked target's storage result lands
    nowhere (flush_land). No Vulkan loader, device or GPU is used:
@@ -191,7 +193,8 @@ int vk_tex_can_coarsen(const Surf* t) { stub_hit("vk_tex_can_coarsen"); }
 u64 vk_tex_coarser(Surf* t) { stub_hit("vk_tex_coarser"); }
 u64 vk_tex_demote(Surf* t) { stub_hit("vk_tex_demote"); }
 u32 vk_mem_owner_prio(u32 owner) { stub_hit("vk_mem_owner_prio"); }
-void vk_tex_evicted(const Surf* t) { stub_hit("vk_tex_evicted"); }
+static u32 g_tex_evictions; /* textures the cache let go (tex_superseded_takes) */
+void vk_tex_evicted(const Surf* t) { g_tex_evictions++; }
 int vk_tex_finer(Surf* t) { stub_hit("vk_tex_finer"); }
 void vk_tex_note_writeback(Surf* s) { stub_hit("vk_tex_note_writeback"); }
 int vk_tex_promote(Surf* t) { stub_hit("vk_tex_promote"); }
@@ -239,11 +242,13 @@ void vk_devmem_budgets(DevMemBudget* b) {
     b[0].budget = g_sys_budget;
 }
 /* what the trim reads: the heap's use and budget, and the presents before now (memory.c) */
-static u64 g_use, g_budget, g_deferred;
+static u64 g_use, g_budget, g_deferred, g_heap_use;
 void vk_mem_use(u64* usage, u64* budget) {
     *usage = g_use;
     *budget = g_budget;
 }
+/* the heap's use with the free space inside the blocks (memory.c) */
+u64 vk_mem_heap_use(void) { return g_heap_use; }
 /* the present `presents` ago, or 60 more where a time is asked too: a second is 60 presents here */
 u32 vk_present_before(u64 ago_ns, u32 presents) { return g_vk_present - presents - (ago_ns ? 60 : 0); }
 u64 vk_deferred_bytes(void) { return 0; }
@@ -308,6 +313,64 @@ static int trim_takes(int pageable, int force, u32 ago) {
     while (g_rows.lists[VK_LRU_RT].head) surf_evict(g_rows.surf[g_rows.lists[VK_LRU_RT].head]);
     CHECK(targets_held() == 0 && !g_ndrawn);
     return held == 1;
+}
+
+/* A target last used `ago` presents ago that a later one drew all over, and a trim for headroom where the driver
+   pages, with the caches' use (the free space inside the blocks counted as room) under the trim's start and the
+   heap's own use at its budget (heap_full) or under the start: 1 when the trim took it */
+static int heap_full_takes(int heap_full, u32 ago) {
+    g_vk_present += 1000;
+    g_vk.has_pageable = 1;
+    Surf* old = target(0x40000000, 1 << 20, 1);
+    old->last_used = g_vk_present - ago;
+    Surf* over = target(0x40000000, 1 << 20, 2);
+    drawn_over(over);
+    g_use = vk_mem_trim_start(g_budget) - trim_head(g_budget);
+    g_heap_use = heap_full ? g_budget : g_use;
+    g_deferred = 0;
+    vk_mem_trim(0, 0);
+    const u32 held = targets_held();
+    CHECK(held == 1 ? g_deferred == 1 << 20 : held == 2 && !g_deferred);
+    while (g_rows.lists[VK_LRU_RT].head) surf_evict(g_rows.surf[g_rows.lists[VK_LRU_RT].head]);
+    CHECK(targets_held() == 0 && !g_ndrawn);
+    g_heap_use = 0;
+    return held == 1;
+}
+
+/* A texture of 1 MB at 0x50000000 that took pixels from targets when the surfaces' write count was 10, last used
+   five presents ago, and targets drawn over its memory: (over_from, over_size, over_wseq) each. 1 when it is no one's
+   (tex_superseded) and the sweep (vk_tex_reclaim_superseded) let it go, 0 when it stayed, -1 when the two disagree */
+typedef struct {
+    u64 from, size;
+    u32 wseq;
+} Over;
+static int tex_superseded_takes(int took, const Over* over, u32 n) {
+    g_vk_present += 1000;
+    Surf* t = calloc(1, sizeof *t);
+    CHECK(t);
+    t->gva = 0x50000000;
+    t->size = t->bytes = 1 << 20;
+    t->took_drawn = took;
+    g_wseq = 10;
+    if (took) vk_tex_took(t);
+    row_take(t);
+    lru_add(t, VK_LRU_TEX);
+    t->last_used = g_vk_present - 5;
+    for (u32 i = 0; i < n; i++) {
+        Surf* o = target(over[i].from, over[i].size, over[i].wseq);
+        drawn_over(o);
+    }
+    const int gone = tex_superseded(t), lost = lossless(t);
+    const u32 evictions = g_tex_evictions;
+    g_deferred = 0;
+    /* used two presents ago or more: five here */
+    const u64 freed = vk_tex_reclaim_superseded(vk_present_before(0, 2), ~0ull);
+    const int went = g_tex_evictions == evictions + 1 && freed == 1 << 20 && g_deferred == freed;
+    if (!went) surf_evict(t);
+    while (g_rows.lists[VK_LRU_RT].head) surf_evict(g_rows.surf[g_rows.lists[VK_LRU_RT].head]);
+    CHECK(!g_ndrawn && !g_rows.lists[VK_LRU_TEX].head);
+    if (gone != went || (took && lost != gone)) return -1;
+    return went;
 }
 
 /* A target whose pixels exist only on the GPU, where its image can't move into system memory (in pieces here: no
@@ -412,13 +475,26 @@ int main(void) {
     CHECK(trim_takes(1, 1, 5) && !trim_takes(1, 1, 1)); /* for an allocation: taken after two presents */
     /* where the driver does not page: taken after two presents */
     CHECK(trim_takes(0, 0, 5) && !trim_takes(0, 0, 1) && trim_takes(0, 1, 5));
+    /* the caches count room in the blocks, but the heap itself is at its budget: taken after two presents, the hold
+       of a second and eight presents aside; with the heap under the trim's start, nothing runs */
+    CHECK(heap_full_takes(1, 5) && !heap_full_takes(1, 1) && !heap_full_takes(0, 5) && !heap_full_takes(0, 69));
+    /* a texture that took targets' pixels goes once targets drawn after the take cover all its memory: one target, or
+       two that meet; not where they leave a gap or one was drawn before the take, nor one loaded from memory alone
+       (lossless anyway: the trim's steps take it) */
+    const Over whole[] = {{0x50000000, 1 << 20, 11}}, two[] = {{0x4ff00000, 0x180000, 11}, {0x50080000, 1 << 20, 12}},
+               gap[] = {{0x50000000, 0x80000, 11}, {0x50090000, 1 << 20, 12}}, before[] = {{0x50000000, 1 << 20, 9}},
+               mixed[] = {{0x50000000, 0x80000, 9}, {0x50080000, 0x80000, 11}};
+    CHECK(tex_superseded_takes(1, whole, 1) == 1 && tex_superseded_takes(1, two, 2) == 1);
+    CHECK(tex_superseded_takes(1, gap, 2) == 0 && tex_superseded_takes(1, before, 1) == 0);
+    CHECK(tex_superseded_takes(1, mixed, 2) == 0 && tex_superseded_takes(0, whole, 1) == 0);
     /* a target with pixels memory lacks: kept for its age, taken by the pressure, where it can't move */
     CHECK(aside_or_lost(VK_MEM_UMA) && aside_or_lost(VK_MEM_SMALL_BAR));
     CHECK(aside_hash());
     CHECK(parked_lands_nothing());
     CHECK(sys_heap_short());
     printf(
-        "vk_mem_trim: the trims kept and took the targets drawn over as they should; a target with pixels memory "
+        "vk_mem_trim: the trims kept and took the targets drawn over as they should, and the sweep took the textures "
+        "whose memory targets drew all over after their take and left the others; a target with pixels memory "
         "lacks stayed for its age and went under the pressure where it can't move, loaded memory again where its bytes "
         "changed meanwhile, targets in system memory went oldest first while the system heap was short, and a parked "
         "target's storage result landed nothing\n");

@@ -10,7 +10,7 @@
 # DSP's AAC, and for the Vita AAC, ATRAC9, the MP4 demuxer and H.264's Annex B filter, and the Ounce's AV1 through dav1d
 # where cmake/dav1d.cmake builds it (snx_dav1d_ready). With the Android driver (SNX_BUILD_ANDROID), its
 # images (src/android/hwui/image.c) add the PNG, JPEG (mjpeg), WebP, GIF and BMP decoders, the PNG and JPEG encoders, and
-# libswscale for their pixel formats; PNG needs zlib, the build's own static one (snx_zlib in cmake/dependencies.cmake).
+# libswscale for their pixel formats; PNG needs zlib, the build's own static one (snx_zlib in cmake/zlib.cmake).
 # Its MediaPlayer and SoundPool (src/android/runtime/audio.c) add the MP3, Vorbis, FLAC, PCM and ADPCM decoders and the
 # MP3, Ogg, WAV, FLAC and AAC demuxers.
 # No programs, other formats, filters, devices, network or autodetected system libraries, so
@@ -55,6 +55,9 @@ set(snx_ffmpeg_args
     --disable-avfilter
     --disable-iconv
     --enable-decoder=h264,vp8,vp9,opus,aac,atrac9
+    # the Switch movie library's NVJPG decoder and encoder (src/nx/nn/tvmr_jpeg.c): baseline JPEG pictures
+    --enable-decoder=mjpeg
+    --enable-encoder=mjpeg
     # the Vita's SceMp4 (src/vita/hle/mp4.c): MP4 files demuxed from memory (no protocol), their H.264 made Annex B
     --enable-demuxer=mov
     --enable-bsf=h264_mp4toannexb

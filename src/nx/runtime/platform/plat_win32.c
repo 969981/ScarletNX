@@ -221,8 +221,8 @@ void plat_vm_track(u8* p, u64 size) {
              p == g_ww_watched ? "the reservation's write watch tracks writes, as write_tracking=0 does"
                                : "the reservation has no write watch, so the caches compare contents");
     if (g_settings.write_tracking_hot_pages == 1)
-        WARN("memory: write_tracking_hot=1 leaves pages hot only where page protection tracks the writes, which has "
-             "no Windows version: no page is hot this run\n");
+        WARN("memory: write_tracking_hot_pages=1 leaves pages hot only where page protection tracks the writes, "
+             "which has no Windows version: no page is hot this run\n");
     if (p != g_ww_watched || g_settings.write_tracking == 2) return;
     g_ww_base = p; /* mem_init runs before any thread that scans */
     g_ww_size = size;
@@ -335,6 +335,19 @@ int plat_vm_map_fd(u8* p, u64 size, int fd, u64 off, u64 allocation_size) {
     return -1;
 }
 void plat_vm_fd_close(int fd) { (void)fd; }
+int plat_vm_files(u8* base, u64 size, const char* dir) {
+    (void)base;
+    (void)size;
+    (void)dir;
+    errno = ENOSYS;
+    return -1;
+}
+int plat_vm_files_slot(const u8* p, int* fd, u64* off) {
+    (void)p;
+    (void)fd;
+    (void)off;
+    return 0;
+}
 int plat_alias_write(u64 off, const void* src, u64 size) {
     (void)off;
     (void)src;

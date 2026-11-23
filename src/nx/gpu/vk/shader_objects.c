@@ -8,6 +8,8 @@
 #include "common/gpu/vk/vk_common.h"
 #include "common/utilities/bits.h"
 #include "common/utilities/common.h"
+#include "nx/gpu/shader/shader.h"
+#include "nx/gpu/vk/descriptor_heaps.h"
 #include "nx/gpu/vk/pipeline_parts.h"
 #include "nx/runtime/options.h"
 #include "nx/runtime/platform/log.h"
@@ -24,13 +26,16 @@ typedef struct {
     u32 serial; /* given at each keep: a handle a destroyed module had names another program */
 } SoSpirv;
 /* One stage's object, by what its create info is made of (stage_lock): the module, the stage, the set layouts' texture
-   array bits (PipeKey.arrays) and the fragment specialization (PipeKey.fs_spec). state 1 while a thread makes it, 2
-   once made (obj VK_NULL_HANDLE when the device refused it) */
+   array bits (PipeKey.arrays), the fragment specialization (PipeKey.fs_spec), a mesh or task stage's flags (whole
+   subgroups, a mesh stage with no task stage) and, with descriptor heaps, the stage's mapping of its set (heaps 1,
+   and the constant buffers its set maps by address, PipeKey.cb_addr). state 1 while a thread makes it, 2 once made
+   (obj VK_NULL_HANDLE when the device refused it) */
 typedef struct SoStage {
     VkShaderModule mod;
     u32 serial; /* of the module's SPIR-V (SoSpirv) */
     VkShaderStageFlagBits stage;
-    u32 arrays, spec;
+    u32 arrays, spec, heaps, cb_addr;
+    VkShaderCreateFlagsEXT flags;
     int state;
     VkShaderEXT obj;
     struct SoStage* next;
@@ -140,11 +145,12 @@ static const u32* spirv_of(VkShaderModule m, size_t* count, u32* serial) {
 
 int vk_so_takes(const PipeKey* k, VkShaderModule fs) {
     if (!g_vk.has_shader_objects) return 0;
-    /* state that is no dynamic state for shader objects (minSampleShading), or that this path does not set yet: a
-       mesh draw's stages, descriptor heaps' mappings, mixed samples, coverage to color and sample locations */
-    if (k->mesh || k->heaps || k->sample_shading || k->coverage.raster_samples || k->coverage_to_color ||
-        k->sample_locations.samples)
+    /* state that is no dynamic state for shader objects (minSampleShading), or that this path does not set yet:
+       mixed samples, coverage to color and sample locations. A mesh draw's mesh and task stages are objects where the
+       device has the stages */
+    if (k->sample_shading || k->coverage.raster_samples || k->coverage_to_color || k->sample_locations.samples)
         return 0;
+    if (k->mesh && (!(g_so.dev & SO_MESH) || (k->tcs && !(g_so.dev & SO_TASK)))) return 0;
     if (k->feedback && !g_vk.has_feedback_dynamic) return 0;
     if (k->logic_op && !(g_so.dev & SO_LOGIC_OP)) return 0;
     const VkShaderModule modules[5] = {k->vs, k->tcs, k->tes, k->gs, fs};
@@ -165,13 +171,15 @@ static VkShaderStageFlags next_stages(VkShaderStageFlagBits stage) {
     case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT: return VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
     case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: return geom | VK_SHADER_STAGE_FRAGMENT_BIT;
     case VK_SHADER_STAGE_GEOMETRY_BIT: return VK_SHADER_STAGE_FRAGMENT_BIT;
+    case VK_SHADER_STAGE_TASK_BIT_EXT: return VK_SHADER_STAGE_MESH_BIT_EXT;
+    case VK_SHADER_STAGE_MESH_BIT_EXT: return VK_SHADER_STAGE_FRAGMENT_BIT;
     default: return 0;
     }
 }
 
 /* The object of st made, from the binary of an earlier run where the file has one the driver takes, else compiled
    from words and its binary kept. VK_NULL_HANDLE when the device refuses it */
-static VkShaderEXT stage_create(const SoStage* st, const u32* words, size_t count) {
+static VkShaderEXT stage_create(const SoStage* st, const u32* words, size_t count, int index) {
     /* vk_playout's sets: with split sets, each stage's textures five after its buffers */
     VkDescriptorSetLayout sets[11];
     u32 nsets = g_spirv_translate.split_sets ? 10 : g_vk_stage_sets;
@@ -202,10 +210,36 @@ static VkShaderEXT stage_create(const SoStage* st, const u32* words, size_t coun
         .pushConstantRangeCount = 1,
         .pPushConstantRanges = &pc,
         .pSpecializationInfo = st->spec ? &spec : NULL};
+    /* a mesh or task program's lanes are a warp's: its subgroups are 32 invocations, as pipe_info gives a mesh
+       pipeline's stages */
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo warp = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+        .requiredSubgroupSize = 32};
+    if (st->stage == VK_SHADER_STAGE_MESH_BIT_EXT || st->stage == VK_SHADER_STAGE_TASK_BIT_EXT) info.pNext = &warp;
+    info.flags |= st->flags;
+    /* descriptor heaps: the stage's mapping of its set's bindings, as pipe_info gives a pipeline's stage, in place of
+       the layouts; push constants are the heaps' push data then (rec_CmdPushConstants) */
+    VkDescriptorSetAndBindingMappingEXT maps[SNX_VKB_END];
+    VkShaderDescriptorSetAndBindingMappingInfoEXT mapping;
+    if (st->heaps) {
+        const u32 set = (u32)shader_vk_set(index);
+        mapping = (VkShaderDescriptorSetAndBindingMappingInfoEXT){
+            .sType = VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT,
+            .pNext = info.pNext, /* a mesh stage's required subgroup size */
+            .mappingCount = vk_descriptor_heaps_mapping(g_vk_dslayout[(st->arrays >> set) & 1][set], set, maps,
+                                                        SNX_VKB_END, st->cb_addr),
+            .pMappings = maps};
+        info.pNext = &mapping;
+        info.flags |= VK_SHADER_CREATE_DESCRIPTOR_HEAP_BIT_EXT;
+        info.setLayoutCount = info.pushConstantRangeCount = 0;
+        info.pSetLayouts = NULL;
+        info.pPushConstantRanges = NULL;
+    }
     /* snx_vk_shader_key keeps no specialization, no set layouts' bindings and no flags: they are mixed in, the
        layouts by what they are made of (g_vk_dslayout_hash), which another build or setting changes */
     u64 key = snx_fnv_step(snx_fnv_step(snx_vk_shader_key(&info), g_vk_dslayout_hash), (u64)st->arrays);
     key = snx_fnv_step(key, info.flags);
+    if (st->heaps) key = snx_fnv_step(key, st->cb_addr);
     if (st->spec) key = snx_fnv1a(key, values, sizeof values);
     u64 t0 = plat_ns();
     VkShaderEXT obj = VK_NULL_HANDLE;
@@ -258,14 +292,17 @@ static VkShaderEXT stage_create(const SoStage* st, const u32* words, size_t coun
     return obj;
 }
 
-/* the object of mod at stage, made here unless a thread makes it already, then waited for */
-static VkShaderEXT stage_get(VkShaderModule mod, VkShaderStageFlagBits stage, u32 arrays, u32 spec) {
+/* the object of mod at stage (index: its slot in vk_so_make, an ST_* stage), made here unless a thread makes it
+   already, then waited for */
+static VkShaderEXT stage_get(VkShaderModule mod, VkShaderStageFlagBits stage, int index, u32 arrays, u32 spec,
+                             VkShaderCreateFlagsEXT flags, u32 heaps, u32 cb_addr) {
     size_t count = 0;
     u32 serial = 0;
     const u32* words = spirv_of(mod, &count, &serial);
     if (!words) return VK_NULL_HANDLE;
     u64 h = snx_fnv_step(snx_fnv_step(snx_fnv_step(snx_fnv_step(SNX_FNV_BASIS, mod_bits(mod)), serial), stage),
                          (u64)arrays << 32 | spec);
+    h = snx_fnv_step(snx_fnv_step(h, flags), (u64)cb_addr << 1 | heaps);
     u32 b = (u32)(h & (SO_STAGEH - 1));
     pm_lock(&g_so.stage_lock);
     if (!g_so.stage_cond_ready) {
@@ -274,7 +311,7 @@ static VkShaderEXT stage_get(VkShaderModule mod, VkShaderStageFlagBits stage, u3
     }
     SoStage* st = g_so.stages[b];
     while (st && (st->mod != mod || st->serial != serial || st->stage != stage || st->arrays != arrays ||
-                  st->spec != spec))
+                  st->spec != spec || st->flags != flags || st->heaps != heaps || st->cb_addr != cb_addr))
         st = st->next;
     if (!st) {
         st = calloc(1, sizeof *st);
@@ -282,7 +319,7 @@ static VkShaderEXT stage_get(VkShaderModule mod, VkShaderStageFlagBits stage, u3
             pm_unlock(&g_so.stage_lock);
             return VK_NULL_HANDLE;
         }
-        *st = (SoStage){mod, serial, stage, arrays, spec, 0, VK_NULL_HANDLE, g_so.stages[b]};
+        *st = (SoStage){mod, serial, stage, arrays, spec, heaps, cb_addr, flags, 0, VK_NULL_HANDLE, g_so.stages[b]};
         g_so.stages[b] = st;
     }
     while (st->state == 1) pc_wait(&g_so.stage_done, &g_so.stage_lock, -1);
@@ -294,7 +331,7 @@ static VkShaderEXT stage_get(VkShaderModule mod, VkShaderStageFlagBits stage, u3
     st->state = 1;
     pm_unlock(&g_so.stage_lock);
     vk_so_note(mod, stage);
-    VkShaderEXT obj = stage_create(st, words, count);
+    VkShaderEXT obj = stage_create(st, words, count, index);
     plat_thread_note_clear();
     pm_lock(&g_so.stage_lock);
     st->obj = obj;
@@ -308,22 +345,35 @@ int vk_so_make(const PipeKey* k, VkShaderModule fs, VkShaderEXT out[5]) {
     static const VkShaderStageFlagBits bits[5] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
                                                   VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
                                                   VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_FRAGMENT_BIT};
+    /* a mesh draw's mesh and task programs, in the vertex and tessellation control slots (pipe_info's mesh_bits) */
+    static const VkShaderStageFlagBits mesh_bits[5] = {VK_SHADER_STAGE_MESH_BIT_EXT, VK_SHADER_STAGE_TASK_BIT_EXT, 0, 0,
+                                                       VK_SHADER_STAGE_FRAGMENT_BIT};
     const VkShaderModule modules[5] = {k->vs, k->tcs, k->tes, k->gs, fs};
     u32 arrays = k->arrays & ((1u << g_vk_stage_sets) - 1);
     for (int s = 0; s < 5; s++) {
         out[s] = VK_NULL_HANDLE;
-        if (modules[s] && !(out[s] = stage_get(modules[s], bits[s], arrays, s == 4 ? k->fs_spec : 0))) return 0;
+        VkShaderCreateFlagsEXT flags = 0;
+        if (k->mesh && s < 2) {
+            /* a workgroup of fewer invocations than a warp is one subgroup, its lanes the first ones */
+            if (k->mesh & PIPE_MESH_WHOLE(s ? ST_TS : ST_MS)) flags |= VK_SHADER_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
+            if (!s && !k->tcs && (g_so.dev & SO_TASK)) flags |= VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT;
+        }
+        const u32 cb_addr = k->heaps ? k->cb_addr[shader_vk_set(s)] : 0; /* the slots are ST_VS to ST_FS */
+        if (modules[s] && !(out[s] = stage_get(modules[s], k->mesh ? mesh_bits[s] : bits[s], s, arrays,
+                                               s == 4 ? k->fs_spec : 0, flags, k->heaps != 0, cb_addr)))
+            return 0;
     }
     return 1;
 }
 
 void vk_so_bind(VkCommandBuffer cb, const PipeKey* k, const VkShaderEXT sh[5]) {
+    /* a mesh draw: its mesh and task objects (sh[0], sh[1]), and no vertex stage */
     VkShaderStageFlagBits stages[7] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT};
-    VkShaderEXT objects[7] = {sh[0], sh[4]};
+    VkShaderEXT objects[7] = {k->mesh ? VK_NULL_HANDLE : sh[0], sh[4]};
     u32 n = 2;
     if (g_so.dev & SO_TESS) {
         stages[n] = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
-        objects[n++] = sh[1];
+        objects[n++] = k->mesh ? VK_NULL_HANDLE : sh[1];
         stages[n] = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
         objects[n++] = sh[2];
     }
@@ -333,11 +383,11 @@ void vk_so_bind(VkCommandBuffer cb, const PipeKey* k, const VkShaderEXT sh[5]) {
     }
     if (g_so.dev & SO_TASK) { /* a pipeline's draws had none: stages a draw does not use are bound empty */
         stages[n] = VK_SHADER_STAGE_TASK_BIT_EXT;
-        objects[n++] = VK_NULL_HANDLE;
+        objects[n++] = k->mesh ? sh[1] : VK_NULL_HANDLE;
     }
     if (g_so.dev & SO_MESH) {
         stages[n] = VK_SHADER_STAGE_MESH_BIT_EXT;
-        objects[n++] = VK_NULL_HANDLE;
+        objects[n++] = k->mesh ? sh[0] : VK_NULL_HANDLE;
     }
     vkCmdBindShadersEXT(cb, n, stages, objects);
 
@@ -375,8 +425,9 @@ void vk_so_bind(VkCommandBuffer cb, const PipeKey* k, const VkShaderEXT sh[5]) {
     }
     if (g_so.dev & SO_TO_COLOR) vkCmdSetCoverageToColorEnableNV(cb, VK_FALSE);
 
-    /* the color targets' blending and write masks, as pipe_info gives them (vk_pipe_blend), or a logic operation */
-    if (k->ncolor) {
+    /* the color targets' blending and write masks, as pipe_info gives them (vk_pipe_blend), or a logic operation. A
+       key whose blending is dynamic state has the draw's set by the draw after the bind (render.c) */
+    if (k->ncolor && !vk_pipe_blend_dynamic(k)) {
         VkPipelineColorBlendAttachmentState cba[8];
         vk_pipe_blend(k, cba);
         VkBool32 enable[8];

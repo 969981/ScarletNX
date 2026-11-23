@@ -241,6 +241,9 @@ static struct {
     int give; /* vk_devmem_image gives memory */
     int ready;
     void* moving;
+    void* list[8]; /* or these, in one call (a block of several textures) */
+    u32 nlist;
+    u64 size; /* an allocation's bytes, 64 KiB when 0 */
     u64 moved;
     VkImageCopy reg[VK_TEX_MAX_LEVELS];
 } g_mv;
@@ -672,6 +675,11 @@ u64 vk_rt_reclaim_superseded(u32 before, u64 want) {
     (void)before, (void)want;
     return 0;
 }
+u64 vk_tex_reclaim_superseded(u32 before, u64 want) {
+    (void)before, (void)want;
+    return 0;
+}
+void vk_tex_took(Surf* t) { (void)t; }
 void vk_surf_ended_frame(void) {}
 void vk_tex_refine_frame(void) {}
 void vk_tex_promote_frame(void) {}
@@ -824,7 +832,7 @@ void vk_devmem_info(DevMem mem, DevMemInfo* info) {
     *info = (DevMemInfo){0};
     if (mem == MV_OLD || mem == MV_NEW) {
         info->tag = g_mv.tag;
-        info->size = 64 << 10;
+        info->size = g_mv.size ? g_mv.size : 64 << 10;
     }
 }
 /* texture.c creates allocations without memory.c and ledger.c, which have the real ones */
@@ -840,6 +848,15 @@ void vk_devmem_priority(DevMem mem, u32 prio) { (void)mem, (void)prio; }
 void vk_devmem_owner(DevMem mem, void* owner) { (void)mem, (void)owner; }
 u32 vk_devmem_moving(DevMem* mems, void** owners, u32 max, u64 budget) {
     (void)budget;
+    if (g_mv.nlist) {
+        u32 n = g_mv.nlist < max ? g_mv.nlist : max;
+        for (u32 i = 0; i < n; i++) {
+            mems[i] = MV_OLD;
+            owners[i] = g_mv.list[i];
+        }
+        g_mv.nlist = 0;
+        return n;
+    }
     if (!g_mv.moving || !max) return 0;
     mems[0] = MV_OLD;
     owners[0] = g_mv.moving;
@@ -1244,10 +1261,12 @@ static void check_take_skip(void) {
     vkCmdCopyImage = NULL;
 }
 
-/* A crop of a target (rt_crop: a read narrower than the target, or in another format) is copied again only after a
-   texture barrier (g_vk_texture_epoch), as a same-size read (vk_rt_snapshot) is: a draw to the target with no barrier
-   since the copy reuses it. A guest-size copy (rt_guest) still follows each draw. Each read is counted in copies of
-   the image (vkCmdCopyImage) and in g_vk_rt_copy_writes */
+/* A copy of a target for a draw's read (rt_crop: a read narrower than the target, or in another format; vk_rt_snapshot:
+   a feedback draw's read of the whole) is reused after the writes of the draws that sampled it (render.c's draws
+   call vk_rt_copy_drawn for each target write; g_vk_drawing is the draw being recorded), until a texture barrier
+   (g_vk_texture_epoch). A write by a draw that sampled none of it, or by none at all (a clear), has it copied again
+   at the next read. A guest-size copy (rt_guest) still follows each draw. Each read is counted in copies of the image
+   (vkCmdCopyImage) and in g_vk_rt_copy_writes */
 static void check_crop_reuse(void) {
     Surf rt = tex(800, 448, 1, 1, 4, 2, 0, 1);
     VkFmt as = rt.f;
@@ -1261,16 +1280,19 @@ static void check_crop_reuse(void) {
     vkCmdCopyImage = count_copy_image;
     g_crop_images = 1;
     g_image_copies = 0;
-    u64 writes = g_vk_rt_copy_writes, epoch = g_vk_texture_epoch;
+    u64 writes = g_vk_rt_copy_writes, epoch = g_vk_texture_epoch, draw = 1000;
     /* the first read copies */
+    g_vk_drawing = ++draw;
     Surf* c = rt_crop(&rt, 792, 448, NULL);
-    CHECK(c && c != &rt && c->w == 792 && c->h == 448 && c->crop_gen == rt.wgen);
+    CHECK(c && c != &rt && c->w == 792 && c->h == 448 && c->crop_gen == rt.wgen && c->fb_gen == rt.wgen);
     CHECK(g_image_copies == 1 && g_vk_rt_copy_writes == writes + 1);
     /* read again with no draw since: the same copy */
     CHECK(rt_crop(&rt, 792, 448, NULL) == c && g_image_copies == 1);
-    /* drawn to, with no texture barrier since the copy: the copy is reused, three times */
+    /* three draws, each sampling it and writing the target, with no texture barrier: the copy is reused */
     for (int i = 0; i < 3; i++) {
         rt.wgen++;
+        vk_rt_copy_drawn(&rt);
+        g_vk_drawing = ++draw;
         CHECK(rt_crop(&rt, 792, 448, NULL) == c);
     }
     CHECK(g_image_copies == 1 && g_vk_rt_copy_writes == writes + 1);
@@ -1279,27 +1301,52 @@ static void check_crop_reuse(void) {
     CHECK(rt_crop(&rt, 792, 448, NULL) == c && c->crop_gen == rt.wgen && c->crop_epoch == g_vk_texture_epoch);
     CHECK(g_image_copies == 2 && g_vk_rt_copy_writes == writes + 2);
     CHECK(rt_crop(&rt, 792, 448, NULL) == c && g_image_copies == 2);
+    /* a draw that sampled none of it writes the target: the next read copies, though no barrier came */
+    g_vk_drawing = ++draw;
     rt.wgen++;
-    CHECK(rt_crop(&rt, 792, 448, NULL) == c && g_image_copies == 2);
+    vk_rt_copy_drawn(&rt);
+    g_vk_drawing = ++draw;
+    CHECK(rt_crop(&rt, 792, 448, NULL) == c && g_image_copies == 3 && c->fb_gen == rt.wgen);
+    /* that draw sampled it and writes the target, twice (an attachment, then its programmable blend): still the copy;
+       a clear after it, outside any draw: copied again */
+    rt.wgen++;
+    vk_rt_copy_drawn(&rt);
+    rt.wgen++;
+    vk_rt_copy_drawn(&rt);
+    CHECK(c->fb_gen == rt.wgen);
+    g_vk_drawing = 0;
+    rt.wgen++;
+    vk_rt_copy_drawn(&rt);
+    CHECK(c->fb_gen != rt.wgen);
+    g_vk_drawing = ++draw;
+    CHECK(rt_crop(&rt, 792, 448, NULL) == c && g_image_copies == 4);
     /* another size, and another format: each a copy of its own, made at its first read */
     Surf* d = rt_crop(&rt, 800, 440, NULL);
     Surf* e = rt_crop(&rt, 800, 448, &as);
     CHECK(d && e && d != c && e != c && d != e && e->f.vk == VK_FORMAT_R32_UINT);
-    CHECK(g_image_copies == 4 && g_vk_rt_copy_writes == writes + 4);
+    CHECK(g_image_copies == 6 && g_vk_rt_copy_writes == writes + 6);
+    /* the draw that read them writes the target: the last copy it took (e) stands for that, the others don't */
     rt.wgen++;
-    CHECK(rt_crop(&rt, 800, 440, NULL) == d && rt_crop(&rt, 800, 448, &as) == e && g_image_copies == 4);
-    /* each draw after a barrier is copied once for each crop */
+    vk_rt_copy_drawn(&rt);
+    g_vk_drawing = ++draw;
+    CHECK(rt_crop(&rt, 800, 448, &as) == e && g_image_copies == 6);
+    CHECK(rt_crop(&rt, 800, 440, NULL) == d && g_image_copies == 7);
+    /* a same-size read (vk_rt_snapshot, a feedback draw's) follows the same rule */
+    Surf* sn = vk_rt_snapshot(&rt, 1);
+    CHECK(sn && sn != &rt && g_image_copies == 8 && sn->fb_gen == rt.wgen);
+    for (int i = 0; i < 3; i++) { /* three feedback draws, each sampling it and writing the target */
+        rt.wgen++;
+        vk_rt_copy_drawn(&rt);
+        g_vk_drawing = ++draw;
+        CHECK(vk_rt_snapshot(&rt, 1) == sn && g_image_copies == 8);
+    }
     g_vk_texture_epoch++;
+    CHECK(vk_rt_snapshot(&rt, 1) == sn && g_image_copies == 9);
+    g_vk_drawing = ++draw; /* a draw that samples nothing of it writes the target */
     rt.wgen++;
-    CHECK(rt_crop(&rt, 792, 448, NULL) == c && rt_crop(&rt, 800, 440, NULL) == d);
-    CHECK(rt_crop(&rt, 800, 448, &as) == e && g_image_copies == 7 && g_vk_rt_copy_writes == writes + 7);
-    /* a same-size read does the same (vk_rt_snapshot) */
-    Surf* s = vk_rt_snapshot(&rt, 1);
-    CHECK(s && s != &rt && g_image_copies == 8);
-    rt.wgen++;
-    CHECK(vk_rt_snapshot(&rt, 1) == s && g_image_copies == 8);
-    g_vk_texture_epoch++;
-    CHECK(vk_rt_snapshot(&rt, 1) == s && g_image_copies == 9);
+    vk_rt_copy_drawn(&rt);
+    CHECK(vk_rt_snapshot(&rt, 1) == sn && g_image_copies == 10 && sn->fb_gen == rt.wgen);
+    g_vk_drawing = 0;
     while (rt.crop) {
         Surf* x = rt.crop;
         rt.crop = x->next;
@@ -2011,7 +2058,7 @@ static void check_tex_moves(void) {
         g_mv.moving = &t;
         g_mv.tracks = 0;
         g_mv.moved = 0;
-        vk_tex_defrag_frame();
+        vk_tex_defrag_frame(0, 0);
         CHECK(g_mv.want.at == DM_DEVICE && g_mv.want.existing && g_mv.want.low == !other);
         CHECK(g_mv.tracks == 1 && g_mv.owner == (other ? VK_OWN_IMAGE_OTHER : VK_OWN_TEXTURE));
         CHECK(g_mv.moved == 64 << 10 && !g_mv.stops);
@@ -2023,7 +2070,7 @@ static void check_tex_moves(void) {
     g_mv.tracks = 0;
     Surf v = mv_tex(16, 8, 4, 1, 2);
     g_mv.moving = &v;
-    vk_tex_defrag_frame();
+    vk_tex_defrag_frame(0, 0);
     CHECK(g_mv.want.existing && g_mv.want.low && !g_mv.tracks);
     check_move_copy(&v, 16, 8, 4, 1, 2);
     /* no run holds it: the block is left as it is */
@@ -2031,8 +2078,27 @@ static void check_tex_moves(void) {
     g_mv.give = 0;
     g_mv.moving = &u;
     const u32 copies = g_mv.copies;
-    vk_tex_defrag_frame();
+    vk_tex_defrag_frame(0, 0);
     CHECK(g_mv.stops == 1 && g_mv.copies == copies && u.mem == MV_OLD);
+    /* six textures of 4 MiB in the block: all move after a frame on the game's pace (16 ms of 33), two after a late one
+       (40 ms): DEFRAG_BYTES_LATE, 8 MiB. Before, a late frame moved all six too */
+    g_mv.give = 1;
+    g_mv.size = 4u << 20;
+    for (int late = 0; late < 2; late++) {
+        Surf ts[6];
+        for (u32 k = 0; k < 6; k++) {
+            ts[k] = mv_tex(16, 16, 1, 1, 1);
+            g_mv.list[k] = &ts[k];
+        }
+        g_mv.nlist = 6;
+        g_mv.moved = 0;
+        vk_tex_defrag_frame(late ? 40000000 : 16000000, 33333333);
+        if (g_mv.moved != (late ? 8ull : 24ull) << 20)
+            fprintf(stderr, "defrag after a %s frame: %llu MiB moved, %u expected\n", late ? "late" : "paced",
+                    (unsigned long long)(g_mv.moved >> 20), late ? 8 : 24);
+        CHECK(g_mv.moved == (late ? 8ull : 24ull) << 20);
+    }
+    g_mv.size = 0;
     g_mv.ready = 0;
     /* a copy of a render target that draws sample */
     Surf rt = tex(64, 64, 1, 1, 4, 0, 0, 1);

@@ -931,7 +931,7 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     int has_host_import = 0, has_ahb = 0, has_placed = 0, has_map2 = 0, has_dmabuf = 0;
     int has_descriptor_buffer = 0, has_descriptor_heap = 0, has_extended_flags = 0, has_maintenance5 = 0;
     int has_maintenance8 = 0, has_copy_indirect = 0;
-    int has_vertex_input = 0;
+    int has_vertex_input = 0, has_legacy_vertex = 0, has_unused_attachments = 0;
     int has_hdr_metadata = 0;
     int has_gpl = 0, has_eds2 = 0, has_eds3 = 0; /* the extensions of pipeline libraries and their dynamic state */
     int has_depth_clip_control = 0;              /* and of the depth range as one of those states */
@@ -979,6 +979,8 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         }
         g_vk.has_divisor = snx_vk_choice_has(c, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
         has_vertex_input = snx_vk_choice_has(c, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+        has_legacy_vertex = snx_vk_choice_has(c, VK_EXT_LEGACY_VERTEX_ATTRIBUTES_EXTENSION_NAME);
+        has_unused_attachments = snx_vk_choice_has(c, VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME);
         has_gpl = snx_vk_choice_has(c, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
                   snx_vk_choice_has(c, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
         has_eds2 = snx_vk_choice_has(c, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
@@ -1250,6 +1252,10 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_KHR};
     VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT qvertex_input = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT};
+    VkPhysicalDeviceLegacyVertexAttributesFeaturesEXT qlegacy_vertex = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LEGACY_VERTEX_ATTRIBUTES_FEATURES_EXT};
+    VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT qunused = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT};
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT qgpl = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
     /* qeds2 above: a 1.2 device's, and the pipeline libraries' patch control points (has_eds2) */
@@ -1314,6 +1320,8 @@ static bool choose_device(SnxVkChoice* c, void* user) {
                            has_barycentric ? &qbarycentric : NULL,
                            index8_ext ? &qindex8 : NULL,
                            has_vertex_input ? &qvertex_input : NULL,
+                           has_legacy_vertex ? &qlegacy_vertex : NULL,
+                           has_unused_attachments ? &qunused : NULL,
                            has_gpl ? &qgpl : NULL,
                            has_eds3 ? &qeds3 : NULL,
                            has_depth_clip_control ? &qclip_control : NULL,
@@ -1494,6 +1502,27 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         else
             LOG("%s\n", line);
     }
+    /* VK_EXT_legacy_vertex_attributes reads an attribute at any byte, which the console does: a stream whose stride
+       isn't a multiple of its attributes' components is bound as the guest has it, where each draw of it otherwise
+       reads a copy restrided on the GPU (render.c's restride), a dispatch that ends the rendering pass. The extension
+       needs VK_EXT_vertex_input_dynamic_state (its dependency), and the renderer takes it with the dynamic layout */
+    g_vk.has_legacy_vertex = has_legacy_vertex && qlegacy_vertex.legacyVertexAttributes && g_vk.vertex_input_dynamic;
+    const char* legacy_why =
+        !has_legacy_vertex ? "no VK_EXT_legacy_vertex_attributes, or a setting or a ban took it out"
+        : !qlegacy_vertex.legacyVertexAttributes ? "VK_EXT_legacy_vertex_attributes without legacyVertexAttributes"
+                                                 : "the vertex layout is no dynamic state";
+    /* VK_EXT_dynamic_rendering_unused_attachments: a pipeline leaves the format of a target its draws write nothing
+       to UNDEFINED, so draws into passes that hold other formats there share it (render.c's draw_key) */
+    g_vk.has_unused_attachments = has_unused_attachments && qunused.dynamicRenderingUnusedAttachments;
+    if (g_vk.has_unused_attachments)
+        LOG("vulkan: a pipeline leaves out the color targets its draws write nothing to "
+            "(VK_EXT_dynamic_rendering_unused_attachments)\n");
+    if (g_vk.has_legacy_vertex)
+        LOG("vulkan: a vertex stream of any stride is bound as the guest has it (VK_EXT_legacy_vertex_attributes)\n");
+    else
+        LOG("vulkan: a vertex stream whose stride isn't a multiple of its attributes' components is restrided on the "
+            "GPU for each draw: %s\n",
+            legacy_why);
     /* the dynamic state and the barriers within a pass only serve feedback loops */
     g_vk.has_feedback = g_vk.has_feedback && qloop.attachmentFeedbackLoopLayout;
     g_vk.has_feedback_dynamic =
@@ -1562,6 +1591,24 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         vk_gpl_bans(&gd, ban_say);
         g_vk.has_gpl = vk_gpl_choose(&gd, &g_vk.dyn_pr, line, sizeof line);
         LOG("%s\n", line);
+        /* the blending as dynamic state: a draw's pipeline serves every blend of its programs and state, and the draw
+           sets its own (render.c). Each of the three members a ban can turn off */
+        const int blend_members = has_eds3 && qeds3.extendedDynamicState3ColorBlendEnable &&
+                                  qeds3.extendedDynamicState3ColorBlendEquation &&
+                                  qeds3.extendedDynamicState3ColorWriteMask;
+        g_vk.dyn_blend =
+            blend_members &&
+            !vk_ban("VK_EXT_extended_dynamic_state3.extendedDynamicState3ColorBlendEnable", 1, ban_say) &&
+            !vk_ban("VK_EXT_extended_dynamic_state3.extendedDynamicState3ColorBlendEquation", 1, ban_say) &&
+            !vk_ban("VK_EXT_extended_dynamic_state3.extendedDynamicState3ColorWriteMask", 1, ban_say);
+        if (g_vk.dyn_blend)
+            LOG("vulkan: a draw's blending is dynamic state (VK_EXT_extended_dynamic_state3): one pipeline serves every "
+                "blend of its programs\n");
+        else
+            LOG("vulkan: a draw's blending is in its pipeline, one for each blend: %s\n",
+                !blend_members ? "the device has not VK_EXT_extended_dynamic_state3's blend enable, equation and write "
+                                 "mask, or a setting or a ban took the extension out"
+                               : "a ban turned one of them off");
         /* a ban that holds took the extension out of the list (vk_bans_filter): its line says why */
         uint32_t ban_line = vk_ban_find(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
         if (ban_line) {
@@ -2197,9 +2244,25 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT,
         .pNext = chain,
         .vertexInputDynamicState = VK_TRUE};
+    VkPhysicalDeviceLegacyVertexAttributesFeaturesEXT flegacy_vertex = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LEGACY_VERTEX_ATTRIBUTES_FEATURES_EXT,
+        .legacyVertexAttributes = VK_TRUE};
+    VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT funused = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT,
+        .dynamicRenderingUnusedAttachments = VK_TRUE};
     if (g_vk.vertex_input_dynamic) {
         chain = &fvertex_input;
         snx_vk_choice_enable(c, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+    }
+    if (g_vk.has_legacy_vertex) {
+        flegacy_vertex.pNext = chain;
+        chain = &flegacy_vertex;
+        snx_vk_choice_enable(c, VK_EXT_LEGACY_VERTEX_ATTRIBUTES_EXTENSION_NAME);
+    }
+    if (g_vk.has_unused_attachments) {
+        funused.pNext = chain;
+        chain = &funused;
+        snx_vk_choice_enable(c, VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME);
     }
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT fgpl = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
@@ -2240,6 +2303,13 @@ static bool choose_device(SnxVkChoice* c, void* user) {
             chain = &fclip_control;
             snx_vk_choice_enable(c, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
         }
+    }
+    feds3.extendedDynamicState3ColorBlendEnable = feds3.extendedDynamicState3ColorBlendEquation =
+        feds3.extendedDynamicState3ColorWriteMask = (VkBool32)g_vk.dyn_blend;
+    if (g_vk.dyn_blend && !(g_vk.has_gpl && (g_vk.dyn_pr & ~VK_DYN_PR_PATCH))) { /* not in the chain above */
+        feds3.pNext = chain;
+        chain = &feds3;
+        snx_vk_choice_enable(c, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
     }
     VkPhysicalDeviceDepthClipEnableFeaturesEXT fclip_enable = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT,

@@ -56,6 +56,9 @@ static struct {
     char logged[2048]; /* a line as options.c makes its longest (say_deprecated's), never cut */
     char said[4096]; /* every line, one after the other */
     int write;       /* plat_replace_file replaces the file: ini_open writes it */
+    /* the notice over the game's first frame (overlay_settings_notice): its lists, and how many were given */
+    char game[1024], global[1024];
+    int notices;
 } g_test;
 
 int plat_power_on_charger(void) {
@@ -118,6 +121,11 @@ int backend_ini(const char* k, const char* v) {
 int hud_debug_set(const char* text) {
     (void)text;
     return 0;
+}
+void overlay_settings_notice(const char* game, const char* global) {
+    snprintf(g_test.game, sizeof g_test.game, "%s", game);
+    snprintf(g_test.global, sizeof g_test.global, "%s", global);
+    g_test.notices++;
 }
 int unattended_known(const char* k) {
     (void)k;
@@ -584,6 +592,52 @@ static void test_vk_descriptors_old(void) {
     ini_override("vk_descriptors_mode", NULL);
     g_test.write = 0;
 }
+/* write_tracking_hot, deprecated for write_tracking_hot_pages (0 Off, 1 On, 2 Auto, its default): in an old .ini its 1
+   is On, carried to the new key, and its 0, the default every .ini had written, leaves the new key at its own Auto; any
+   other value is said with the default it leaves; the new key given, the old one is not read. On the command line 0
+   is that run's Off, said, with no "not a setting", and the file keeps its own */
+static void test_write_tracking_hot_old(void) {
+    char *text, *again;
+    CHECK(options_write_tracking_hot_old("1", 0) == 1 && options_write_tracking_hot_old("1", 1) == 1);
+    CHECK(options_write_tracking_hot_old("0", 0) == -1 && options_write_tracking_hot_old("0", 1) == 0);
+    CHECK(options_write_tracking_hot_old("2", 0) == -2 && options_write_tracking_hot_old("", 1) == -2);
+    g_test.write = 1;
+    text = open_ini("[Debug]\nwrite_tracking_hot=1\n");
+    CHECK(strstr(g_test.said, "settings: write_tracking_hot=1, deprecated, is write_tracking_hot_pages=1 (On) now "
+                              "(docs/user/deprecations.md)\n"));
+    CHECK(text && strstr(text, "\nwrite_tracking_hot_pages=1\n") && strstr(text, "\n[Deprecated]\n") &&
+          strstr(text, "\n[Deprecated]\n") < strstr(text, "\nwrite_tracking_hot=1\n"));
+    again = open_ini(text); /* the next run: write_tracking_hot_pages given, write_tracking_hot not read again */
+    CHECK(!strstr(g_test.said, "settings: write_tracking_hot=") && again &&
+          strstr(again, "\nwrite_tracking_hot_pages=1\n"));
+    free(again);
+    free(text);
+    text = open_ini("[Debug]\nwrite_tracking_hot=0\n");
+    CHECK(strstr(g_test.said, "settings: write_tracking_hot=0, deprecated, was its default: write_tracking_hot_pages "
+                              "takes its own, 2 (Auto), hot pages where page protection tracks the writes "
+                              "(docs/user/deprecations.md)\n"));
+    CHECK(text && strstr(text, "\nwrite_tracking_hot_pages=2\n"));
+    free(text);
+    text = open_ini("[Debug]\nwrite_tracking_hot=yes\n");
+    CHECK(strstr(g_test.said, "settings: write_tracking_hot=yes, deprecated, is neither 0 nor 1: "
+                              "write_tracking_hot_pages takes its default, 2 (Auto) (docs/user/deprecations.md)\n"));
+    free(text);
+    text = open_ini("[Debug]\nwrite_tracking_hot=1\nwrite_tracking_hot_pages=0\n");
+    CHECK(!strstr(g_test.said, "settings: write_tracking_hot=") && text &&
+          strstr(text, "\nwrite_tracking_hot_pages=0\n"));
+    free(text);
+    ini_override("write_tracking_hot", "0");
+    text = open_ini("[Debug]\nwrite_tracking_hot_pages=2\n");
+    CHECK(!strstr(g_test.said, "is not a setting") && ini_overridden("write_tracking_hot_pages") &&
+          !strcmp(ini_overridden("write_tracking_hot_pages"), "0"));
+    CHECK(strstr(g_test.said, "settings: --write_tracking_hot=0 is deprecated: this run reads it as "
+                              "--write-tracking-hot-pages=0 (Off) (docs/user/deprecations.md)\n"));
+    CHECK(text && strstr(text, "\nwrite_tracking_hot_pages=2\n"));
+    free(text);
+    ini_override("write_tracking_hot_pages", NULL);
+    ini_override("write_tracking_hot", NULL);
+    g_test.write = 0;
+}
 /* a startup setting is read by the process's first ini_open alone, so each of these is a process of its own
    (CMakeLists.txt's options_vk_descriptors_*): what the run plays with and says over its picture. old: an older
    version's .ini with vk_descriptors=0, its default then, plays Automatic with nothing over the picture; pick: its 2,
@@ -821,17 +875,83 @@ static int picks_clean(void) {
     free(dir);
     return 0;
 }
+/* the settings that change how fast the game runs, named over its first frame (options_perf_notice), by where each
+   came from: the game's picks and its .ini a gamepad's, the launcher's for every game a globe's, with how the game's code
+   was made (its .abi's made line). Off its default and perf alone: stats (the screen shows it) and the Volume are not
+   named, nor a value nobody gave that the runtime picked itself (an Ounce program's async_pipelines) */
+static void abi(const char* dir, const char* text) {
+    char* path = snx_format("%s/game.abi", dir);
+    CHECK(path && !snx_write_file(path, text, strlen(text)));
+    free(path);
+}
+static int picks_perf(void) {
+    char *ini, *picks, *base,
+        *dir = picks_game("[Display]\nstats=1\n[Graphics]\nvk_ext_shader_object=off\nresolution=1\n"
+                          "[Performance]\nfps_limit=0\nmemory_gb=8\njit_opt=2\nasync_pipelines=0\n",
+                          "[Performance]\njit_opt=0\n[Audio]\nvolume=40\n", &ini, &picks);
+    ini_override(SNX_LAUNCHER_PICKS, "1");
+    ini_override("resolution", "2");
+    ini_override("vsync", "0");
+    ini_override("fps_limit", "90");              /* the launcher's, over the .ini's 0 */
+    ini_override("anisotropy", "0");              /* its default, given: not named */
+    ini_override("vk_ext_shader_object", "auto"); /* the launcher's auto over the .ini's off: its default, not named */
+    ini_open(ini);
+    g_settings.async_pipelines = 1; /* the runtime's own pick, as for an Ounce program: nobody gave it */
+    base = snx_path_join(dir, "game");
+    CHECK(base);
+    /* no .abi: nothing of how it was made */
+    CHECK(options_perf_notice(base) == 5 && g_test.notices == 1);
+    CHECK(!strcmp(g_test.game, "memory_gb, jit_opt"));
+    CHECK(!strcmp(g_test.global, "resolution, vsync, fps_limit"));
+    /* made at -O0 ahead of time, by a recompile with its batch and unit size off their defaults */
+    abi(dir, "14\nmade opt=0 aot=1 found=1 code=2 off=llvm_batch,unit_instructions\n");
+    CHECK(options_perf_notice(base) == 8 && g_test.notices == 2);
+    CHECK(!strcmp(g_test.game, "memory_gb, jit_opt"));
+    CHECK(!strcmp(g_test.global, "resolution, vsync, fps_limit, opt, llvm_batch, unit_instructions"));
+    /* an older version's made line: its opt alone */
+    abi(dir, "14\nmade opt=0 aot=1 found=1 code=2\n");
+    CHECK(options_perf_notice(base) == 6 && !strcmp(g_test.global, "resolution, vsync, fps_limit, opt"));
+    /* --jit-only's, no code made ahead of time: its opt made nothing that runs; and opt's default */
+    abi(dir, "14\nmade opt=0 aot=0 found=0 code=2\n");
+    CHECK(options_perf_notice(base) == 5 && !strcmp(g_test.global, "resolution, vsync, fps_limit"));
+    abi(dir, "14\nmade opt=2 aot=1 found=1 code=2\n");
+    CHECK(options_perf_notice(base) == 5 && !strcmp(g_test.global, "resolution, vsync, fps_limit"));
+    CHECK(!snx_remove_tree(dir));
+    free(base);
+    free(ini);
+    free(picks);
+    free(dir);
+    return 0;
+}
+/* this run's own command line (no --launcher-picks): the launcher's sign, a globe, as a value given for this run */
+static int picks_perf_run(void) {
+    char *ini, *picks, *dir = picks_game("[Performance]\nmemory_gb=6\n", NULL, &ini, &picks);
+    ini_override("fps_limit", "0");
+    ini_override("memory_gb", "0"); /* its default over the .ini's 6: the variable at its default, nothing named */
+    ini_override("vsync", "1");     /* its default: nothing to name */
+    ini_open(ini);
+    CHECK(options_perf_notice(dir) == 1 && !strcmp(g_test.game, "") && !strcmp(g_test.global, "fps_limit"));
+    CHECK(!snx_remove_tree(dir));
+    free(ini);
+    free(picks);
+    free(dir);
+    return 0;
+}
 static int options_picks(const char* which) {
-    int failed = !strcmp(which, "--picks-clean")    ? picks_clean()
-                 : !strcmp(which, "--picks-next")   ? picks_next()
-                 : !strcmp(which, "--picks-order")  ? picks_order()
-                 : !strcmp(which, "--picks-menu")   ? picks_menu()
-                 : !strcmp(which, "--picks-hand")   ? picks_hand()
-                 : !strcmp(which, "--picks-reload") ? picks_reload()
-                                                    : 2;
+    int failed = !strcmp(which, "--picks-perf")       ? picks_perf()
+                 : !strcmp(which, "--picks-perf-run") ? picks_perf_run()
+                 : !strcmp(which, "--picks-clean")    ? picks_clean()
+                 : !strcmp(which, "--picks-next")     ? picks_next()
+                 : !strcmp(which, "--picks-order")    ? picks_order()
+                 : !strcmp(which, "--picks-menu")     ? picks_menu()
+                 : !strcmp(which, "--picks-hand")     ? picks_hand()
+                 : !strcmp(which, "--picks-reload")   ? picks_reload()
+                                                      : 2;
     if (failed == 2)
-        fprintf(stderr, "options_tv_mode: %s is none of --picks-order, -menu, -hand, -reload, -clean, -next\n",
-                which);
+        fprintf(
+            stderr,
+            "options_tv_mode: %s is none of --picks-order, -menu, -hand, -reload, -clean, -next, -perf, -perf-run\n",
+            which);
     if (!failed) printf("options_tv_mode %s: ok\n", which);
     return failed;
 }
@@ -930,6 +1050,7 @@ int main(int argc, char** argv) {
     test_dropped_keys_old();
     test_vk_descriptors_old_default();
     test_vk_descriptors_old();
+    test_write_tracking_hot_old();
     test_key_steps();
     printf("options_tv_mode: ok\n");
     return 0;

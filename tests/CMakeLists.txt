@@ -481,6 +481,9 @@ if(TARGET snx_ctr_board)
     # target at the same scale samples it. At scale 1 the destination is the transfer's own result
     add_test(NAME 3ds_vk_draw_scaled_transfer_into_target COMMAND snx-test-3ds-vk-draw --scaled-transfer-into-target)
     set_tests_properties(3ds_vk_draw_scaled_transfer_into_target PROPERTIES SKIP_RETURN_CODE 77)
+    # shadow maps drawn and read at the render scale, plus flipped 1x fallback and centre-texel store
+    add_test(NAME 3ds_vk_draw_shadow_scaled COMMAND snx-test-3ds-vk-draw --shadow-scaled)
+    set_tests_properties(3ds_vk_draw_shadow_scaled PROPERTIES SKIP_RETURN_CODE 77)
     # a display transfer into a destination over a scaled target's first rows, and no row it reads: the copy is kept,
     # and a draw into the target after it is checked the same way
     add_test(NAME 3ds_vk_draw_scaled_transfer_overlap COMMAND snx-test-3ds-vk-draw --scaled-transfer-overlap)
@@ -568,9 +571,9 @@ if(TARGET snx_ctr_board)
         set(snx_vk_validation_tests 3ds_vk_draw_present_validation 3ds_vk_draw_after_draw_validation
             3ds_vk_draw_texture_after_draw_validation 3ds_vk_draw_index_copy_validation
             3ds_vk_draw_after_submit_validation 3ds_vk_draw_async_validation
-            3ds_vk_draw_shadow_validation)
+            3ds_vk_draw_shadow_validation 3ds_vk_draw_shadow_scaled_validation)
         set(snx_vk_validation_modes --present --after-draw --texture-after-draw --draw-after-index-copy
-            --draw-after-submit --async --shadow)
+            --draw-after-submit --async --shadow --shadow-scaled)
         foreach(snx_test snx_mode IN ZIP_LISTS snx_vk_validation_tests snx_vk_validation_modes)
             add_test(NAME ${snx_test}
                 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_vk_validation.py"
@@ -628,7 +631,8 @@ if(TARGET snx_ctr_board)
             list(APPEND snx_tests ${snx_test}_new3ds${snx_suffix})
         endforeach()
     endforeach()
-    foreach(snx_mode present after-draw texture-after-draw draw-after-index-copy draw-after-submit async shadow)
+    foreach(snx_mode present after-draw texture-after-draw draw-after-index-copy draw-after-submit async shadow
+            shadow-scaled)
         string(REPLACE "-" "_" snx_name "${snx_mode}")
         add_test(NAME 3ds_vk_draw_${snx_name}_new3ds COMMAND snx-test-3ds-vk-draw --new3ds --${snx_mode})
         list(APPEND snx_tests 3ds_vk_draw_${snx_name}_new3ds)
@@ -794,6 +798,11 @@ add_executable(snx-test-arm-profile arm_profile.c)
 snx_test_target(snx-test-arm-profile gnu23)
 target_link_libraries(snx-test-arm-profile PRIVATE snx_arm_decode)
 add_test(NAME arm_isa_profiles COMMAND snx-test-arm-profile)
+# which targets async_pipelines may skip a draw into (src/nx/gpu/vk/redraw.h): those the game regenerates every frame
+add_executable(snx-test-vk-redraw vk_redraw.c)
+snx_test_target(snx-test-vk-redraw c23)
+target_include_directories(snx-test-vk-redraw PRIVATE "${PROJECT_SOURCE_DIR}/src")
+add_test(NAME vk_redraw COMMAND snx-test-vk-redraw)
 # a game's cheats by their names, as the launcher lists them and cheats_off= leaves them out
 add_executable(snx-test-cheat-list cheat_list.c)
 snx_test_target(snx-test-cheat-list c23)
@@ -2225,6 +2234,14 @@ if(TARGET OpenSSL::Crypto AND NOT SNX_TOOLS_ONLY)
     snx_service_swipc(snx-test-nn-audio)
     snx_hookgen(snx-test-nn-audio SPEC "${PROJECT_SOURCE_DIR}/src/nx/nn/audio.hook" A32_MARKED)
     add_test(NAME nn_audio COMMAND snx-test-nn-audio)
+    # the movie library's native JPEG decoder and encoder (nn/tvmr_jpeg.c) over FFmpeg: pictures through both, their
+    # surfaces' layouts, the statuses of what NVJPG refuses, and tvmr_jpeg.hook's table by movie version
+    add_executable(snx-test-nn-tvmr-jpeg nn_tvmr_jpeg.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/version.c")
+    snx_test_target(snx-test-nn-tvmr-jpeg gnu23)
+    snx_service_swipc(snx-test-nn-tvmr-jpeg)
+    snx_hookgen(snx-test-nn-tvmr-jpeg SPEC "${PROJECT_SOURCE_DIR}/src/nx/nn/tvmr_jpeg.hook" A32_MARKED)
+    target_link_libraries(snx-test-nn-tvmr-jpeg PRIVATE FFmpeg::avcodec FFmpeg::avutil)
+    add_test(NAME nn_tvmr_jpeg COMMAND snx-test-nn-tvmr-jpeg)
     # the native audio renderer (nn/audio_renderer.c): the parameters, the handle, RequestUpdateAudioRenderer over a
     # stand-in SDK's managers, and audio_renderer.hook's table by SDK version
     add_executable(snx-test-nn-audio-renderer nn_audio_renderer.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/version.c")
@@ -2486,7 +2503,7 @@ foreach(case old pick cli)
     add_test(NAME options_vk_descriptors_${case} COMMAND snx-test-options-tv-mode --vk-descriptors-${case})
 endforeach()
 # a game's own picks (<name>.picks) over the launcher's and its .ini, under this run's command line: a process each
-foreach(case order menu hand reload clean next)
+foreach(case order menu hand reload clean next perf perf-run)
     add_test(NAME options_picks_${case} COMMAND snx-test-options-tv-mode --picks-${case})
 endforeach()
 
@@ -2677,6 +2694,16 @@ add_test(NAME host_tools_emulator COMMAND "${CMAKE_COMMAND}" "-DSRC=${PROJECT_SO
 add_test(NAME curl_cache_key COMMAND "${CMAKE_COMMAND}" "-DSRC=${PROJECT_SOURCE_DIR}"
          "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/curl-cache-key-test" "-DGENERATOR=${CMAKE_GENERATOR}"
          "-DMAKE=${CMAKE_MAKE_PROGRAM}" -P "${CMAKE_CURRENT_SOURCE_DIR}/curl_cache_key_test.cmake")
+# libz.a, which FFmpeg's configure links its zlib check against with no -flto, stays machine code with SNX_LTO
+# (cmake/zlib.cmake). Not on Apple, where cmake/lto.cmake refuses SNX_LTO, nor in a cross build, whose target flags the
+# test's project would not get
+if(TARGET snx_zlib AND NOT APPLE AND NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME zlib_lto COMMAND "${CMAKE_COMMAND}" "-DSRC=${PROJECT_SOURCE_DIR}" "-DZLIB=${zlib_SOURCE_DIR}"
+             "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/zlib-lto-test" "-DGENERATOR=${CMAKE_GENERATOR}"
+             "-DMAKE=${CMAKE_MAKE_PROGRAM}" "-DCC=${CMAKE_C_COMPILER}" "-DCXX=${CMAKE_CXX_COMPILER}" -P
+             "${CMAKE_CURRENT_SOURCE_DIR}/zlib_lto_test.cmake")
+    set_tests_properties(zlib_lto PROPERTIES SKIP_REGULAR_EXPRESSION "zlib_lto skipped:")
+endif()
 # where cmake/cross.cmake puts -mabi=elfv2: PowerPC64's compiles and links, no other processor's
 add_test(NAME cross_flags COMMAND "${CMAKE_COMMAND}" "-DSRC=${PROJECT_SOURCE_DIR}" -P
          "${CMAKE_CURRENT_SOURCE_DIR}/cross_flags_test.cmake")
@@ -3691,6 +3718,13 @@ add_executable(snx-test-recompiler-library recompiler_library.c)
 snx_test_target(snx-test-recompiler-library gnu23)
 target_link_libraries(snx-test-recompiler-library PRIVATE scarletnx-recompiler)
 add_test(NAME recompiler_library COMMAND snx-test-recompiler-library)
+# the same header from C++, as the embedders include it
+add_executable(snx-test-recompiler-library-cpp recompiler_library_cpp.cpp)
+set_target_properties(snx-test-recompiler-library-cpp PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)
+target_compile_options(snx-test-recompiler-library-cpp PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(snx-test-recompiler-library-cpp PRIVATE scarletnx-recompiler Threads::Threads)
+snx_test_sanitize(snx-test-recompiler-library-cpp) # this target is not made through snx_test_target
+add_test(NAME recompiler_library_cpp COMMAND snx-test-recompiler-library-cpp)
 # what the library's archive needs from outside it: LLVM and the system's libraries alone
 # (tests/recompiler_symbols.cmake). Its program links every object of the archive with those, named here rather than
 # taken from the archive's own link line, which a new library would join. Built by the test, so a library more fails
@@ -4094,6 +4128,17 @@ add_executable(snx-test-audren-host audren_host.c)
 snx_test_target(snx-test-audren-host gnu23)
 add_test(NAME audren_host COMMAND snx-test-audren-host)
 
+# the audio clock (audio.c) and the renderer's frames it queues (audren.c) on a host the test makes, whose clock
+# thread stalls: how far the sound trails the clock afterwards. Without FFmpeg: no Opus decoder opens here
+add_executable(snx-test-audio-clock audio_clock.c)
+snx_test_target(snx-test-audio-clock gnu23)
+snx_service_swipc(snx-test-audio-clock hle/services/audio.swipc)
+target_compile_definitions(snx-test-audio-clock PRIVATE SNX_NO_H264)
+if(NOT WIN32)
+    target_link_libraries(snx-test-audio-clock PRIVATE m)
+endif()
+add_test(NAME audio_clock COMMAND snx-test-audio-clock)
+
 add_executable(snx-test-render-enable render_enable.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/engines.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/maxwell3d.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/write_pages.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/draw_state.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/draw_state.c")
@@ -4279,12 +4324,13 @@ if(UNIX)
     add_test(NAME memory_alias_copies COMMAND snx-test-memory-alias --copies)
     set_tests_properties(memory_alias_copies PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     # views over pages the write tracking protects (write_tracking=1: the tracking of hosts without Linux 6.7's)
-    add_test(NAME memory_alias_signal_ww COMMAND snx-test-memory-alias --write_tracking=1)
+    add_test(NAME memory_alias_signal_ww COMMAND snx-test-memory-alias --write_tracking=1 --write_tracking_hot_pages=0)
     set_tests_properties(memory_alias_signal_ww PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     # the write tracking in NCE's layout (g_mem 0, moved up from 64 GiB), each kind: Android's is the protection
     add_test(NAME memory_alias_nce COMMAND snx-test-memory-alias --nce)
     set_tests_properties(memory_alias_nce PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
-    add_test(NAME memory_alias_nce_signal_ww COMMAND snx-test-memory-alias --nce --write_tracking=1)
+    add_test(NAME memory_alias_nce_signal_ww COMMAND snx-test-memory-alias --nce --write_tracking=1
+             --write_tracking_hot_pages=0)
     set_tests_properties(memory_alias_nce_signal_ww PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     # a source given back while the pool can't give its bytes: the fatal says which step failed, and the error
     add_test(NAME memory_alias_unpool_fails COMMAND snx-test-memory-alias --unpool-read-fails)
@@ -4307,11 +4353,12 @@ if(UNIX)
     add_test(NAME memory_own COMMAND snx-test-memory-own)
     set_tests_properties(memory_own PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     # traps over pages the write tracking protects (write_tracking=1)
-    add_test(NAME memory_own_signal_ww COMMAND snx-test-memory-own --write_tracking=1)
+    add_test(NAME memory_own_signal_ww COMMAND snx-test-memory-own --write_tracking=1 --write_tracking_hot_pages=0)
     # traps by protection and the fault handler (memory_traps=1: those of Linux before 5.13 and Android), beside
     # userfaultfd's write tracking and beside the tracking by protection
     add_test(NAME memory_own_signal_traps COMMAND snx-test-memory-own --memory_traps=1)
-    add_test(NAME memory_own_signal_both COMMAND snx-test-memory-own --memory_traps=1 --write_tracking=1)
+    add_test(NAME memory_own_signal_both COMMAND snx-test-memory-own --memory_traps=1 --write_tracking=1
+             --write_tracking_hot_pages=0)
     # no traps, asked for (memory_traps=2) and where the protection has no pool to trap: the log says which
     add_test(NAME memory_own_no_traps COMMAND snx-test-memory-own --memory_traps=2)
     add_test(NAME memory_own_signal_traps_no_pool COMMAND snx-test-memory-own --memory_traps=1 --alias_pool=0)
@@ -4434,19 +4481,25 @@ if(NOT WIN32 AND TARGET SDL3::SDL3) # SDL3 is there with a driver that draws (cm
     endif()
     add_test(NAME platform_posix COMMAND snx-test-platform-posix "${CMAKE_CURRENT_BINARY_DIR}")
     # the written-page tracking macOS, FreeBSD, Android and older Linux have: protection and the fault handler, also
-    # with its hot pages from the setting (write_tracking_hot, which says it does nothing where userfaultfd tracks);
+    # without and with its hot pages (write_tracking_hot_pages 0 and 1, which says it does nothing where userfaultfd
+    # tracks), and with Auto, the default, which turns them on there;
     # and none: the scan says so, and the caches compare contents. Each in a folder of its own, as ctest may run them
     # at once and each writes and replaces the same files
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/platform_posix_signal_ww"
          "${CMAKE_CURRENT_BINARY_DIR}/platform_posix_signal_ww_hot" "${CMAKE_CURRENT_BINARY_DIR}/platform_posix_hot"
-         "${CMAKE_CURRENT_BINARY_DIR}/platform_posix_no_tracking")
+         "${CMAKE_CURRENT_BINARY_DIR}/platform_posix_signal_ww_auto" "${CMAKE_CURRENT_BINARY_DIR}/platform_posix_no_tracking")
     add_test(NAME platform_posix_signal_ww
-             COMMAND snx-test-platform-posix "${CMAKE_CURRENT_BINARY_DIR}/platform_posix_signal_ww" --write_tracking=1)
+             COMMAND snx-test-platform-posix "${CMAKE_CURRENT_BINARY_DIR}/platform_posix_signal_ww" --write_tracking=1
+                     --write_tracking_hot_pages=0)
     add_test(NAME platform_posix_signal_ww_hot
              COMMAND snx-test-platform-posix "${CMAKE_CURRENT_BINARY_DIR}/platform_posix_signal_ww_hot"
-                     --write_tracking=1 --write_tracking_hot=1)
+                     --write_tracking=1 --write_tracking_hot_pages=1)
+    add_test(NAME platform_posix_signal_ww_auto
+             COMMAND snx-test-platform-posix "${CMAKE_CURRENT_BINARY_DIR}/platform_posix_signal_ww_auto"
+                     --write_tracking=1)
     add_test(NAME platform_posix_hot
-             COMMAND snx-test-platform-posix "${CMAKE_CURRENT_BINARY_DIR}/platform_posix_hot" --write_tracking_hot=1)
+             COMMAND snx-test-platform-posix "${CMAKE_CURRENT_BINARY_DIR}/platform_posix_hot"
+                     --write_tracking_hot_pages=1)
     add_test(NAME platform_posix_no_tracking
              COMMAND snx-test-platform-posix "${CMAKE_CURRENT_BINARY_DIR}/platform_posix_no_tracking" --write_tracking=2)
     # what the tracking costs on this host, with no game (bench_ww): page protection without and with hot pages, and

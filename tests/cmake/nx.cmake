@@ -194,6 +194,23 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     add_test(NAME vulkan_headless_mesh_native COMMAND snx-test-vulkan -H --vk-ext-mesh-shader=on --vk-mesh-path=native)
     set_tests_properties(vulkan_headless_mesh_native PROPERTIES TIMEOUT 60
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
+    # a vertex stream whose stride isn't a multiple of its components (check_vertex_restride) both ways, under the
+    # validation layer when it is installed: bound as it is with VK_EXT_legacy_vertex_attributes, restrided on the GPU
+    # without it (the default run takes the extension where the device has it)
+    add_test(NAME vulkan_vertex_restride COMMAND snx-test-vulkan -H --vk-validation=1)
+    add_test(NAME vulkan_vertex_restride_off COMMAND snx-test-vulkan -H --vk-validation=1
+                                                     --vk-ext-legacy-vertex-attributes=off)
+    set_tests_properties(vulkan_vertex_restride vulkan_vertex_restride_off PROPERTIES TIMEOUT 60
+        ENVIRONMENT "SNX_TEST_NVN_CASE=vertex_restride;VK_KHRONOS_VALIDATION_REPORT_FLAGS=error"
+        FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
+    # the mesh draws alone under the validation layer when it is installed, with the mesh and task stages as shader
+    # objects where the device draws with them (gpu/vk/shader_objects.c): their stages, flags and binds checked
+    add_test(NAME vulkan_mesh_shader_objects COMMAND snx-test-vulkan -H --vk-ext-mesh-shader=on --vk-validation=1)
+    add_test(NAME vulkan_mesh_shader_objects_native COMMAND snx-test-vulkan -H --vk-ext-mesh-shader=on
+                                                            --vk-mesh-path=native --vk-validation=1)
+    set_tests_properties(vulkan_mesh_shader_objects vulkan_mesh_shader_objects_native PROPERTIES TIMEOUT 60
+        ENVIRONMENT "SNX_TEST_NVN_CASE=mesh_draws;VK_KHRONOS_VALIDATION_REPORT_FLAGS=error"
+        FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR;went through a pipeline")
     # an Ounce fragment program's colour into integer targets (tests/vulkan_ounce_int_targets.inc) under the validation
     # layer when it is installed, which reports a float output in an integer attachment
     add_test(NAME vulkan_ounce_int_targets COMMAND snx-test-vulkan -H --vk-validation=1)
@@ -319,6 +336,13 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
         ENVIRONMENT "SNX_TEST_NVN_CASE=heap_pipeline_flags;VK_KHRONOS_VALIDATION_REPORT_FLAGS=error"
         SKIP_REGULAR_EXPRESSION "SKIP descriptor heap pipeline flags"
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
+    # the shader objects of a draw of heaps (check_heap_shader_objects) under the validation layer when it is installed:
+    # the heaps' flag and each stage's mapping of its set in place of the set layouts, apart from those of sets
+    add_test(NAME vulkan_heap_shader_objects COMMAND snx-test-vulkan -H --vk-descriptors-mode=2 --vk-validation=1)
+    set_tests_properties(vulkan_heap_shader_objects PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "SNX_TEST_NVN_CASE=heap_shader_objects;VK_KHRONOS_VALIDATION_REPORT_FLAGS=error"
+        SKIP_REGULAR_EXPRESSION "SKIP descriptor heap shader objects"
+        FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     # every check again the Vulkan 1.2 way on a newer device, as a game's .ini with vk_api=1.2 asks (gpu/vk/device.c
     # vk12_extensions): the 1.3 commands by their extensions' names, shaders in SPIR-V 1.5, under the validation layer
     # when it is installed, which takes the instance's 1.2 as the version and flags any 1.3 use left
@@ -436,9 +460,9 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     add_test(NAME vulkan_headless_stage_cached COMMAND snx-test-vulkan -H --vk-stage-memory=2)
     set_tests_properties(vulkan_headless_stage_cached PROPERTIES TIMEOUT 180
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
-    # every check again with the write tracking by page protection and its hot pages (write_tracking_hot): each render
-    # target's baseline cools its pages, or its write-back keeps the CPU's old bytes over its pixels
-    add_test(NAME vulkan_headless_hot COMMAND snx-test-vulkan -H --write-tracking=1 --write-tracking-hot=1)
+    # every check again with the write tracking by page protection and its hot pages (write_tracking_hot_pages): each
+    # render target's baseline cools its pages, or its write-back keeps the CPU's old bytes over its pixels
+    add_test(NAME vulkan_headless_hot COMMAND snx-test-vulkan -H --write-tracking=1 --write-tracking-hot-pages=1)
     set_tests_properties(vulkan_headless_hot PROPERTIES TIMEOUT 120
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     # every check again with draw_state_check=1: a kept state that differs when it is made again fails it, and so does
@@ -448,17 +472,20 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR;draw_state_check=1: a draw that kept")
     # the checks of guest memory read in place again with the write tracking by page protection: the driver takes an
     # import's pages for writing, and amdgpu refuses those a scan left protected (VK_ERROR_INVALID_EXTERNAL_HANDLE)
-    add_test(NAME vulkan_uma_hot COMMAND snx-test-vulkan -H --vk-memory=2 --write-tracking=1 --write-tracking-hot=1)
+    add_test(NAME vulkan_uma_hot
+        COMMAND snx-test-vulkan -H --vk-memory=2 --write-tracking=1 --write-tracking-hot-pages=1)
     set_tests_properties(vulkan_uma_hot PROPERTIES TIMEOUT 60 ENVIRONMENT "SNX_TEST_UMA_ONLY=1"
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")
     # the write tracking's contract alone (tests/vulkan_write_tracking.inc), with each way the host tracks: its own
     # (userfaultfd on Linux), page protection and the fault handler for the tracking and the traps (macOS, FreeBSD,
-    # Android, older Linux), with its hot pages (write_tracking_hot), unified memory's reads in place, and none (the
-    # caches compare contents: the cases that need the tracking skip, the others check the comparisons)
+    # Android, older Linux), without and with its hot pages (write_tracking_hot_pages 0 and 1), unified memory's reads
+    # in place, and none (the caches compare contents: the cases that need the tracking skip, the others check the
+    # comparisons)
     add_test(NAME vulkan_write_tracking COMMAND snx-test-vulkan -H)
-    add_test(NAME vulkan_write_tracking_protection COMMAND snx-test-vulkan -H --write-tracking=1 --memory-traps=1)
+    add_test(NAME vulkan_write_tracking_protection
+        COMMAND snx-test-vulkan -H --write-tracking=1 --memory-traps=1 --write-tracking-hot-pages=0)
     add_test(NAME vulkan_write_tracking_hot
-        COMMAND snx-test-vulkan -H --write-tracking=1 --memory-traps=1 --write-tracking-hot=1)
+        COMMAND snx-test-vulkan -H --write-tracking=1 --memory-traps=1 --write-tracking-hot-pages=1)
     add_test(NAME vulkan_write_tracking_uma COMMAND snx-test-vulkan -H --vk-memory=2)
     add_test(NAME vulkan_write_tracking_off COMMAND snx-test-vulkan -H --write-tracking=2)
     set_tests_properties(vulkan_write_tracking vulkan_write_tracking_protection vulkan_write_tracking_hot
@@ -468,7 +495,8 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     # each way the host tracks writes, and without write tracking, where they load the whole texture. The ASTC cases,
     # which lavapipe decodes and encodes as BC7 in software, run with the host's own tracking, as long as astc_vulkan
     add_test(NAME vulkan_tex_partial COMMAND snx-test-vulkan -H)
-    add_test(NAME vulkan_tex_partial_protection COMMAND snx-test-vulkan -H --write-tracking=1 --memory-traps=1)
+    add_test(NAME vulkan_tex_partial_protection
+        COMMAND snx-test-vulkan -H --write-tracking=1 --memory-traps=1 --write-tracking-hot-pages=0)
     add_test(NAME vulkan_tex_partial_untracked COMMAND snx-test-vulkan -H --write-tracking=2)
     set_tests_properties(vulkan_tex_partial PROPERTIES TIMEOUT 300 ENVIRONMENT "SNX_TEST_TEX_PARTIAL_ONLY=1"
         FAIL_REGULAR_EXPRESSION "vulkan validation:;failed: VK_ERROR")

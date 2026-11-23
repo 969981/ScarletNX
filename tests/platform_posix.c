@@ -72,6 +72,7 @@ static void* alias_test_mremap(void* address, size_t old_size, size_t new_size, 
 #include <sys/resource.h> /* RLIMIT_NPROC: a thread the system refuses */
 #include <sys/wait.h>
 #include <stdatomic.h>
+#include <dirent.h> /* test_guest_files: no file keeps its name */
 #if defined(__linux__)
 #include <sys/prctl.h> /* PR_SET_VMA_ANON_NAME, for test_foreign */
 #endif
@@ -426,7 +427,7 @@ static int written_scans(u64 n, int k) {
     }
     return all;
 }
-/* ---- hot pages (write_tracking_hot=1): a page written in WP_HOT_AFTER scans in a row stays writable and is reported
+/* ---- hot pages (write_tracking_hot_pages=1): a page written in WP_HOT_AFTER scans in a row stays writable and is reported
    at each scan, until its WP_HOT_AFTER + WP_HOT_FOR-th report; plat_ww_cool makes its reports exact again. Run on a
    table of counts of its own when the setting left none */
 static void test_hot_pages(void) {
@@ -564,16 +565,18 @@ static void test_guest_memory(const char* dir) {
     g_log_on = 1;
     plat_vm_track(g_base, (u64)1 << 30);
     g_log_on = 0;
-    /* write_tracking_hot=1 reaches the tracking by protection, and is said to do nothing elsewhere */
-    if (g_settings.write_tracking_hot_pages == 1 && g_wp_track)
-        CHECK(g_wp_hot != NULL, "write_tracking_hot=1 left the tracking by protection without hot pages");
+    /* write_tracking_hot_pages=1 and 2 (Auto, the default) reach the tracking by protection; 1 is said to do nothing
+       elsewhere, and Auto says nothing there */
+    if (g_settings.write_tracking_hot_pages && g_wp_track)
+        CHECK(g_wp_hot != NULL, "write_tracking_hot_pages 1 or 2 left the tracking by protection without hot pages");
     else if (g_settings.write_tracking_hot_pages == 1)
-        CHECK(strstr(g_log, "memory: write_tracking_hot=1 leaves pages hot only where page protection tracks the "
-                            "writes, and ") &&
+        CHECK(strstr(g_log, "memory: write_tracking_hot_pages=1 leaves pages hot only where page protection tracks "
+                            "the writes, and ") &&
                   strstr(g_log, ": no page is hot this run\n"),
-              "write_tracking_hot=1 where nothing protects pages for the tracking was not said");
+              "write_tracking_hot_pages=1 where nothing protects pages for the tracking was not said");
     else
-        CHECK(g_wp_hot == NULL, "hot pages without write_tracking_hot=1");
+        CHECK(g_wp_hot == NULL && !strstr(g_log, "write_tracking_hot_pages"),
+              "hot pages, or a line about them, with write_tracking_hot_pages 0, or 2 where nothing protects pages");
     CHECK(!plat_vm_commit(g_base, 64 * 4096), "commit failed");
     if (g_settings.write_tracking == 2 || plat_ww_scan(g_base, 4096, on_written) < 0) {
         printf("written-page tracking unavailable here: only checking that it says so\n");
@@ -889,7 +892,7 @@ static void test_memory_watch(void) {
 }
 
 /* ---- --bench-ww: what the written-page tracking costs on this host, with no game: page protection without and with
-   hot pages (write_tracking_hot, #1237), through the real scan and fault handler, or the host's own way where it has
+   hot pages (write_tracking_hot_pages, #1237), through the real scan and fault handler, or the host's own way where it has
    one. A region of BENCH_PAGES pages; each epoch writes a byte on each of hot pages (the same ones every epoch, every
    other page, so each is a run of its own to protect) and on cold ones picked anew, then one scan of the region takes
    in what was written, as a cache's check does. Per pattern and arm: the faults the handler took and its time (a
@@ -1003,7 +1006,7 @@ static void bench_ww(void) {
         if (own == MAP_FAILED) own = NULL;
         hot_table = own;
     }
-    printf("  %s\n", g_wp_track ? "page protection: arm protect is write_tracking_hot=0, arm hot is 1"
+    printf("  %s\n", g_wp_track ? "page protection: arm protect is write_tracking_hot_pages=0, arm hot is 1"
                                 : "the host's own tracking (userfaultfd): hot pages are protection's alone");
     for (size_t k = 0; k < sizeof patterns / sizeof *patterns; k++) {
         u32 hot = patterns[k][0], cold = patterns[k][1];
@@ -1039,6 +1042,89 @@ static void bench_ww(void) {
 static void mark_seen(void* data, const SnxRunMark* mark) {
     (void)data;
     (void)mark;
+}
+/* the file slots (plat_vm_files): no file keeps its name, a decommit leaves its range inaccessible and reading zero
+   again, through the guest address and through the file, also across the edge of two slots, the partial last slot
+   keeps its bytes and ends where the reservation does. Last in main: the slots stay to the end */
+static void test_guest_files(const char* dir) {
+#if defined(__APPLE__)
+    u64 page = plat_vm_page(), slot = (u64)1 << 30, size = 2 * slot + page, off = 0;
+    u8* p = plat_vm_reserve(size);
+    u8 *a, *view;
+    int fd = -1;
+    printf("guest files\n");
+    CHECK(p != NULL, "no reservation");
+    if (!p) return;
+    CHECK(plat_vm_files(p, size, "/nonexistent/snx") == -1 && !plat_vm_files_slot(p, NULL, NULL),
+          "a folder that does not exist gave files");
+    CHECK(!plat_vm_files(p, size, dir), "no files");
+    DIR* d = opendir(dir);
+    int named = 0;
+    for (struct dirent* e; d && (e = readdir(d));) named += !strncmp(e->d_name, "snx-guest-", 10);
+    if (d) closedir(d);
+    CHECK(d && !named, "a guest file kept its name in the folder");
+    CHECK(plat_vm_files_slot(p + slot + 5, &fd, &off) && off == 5, "the second slot's offset");
+    CHECK(!plat_vm_files_slot(p + size, NULL, NULL), "a slot past the end");
+    a = p + slot - page; /* the last page of the first slot and the first of the second */
+    CHECK(!plat_vm_commit(a, 2 * page) && !plat_vm_commit(p + 2 * slot, page), "commit");
+    memset(a, 0xAB, (size_t)(2 * page));
+    memset(p + 2 * slot, 0xCD, (size_t)page);
+    plat_vm_decommit(a, 2 * page);
+    int pipe_fd[2] = {-1, -1};
+    CHECK(!pipe(pipe_fd) && write(pipe_fd[1], a, 1) == -1 && errno == EFAULT, "a decommitted page can be read");
+    close(pipe_fd[0]);
+    close(pipe_fd[1]);
+    CHECK(!plat_vm_commit(a, 2 * page), "commit again");
+    CHECK(a[0] == 0 && a[page - 1] == 0 && a[page] == 0 && a[2 * page - 1] == 0, "a decommitted range kept its bytes");
+    CHECK(p[2 * slot] == 0xCD && p[2 * slot + page - 1] == 0xCD, "the partial slot lost its bytes");
+    CHECK(plat_vm_files_slot(a + page, &fd, &off), "no slot");
+    view = (u8*)mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)off);
+    CHECK(view != (u8*)MAP_FAILED, "no second mapping of the file");
+    if (view != (u8*)MAP_FAILED) {
+        CHECK(view[0] == 0, "the file kept the decommitted bytes");
+        view[0] = 0x5A;
+        CHECK(a[page] == 0x5A, "the guest page is not the file's page");
+        munmap(view, (size_t)page);
+    }
+    /* a page the GPU imported (VK_EXT_external_memory_host) stays wired while mem.c decommits it, until the import
+       goes after the decommit (uma.c's pages_replaced, then vk_uma_mapping_end); mlock wires it as the import does.
+       Committed again, it reads zero all the same */
+    u8* w = p + 8 * page;
+    u8 byte = 0xFF;
+    CHECK(!plat_vm_commit(w, page), "commit the page to wire");
+    memset(w, 0xEE, (size_t)page);
+    int wired = !mlock(w, (size_t)page);
+    if (!wired) printf("mlock of a guest file's page: %s\n", strerror(errno));
+    CHECK(wired, "the page could not be wired");
+    plat_vm_decommit(w, page);
+    if (wired) munlock(w, (size_t)page);
+    CHECK(!plat_vm_commit(w, page), "commit the wired page again");
+    CHECK(w[0] == 0 && w[page - 1] == 0, "a page wired through its decommit kept its bytes");
+    CHECK(plat_vm_files_slot(w, &fd, &off) && pread(fd, &byte, 1, (off_t)off) == 1 && byte == 0,
+          "the file kept the bytes of a page wired through its decommit");
+    /* a reservation past 64 GiB takes slots of 2 GiB, so its descriptors stay within 64 */
+    u64 big = 65 * slot;
+    u8* q = plat_vm_reserve(big);
+    CHECK(q != NULL && !plat_vm_files(q, big, dir), "no files for 65 GiB");
+    if (q) {
+        int fd0 = -1;
+        CHECK(plat_vm_files_slot(q, &fd0, NULL) && plat_vm_files_slot(q + slot, &fd, NULL) && fd == fd0,
+              "two GiB in two files");
+        CHECK(plat_vm_files_slot(q + 3 * slot, NULL, &off) && off == slot, "the middle of a 2 GiB slot");
+    }
+    /* nothing mapped past the end of a reservation that is not a whole number of slots */
+    u64 odd = slot + 4 * page;
+    u8* r = plat_vm_reserve(odd + slot);
+    CHECK(r != NULL, "no reservation of 1 GiB and 4 pages");
+    if (r) {
+        munmap(r + odd, (size_t)slot);
+        CHECK(!plat_vm_files(r, odd, dir), "no files for 1 GiB and 4 pages");
+        CHECK(msync(r + odd, (size_t)page, MS_ASYNC) == -1 && errno == ENOMEM,
+              "the last slot was mapped past the reservation's end");
+    }
+#else
+    (void)dir;
+#endif
 }
 
 int main(int argc, char** argv) {
@@ -1193,6 +1279,7 @@ int main(int argc, char** argv) {
               "a real fault in a child was not reported");
     }
 
+    test_guest_files(dir);
     printf("%u checks, %u failed\n", checks, failures);
     return failures != 0;
 }

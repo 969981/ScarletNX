@@ -8,7 +8,8 @@
 
    An object is made from the program's SPIR-V, which the translator's module keeps here (vk_so_keep_spirv): a draw
    whose modules have no SPIR-V kept, such as the runtime's own clears, is made as a pipeline. So is a key that has
-   state that is no dynamic state for shader objects, or that this path does not set yet (vk_so_takes).
+   state that is no dynamic state for shader objects, or that this path does not set yet (vk_so_takes). With
+   descriptor heaps each object maps its stage's set as a pipeline's stage does, in place of the set layouts.
 
    The driver's binaries of the objects are kept between runs in a file of their own for each driver, beside the
    pipeline cache: an object whose binary the file has is made from it, with no compile */
@@ -30,8 +31,8 @@ void vk_so_forget_spirv(VkShaderModule m);
 /* whether a draw of key k, whose fragment module is fs (k->fs or the empty one), draws with shader objects */
 int vk_so_takes(const PipeKey* k, VkShaderModule fs);
 /* the objects of k's stages (vertex, tessellation control and evaluation, geometry, fragment: VK_NULL_HANDLE for a
-   stage it has not), each made or waited for while another thread makes it. 0 when the device refuses one: the key
-   is made as a pipeline then. A pipeline worker's call */
+   stage it has not; a mesh draw's mesh and task in the first two), each made or waited for while another thread makes
+   it. 0 when the device refuses one: the key is made as a pipeline then. A pipeline worker's call */
 int vk_so_make(const PipeKey* k, VkShaderModule fs, VkShaderEXT out[5]);
 /* the objects bound to cb's graphics stages, and the state of k that a pipeline held set as dynamic state. The
    recording thread's call, or the GPU thread's without it */

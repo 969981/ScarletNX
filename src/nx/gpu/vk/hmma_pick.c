@@ -168,7 +168,8 @@ static int run(Bench* b, Way* x, u32 groups, u32 n, double* ns, int back, char* 
     return 1;
 }
 
-/* way w's module and pipeline, translated as a game's program is with w's flags, and its descriptors; 0 with x->why */
+/* way w's module and pipeline, translated as a game's program is with w's flags, and its descriptors; 0 with x->why
+   for a way that has nothing to run, and -1 where the driver did not make the way's pipeline */
 static int way_make(Bench* b, Way* x, int w, const u8* code, u32 bytes) {
     memset(&x->si, 0, sizeof x->si);
     x->si.cs_local[0] = (int)SH_HMMA_BENCH_LOCAL, x->si.cs_local[1] = x->si.cs_local[2] = 1;
@@ -206,7 +207,7 @@ static int way_make(Bench* b, Way* x, int w, const u8* code, u32 bytes) {
     free(spv);
     if (!VK_OK(r)) {
         snprintf(x->why, sizeof x->why, "its pipeline was not made (%s)", snx_vk_result_str(r));
-        return 0;
+        return -1;
     }
     if (x->si.gbuf_marks &&
         !buf_make(&x->marks, (u64)x->si.nmarks * SH_WLOG_PART * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, DM_DEVICE)) {
@@ -362,7 +363,7 @@ static double outputs_apart(const u32* a, const u32* b) {
 static int bench_run(int rule, int half, double* us, u64* took, char* why, size_t n) {
     u32 ref[2 * SH_HMMA_BENCH_LOCAL];
     u64 t0 = plat_ns();
-    int ok = 1, ref_way = 0;
+    int ok = 1, ref_way = 0, refused = 0;
     for (int w = 0; w < SH_HMMA_WAYS; w++) us[w] = 0;
     *took = 0;
     Bench* b = calloc(1, sizeof *b); /* its ways' ShaderInfo are large for a stack */
@@ -386,7 +387,18 @@ static int bench_run(int rule, int half, double* us, u64* took, char* why, size_
             snprintf(x->why, sizeof x->why, "hmma_f16's half sums take the place of A-stationary's");
             continue;
         }
-        if (!way_make(b, x, w, b->code, bytes)) continue;
+        int made = way_make(b, x, w, b->code, bytes);
+        if (made < 0) {
+            /* A driver that loses its shader compiler spends its retry time on each pipeline, so the bench stops at a
+               refusal. Not at the first one while no way has run: that is the rules' way, which is the pick when the
+               bench stops, and each way is a module of its own, so the next one may compile. A second refusal in a
+               row says the driver refuses them all */
+            if (!ref_way && !refused++) continue;
+            snprintf(why, n, "the %s way: %s", g_shader_hmma_names[w], x->why);
+            ok = -1;
+            break;
+        }
+        if (!made) continue;
         double ns[2];
         int r = run(b, x, PICK_FIRST_GROUPS, 2, ns, 1, x->why, sizeof x->why);
         if (r < 0) {

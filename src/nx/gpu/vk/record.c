@@ -90,6 +90,19 @@ static void rec_kind(RecFn fn) {
     }
 }
 
+static void submit_run(const void* p);
+/* the recording thread's position told to the producer: g_tail moved, and a producer waiting for room or for a
+   submission (room_wait, vk_rec_queue) woken. seq_cst with the load after it, as the producer's store of
+   g_room_waits and its look at g_tail: one of the two sees the other, so a producer about to sleep is woken */
+static void tail_tell(u64 tail) {
+    atomic_store_explicit(&g_tail, tail, memory_order_seq_cst);
+    if (atomic_load_explicit(&g_room_waits, memory_order_seq_cst)) {
+        pm_lock(&g_m);
+        pc_broadcast(&g_room);
+        pm_unlock(&g_m);
+    }
+}
+
 static void rec_thread(void* arg) {
     u64 tail = 0;
     (void)arg;
@@ -113,23 +126,20 @@ static void rec_thread(void* arg) {
         SNX_ZONE(z_rec, "vk record");
         while (tail != head) {
             const RecHdr* h = (const RecHdr*)(g_ring + (tail & (REC_CAP - 1)));
-            if (h->fn) {
-                if (g_rec_kind_count) rec_kind(h->fn);
-                h->fn(h + 1);
+            const RecFn fn = h->fn;
+            if (fn) {
+                if (g_rec_kind_count) rec_kind(fn);
+                fn(h + 1);
             }
             tail += h->size;
             records++;
+            /* a submission is told at once: vk_rec_queue waits for it, not for the packets after it in this batch,
+               which may wait for that caller */
+            if (fn == submit_run) tail_tell(tail);
         }
         SNX_ZONE_VALUE(z_rec, records);
         SNX_ZONE_END(z_rec);
-        /* seq_cst with the load after it, as the producer's store of g_room_waits and its look at g_tail: one of the
-           two sees the other, so a producer about to sleep is woken */
-        atomic_store_explicit(&g_tail, tail, memory_order_seq_cst);
-        if (atomic_load_explicit(&g_room_waits, memory_order_seq_cst)) {
-            pm_lock(&g_m);
-            pc_broadcast(&g_room);
-            pm_unlock(&g_m);
-        }
+        tail_tell(tail);
     }
 }
 
@@ -378,8 +388,18 @@ void vk_rec_run(void (*fn)(void*), void* arg) {
     vk_rec_sync(); /* the packet, and the commands queued before it */
 }
 
+/* The submissions queued before (their binds just before each) are on q once the ring has run past the last of them:
+   what the ring holds after it, the next submission's commands, is no business of q's. Draining the whole ring held a
+   compute batch's submission until those commands were recorded too */
+static u64 g_submit_end; /* the ring's position after the last submission's packet (vk_lock) */
 void vk_rec_queue(VkQueue q) {
-    if (q == g_vk.gfx) vk_rec_sync();
+    if (q != g_vk.gfx || g_rec <= 0) return;
+    if (atomic_load_explicit(&g_rec_tid, memory_order_acquire) == plat_tid()) return; /* vk_rec_sync_until's */
+    vk_lock();                                                                        /* no packet is added meanwhile */
+    publish();
+    if (atomic_load_explicit(&g_tail, memory_order_seq_cst) < g_submit_end)
+        room_wait(REC_CAP - (g_pending - g_submit_end), VK_REC_FOREVER);
+    vk_unlock();
 }
 
 /* The graphics and the compute queue's locks (vk_queue_lock): this thread submits, presents and binds sparse memory
@@ -487,6 +507,7 @@ void vk_rec_submit(VkCommandBuffer up, VkCommandBuffer cb, const VkSemaphoreSubm
         return;
     }
     *(Submit*)rec_push(submit_run, sizeof x) = x;
+    g_submit_end = g_pending;
     publish(); /* the timeline value is waited for by whoever needs the work done */
 }
 
@@ -609,9 +630,11 @@ VkResult vk_rec_present_result(void) {
    here, at its bind. One that couldn't be made binds nothing, and the draws after it until the next graphics bind are
    dropped, as the GPU thread drops a draw without its pipeline (the recording thread's own flag: 1). With
    async_pipelines one still being made isn't waited for: its draws are dropped the same way (2) until a later frame
-   binds it made. A new shader's compile, 60 to 400 ms on one driver, stalled the frame it first appeared in */
+   binds it made, and only into targets the game regenerates every frame (rec_async_pass): elsewhere the bind
+   waits. A new shader's compile, 60 to 400 ms on one driver, stalled the frame it first appeared in */
 static int g_rec_unbound;
 static u64 g_rec_dropped, g_rec_skipped;
+static int g_rec_async; /* render.c's rec_async_pass: async_pipelines may skip the next draws */
 typedef struct {
     VkCommandBuffer cb;
     VkPipelineBindPoint bp;
@@ -620,13 +643,50 @@ typedef struct {
 static void bind_pipeline_run(const void* p) {
     const BindPipelineArgs* x = p;
     int graphics = x->bp == VK_PIPELINE_BIND_POINT_GRAPHICS, pending = 0;
-    VkPipeline pipe =
-        graphics && g_settings.async_pipelines ? vk_pipeline_now(x->p, &pending) : vk_pipeline_resolve(x->p);
+    VkPipeline pipe = graphics && g_settings.async_pipelines && g_rec_async ? vk_pipeline_now(x->p, &pending)
+                                                                            : vk_pipeline_resolve(x->p);
     if (graphics) g_rec_unbound = pipe ? 0 : pending ? 2 : 1;
     if (pipe) vk_pipeline_bind(x->cb, x->bp, pipe);
 }
+typedef struct {
+    VkCommandBuffer cb;
+    u32 n;
+    VkPipelineColorBlendAttachmentState cba[8];
+} ColorBlendArgs;
+static void color_blend_set(VkCommandBuffer cb, u32 n, const VkPipelineColorBlendAttachmentState* cba) {
+    VkBool32 enable[8];
+    VkColorBlendEquationEXT eq[8];
+    VkColorComponentFlags write[8];
+    for (u32 i = 0; i < n; i++) {
+        enable[i] = cba[i].blendEnable;
+        eq[i] = (VkColorBlendEquationEXT){cba[i].srcColorBlendFactor, cba[i].dstColorBlendFactor, cba[i].colorBlendOp,
+                                          cba[i].srcAlphaBlendFactor, cba[i].dstAlphaBlendFactor, cba[i].alphaBlendOp};
+        write[i] = cba[i].colorWriteMask;
+    }
+    vkCmdSetColorBlendEnableEXT(cb, 0, n, enable);
+    vkCmdSetColorBlendEquationEXT(cb, 0, n, eq);
+    vkCmdSetColorWriteMaskEXT(cb, 0, n, write);
+}
+static void color_blend_run(const void* p) {
+    const ColorBlendArgs* x = p;
+    color_blend_set(x->cb, x->n, x->cba);
+}
+void rec_CmdSetColorBlendState(VkCommandBuffer cb, u32 n, const VkPipelineColorBlendAttachmentState* cba) {
+    if (!rec_on(cb)) {
+        color_blend_set(cb, n, cba);
+        return;
+    }
+    ColorBlendArgs* x = rec_push(color_blend_run, sizeof *x);
+    x->cb = cb;
+    x->n = n;
+    memcpy(x->cba, cba, n * sizeof *cba);
+    rec_commit();
+}
 void rec_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p) {
-    if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) vk_descriptor_heaps_pipeline_state(0);
+    if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        vk_descriptor_heaps_pipeline_state(0);
+        vk_pipeline_bound(p);
+    }
     if (!rec_on(cb)) {
         VkPipeline pipe = vk_pipeline_resolve(p);
         if (pipe) vk_pipeline_bind(cb, bp, pipe);
@@ -634,6 +694,16 @@ void rec_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline 
     }
     BindPipelineArgs* x = rec_push(bind_pipeline_run, sizeof *x);
     *x = (BindPipelineArgs){cb, bp, p};
+    rec_commit();
+}
+static void async_pass_run(const void* p) { g_rec_async = *(const int*)p; }
+void rec_async_pass(VkCommandBuffer cb, int may_skip) {
+    if (!rec_on(cb)) {
+        g_rec_async = may_skip;
+        return;
+    }
+    int* x = rec_push(async_pass_run, sizeof *x);
+    *x = may_skip;
     rec_commit();
 }
 static int rec_drop_draw(void) {

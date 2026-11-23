@@ -122,6 +122,113 @@ static int check_recorder_self_sync(void) {
     return 0;
 }
 
+/* A submission to the graphics queue from outside the ring (a compute batch's where the queue is shared, a landing's)
+   waits for the ring's submissions before it (vk_rec_queue), not for the commands queued after the last of them: a
+   packet after the submission blocks until a thread lets it go, 10 s on, and vk_rec_queue returns before that. The
+   recording thread is held in a packet of its own until the submission and the packet after it are both published,
+   so it finds them in one batch, as a slow runner did: its position went to the producer only at a batch's end, and
+   vk_rec_queue waited for the blocked packet too */
+static _Atomic int g_rq_go, g_rq_held, g_rq_hold;
+static _Atomic u64 g_rq_behind;
+static void rq_block(const void* arg) {
+    (void)arg;
+    while (!atomic_load_explicit(&g_rq_go, memory_order_acquire)) plat_sleep_ns(100000);
+}
+static void rq_hold(const void* arg) {
+    (void)arg;
+    atomic_store_explicit(&g_rq_held, 1, memory_order_release);
+    while (atomic_load_explicit(&g_rq_hold, memory_order_acquire)) plat_sleep_ns(100000);
+}
+/* lets the recording thread go once the packet after the submission is published (vk_rec_queue publishes first), and
+   the blocked packet 10 s on */
+static void rq_go_later(void* arg) {
+    (void)arg;
+    const u64 end = plat_ns() + 10000000000ull;
+    while (plat_ns() < end && vk_rec_behind() <= atomic_load_explicit(&g_rq_behind, memory_order_acquire))
+        plat_sleep_ns(100000);
+    atomic_store_explicit(&g_rq_hold, 0, memory_order_release);
+    while (plat_ns() < end && !atomic_load_explicit(&g_rq_go, memory_order_acquire)) plat_sleep_ns(1000000);
+    atomic_store_explicit(&g_rq_go, 1, memory_order_release);
+}
+static int check_rec_queue_submissions(void) {
+    if (!vk_rec_threaded()) {
+        puts("SKIP the ring's submissions before a queue's: vk_record=0 runs the commands on the GPU thread");
+        return 0;
+    }
+    const u8 nothing = 0;
+    vk_lock();
+    vk_finish();
+    (void)vk_cmd();
+    atomic_store_explicit(&g_rq_hold, 1, memory_order_release);
+    vk_rec_call(rq_hold, &nothing, sizeof nothing);
+    vk_rec_queue(g_vk.gfx); /* publishes the hold alone: every submission before it is done */
+    for (const u64 end = plat_ns() + 10000000000ull; !atomic_load_explicit(&g_rq_held, memory_order_acquire);) {
+        if (plat_ns() >= end) {
+            atomic_store_explicit(&g_rq_hold, 0, memory_order_release);
+            vk_unlock();
+            fprintf(stderr, "ring before a queue: the recording thread never ran the hold packet in 10 s\n");
+            CHECK(0);
+        }
+        plat_sleep_ns(100000);
+    }
+    vk_submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
+    const u64 submitted = vk_last_submit();
+    atomic_store_explicit(&g_rq_behind, vk_rec_behind(), memory_order_release);
+    vk_rec_call(rq_block, &nothing, sizeof nothing);
+    CHECK(!plat_thread(rq_go_later, NULL, 1u << 16));
+    const u64 t0 = plat_ns();
+    vk_rec_queue(g_vk.gfx);
+    const int early = !atomic_load_explicit(&g_rq_go, memory_order_acquire);
+    const u64 took = plat_ns() - t0;
+    const u64 queued = vk_rec_gfx_queued();
+    atomic_store_explicit(&g_rq_go, 1, memory_order_release);
+    vk_rec_sync();
+    vk_unlock();
+    if (!early || queued < submitted)
+        fprintf(stderr,
+                "ring before a queue: vk_rec_queue returned %s the packet after the submission ran, in %llu ms, with "
+                "submission %llu on the queue (%llu made)\n",
+                early ? "before" : "after", (unsigned long long)(took / 1000000), (unsigned long long)queued,
+                (unsigned long long)submitted);
+    CHECK(early && queued >= submitted);
+    puts("ring before a queue: its submissions on the queue, not the commands after them");
+    return 0;
+}
+
+/* A slot whose use took every command buffer it had gets as many again at its next recycle, when its pool is reset and
+   no thread records in it: that use, as busy plus one submission, grows none in use, each of which waited for the
+   recording thread first (g_vk_cb_grows_waited). Before, it grew in use at its last submission */
+static int check_cb_grow_at_recycle(void) {
+    vk_lock();
+    vk_finish();
+    vk_frame_next(); /* a slot of its own: its first vk_cmd recycles it */
+    const u32 slot = vk_frame_slot();
+    (void)vk_cmd();
+    const u32 had = vk_frame_cbs();
+    for (u32 i = 0; i < had; i++) {
+        (void)vk_cmd();
+        vk_submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
+    }
+    CHECK(vk_frame_cbs() == had);
+    for (u32 k = 0; k < VK_FRAMES; k++) vk_frame_next();
+    CHECK(vk_frame_slot() == slot);
+    const u64 grows = g_vk_cb_grows_waited;
+    for (u32 i = 0; i <= had; i++) {
+        (void)vk_cmd();
+        vk_submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
+    }
+    vk_finish();
+    vk_unlock();
+    if (g_vk_cb_grows_waited != grows)
+        fprintf(stderr,
+                "command buffers at the recycle: a slot of %u that used them all grew %llu times in its next "
+                "use of %u submissions\n",
+                had, (unsigned long long)(g_vk_cb_grows_waited - grows), had + 1);
+    CHECK(g_vk_cb_grows_waited == grows && vk_frame_cbs() > had);
+    puts("command buffers at the recycle: a slot that used them all grew before its next use");
+    return 0;
+}
+
 /* An error or a crash on the recording thread stops it inside a packet for good, with what the packet took: a submit or
    a present keeps the graphics queue's lock. The window's release for the error's screen, which the main thread makes
    (sdl3.c's fatal_screen), waited for that ring to drain with no end: the window froze, no error showed and the process
@@ -6932,6 +7039,88 @@ static int check_rt_watch_holder(void) {
     free(ch);
     return 0;
 }
+/* A pitch-linear color target is watched at a release as a block linear one is: drawn over three releases and never
+   read, it is armed once, copied back never and lands nothing. The CPU's read publishes it and gets the last clear's
+   pixels, and once read, the next release publishes it at once. Before, every release copied it back */
+#define LWATCH_A  (HEAP_BASE + 0x7400000)
+#define LWATCH_GA 0x3A0800000ull
+static void lin_clear(GpuChannel* ch, u64 gva, const float color[4]) {
+    u32* r = ch->r3d;
+    r[0x487] = 1;
+    r[0x200] = (u32)(gva >> 32);
+    r[0x201] = (u32)gva;
+    r[0x202] = 256; /* 64 RGBA pixels a row, pitch linear */
+    r[0x203] = 16;
+    r[0x204] = 0xD5;
+    r[0x205] = 0x1000;
+    r[0x206] = 1;
+    r[0x207] = 0;
+    r[0x43E] &= ~0x100u;
+    r[0x380] = 0;
+    memcpy(&r[0x360], color, 16);
+    engine_clear(ch, 15 << 2);
+    vk_lock();
+    vk_render_end();
+    vk_unlock();
+}
+static int check_rt_watch_linear(void) {
+    const u64 size = 256 * 16;
+    const float blue[4] = {0, 0, 1, 1}, red[4] = {1, 0, 0, 1};
+    static const u8 px_blue[4] = {0, 0, 255, 255};
+    if (!own_traps() || vk_uma()) {
+        puts("pitch-linear target watch: needs traps and no unified memory, skipped");
+        return 0;
+    }
+    GpuChannel* ch = calloc(1, sizeof *ch);
+    CHECK(ch);
+    CHECK(mem_map(LWATCH_A, 0x10000, MS_NORMAL, PERM_RW) == 0);
+    gmmu_map(LWATCH_GA, LWATCH_A, 0x10000);
+    memset(GP(LWATCH_A), 0x11, 0x10000);
+    g_renderer->mem_may_have_changed();
+    vk_lock();
+    vk_rt_publish_drawn(); /* the targets the tests before drew */
+    vk_unlock();
+    VkRtWatchStats w0 = g_vk_rt_watch;
+    u64 lands = own_landings();
+    for (int i = 0; i < 3; i++) {
+        lin_clear(ch, LWATCH_GA, i & 1 ? red : blue);
+        vk_lock();
+        vk_rt_publish_drawn();
+        vk_unlock();
+    }
+    if (g_vk_rt_watch.arms != w0.arms + 1 || g_vk_rt_watch.publishes != w0.publishes)
+        fprintf(stderr,
+                "pitch-linear target watch: %llu arms and %llu publishes over three releases (1 and 0 expected)\n",
+                (unsigned long long)(g_vk_rt_watch.arms - w0.arms),
+                (unsigned long long)(g_vk_rt_watch.publishes - w0.publishes));
+    CHECK(g_vk_rt_watch.arms == w0.arms + 1 && g_vk_rt_watch.publishes == w0.publishes);
+    CHECK(own_watched(LWATCH_A, size) && own_lookup(LWATCH_A, size, NULL, 0) == 0 && own_landings() == lands);
+    /* this thread holds no lock: its read faults, publishes the target and lands the GPU's pixels. The trap thread does
+       that work while the copy waits, so the compiler must not read the counters before the copy */
+    u8* got = malloc(size);
+    CHECK(got);
+    memcpy(got, GP(LWATCH_A), size);
+    atomic_signal_fence(memory_order_seq_cst);
+    CHECK(g_vk_rt_watch.hits == w0.hits + 1 && own_landings() > lands);
+    int same = 1;
+    for (u64 i = 0; i < size; i += 4) same &= !memcmp(got + i, px_blue, 4);
+    free(got);
+    CHECK(same);
+    /* read lately: the next release publishes it at once */
+    lin_clear(ch, LWATCH_GA, red);
+    vk_lock();
+    vk_rt_publish_drawn();
+    vk_unlock();
+    CHECK(g_vk_rt_watch.publishes == w0.publishes + 1 && !own_watched(LWATCH_A, 1));
+    CHECK(GP(LWATCH_A)[0] == 255 && GP(LWATCH_A)[2] == 0);
+    puts("pitch-linear target watch: armed once over three releases, published at the CPU's read and after it");
+    vk_lock();
+    vk_rt_before_write(LWATCH_GA, 0x10000);
+    vk_unlock();
+    CHECK(mem_unmap(LWATCH_A, 0x10000) == 0);
+    free(ch);
+    return 0;
+}
 /* Depth targets the 3D engine clears and the CPU then reads from memory, as edenprobe's zeta and msaa suites do after a
    barrier and a wait for idle: a release watches them as it does color ones, and the CPU's first read publishes them
    and lands them in their format's layout (S8's a byte a texel, its stencil). Each format a 80x40 block linear target
@@ -7538,6 +7727,49 @@ static int check_pipeline_stats_compute(void) {
 #include "vulkan_compute_depth.inc"
 #include "vulkan_depth_state.inc"
 #include "vulkan_owned_readback.inc"
+/* A finish that lets go (vk_finish_letting_go, the GPU mirror's for a CPU read of pages it holds) lets go of vk_lock
+   while it waits for the GPU: another thread takes the lock meanwhile. The submission waits for a semaphore that thread
+   signals once it held the lock, or after 5 s without it, so the finish cannot end first. Before, the finish held the
+   lock through its wait, and the other thread got it only after */
+static _Atomic int g_fl_got, g_fl_done;
+static VkSemaphore g_fl_gate;
+static void fl_thread(void* p) {
+    (void)p;
+    const u64 end = plat_ns() + 5000000000ull;
+    while (plat_ns() < end) {
+        if (vk_trylock()) {
+            vk_unlock();
+            atomic_store_explicit(&g_fl_got, 1, memory_order_release);
+            break;
+        }
+        plat_sleep_ns(100000);
+    }
+    VkSemaphoreSignalInfo signal = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = g_fl_gate, .value = 1};
+    VK_OK(vkSignalSemaphore(g_vk.dev, &signal));
+    atomic_store_explicit(&g_fl_done, 1, memory_order_release);
+}
+static int check_finish_lets_go(void) {
+    VkSemaphoreTypeCreateInfo type = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                                      .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
+    VkSemaphoreCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &type};
+    CHECK(VK_OK(vkCreateSemaphore(g_vk.dev, &ci, NULL, &g_fl_gate)));
+    vk_lock();
+    vk_finish();
+    (void)vk_cmd(); /* a submission for the finish to make, waiting for the gate */
+    vk_submit_after(g_fl_gate, 1, 2);
+    CHECK(!plat_thread(fl_thread, NULL, 1u << 16));
+    vk_finish_letting_go();
+    vk_unlock();
+    while (!atomic_load_explicit(&g_fl_done, memory_order_acquire)) plat_sleep_ns(1000000);
+    if (!atomic_load_explicit(&g_fl_got, memory_order_acquire))
+        fprintf(stderr, "finish letting go: the other thread did not get vk_lock in 5 s of the finish's wait\n");
+    CHECK(atomic_load_explicit(&g_fl_got, memory_order_acquire));
+    vkDestroySemaphore(g_vk.dev, g_fl_gate, NULL);
+    puts("finish letting go: another thread took vk_lock while the finish waited for the GPU");
+    return 0;
+}
+
 #include "vulkan_own_trim.inc"
 #include "vulkan_wlog_again.inc"
 #include "vulkan_wlog_clear.inc"
@@ -7559,6 +7791,7 @@ static int check_pipeline_stats_compute(void) {
 #include "vulkan_vertex_input.inc"
 #include "vulkan_frag_coord.inc"
 #include "vulkan_varying.inc"
+#include "vulkan_perspective_fold.inc"
 #include "vulkan_vertex_restride.inc"
 #include "vulkan_msaa.inc"
 #include "vulkan_cross_stage_alias.inc"
@@ -7566,6 +7799,7 @@ static int check_pipeline_stats_compute(void) {
 #include "vulkan_lone_lane.inc"
 #include "vulkan_memory_release.inc"
 #include "vulkan_descriptor_heaps.inc"
+#include "vulkan_link_presents.inc"
 #include "vulkan_cb_address.inc"
 #include "vulkan_descriptor_memo.inc"
 #include "vulkan_sample_raster.inc"
@@ -8241,6 +8475,8 @@ static int run_headless(int argc, char** argv) {
         CHECK(!check_recorder_self_sync());
         CHECK(!check_release_stopped_recorder());
         CHECK(!check_full_ring_sleeps());
+        CHECK(!check_rec_queue_submissions());
+        CHECK(!check_cb_grow_at_recycle());
         vk_finish();
         vk_pipeline_quiesce();
         printf("PASS headless Vulkan recorder only: %u validation messages\n", g_vk_validation_messages);
@@ -8249,6 +8485,8 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_recorder_self_sync());
     CHECK(!check_release_stopped_recorder());
     CHECK(!check_full_ring_sleeps());
+    CHECK(!check_rec_queue_submissions());
+    CHECK(!check_cb_grow_at_recycle());
     viw_install();
     /* every check with each draw binding the pipeline linked from its parts and never the one made whole
        (SNX_TEST_GPL=linked), or with each pipeline made whole, with the dynamic state the libraries gave (whole) */
@@ -8417,7 +8655,7 @@ static int run_headless(int argc, char** argv) {
         else if (!strcmp(name, "late_depth_shadow"))
             result = check_late_depth_shadow();
         else if (!strcmp(name, "shader_windows"))
-            result = check_shader_read_windows();
+            result = check_shader_read_windows() || check_sm86_long_window();
         else if (!strcmp(name, "texture_half"))
             result = check_texture_half_rounding();
         else if (!strcmp(name, "cross_stage_alias"))
@@ -8436,6 +8674,8 @@ static int run_headless(int argc, char** argv) {
             result = check_targetless_stores();
         else if (!strcmp(name, "owned_page_reads"))
             result = check_owned_page_reads();
+        else if (!strcmp(name, "index_draws"))
+            result = check_index_draws();
         else if (!strcmp(name, "memory_release"))
             result = check_memory_release();
         else if (!strcmp(name, "cross_stage_blend"))
@@ -8478,6 +8718,12 @@ static int run_headless(int argc, char** argv) {
             result = check_descriptor_heaps();
         else if (!strcmp(name, "heap_pipeline_flags"))
             result = check_heap_pipeline_flags();
+        else if (!strcmp(name, "mesh_draws"))
+            result = check_mesh_draws();
+        else if (!strcmp(name, "vertex_restride"))
+            result = check_vertex_restride();
+        else if (!strcmp(name, "heap_shader_objects"))
+            result = check_heap_shader_objects();
         else if (!strcmp(name, "cb_address"))
             result = check_cb_address();
         else if (!strcmp(name, "indirect_dispatch"))
@@ -8517,6 +8763,7 @@ static int run_headless(int argc, char** argv) {
     if (getenv("SNX_TEST_RT_WATCH_ONLY")) { /* the watched targets' checks alone, for their mutants */
         CHECK(!check_rt_watch());
         CHECK(!check_zt_watch());
+        CHECK(!check_rt_watch_linear());
         vk_finish();
         vk_pipeline_quiesce();
         printf("PASS headless Vulkan watched targets only: %u validation messages\n", g_vk_validation_messages);
@@ -8804,6 +9051,8 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_chunk_written_first());
     CHECK(!check_stream_epoch());
     CHECK(!check_owned_readback());
+    CHECK(!check_owned_landing_stages());
+    CHECK(!check_finish_lets_go());
     CHECK(!check_mapping_lock());
     CHECK(!check_landing_wait());
     CHECK(!check_frame_ready());
@@ -8867,6 +9116,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_nvn_blend_capture());
     CHECK(!check_late_depth_shadow());
     CHECK(!check_shader_read_windows());
+    CHECK(!check_sm86_long_window());
     CHECK(!check_texture_half_rounding());
     CHECK(!check_cross_stage_image_alias());
     CHECK(!check_cross_stage_blend_snapshots());
@@ -8890,6 +9140,9 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_memo_over_target());
     CHECK(!check_descriptor_heaps());
     CHECK(!check_heap_pipeline_flags());
+    CHECK(!check_heap_shader_objects());
+    CHECK(!check_link_optimized_after_presents());
+    CHECK(!check_blend_one_pipeline());
     CHECK(!check_cb_address());
     CHECK(!check_descriptor_memo());
     CHECK(!check_fragment_barrier_backend());
@@ -8919,6 +9172,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_frag_coord_origin());
     CHECK(!check_varying_passes());
     CHECK(!check_sm86_perspective_fold());
+    CHECK(!check_perspective_fold());
     CHECK(!check_rt_other_layout());
     CHECK(!check_vertex_restride());
     CHECK(!check_vertex_input_layouts());
@@ -9026,6 +9280,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_rt_overlap());
     CHECK(!check_rt_watch());
     CHECK(!check_zt_watch());
+    CHECK(!check_rt_watch_linear());
     CHECK(!check_uma());
     CHECK(!check_uma_copies());
     CHECK(!check_uma_way());

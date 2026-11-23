@@ -30,6 +30,10 @@ msgstr "MainActivity.%s não rodou: %s"
 msgid "MainActivity.%s did not run."
 msgstr "MainActivity.%s não rodou."
 
+#: src/gui/android.c src/gui/main.c
+msgid "Out of memory"
+msgstr ""
+
 #: src/gui/apple.m
 msgid "The document picker did not open."
 msgstr "O seletor de documentos não abriu."
@@ -2593,6 +2597,10 @@ msgid "Made with: O%c, AOT %s"
 msgstr "Feito com: O%c, AOT %s"
 
 #: src/gui/main.c
+msgid "Loading games"
+msgstr "Carregando jogos"
+
+#: src/gui/main.c
 #, c-format
 msgid "Not found: %s"
 msgstr ""
@@ -3801,10 +3809,6 @@ msgid "%s is no recompiled Switch game: only one has settings of its own"
 msgstr ""
 
 #: src/gui/main.c
-msgid "Out of memory"
-msgstr ""
-
-#: src/gui/main.c
 #, c-format
 msgid "%s holds what no setting takes, which the next change leaves out: %s"
 msgstr ""
@@ -4921,6 +4925,24 @@ msgid "AOT Pack"
 msgstr ""
 
 #: src/gui/main.c
+msgid "Add to Home Screen"
+msgstr ""
+
+#: src/gui/main.c
+msgid "No game in focus with a title ID to add."
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "The home screen was asked to add %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s is not on the home screen: %s"
+msgstr ""
+
+#: src/gui/main.c
 #, c-format
 msgid "Removed games not kept: %s could not be written (%s)."
 msgstr ""
@@ -5555,6 +5577,41 @@ msgstr "Jogos não acompanha jogos novos (%s): F5 os lista"
 #: src/gui/main.c
 msgid "Not saved: Ctrl+S saves it, ESC again leaves without it"
 msgstr "Não salvo: Ctrl+S salva, ESC de novo sai sem salvar"
+
+#: src/gui/main.c
+#, c-format
+msgid "%s is not a title ID: 16 hex digits in capitals"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s plays once the setup ends"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s did not start: a run is on the screen"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s did not start: a box is open on the screen"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s did not start: the theme edited is not saved"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "No recompiled game has the title ID %s"
+msgstr ""
+
+#: src/gui/main.c
+#, c-format
+msgid "%s did not start: a game plays"
+msgstr ""
 
 #. A key of the foot's sentences, which a click finds by this word
 #: src/gui/main.c
@@ -7140,6 +7197,10 @@ msgstr "Só Linux e Android arm64"
 #: src/nx/runtime/ini.c
 msgid "Not offered"
 msgstr ""
+
+#: src/nx/runtime/ini.c
+msgid "macOS and iOS only"
+msgstr "Só macOS e iOS"
 
 #: src/nx/runtime/settings.txt
 msgid "gdbstub"

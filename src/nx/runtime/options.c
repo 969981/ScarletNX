@@ -8,6 +8,7 @@
 #include "common/utilities/game_ini.h"
 #include "common/utilities/ini_lines.h"
 #include "common/utilities/key_said.h"
+#include "common/utilities/mods.h"
 #include "nx/hle/hle.h"
 #include "nx/hle/kernel/kernel.h"
 #include "nx/hle/services/hid.h"
@@ -20,6 +21,7 @@
 #include "nx/runtime/platform/gamepad.h"
 #include "nx/runtime/platform/hud.h"
 #include "nx/runtime/platform/log.h"
+#include "nx/runtime/platform/overlay.h"
 #include "nx/runtime/platform/plat.h"
 #include "nx/runtime/platform/unattended.h"
 #include "nx/runtime/platform/vpad.h"
@@ -1064,6 +1066,61 @@ static void vk_descriptors_old(void) {
     }
 }
 
+int options_write_tracking_hot_old(const char* old, int given) {
+    if (!strcmp(old, "1")) return 1;
+    if (!strcmp(old, "0")) return given ? 0 : -1;
+    return -2;
+}
+/* write_tracking_hot, deprecated for write_tracking_hot_pages: the file's read while the file and the command line give
+   write_tracking_hot_pages no value, into the store, which the file is written with, so the next run reads
+   write_tracking_hot_pages; the command line's this run's write_tracking_hot_pages while the command line gives that
+   one none */
+static void write_tracking_hot_old(void) {
+    static const char* const words[] = {"Off", "On", "Auto"};
+    const char *old = ini_deprecated_value("write_tracking_hot"), *given = override_of("write_tracking_hot"),
+               *first = override_of("write_tracking_hot_pages");
+    if (!given) given = override_of("write-tracking-hot"); /* the name, which the old key no longer has */
+    int now;
+    if (old && !first && !store_find("write_tracking_hot_pages")) {
+        now = options_write_tracking_hot_old(old, 0);
+        if (now == -2)
+            WARN("settings: write_tracking_hot=%s, deprecated, is neither 0 nor 1: write_tracking_hot_pages takes its "
+                 "default, 2 (Auto) (docs/user/deprecations.md)\n",
+                 old);
+        else if (now == -1)
+            WARN(
+                "settings: write_tracking_hot=%s, deprecated, was its default: write_tracking_hot_pages takes its own, "
+                "2 (Auto), hot pages where page protection tracks the writes (docs/user/deprecations.md)\n",
+                old);
+        else {
+            store_put("write_tracking_hot_pages", "1");
+            WARN("settings: write_tracking_hot=%s, deprecated, is write_tracking_hot_pages=1 (On) now "
+                 "(docs/user/deprecations.md)\n",
+                 old);
+        }
+    }
+    if (!given) return;
+    if (first) {
+        WARN(
+            "settings: --write_tracking_hot=%s is deprecated, and the command line gives --write-tracking-hot-pages=%s "
+            "too: write_tracking_hot_pages=%s this run (docs/user/deprecations.md)\n",
+            given, first, first);
+        return;
+    }
+    now = options_write_tracking_hot_old(given, 1);
+    if (now >= 0) {
+        ini_override("write_tracking_hot_pages", now ? "1" : "0");
+        WARN("settings: --write_tracking_hot=%s is deprecated: this run reads it as --write-tracking-hot-pages=%d (%s) "
+             "(docs/user/deprecations.md)\n",
+             given, now, words[now]);
+    } else {
+        const Entry* file = store_find("write_tracking_hot_pages");
+        WARN("settings: --write_tracking_hot=%s, deprecated, is neither 0 nor 1: write_tracking_hot_pages=%s this run, "
+             "%s (docs/user/deprecations.md)\n",
+             given, file ? file->value : "2", file ? "the .ini's" : "its default (Auto)");
+    }
+}
+
 static void say_deprecated(void) {
     const char* keys[STORE_MAX];
     char line[2048];
@@ -1092,6 +1149,73 @@ int options_settings(char* out, size_t n) {
     }
     return count;
 }
+/* the value v a layer of value_of gave o is another than o's default: a value of o's that the runtime then changed (an
+   Ounce program's emulated_cores) is not the player's. A row with no default is a once text's, empty by default */
+static int layer_differs(const IniOpt* o, const char* v) {
+    if (!o->def) return v[0] != 0;
+    if (o->type == INI_TEXT) return strcmp(v, o->def) != 0;
+    return strtod(v, NULL) != strtod(o->def, NULL);
+}
+/* key appended to out at *at, after ", " but for the first */
+static void key_put(char* out, size_t n, size_t* at, const char* key) {
+    if (*at < n) *at += (size_t)snprintf(out + *at, n - *at, "%s%s", *at ? ", " : "", key);
+}
+/* options_perf_notice's lists: the perf rows of the .ini's sections off their default, by the layer of value_of that
+   gave each, the game's (its picks, its .ini) into game, the launcher's and this run's command line's into global */
+static int perf_changed(char* game, size_t game_n, char* global, size_t global_n) {
+    size_t at[2] = {0, 0};
+    int s, t, count = 0;
+    pm_lock(&g_picks_lock);
+    for (s = 0; s < g_ini_sections_count; s++)
+        for (t = 0; t < 3 && g_ini_sections[s].table[t]; t++)
+            for (const IniOpt* o = g_ini_sections[s].table[t]; o->key; o++) {
+                const Entry* e = !(o->flags & INI_IN_GAME) ? picks_find(o->key) : NULL;
+                const char* v = run_value(o->key);
+                int ours = 0;
+                if (!(o->flags & INI_PERF) || ini_at_default(o)) continue;
+                if (!v && e) {
+                    v = e->value;
+                    ours = 1;
+                } else if (!v && !(v = launcher_value(o->key)) && (e = store_find(o->key)) != NULL) {
+                    v = e->value;
+                    ours = 1;
+                }
+                if (!v || !layer_differs(o, v)) continue;
+                if (ours)
+                    key_put(game, game_n, &at[0], o->key);
+                else
+                    key_put(global, global_n, &at[1], o->key);
+                ++count;
+            }
+    pm_unlock(&g_picks_lock);
+    return count;
+}
+int options_perf_notice(const char* base) {
+    char game[1024] = "", global[1024] = "", *off = NULL;
+    SnxGameMade made;
+    const IniOpt* opt = ini_find(g_recompile_ini, "opt");
+    size_t at;
+    int count = perf_changed(game, sizeof game, global, sizeof global);
+    if (snx_game_made_read(base, &made)) off = snx_game_made_off(base);
+    at = strlen(global);
+    /* the code made ahead of time at another level than opt's default: what runs, whatever opt is now */
+    if (made.aot == 1 && opt && opt->def && made.opt != opt->def[0]) {
+        key_put(global, sizeof global, &at, "opt");
+        ++count;
+    }
+    for (char* k = off; k && *k;) {
+        size_t len = strcspn(k, ",");
+        char key[KEY_MAX];
+        snprintf(key, sizeof key, "%.*s", (int)(len < sizeof key ? len : sizeof key - 1), k);
+        key_put(global, sizeof global, &at, key);
+        ++count;
+        k += len + (k[len] == ',');
+    }
+    free(off);
+    overlay_settings_notice(game, global);
+    return count;
+}
+
 /* the Display, Graphics, Audio and Performance settings as the log last said them */
 static char g_said[2048];
 /* after a reload, the Display, Graphics, Audio and Performance settings again when they changed */
@@ -1125,8 +1249,10 @@ void ini_open(const char* path) {
     snprintf(g_path, sizeof g_path, "%s", path);
     picks_path();
     ini_set_say(say_setting);
-    for (i = 0; i < g_nover; i++) /* --vk_descriptors is read as vk_descriptors_mode, said there */
-        if (!snx_setting_known(g_over[i].key) && strcmp(g_over[i].key, "vk_descriptors"))
+    /* --vk_descriptors and --write_tracking_hot are read as their new keys, said there */
+    for (i = 0; i < g_nover; i++)
+        if (!snx_setting_known(g_over[i].key) && strcmp(g_over[i].key, "vk_descriptors") &&
+            strcmp(g_over[i].key, "write_tracking_hot") && strcmp(g_over[i].key, "write-tracking-hot"))
             WARN("--%s is not a setting, so it does nothing\n", g_over[i].key);
     launcher_picks();
     options_old_environment();
@@ -1137,6 +1263,7 @@ void ini_open(const char* path) {
         WARN("settings: cannot read %s (%s): every setting takes its default, and the file is not written over\n",
              g_path, why);
         vk_descriptors_old(); /* the command line's */
+        write_tracking_hot_old();
         apply_all();
         picks_said();
         options_old_environment_say();
@@ -1156,6 +1283,7 @@ void ini_open(const char* path) {
     bc7_cache_gb_old();
     compress_shader_cache_old();
     vk_descriptors_old();
+    write_tracking_hot_old();
     n = pending_take(taken);
     say_deprecated();
     apply_all();

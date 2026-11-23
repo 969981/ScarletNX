@@ -625,6 +625,48 @@ static int run_fs_at(const u8* code, u32 n, u32 lane, const u32* cb1, u32 cb1_wo
     return !why && env.out_written[0];
 }
 
+/* A loop's exit, @PT CALL.REL.NOINC to the code after its back edge (the BRA back right after the CALL), then 33,000
+   instructions, a call of a function after the main program's EXIT, and that function: no BRA to itself but the
+   function's own. The exit is a branch, though the function's RET lies before that BRA: taken for a call, everything
+   after the loop was copied and went past 65,536 instructions */
+static void test_loop_exit_call(void) {
+    const u32 body = 33000;
+    u8* big = calloc((size_t)body + 16, 16);
+    CHECK(big != NULL);
+    if (!big) return;
+    u32 n = 0;
+    Word x = fix(0x944);
+    set(&x, 34, 48, (u64)(2 - 0 - 1) * 4);
+    set(&x, 86, 4, 0xf);
+    put(big, n++, x);             /* 0: the loop's exit, to 2 */
+    put(big, n, bra(n, 0, 7, 0)); /* 1: back to the loop's start */
+    n++;
+    for (u32 k = 0; k < body; k++) {
+        x = alu(0x002, 1, 3, 255); /* MOV R3, RZ */
+        set(&x, 32, 8, 255);
+        put(big, n++, x);
+    }
+    const u32 call = n++; /* the call of the function, set below */
+    put(big, n++, exit_insn());
+    const u32 entry = n;
+    x = alu(0x002, 4, 0, 255); /* MOV R0, 1.0 */
+    set(&x, 32, 32, 0x3f800000u);
+    put(big, n++, x);
+    x = fix(0x950); /* RET.REL.NODEC R2 */
+    set(&x, 24, 8, 2);
+    set(&x, 86, 4, 0xf);
+    put(big, n++, x);
+    put(big, n, bra(n, n, 7, 0));
+    n++;
+    x = fix(0x944);
+    set(&x, 34, 48, (u64)(entry - call - 1) * 4);
+    set(&x, 86, 4, 0xf);
+    put(big, call, x);
+    u32 out[4] = {0};
+    CHECK(run_fs_at(big, n, 0, NULL, 0, out) && out[0] == 0x3f800000u);
+    free(big);
+}
+
 /* the jump table of the BRX test: c[1][0x10] on, the targets' byte addresses, then a word that is no target */
 static int table_read(u32 idx, u32 off, u32* out) {
     static const u32 table[3] = {2 * 16, 4 * 16, 0xffffffffu};
@@ -3272,6 +3314,89 @@ static void test_global_indirect(const char* dir) {
     }
 }
 
+static Word mov_cbuf(u32 dst, u32 bank, u32 off);
+/* IADD3 dst, a, c[bank][off], RZ */
+static Word iadd3_cb(u32 dst, u32 a, u32 bank, u32 off) {
+    Word x = alu(0x010, 5, dst, a);
+    cbuf(&x, bank, off);
+    set(&x, 64, 8, 255);
+    set(&x, 81, 3, 7);
+    set(&x, 84, 3, 7);
+    set(&x, 87, 4, 7);
+    set(&x, 77, 4, 7);
+    return x;
+}
+/* Two paths that meet at an LDG with an address in a different storage buffer on each, as one game's instanced
+   vertex programs fetch their matrices: where P0 holds, R6:R7 is buffer B's base (c[0][0x120]) plus an index the
+   program loads from buffer A (c[0][0x110]), and @P0 BRA skips the other path, where it is buffer C's base
+   (c[0][0x130]) plus R2. The loaded index makes the address a value from memory, so the LDG compares it with the
+   program's buffers as it runs (global_dynamic): B and C must be among them, and each path reads its own word. The
+   word goes to buffer D (c[0][0x140]). With only A and D compared, the load read 0 on both paths */
+static void test_global_join_bases(const char* dir) {
+    for (u32 pick = 0; pick < 2; pick++) {
+        u8 code[16 * 16] = {0};
+        u32 n = 0;
+        put(code, n++, setp_const(0, pick ? 0 : 1)); /* P0 = pick */
+        put(code, n++, mov_imm(2, 8));
+        put(code, n++, predicated(mov_cbuf(0, 0, 0x110), 0));
+        put(code, n++, predicated(mov_cbuf(1, 0, 0x114), 0));
+        put(code, n++, predicated(ldg_nou(3, 0, 0, 4), 0)); /* @P0 LDG R3, [R0]: the index, A's word 0 */
+        put(code, n++, predicated(iadd3_cb(6, 3, 0, 0x120), 0));
+        put(code, n++, predicated(mov_cbuf(7, 0, 0x124), 0));
+        put(code, n, bra(n, 10, 0, 0));
+        n++;
+        put(code, n++, iadd3_cb(6, 2, 0, 0x130));
+        put(code, n++, mov_cbuf(7, 0, 0x134));
+        put(code, n++, ldg_nou(8, 6, 0, 4)); /* LDG R8, [R6]: B's or C's */
+        put(code, n++, mov_cbuf(10, 0, 0x140));
+        put(code, n++, mov_cbuf(11, 0, 0x144));
+        put(code, n++, stg_nou(10, 0, 8));
+        put(code, n++, exit_insn());
+        put(code, n, bra(n, n, 7, 0));
+        n++;
+        ShaderInfo si = {0};
+        size_t count = 0;
+        u32* spv = sm86_to_spirv(code, n * 16, ST_CS, NULL, &si, &count);
+        CHECK(spv != NULL);
+        if (!spv) {
+            fprintf(stderr, "global join bases: %s\n", si.first_unsupported);
+            continue;
+        }
+        static u32 bank0[1024], a[16], b[16], cbuf_c[16], d[16], log[2 * SH_WLOG_PART];
+        static const u32 bases[4] = {0x110, 0x120, 0x130, 0x140};
+        u32* data[4] = {a, b, cbuf_c, d};
+        memset(bank0, 0, sizeof bank0);
+        memset(a, 0, sizeof a), memset(b, 0, sizeof b), memset(cbuf_c, 0, sizeof cbuf_c), memset(d, 0, sizeof d);
+        a[0] = 4;
+        b[1] = 0xbbb;
+        cbuf_c[2] = 0xccc;
+        SpvEvalEnv env = {0};
+        env.ubo[SNX_VKB_CB] = bank0;
+        env.ubo_words[SNX_VKB_CB] = 1024;
+        env.ubo[SNX_VKB_WPAGES] = log; /* the store's write log, a compute program's */
+        env.ubo_words[SNX_VKB_WPAGES] = 2 * SH_WLOG_PART;
+        int bound = 0;
+        for (u32 k = 0; k < 4; k++) {
+            bank0[bases[k] / 4] = 0, bank0[bases[k] / 4 + 1] = k + 1, bank0[bases[k] / 4 + 2] = 64;
+            for (int slot = 0; slot < si.ngbuf; slot++)
+                if (si.gbuf_cbuf_off[slot] == bases[k]) {
+                    env.ubo[SNX_VKB_SSBO + slot] = data[k];
+                    env.ubo_words[SNX_VKB_SSBO + slot] = 16;
+                    bound++;
+                }
+        }
+        CHECK(bound == 4 && si.ngbuf == 4);
+        const char* why = spv_eval(spv, count, &env);
+        int ok = !why && d[0] == (pick ? 0xbbbu : 0xcccu);
+        CHECK(ok);
+        if (!ok)
+            fprintf(stderr, "global join bases (%s): %s, %d buffers, D word 0 %x\n", pick ? "B" : "C",
+                    why ? why : "ran", si.ngbuf, d[0]);
+        CHECK(keep_module(dir, pick ? "global_join_bases_b" : "global_join_bases_c", spv, count));
+        free(spv);
+    }
+}
+
 /* ATOMG.E.ADD (no uniform, 0x3a8) of 32-bit data into dst, at [addr + imm], as one game's culling programs encode it */
 static Word atomg_add(u32 dst, u32 addr, u32 imm, u32 data) {
     Word x = fix(0x3a8);
@@ -5299,6 +5424,107 @@ static void test_clip_distances(const char* dir) {
     if (spv) CHECK(keep_module(dir, "gs_clip_distance", spv, count));
     free(spv);
 }
+/* whether a module declares a 16-bit integer type: only the narrow LDSM path loads one */
+static int spv_has_u16(const u32* words, size_t count) {
+    for (size_t i = 5; i + 3 < count && words[i] >> 16; i += words[i] >> 16)
+        if ((words[i] & 0xffff) == 21 && words[i + 2] == 16) return 1; /* OpTypeInt, width 16 */
+    return 0;
+}
+/* an LDSM.T.4 with hmma_narrow_lds off and on: the default reads each half with a 32-bit shared load, a shift and a
+   mask, the narrow one loads the 16 bits directly through a bit-cast pointer. Both must translate, only the narrow
+   module declares a 16-bit integer type, and spirv-val checks both. */
+static void test_narrow_ldsm(const char* dir) {
+    u8 code[16 * 4] = {0};
+    u32 n = 0;
+    Word x = fix(0x83b); /* LDSM.16.M88.4.T R24, [R7 + 0x40] */
+    set(&x, 16, 8, 24);
+    set(&x, 24, 8, 7);
+    set(&x, 40, 24, 0x40);
+    set(&x, 72, 2, 2);
+    set(&x, 78, 1, 1);
+    put(code, n++, x);
+    put(code, n++, exit_insn());
+    put(code, n, bra(n, n, 7, 0));
+    n++;
+    int narrow_was = g_spirv_translate.hmma_narrow_lds;
+    int coop_was = g_spirv_translate.hmma_coop;
+    u32 shapes_was = g_spirv_translate.hmma_coop_shapes;
+    for (int narrow = 0; narrow < 2; narrow++) {
+        g_spirv_translate.hmma_narrow_lds = narrow;
+        g_spirv_translate.hmma_coop = 0, g_spirv_translate.hmma_coop_shapes = 0;
+        ShaderInfo si = {0};
+        si.cs_local[0] = 32, si.cs_local[1] = si.cs_local[2] = 1;
+        si.shared_size = 1024;
+        size_t count = 0;
+        u32* spv = sm86_to_spirv(code, n * 16, ST_CS, NULL, &si, &count);
+        CHECK(spv != NULL);
+        if (!spv) continue;
+        CHECK(spv_has_u16(spv, count) == (narrow != 0));
+        CHECK(keep_module(dir, narrow ? "narrow_ldsm_on" : "narrow_ldsm_off", spv, count));
+        free(spv);
+    }
+    /* a sub-word shared store cannot be mirrored into the u16 view: with the flag on the module must fall back to
+       the general LDSM path and carry no 16-bit workgroup load */
+    {
+        u8 unsafe[16 * 5] = {0};
+        u32 m = 0;
+        Word st = fix(0x388); /* STS.U16 [R7 + 0x40], R8 */
+        set(&st, 24, 8, 7);
+        set(&st, 32, 8, 8);
+        set(&st, 40, 24, 0x40);
+        set(&st, 73, 3, 2);
+        put(unsafe, m++, st);
+        Word ld = fix(0x83b); /* the same LDSM.T as above */
+        set(&ld, 16, 8, 24);
+        set(&ld, 24, 8, 7);
+        set(&ld, 40, 24, 0x40);
+        set(&ld, 72, 2, 2);
+        set(&ld, 78, 1, 1);
+        put(unsafe, m++, ld);
+        put(unsafe, m++, exit_insn());
+        put(unsafe, m, bra(m, m, 7, 0));
+        m++;
+        g_spirv_translate.hmma_narrow_lds = 1;
+        g_spirv_translate.hmma_coop = 0, g_spirv_translate.hmma_coop_shapes = 0;
+        ShaderInfo si = {0};
+        si.cs_local[0] = 32, si.cs_local[1] = si.cs_local[2] = 1;
+        si.shared_size = 1024;
+        size_t count = 0;
+        u32* spv = sm86_to_spirv(unsafe, m * 16, ST_CS, NULL, &si, &count);
+        CHECK(spv != NULL && !spv_has_u16(spv, count));
+        CHECK(spv && keep_module(dir, "narrow_ldsm_unsafe", spv, count));
+        free(spv);
+    }
+    /* a shared atomic cannot be mirrored either: ATOMS.POPC.INC before the LDSM must also fall back */
+    {
+        u8 atom[16 * 4] = {0};
+        u32 m = 0;
+        Word a = fix(0xf8c); /* ATOMS.POPC.INC [URZ] */
+        put(atom, m++, a);
+        Word ld = fix(0x83b);
+        set(&ld, 16, 8, 24);
+        set(&ld, 24, 8, 7);
+        set(&ld, 40, 24, 0x40);
+        set(&ld, 72, 2, 2);
+        set(&ld, 78, 1, 1);
+        put(atom, m++, ld);
+        put(atom, m++, exit_insn());
+        put(atom, m, bra(m, m, 7, 0));
+        m++;
+        g_spirv_translate.hmma_narrow_lds = 1;
+        g_spirv_translate.hmma_coop = 0, g_spirv_translate.hmma_coop_shapes = 0;
+        ShaderInfo si = {0};
+        si.cs_local[0] = 32, si.cs_local[1] = si.cs_local[2] = 1;
+        si.shared_size = 1024;
+        size_t count = 0;
+        u32* spv = sm86_to_spirv(atom, m * 16, ST_CS, NULL, &si, &count);
+        CHECK(spv != NULL && !spv_has_u16(spv, count));
+        CHECK(spv && keep_module(dir, "narrow_ldsm_atomic", spv, count));
+        free(spv);
+    }
+    g_spirv_translate.hmma_narrow_lds = narrow_was;
+    g_spirv_translate.hmma_coop = coop_was, g_spirv_translate.hmma_coop_shapes = shapes_was;
+}
 /* HMMA (16816 and 1688, F16 and F32), LDSM and MOVM with and without the device's quads in compute and its mixed dot
    product: A's 48 reads are quad broadcasts or shuffles, B's 48, LDSM's 4 and MOVM's 2 stay shuffles, and each pair
    of products is an OpFDot2MixAcc32VALVE (96) or an OpDot. B's registers are OR'd with hmma_zero's zero, which
@@ -6639,6 +6865,45 @@ static void test_complementary_pair(const char* dir) {
     (void)dir;
 }
 
+/* IABS R0, R5 is x < 0 ? -x : x without GLSL.std.450's SAbs (instruction 5 of the program's one extended set): R0 is
+   |R5| for positive, zero and negative values, and the most negative value stays as it is */
+static void test_iabs_select(void) {
+    static const u32 values[5][2] = {{5, 5}, {0xfffffffbu, 5}, {0, 0}, {0xffffffffu, 1}, {0x80000000u, 0x80000000u}};
+    for (u32 k = 0; k < 5; k++) {
+        u8 code[16 * 8] = {0};
+        u32 n = 0;
+        for (u32 r = 0; r < 4; r++) put(code, n++, mov_imm(r, f2u(0.25f)));
+        put(code, n++, mov_imm(5, values[k][0]));
+        Word x = alu(0x013, 1, 0, 255); /* IABS R0, R5 */
+        set(&x, 32, 8, 5);
+        put(code, n++, x);
+        put(code, n++, exit_insn());
+        put(code, n, bra(n, n, 7, 0));
+        n++;
+        u32 fsph[32] = {0};
+        fsph[0] = sph0(2, 5);
+        fsph[18] = 0xf;
+        ShaderInfo si = {0};
+        size_t count = 0;
+        u32* spv = sm86_to_spirv(code, n * 16, ST_FS, fsph, &si, &count);
+        CHECK(spv != NULL);
+        if (!spv) {
+            fprintf(stderr, "iabs: %s\n", si.first_unsupported);
+            continue;
+        }
+        u32 at[256], sabs = 0;
+        u32 ext = spv_find(spv, count, 12 /* OpExtInst */, at, 256);
+        for (u32 i = 0; i < ext; i++) sabs += spv[at[i] + 4] == 5;
+        free(spv);
+        CHECK(sabs == 0);
+        SpvEvalEnv env = {0};
+        int ran = run_stage(ST_FS, code, n, fsph, &env);
+        CHECK(ran && env.out[0][0] == values[k][1]);
+        if (!ran || env.out[0][0] != values[k][1] || sabs)
+            fprintf(stderr, "iabs of %08x: %08x (%08x), %u SAbs\n", values[k][0], env.out[0][0], values[k][1], sabs);
+    }
+}
+
 /* the fuse of an LDSM and the HMMA that reads its fragments (fuse.c): one instruction where the two were, with the
    HMMA's fields kept and the LDSM's packed beside them. The HMMA has the scheduling bits a compiled one has (105-125:
    its stalls, yield, barriers, waits and reuse), which the LDSM's fields once took: OR'ed into stall 15 and yield,
@@ -7410,6 +7675,7 @@ int main(int argc, char** argv) {
     test_tcs_empty();
     test_programs(dir);
     test_game_forms(dir);
+    test_loop_exit_call();
     test_brx(dir);
     test_warp_base_blocks(dir);
     test_brx_bounded(dir);
@@ -7462,6 +7728,7 @@ int main(int argc, char** argv) {
     test_base_instance_word(dir);
     test_u64_conversions();
     test_global_indirect(dir);
+    test_global_join_bases(dir);
     test_global_table(dir);
     test_global_table_cells(dir);
     test_f2ip(dir);
@@ -7491,6 +7758,7 @@ int main(int argc, char** argv) {
     test_uses_isbe();
     test_warp_matrix(dir);
     test_hfma2_once(dir);
+    test_narrow_ldsm(dir);
     test_warp_matrix_values(dir);
     test_coop_fused_chain(dir);
     test_coop_rz(dir);
@@ -7508,6 +7776,7 @@ int main(int argc, char** argv) {
     test_ftz_modes(dir);
     test_ffma_fused();
     test_complementary_pair(dir);
+    test_iabs_select();
     test_fuse_pairs();
     test_fuse_branch();
     test_fuse_ldsm_hmma(dir);

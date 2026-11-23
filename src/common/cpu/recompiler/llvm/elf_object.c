@@ -69,7 +69,9 @@ int snx_elf_parse(SnxElfObject* o, const SnxLinkInput* input, unsigned* machine,
          o->eh->e_machine != EM_RISCV && o->eh->e_machine != EM_LOONGARCH && o->eh->e_machine != EM_MIPS &&
          o->eh->e_machine != EM_S390) ||
         o->eh->e_shentsize != sizeof(Elf64_Shdr) ||
-        o->eh->e_shoff + (uint64_t)o->eh->e_shnum * sizeof(Elf64_Shdr) > input->size)
+        /* the size against what is left after the offset, which their sum passes when they wrap */
+        o->eh->e_shoff > input->size ||
+        (uint64_t)o->eh->e_shnum * sizeof(Elf64_Shdr) > input->size - o->eh->e_shoff)
         return snx_link_fail(
             error, error_size,
             "%s: not an x86-64, AArch64, PowerPC64, RISC-V, LoongArch, MIPS64 or s390x ELF relocatable object in "
@@ -103,14 +105,18 @@ int snx_elf_parse(SnxElfObject* o, const SnxLinkInput* input, unsigned* machine,
         if (s->sh_type != SHT_NOBITS && (s->sh_offset > input->size || s->sh_size > input->size - s->sh_offset))
             return snx_link_fail(error, error_size, "%s: truncated section%s", input->name, "");
         if (s->sh_type == SHT_SYMTAB) {
+            const Elf64_Shdr* link;
             o->syms = (const Elf64_Sym*)(input->data + s->sh_offset);
             o->nsyms = s->sh_size / sizeof(Elf64_Sym);
             if (s->sh_link >= o->eh->e_shnum)
                 return snx_link_fail(error, error_size, "%s: bad symbol table%s", input->name, "");
-            /* the names' section may come after this one, its own check with it: no pointer past the file before */
-            if (o->sh[s->sh_link].sh_offset > input->size)
+            /* The linked string table's own offset and size, which this section's check above does not cover: the
+               symbols' names are read through it at once, and its offset may point past the object or wrap */
+            link = &o->sh[s->sh_link];
+            if (link->sh_offset > input->size || link->sh_size > input->size - link->sh_offset)
                 return snx_link_fail(error, error_size, "%s: truncated section%s", input->name, "");
-            o->strtab = (const char*)input->data + o->sh[s->sh_link].sh_offset;
+            o->strtab = (const char*)input->data + link->sh_offset;
+            o->strtab_size = link->sh_size;
         }
         if (!(s->sh_flags & SHF_ALLOC)) continue;
         if (s->sh_flags & SHF_TLS)
@@ -139,6 +145,14 @@ int snx_elf_parse(SnxElfObject* o, const SnxLinkInput* input, unsigned* machine,
         unsigned section = o->syms[j].st_shndx;
         int bind = ELF64_ST_BIND(o->syms[j].st_info);
         char what[80];
+        /* its name inside the linked string table and ended there: each reader takes it with strlen or strcmp */
+        if (ELF64_ST_TYPE(o->syms[j].st_info) != STT_SECTION &&
+            (o->syms[j].st_name >= o->strtab_size ||
+             !memchr(o->strtab + o->syms[j].st_name, 0, o->strtab_size - o->syms[j].st_name))) {
+            snprintf(what, sizeof(what), "symbol %zu's name at %u passes its %zu-byte string table", j,
+                     (unsigned)o->syms[j].st_name, o->strtab_size);
+            return snx_link_fail(error, error_size, "%s: %s", input->name, what);
+        }
         if (section < o->eh->e_shnum || section == SHN_ABS ||
             (section == SHN_COMMON && (bind == STB_GLOBAL || bind == STB_WEAK)))
             continue;

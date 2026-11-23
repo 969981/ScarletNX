@@ -5,6 +5,7 @@
 #include "nx/runtime/ini.h"
 #include "snx_settings.h" /* the game's Debug table, g_debug_ini */
 #include <assert.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -215,6 +216,49 @@ int main(void) {
         folder[0] = 0;
         assert(ini_changed(changed, INI_CHANGED_DEFAULT, list, sizeof list) == 0 && !strcmp(list, ""));
     }
+    /* the perf rows off their default (settings.txt's perf), keys alone with a comma between, one skipped: a row with no
+       default is at it as an LLVM option's INT_MIN (LLVM's own, until set) and as a once text's empty value. The length
+       the whole list takes, whatever the room, the list cut as snprintf cuts */
+    {
+        static int level = 1, quiet = 0, threshold = INT_MIN;
+        static char driver[16] = "";
+        static const IniOpt rows[] = {
+            {"level", "1", NULL, INI_INT, INI_PERF, &level, 0, 2, NULL, NULL, NULL, 0, 0, 0},
+            {"quiet", "0", NULL, INI_INT, 0, &quiet, 0, 1, NULL, NULL, NULL, 0, 0, 0},
+            {"threshold", NULL, NULL, INI_INT, INI_PERF, &threshold, INT_MIN + 1, INT_MAX, NULL, NULL, NULL, 0, 0, 0},
+            {"driver", NULL, NULL, INI_TEXT, INI_PERF, driver, 0, 0, NULL, NULL, NULL, 0, 0, sizeof driver},
+            {NULL, NULL, NULL, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0, 0}};
+        char list[64];
+        assert(ini_at_default(&rows[0]) && ini_at_default(&rows[2]) && ini_at_default(&rows[3]));
+        assert(ini_perf_keys(rows, NULL, list, sizeof list) == 0 && !strcmp(list, ""));
+        quiet = 1; /* off its default, no perf row */
+        assert(ini_perf_keys(rows, NULL, list, sizeof list) == 0 && !strcmp(list, ""));
+        level = 2;
+        threshold = 225;
+        snprintf(driver, sizeof driver, "turnip");
+        assert(!ini_at_default(&rows[0]) && !ini_at_default(&rows[2]) && !ini_at_default(&rows[3]));
+        assert(ini_perf_keys(rows, NULL, list, sizeof list) == 22 && !strcmp(list, "level,threshold,driver"));
+        assert(ini_perf_keys(rows, "level", list, sizeof list) == 16 && !strcmp(list, "threshold,driver"));
+        assert(ini_perf_keys(rows, NULL, list, 8) == 22 && !strcmp(list, "level,t"));
+        assert(ini_perf_keys(rows, NULL, NULL, 0) == 22);
+        level = 1;
+        quiet = 0;
+        threshold = INT_MIN;
+        driver[0] = 0;
+        assert(ini_perf_keys(rows, NULL, list, sizeof list) == 0);
+    }
+    /* settings.txt's perf rows as settingsgen makes them: a game's, the recompile's, every Vulkan extension's and every
+       LLVM row; not one the screen shows (shadows), nor the AOT threads, which change only how long a recompile takes.
+       Tables whose rows call no runtime function: the test links none */
+    {
+        const IniOpt* o;
+        assert((o = ini_find(g_graphics_ini, "resolution")) && (o->flags & INI_PERF));
+        assert((o = ini_find(g_recompile_ini, "llvm_batch")) && (o->flags & INI_PERF));
+        assert((o = ini_find(g_graphics_ini, "shadows")) && !(o->flags & INI_PERF));
+        assert((o = ini_find(g_recompile_ini, "aot_threads")) && !(o->flags & INI_PERF));
+        for (o = g_vk_extensions_ini; o->key; ++o) assert(o->flags & INI_PERF);
+        for (o = g_llvm_ini; o->key; ++o) assert(o->flags & INI_PERF); /* the passes the build's LLVM has */
+    }
     /* a setting of some systems alone (settings.txt's only): where it does something as a greyed row says it, said on
        every system but those and listed last on its line for the launcher; one of every system says nothing */
     {
@@ -225,21 +269,27 @@ int main(void) {
             {"phone", "0", "Help", INI_INT, INI_ONLY_ANDROID, &v, 0, 1, NULL, "Phone", "Off|On", 0, 0, 0},
             {"kernel", "0", "Help", INI_INT, INI_ONLY_LINUX, &v, 0, 1, NULL, "Kernel", "Off|On", 0, 0, 0},
             {"nce", "0", "Help", INI_INT, INI_ONLY_ARM64_LINUX, &v, 0, 1, NULL, "NCE", "Off|On", 0, 0, 0},
+            {"apple", "0", "Help", INI_INT, INI_ONLY_APPLE, &v, 0, 1, NULL, "Apple", "Off|On", 0, 0, 0},
             {"all", "0", "Help", INI_INT, INI_STARTUP, &v, 0, 1, NULL, "All", "Off|On", 0, 0, 0},
             {"never", "0", "Help", INI_INT, INI_ONLY_NONE, &v, 0, 0, NULL, "Never", "Off", 0, 0, 0},
             {NULL, NULL, NULL, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0, 0}};
         static const IniSection sections[] = {{"Test", 1, {rows, NULL, NULL}, {NULL, NULL, NULL}}};
         const char *mac = "macOS only", *win = "Windows only", *phone = "Android only";
         const char *kernel = "Linux and Android only", *nce = "arm64 Linux and Android only";
+        const char* apple = "macOS and iOS only";
         char list[1024], want[1024];
         assert(!strcmp(ini_only_words(INI_STARTUP | INI_ONLY_MACOS), "macOS only") && !ini_only_words(INI_STARTUP));
         assert(!strcmp(ini_only_words(INI_ONLY_WINDOWS), win) && !strcmp(ini_only_words(INI_ONLY_ANDROID), phone));
         assert(!strcmp(ini_only_words(INI_ONLY_LINUX), kernel) && !strcmp(ini_only_words(INI_ONLY_ARM64_LINUX), nce));
+        assert(!strcmp(ini_only_words(INI_ONLY_APPLE), apple));
         assert(!ini_only_words(INI_ONLY)); /* no system's: a setting of every one */
-        assert(!ini_only(&rows[5]));
+        assert(!ini_only(&rows[6]));
         /* none: greyed on every system, this one too */
-        assert(!strcmp(ini_only_words(INI_ONLY_NONE), "Not offered") && !strcmp(ini_only(&rows[6]), "Not offered"));
+        assert(!strcmp(ini_only_words(INI_ONLY_NONE), "Not offered") && !strcmp(ini_only(&rows[7]), "Not offered"));
         /* this system's are said by no row: the others' by each */
+#if defined(__APPLE__)
+        apple = "";
+#endif
 #if defined(__APPLE__) && !defined(SNX_IOS)
         mac = "";
 #elif defined(_WIN32)
@@ -256,18 +306,20 @@ int main(void) {
         assert(!ini_only(&rows[0]) == !mac[0] && (!mac[0] || !strcmp(ini_only(&rows[0]), mac)));
         assert(!ini_only(&rows[1]) == !win[0] && !ini_only(&rows[2]) == !phone[0]);
         assert(!ini_only(&rows[3]) == !kernel[0] && !ini_only(&rows[4]) == !nce[0]);
+        assert(!ini_only(&rows[5]) == !apple[0] && (!apple[0] || !strcmp(ini_only(&rows[5]), apple)));
         snprintf(want, sizeof want,
                  "Test\tmac\t0\tint\t0\t1\tHelp\tMac\t0=Off|1=On\t%s\n"
                  "Test\twin\t0\tint\t0\t1\tHelp\tWin\t0=Off|1=On\t%s\n"
                  "Test\tphone\t0\tint\t0\t1\tHelp\tPhone\t0=Off|1=On\t%s\n"
                  "Test\tkernel\t0\tint\t0\t1\tHelp\tKernel\t0=Off|1=On\t%s\n"
                  "Test\tnce\t0\tint\t0\t1\tHelp\tNCE\t0=Off|1=On\t%s\n"
+                 "Test\tapple\t0\tint\t0\t1\tHelp\tApple\t0=Off|1=On\t%s\n"
                  "Test\tall\t0\tint\t0\t1\tHelp\tAll\t0=Off|1=On\t\n"
                  "Test\tnever\t0\tint\t0\t0\tHelp\tNever\t0=Off\tNot offered\n",
-                 mac, win, phone, kernel, nce);
+                 mac, win, phone, kernel, nce, apple);
         assert(ini_list_text(sections, 1, list, sizeof list) == strlen(want) && !strcmp(list, want));
 #if defined(__linux__) && defined(__x86_64__) && !defined(__ANDROID__) /* a Linux PC: all but the kernel's greyed */
-        assert(mac[0] && win[0] && phone[0] && !kernel[0] && nce[0]);
+        assert(mac[0] && win[0] && phone[0] && !kernel[0] && nce[0] && apple[0]);
 #endif
         /* the Switch's online service, offered nowhere: its row greyed on every system, Off its one value */
         const IniOpt* online = ini_find(g_switch_online_ini, "switch_online");

@@ -124,7 +124,7 @@ int plat_ww_scan(u8* p, u64 size, void (*cb)(u8* p, u64 size));
    kernel's writes are tracked as they come (Linux's userfaultfd, Windows' write watch) */
 void plat_ww_open(u8* p, u64 size);
 void plat_ww_close(u8* p, u64 size);
-/* Hot pages (write_tracking_hot=1, with page protection only): a page the scans found written in a row is left
+/* Hot pages (write_tracking_hot_pages=1, with page protection only): a page the scans found written in a row is left
    writable and reported written by every scan, so a scan may report one nothing wrote. plat_ww_hot_in says whether
    [p, p + size) has one; plat_ww_cool protects its hot pages again and reports them to cb as written, as a scan
    would, so from then on a report of one stands for a write. A consumer whose "written" must be exact (a render
@@ -150,6 +150,14 @@ int plat_alias_unmap(u8* p, u64 size);
    allocation temporarily, then move the requested page range to p without a copy. */
 int plat_vm_map_fd(u8* p, u64 size, int fd, u64 off, u64 allocation_size);
 void plat_vm_fd_close(int fd);
+/* The file slots (Apple): the reservation [base, base + size), before its first commit, mapped PROT_NONE over
+   unlinked sparse files of 1 GiB each in dir, so its committed pages are file pages, which the system can write out
+   and does not count against an app's memory limit (iOS ends an app past it). plat_vm_commit and plat_vm_decommit
+   then keep the files: a decommit punches its range out of its file, so it reads zero when committed again. 0, or
+   -1 with errno and the reservation anonymous again (ENOSYS elsewhere, ENOTSUP where the disk can't punch) */
+int plat_vm_files(u8* base, u64 size, const char* dir);
+/* the file slot under p: 1 with its descriptor and p's offset in its file (either may be NULL), or 0 */
+int plat_vm_files_slot(const u8* p, int* fd, u64* off);
 /* copies between host memory and the pool: 0, or -1 with errno (ENXIO for a read past the pool's end). A read into the
    reservation is the kernel's write to guest memory, which it opens and closes itself (plat_ww_open) */
 int plat_alias_write(u64 off, const void* src, u64 size);

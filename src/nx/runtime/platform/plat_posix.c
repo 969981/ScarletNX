@@ -426,8 +426,9 @@ void plat_vm_track(u8* p, u64 size) {
             if (pm >= 0) {
                 atomic_store_explicit(&g_pagemap, pm, memory_order_relaxed);
                 if (g_settings.write_tracking_hot_pages == 1)
-                    WARN("memory: write_tracking_hot=1 leaves pages hot only where page protection tracks the writes, "
-                         "and userfaultfd tracks them here (write_tracking=0): no page is hot this run\n");
+                    WARN(
+                        "memory: write_tracking_hot_pages=1 leaves pages hot only where page protection tracks the writes, "
+                        "and userfaultfd tracks them here (write_tracking=0): no page is hot this run\n");
                 if (traps_by_signal()) wp_init(p, size, 0); /* the states for the traps alone */
                 return;
             }
@@ -440,7 +441,7 @@ void plat_vm_track(u8* p, u64 size) {
 #endif
     (void)by_signal;
     if (no_ww && g_settings.write_tracking_hot_pages == 1)
-        WARN("memory: write_tracking_hot=1 leaves pages hot only where page protection tracks the writes, and "
+        WARN("memory: write_tracking_hot_pages=1 leaves pages hot only where page protection tracks the writes, and "
              "write_tracking=2 tracks none: no page is hot this run\n");
     /* the states also serve traps by protection, where userfaultfd's minor faults don't (plat_trap_init) */
     if (!no_ww || !g_uffd_minor_on() || traps_by_signal()) wp_init(p, size, !no_ww);
@@ -485,7 +486,7 @@ static unsigned g_wp_shift; /* the host's page, log2 */
 static _Atomic u64 g_wp_budget; /* atomic: pages the tracking and the traps may hold at once */
 static _Atomic u64 g_wp_held;   /* atomic: pages they hold now (WP_PROT or WP_TRAP) */
 static _Atomic u32 g_wp_opened; /* atomic: moves whenever pages become writable (a fault's, a mapping change's) */
-/* Hot pages (write_tracking_hot=1): a page the scans of its leaf report written WP_HOT_AFTER times in a row is left
+/* Hot pages (write_tracking_hot_pages 1 or 2): a page the scans of its leaf report written WP_HOT_AFTER times in a row is left
    writable, and reported written by every scan after without its fault, as a page written in every epoch would be;
    at its WP_HOT_AFTER + WP_HOT_FOR-th report in a row it is protected again and counted from zero, so a page no longer
    written goes quiet. A scan that finds it unwritten, a trap or a mapping change starts its count over. Reporting a
@@ -494,7 +495,7 @@ static _Atomic u32 g_wp_opened; /* atomic: moves whenever pages become writable 
    per host page, changes under the page's lock */
 #define WP_HOT_AFTER 2
 #define WP_HOT_FOR   32
-static _Atomic u8* g_wp_hot;   /* the counts; NULL with write_tracking_hot=0 */
+static _Atomic u8* g_wp_hot;   /* the counts; NULL with write_tracking_hot_pages=0 */
 static _Atomic u64 g_wp_hot_n; /* atomic: pages hot now (counted WP_HOT_AFTER or more) */
 /* A mark per group of pages that a scan has something to do in: a page of it became written, or has a hot count. The
    scans read a state for each page of the leaves checks need, thousands in a scan and hundreds of thousands of scans
@@ -949,17 +950,19 @@ static void wp_init(u8* p, u64 size, int track) {
     g_wp_shift = shift;
     atomic_store_explicit(&g_wp_budget, budget, memory_order_relaxed);
     g_wp_track = track;
-    if (track && g_settings.write_tracking_hot_pages == 1) {
+    if (track && g_settings.write_tracking_hot_pages) { /* 1, or 2 (Auto): on wherever protection tracks */
         void* h = mmap(NULL, (size_t)(size >> shift), PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (h == MAP_FAILED)
-            WARN("memory: write_tracking_hot=1 needs %llu bytes for its counts, which mmap refused (error %d): no page "
-                 "is hot this run\n",
-                 (unsigned long long)(size >> shift), errno);
+            WARN(
+                "memory: write_tracking_hot_pages=%d needs %llu bytes for its counts, which mmap refused (error %d): no "
+                "page is hot this run\n",
+                g_settings.write_tracking_hot_pages, (unsigned long long)(size >> shift), errno);
         else {
             g_wp_hot = (_Atomic u8*)h;
-            LOG("memory: hot pages (write_tracking_hot=1): a page written in %d scans in a row stays writable for %d\n",
-                WP_HOT_AFTER, WP_HOT_FOR);
+            LOG("memory: hot pages (write_tracking_hot_pages=%d): a page written in %d scans in a row stays writable "
+                "for %d\n",
+                g_settings.write_tracking_hot_pages, WP_HOT_AFTER, WP_HOT_FOR);
         }
     }
     if (track) {
@@ -1210,15 +1213,200 @@ u8* plat_vm_reserve_at(u64 addr, u64 size) {
     return NULL;
 #endif
 }
+#if defined(__APPLE__)
+/* the host pages of the file slots a decommit left in memory: a punched hole drops a range's pages but a wired one
+   (a GPU's import of it, uma.c), whose bytes stay, as the GPU's reads need until the import goes, and which the
+   page's next commit would read; noted here, and zeroed at that commit (files_stale_zero). Few: the pages of an
+   import a decommit falls on */
+static struct {
+    pthread_mutex_t lock;
+    u8** page;
+    size_t n, cap;
+} g_stale = {.lock = PTHREAD_MUTEX_INITIALIZER};
+static void files_stale_note(u8* p, u64 len) {
+    const u64 page = (u64)sysconf(_SC_PAGESIZE);
+    char in[256];
+    for (u64 at = 0; at < len; at += sizeof in * page) {
+        u64 pages = (len - at) / page < sizeof in ? (len - at) / page : sizeof in;
+        if (mincore(p + at, (size_t)(pages * page), in)) {
+            WARN_LIMIT(4,
+                       "memory: which of %llu KiB of the game's memory files stayed in memory past their decommit "
+                       "is not known (error %d): their next commit may read their old bytes\n",
+                       (unsigned long long)((pages * page) >> 10), errno);
+            continue;
+        }
+        pthread_mutex_lock(&g_stale.lock);
+        for (u64 k = 0; k < pages; ++k) {
+            if (!(in[k] & MINCORE_INCORE)) continue;
+            if (g_stale.n == g_stale.cap) {
+                size_t cap = g_stale.cap ? 2 * g_stale.cap : 16;
+                u8** more = (u8**)realloc(g_stale.page, cap * sizeof *more);
+                if (!more) fatal("No memory to note %zu pages of the game's memory files a decommit left", cap);
+                g_stale.page = more;
+                g_stale.cap = cap;
+            }
+            g_stale.page[g_stale.n++] = p + at + k * page;
+        }
+        pthread_mutex_unlock(&g_stale.lock);
+    }
+}
+/* the pages of [p, p + size) a decommit left in memory, zeroed: the range is committed, writable */
+static void files_stale_zero(u8* p, u64 size) {
+    const u64 page = (u64)sysconf(_SC_PAGESIZE);
+    pthread_mutex_lock(&g_stale.lock);
+    for (size_t i = 0; i < g_stale.n;) {
+        u8* at = g_stale.page[i];
+        if (at >= p && at < p + size) {
+            memset(at, 0, (size_t)page);
+            g_stale.page[i] = g_stale.page[--g_stale.n];
+        } else
+            ++i;
+    }
+    pthread_mutex_unlock(&g_stale.lock);
+}
+#endif
 int plat_vm_commit(u8* p, u64 size) {
     int r;
     wp_hold(p, size, WP_MAPPED);
     r = plat_mem_protect(p, size, PLAT_MEM_READ | PLAT_MEM_WRITE | (g_vm_exec ? PLAT_MEM_EXEC : 0u));
+#if defined(__APPLE__)
+    if (!r && plat_vm_files_slot(p, NULL, NULL)) files_stale_zero(p, size);
+#endif
     wp_let(p, size, WP_MAPPED, !r);
     return r;
 }
+/* The file slots (plat_vm_files): set once at startup (guest_files, before kernel_init) and kept to the end. A slot is
+   1 GiB, or larger where that keeps the reservation within FILES_MAX descriptors */
+#define FILE_SLOT (1ull << 30)
+#define FILES_MAX 64
+/* what a SIGBUS on a committed page of the file slots says: past the write tracking and the freeze, a page in or out
+   failed */
+#define FILES_IO  "guest memory: a page of the game's memory files could not be read or written (the disk may be full)"
+static struct {
+    u8* base;
+    u64 size, slot;
+    int* fd; /* a descriptor for each slot; NULL without the slots */
+} g_files;
+int plat_vm_files_slot(const u8* p, int* fd, u64* off) {
+    u64 at = (u64)((uintptr_t)p - (uintptr_t)g_files.base);
+    if (!g_files.fd || at >= g_files.size) return 0;
+    if (fd) *fd = g_files.fd[at / g_files.slot];
+    if (off) *off = at % g_files.slot;
+    return 1;
+}
+/* a SIGBUS at a that FILES_IO explains: in the file slots, on a page committed (WP_MAPPED) where the states say. Darwin
+   gives SIGBUS for a protection fault too, as on an uncommitted page, which is the game's bad access */
+static int files_io(const void* a) {
+    if (!plat_vm_files_slot((const u8*)a, NULL, NULL)) return 0;
+    _Atomic u8* w = atomic_load_explicit(&g_wp, memory_order_acquire);
+    u64 i = (u64)((uintptr_t)a - (uintptr_t)g_wp_base) >> g_wp_shift;
+    return !w || i >= g_wp_pages || (atomic_load_explicit(&w[i], memory_order_relaxed) & WP_MAPPED);
+}
+#if defined(__APPLE__)
+static int files_punch(int fd, u64 off, u64 len) {
+    fpunchhole_t ph = {0};
+    ph.fp_offset = (off_t)off;
+    ph.fp_length = (off_t)len;
+    return fcntl(fd, F_PUNCHHOLE, &ph);
+}
+/* one unlinked file of len bytes in dir at p, PROT_NONE: its descriptor, or -1 with errno */
+static int files_slot(u8* p, u64 len, const char* dir, int probe) {
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof path, "%s/snx-guest-XXXXXX", dir) >= (int)sizeof path) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int fd = mkostemp(path, O_CLOEXEC);
+    if (fd < 0) return -1;
+    if (unlink(path)) { /* a named file would keep the game's memory past its end */
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    /* the size first: Darwin gives SIGBUS on a mapped page past a file's end. The probe asks the disk for the punch
+       that every decommit needs, so a disk without it keeps anonymous memory instead of ending the game later */
+    if (ftruncate(fd, (off_t)len) || (probe && (pwrite(fd, "", 1, 0) != 1 || files_punch(fd, 0, plat_vm_page()))) ||
+        mmap(p, (size_t)len, PROT_NONE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    return fd;
+}
+#endif
+int plat_vm_files(u8* base, u64 size, const char* dir) {
+#if defined(__APPLE__)
+    u64 slot = FILE_SLOT;
+    while ((size + slot - 1) / slot > FILES_MAX) slot <<= 1;
+    u64 n = (size + slot - 1) / slot, i;
+    int* fd = (int*)calloc((size_t)n, sizeof *fd);
+    if (!fd) return -1;
+    for (i = 0; i < n; i++) {
+        u64 len = size - i * slot < slot ? size - i * slot : slot;
+        fd[i] = files_slot(base + i * slot, len, dir, i == 0);
+        if (fd[i] < 0) break;
+    }
+    if (i < n) {
+        int e = errno;
+        while (i--) close(fd[i]);
+        /* a hole here would let the host map into the guest's addresses */
+        if (mmap(base, (size_t)size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) ==
+            MAP_FAILED)
+            fatal("Could not reserve the game's memory again after its files failed (error %d)", errno);
+        free(fd);
+        errno = e;
+        return -1;
+    }
+    int cls = fcntl(fd[0], F_GETPROTECTIONCLASS);
+    if (cls < 0)
+        LOG("memory: the guest files have no data protection class: %s\n", strerror(errno));
+    else
+        LOG("memory: the guest files have data protection class %d\n", cls);
+    g_files.base = base; /* before the game's threads */
+    g_files.size = size;
+    g_files.slot = slot;
+    g_files.fd = fd;
+    return 0;
+#else
+    (void)base;
+    (void)size;
+    (void)dir;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
 void plat_vm_decommit(u8* p, u64 size) {
     wp_hold(p, size, 0);
+#if defined(__APPLE__)
+    if (plat_vm_files_slot(p, NULL, NULL)) {
+        if (!size || !plat_vm_files_slot(p + size - 1, NULL, NULL))
+            fatal("A decommit of %llu KiB runs past the game's memory files", (unsigned long long)(size >> 10));
+        /* the file mapping stays: fresh anonymous pages would count against the app's limit again */
+        for (u64 done = 0, len; done < size; done += len) {
+            int fd;
+            u64 off;
+            plat_vm_files_slot(p + done, &fd, &off);
+            len = g_files.slot - off < size - done ? g_files.slot - off : size - done;
+            if (!files_punch(fd, off, len)) {
+                files_stale_note(p + done, len);
+                continue;
+            }
+            /* the range must still read zero at its next commit: zeroed in place, its blocks kept */
+            WARN_LIMIT(4, "memory: could not free %llu KiB of the game's memory files (error %d): zeroed in place\n",
+                       (unsigned long long)(len >> 10), errno);
+            if (mprotect(p + done, (size_t)len, PROT_READ | PROT_WRITE))
+                fatal("Could not free %llu KiB of the game's memory files (error %d)", (unsigned long long)(len >> 10),
+                      errno);
+            memset(p + done, 0, (size_t)len);
+        }
+        mprotect(p, (size_t)size, PROT_NONE);
+        wp_let(p, size, 0, 1);
+        return;
+    }
+#endif
 #if defined(__linux__)
     madvise(p, (size_t)size, MADV_DONTNEED);
     mprotect(p, (size_t)size, PROT_NONE);
@@ -2255,6 +2443,13 @@ static void note_sent(int sig, const siginfo_t* si) {
 /* SIGSEGV or SIGBUS of a write that may be the freeze's: a protection fault (Darwin reports one as SIGBUS) */
 static int access_fault(int sig, const siginfo_t* si) { return sig == SIGBUS || si->si_code == SEGV_ACCERR; }
 
+#if defined(__PROSPERO__)
+#include <stddef.h>
+/* the console puts 48 bytes between uc_sigmask and uc_mcontext that the payload SDK's FreeBSD header lacks: with it,
+   context_write's error code and context_pc's rip would be read 48 bytes off */
+static_assert(offsetof(ucontext_t, uc_mcontext.mc_rip) == 0xe0,
+              "the PS5's ucontext layout: build with the payload SDK's PS5 fork, whose sys/_ucontext.h has it");
+#endif
 /* whether the fault the context holds was a write: 0 where the system doesn't tell */
 static int context_write(void* ctx) {
     ucontext_t* uc = (ucontext_t*)ctx;
@@ -2287,6 +2482,12 @@ static void fault_signal(int sig, siginfo_t* si, void* ctx) {
     if (wp_fault(si->si_addr, context_write(ctx), ctx) || frozen_wait(si->si_addr, access_fault(sig, si))) {
         errno = saved;
         return;
+    }
+    /* past the tracking and the freeze, a SIGBUS on a committed page of the file slots is the disk's (files_io) */
+    if (sig == SIGBUS && files_io(si->si_addr)) {
+        static const char m[] = FILES_IO "\n";
+        ssize_t w = write(STDERR_FILENO, m, sizeof m - 1);
+        (void)w;
     }
     signal(sig, SIG_DFL);
 }
@@ -2419,6 +2620,8 @@ static void crash_signal(int sig, siginfo_t* si, void* ctx) {
                                                  memory_order_seq_cst))
         for (;;) pause();
     log_crash_mode();
+    /* past the tracking and the freeze, a SIGBUS on a committed page of the file slots is the disk's (files_io) */
+    if (sig == SIGBUS && files_io(si->si_addr)) logf_(0, "*** " FILES_IO " ***\n");
     /* for SIGILL and SIGFPE si_addr is the instruction, not an address it touched */
     fault = sig == SIGSEGV || sig == SIGBUS ? si->si_addr : NULL;
     nce_crash_context(ctx, fault); /* the guest's registers, when the native code of the game crashed */

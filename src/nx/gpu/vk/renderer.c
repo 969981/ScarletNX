@@ -606,7 +606,8 @@ static const char* const g_resource_name[VK_RESOURCE_N] = {
     [VK_RESOURCE_RT_RELOAD] = "target reload",
     [VK_RESOURCE_SURFACE_RECLAIM] = "surface reclaim",
     [VK_RESOURCE_BUFFER_MAINTENANCE] = "buffer maintenance",
-    [VK_RESOURCE_BUFFER_CACHE_BUILD] = "buffer cache build"};
+    [VK_RESOURCE_BUFFER_CACHE_BUILD] = "buffer cache build",
+    [VK_RESOURCE_CMD_RESET] = "command resets"};
 #if defined(SNX_TRACY)
 /* The heap the caches manage, as vk_mem_use reads it for their own trimming, in bytes (the plot is a Memory one). */
 static void gpu_memory_plots(void) {
@@ -636,7 +637,8 @@ static const char* const g_resource_plot[VK_RESOURCE_N] = {
     [VK_RESOURCE_RT_RELOAD] = "vk resource: target reload ms",
     [VK_RESOURCE_SURFACE_RECLAIM] = "vk resource: surface reclaim ms",
     [VK_RESOURCE_BUFFER_MAINTENANCE] = "vk resource: buffer maintenance ms",
-    [VK_RESOURCE_BUFFER_CACHE_BUILD] = "vk resource: buffer cache build ms"};
+    [VK_RESOURCE_BUFFER_CACHE_BUILD] = "vk resource: buffer cache build ms",
+    [VK_RESOURCE_CMD_RESET] = "vk resource: command resets ms"};
 static const char* const g_wait_plot[VK_WAIT_N] = {"gpu wait: finish ms", "gpu wait: recycle ms",
                                                    "gpu wait: submit ms"};
 static void resource_plots(const VkResourceStats* is, const VkResourceStats* was) {
@@ -654,6 +656,8 @@ static void resource_plots(const VkResourceStats* is, const VkResourceStats* was
 static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transform, int game, u64 released_ns,
                  u64 period_ns, u32 shown_syncpt) {
     SNX_ZONE(z_show, "vk show");
+    static u32 res_mark;           /* the present the CPU resource window began at */
+    static int res_have;           /* the first window only starts the count: what ran before it is not a steady frame */
     if (transform & 4) { u32 w = fw; fw = fh; fh = w; }
     /* the size the swapchain was made for, not the extent the surface clamped it to: that can stay different */
     int ww, wh, kind = src ? frame_kind(hdr) : g_sc_kind, shown = backend_window_shown();
@@ -822,6 +826,24 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
             }
             if (d > slowest_ns) slowest_ns = d;
         }
+        /* log_level 3: the CPU work a resource category takes over 600 presents, which is where a steady scene's
+           time goes: a slow frame's line only says what one frame did. The window is counted from a mark rather than
+           by the present's number, so no window is longer than a steady 600: the first one would otherwise hold what
+           ran before it, and a window the setting was off for would count its presents too */
+        if (g_vk_present + 1u - res_mark >= 600) {
+            static VkResourceStats res_was;
+            const u32 span = g_vk_present + 1u - res_mark; /* unsigned: a wrapped present's number still counts on */
+            if (g_settings.log_level >= 3 && res_have) {
+                for (u32 k = 0; k < VK_RESOURCE_N; k++) {
+                    u64 ns = resource_is.ns[k] - res_was.ns[k], n = resource_is.calls[k] - res_was.calls[k];
+                    if (ns < 10000000 || !n) continue;
+                    LOG("vulkan: CPU a frame over %u presents: %s %.2f ms (%llu calls, %.3f ms each)\n", span,
+                        g_resource_name[k], (double)ns / 1e6 / (double)span, (unsigned long long)n,
+                        (double)ns / 1e6 / (double)n);
+                }
+            }
+            res_mark = g_vk_present + 1u, res_was = resource_is, res_have = 1;
+        }
         memcpy(was, is, sizeof was);
         resource_was = resource_is;
         last_present_ns = now_ns;
@@ -941,22 +963,28 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
                     (unsigned long long)(slowest_ns / 1000000));
                 vk_tex_check_log();
                 vk_tex_take_log();
-                if (vk_shader_folds())
-                    LOG("vulkan: %llu of those shaders translated again, to hold more of their draws' constant buffer "
-                        "words as constants\n",
-                        (unsigned long long)vk_shader_folds());
+                u64 folds, fold_pipes, fold_dropped;
+                vk_shader_fold_stats(&folds, &fold_pipes, &fold_dropped);
+                if (folds)
+                    LOG("vulkan: %llu of those shaders translated again on the pipeline workers, to hold as constants "
+                        "the constant buffer words their draws found %u submits in a row, %llu of them dropped; %llu "
+                        "pipelines made for them before a draw took one\n",
+                        (unsigned long long)folds, SH_CB_FOLD_STABLE, (unsigned long long)fold_dropped,
+                        (unsigned long long)fold_pipes);
                 slow_frames = slowest_ns = 0;
                 if (g_vk.has_gpl) {
                     u64 made[4], hits[4], make_ms[4], links, link_ms, opts, opt_ms;
                     vk_pipeline_lib_stats(made, hits, make_ms, &links, &link_ms, &opts, &opt_ms);
                     LOG("vulkan: pipeline libraries: %llu pre-rasterization and %llu fragment shader parts made (%llu "
                         "and %llu from the cache, %llu and %llu ms), %llu vertex input and %llu fragment output parts "
-                        "(%llu ms); %llu links (%llu ms); %llu optimized pipelines made in the background (%llu ms)\n",
+                        "(%llu ms); %llu links (%llu ms); %llu optimized pipelines made in the background (%llu ms), "
+                        "for %llu links drawn in %u presents or more\n",
                         (unsigned long long)made[1], (unsigned long long)made[2], (unsigned long long)hits[1],
                         (unsigned long long)hits[2], (unsigned long long)make_ms[1], (unsigned long long)make_ms[2],
                         (unsigned long long)made[0], (unsigned long long)made[3],
                         (unsigned long long)(make_ms[0] + make_ms[3]), (unsigned long long)links,
-                        (unsigned long long)link_ms, (unsigned long long)opts, (unsigned long long)opt_ms);
+                        (unsigned long long)link_ms, (unsigned long long)opts, (unsigned long long)opt_ms,
+                        (unsigned long long)vk_pipeline_opt_asked(), PIPE_OPT_PRESENTS);
                     if (g_vk.has_shader_objects) {
                         u64 so_made, so_binary, so_ms, so_mb;
                         vk_so_stats(&so_made, &so_binary, &so_ms, &so_mb);
@@ -1078,6 +1106,15 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
                     (unsigned long long)(bbuf >> 20), (unsigned long long)(usage >> 20),
                     (unsigned long long)(budget >> 20), (unsigned long long)(trimmed >> 20),
                     (unsigned long long)(vk_surf_ended_freed() >> 20));
+                VkRtKinds k;
+                vk_rt_kinds(&k);
+                LOG("vulkan: render targets by what they hold: %u that later ones drew all over (%llu MB, %u parked), "
+                    "%u that memory holds or that hold nothing (%llu MB, %u parked), %u with pixels memory lacks (%llu "
+                    "MB, %u parked); %u copies of them (%llu MB); %llu MB let go that the frames in flight still hold\n",
+                    k.n[0], (unsigned long long)(k.bytes[0] >> 20), k.parked[0], k.n[1],
+                    (unsigned long long)(k.bytes[1] >> 20), k.parked[1], k.n[2], (unsigned long long)(k.bytes[2] >> 20),
+                    k.parked[2], k.copies, (unsigned long long)(k.copy_bytes >> 20),
+                    (unsigned long long)(vk_deferred_bytes() >> 20));
             }
             vk_tex_report_log();
             LOG("vulkan: %llu draws sampled a target they render to in place (%llu barriers in passes, %llu passes "
@@ -1177,7 +1214,16 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
        of the frame after its present, which they never hold back */
     vk_tex_kind_frame();
     vk_tex_later_frame();
-    vk_tex_defrag_frame();
+    {
+        static u64 last_game_ns; /* the game's last frame shown, for the defrag's share of this one */
+        u64 frame_ns = 0;
+        if (game) {
+            const u64 now = plat_ns();
+            frame_ns = last_game_ns ? now - last_game_ns : 0;
+            last_game_ns = now;
+        }
+        vk_tex_defrag_frame(frame_ns, game ? period_ns : 0);
+    }
     if (recreate && !g_lost && !g_vk.sc_lost) { /* not when this frame's create found the surface lost */
         vk_finish();
         vk_swapchain_create(kind);
@@ -1244,6 +1290,11 @@ static void vkr_present_buffer(u64 cpu_addr, u32 w, u32 h, u32 pitch, u32 layout
     if (src && overlay_loading_shown()) { /* and so does a loaded save state's box, before its first frame */
         ui_lock();
         overlay_game_drew();
+        ui_unlock();
+    }
+    if (src && overlay_settings_waiting()) { /* the settings off their default, named from the game's first frame */
+        ui_lock();
+        overlay_settings_start(plat_ns());
         ui_unlock();
     }
     show(src, &hdr, x1 - x0, y1 - y0, transform, 1, released_ns, period_ns, shown_syncpt);
@@ -1592,6 +1643,7 @@ const Renderer vk_renderer = {
     .render_predicate = vk_render_predicate,
     .render_predicate_drop = vk_render_predicate_drop,
     .release_retire = vk_release_retire,
+    .release_wait = vk_release_wait,
     .report_stall = vk_report_stall,
     .memory_text = vk_memory_text,
     .memory_blocks = vk_memory_blocks,

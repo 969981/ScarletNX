@@ -17,6 +17,8 @@ import android.content.ComponentName;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.content.pm.ShortcutInfo;
+import android.content.pm.ShortcutManager;
 import android.net.Uri;
 import android.os.Environment;
 import android.provider.DocumentsContract;
@@ -198,6 +200,63 @@ public class MainActivityTest {
     @Test
     public void aGameStartedWithoutArgumentsGetsNone() {
         assertArrayEquals(new String[0], Robolectric.buildActivity(GameActivity.class).get().getArguments());
+    }
+
+    /** a PLAY's title ID (PlayActivity) is the menu's to take once, as it comes in front (main.c's play_take) */
+    @Test
+    public void aPlayIsKeptUntilTheMenuTakesIt() {
+        assertArrayEquals(new byte[0], menu.takePlay());
+        menu.onNewIntent(MainActivity.fromIcon(menu).putExtra(PlayActivity.TITLE_ID, "0100ABCD00010000"));
+        assertArrayEquals("0100ABCD00010000".getBytes(StandardCharsets.UTF_8), menu.takePlay());
+        assertArrayEquals("taken once", new byte[0], menu.takePlay());
+        // a second PLAY before the menu took the first: the newer one
+        menu.onNewIntent(MainActivity.fromIcon(menu).putExtra(PlayActivity.TITLE_ID, "0100ABCD00010000"));
+        menu.onNewIntent(MainActivity.fromIcon(menu).putExtra(PlayActivity.TITLE_ID, "0100ABCD00020000"));
+        assertArrayEquals("0100ABCD00020000".getBytes(StandardCharsets.UTF_8), menu.takePlay());
+        // the icon's own tap asks nothing
+        menu.onNewIntent(MainActivity.fromIcon(menu));
+        assertArrayEquals(new byte[0], menu.takePlay());
+    }
+
+    /** a game the menu started (main.c's shortcut_played): with a title ID, first on the app's icon, opening it
+        through PLAY; without one, none, and it is the game that runs either way */
+    @Test
+    public void aGameStartedIsTheIconsFirstShortcut() {
+        ShortcutManager shortcuts = menu.getSystemService(ShortcutManager.class);
+        shadowOf(shortcuts).setMaxShortcutCountPerActivity(4);
+        byte[] id = "0100ABCD00010000".getBytes(StandardCharsets.UTF_8);
+        assertArrayEquals(new byte[0], menu.played(id, "a game".getBytes(StandardCharsets.UTF_8), null));
+        assertEquals("0100ABCD00010000", MainActivity.playing());
+        assertEquals(1, shortcuts.getDynamicShortcuts().size());
+        ShortcutInfo shortcut = shortcuts.getDynamicShortcuts().get(0);
+        assertEquals("a game", shortcut.getShortLabel().toString());
+        assertEquals("0100ABCD00010000", shortcut.getIntent().getStringExtra(PlayActivity.TITLE_ID));
+        assertArrayEquals(new byte[0], menu.played(new byte[0], "a homebrew".getBytes(StandardCharsets.UTF_8), null));
+        assertEquals("", MainActivity.playing());
+        assertEquals(1, shortcuts.getDynamicShortcuts().size());
+    }
+
+    /** the box's Add to Home Screen: the home screen asked, or why not, as UTF-8 */
+    @Test
+    public void aGameToTheHomeScreenOrWhyNot() {
+        ShortcutManager shortcuts = menu.getSystemService(ShortcutManager.class);
+        byte[] id = "0100ABCD00010000".getBytes(StandardCharsets.UTF_8);
+        byte[] name = "a game".getBytes(StandardCharsets.UTF_8);
+        shadowOf(shortcuts).setIsRequestPinShortcutSupported(false);
+        assertEquals("This home screen takes no shortcuts",
+                     new String(menu.pin(id, name, null), StandardCharsets.UTF_8));
+        shadowOf(shortcuts).setIsRequestPinShortcutSupported(true);
+        assertArrayEquals(new byte[0], menu.pin(id, name, null));
+        assertEquals("0100ABCD00010000", shortcuts.getPinnedShortcuts().get(0).getId());
+    }
+
+    /** the recent apps' list starts a task that has gone with the intent it began with: its PLAY was played then */
+    @Test
+    public void aStartFromTheRecentAppsPlaysNothingAgain() {
+        menu.onNewIntent(MainActivity.fromIcon(menu)
+                             .putExtra(PlayActivity.TITLE_ID, "0100ABCD00010000")
+                             .addFlags(Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY));
+        assertArrayEquals(new byte[0], menu.takePlay());
     }
 
     /** what the menu started for a result since the last call, but the screen requestPermissions starts */

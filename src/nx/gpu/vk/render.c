@@ -253,6 +253,38 @@ static VkExtent2D target_extent(Surf* const* rt, const Surf* zt, u32 n) {
     }
     return ext;
 }
+/* async_pipelines skips a draw whose pipeline a worker still makes, and a skipped draw comes back only where a later
+   frame draws the target over again. A target drawn once and kept (a menu's layers, sampled after) kept the hole for
+   good: a racing game's character select lost its background, its text and its cards' fill. So a draw is skipped only
+   into targets the game regenerates every frame (redraw.h): drawn SNX_VK_REDRAW_FRAMES frames in a row and cleared
+   whole this frame, a color target also where the pass's depth target was (a scene drawn over a cleared depth). Into
+   any other the draw waits for its pipeline, as without async_pipelines, and so does a pass with no target */
+/* a test's: on, every target counts as one the game regenerates every frame (vk_async_every) */
+static int g_async_every;
+void vk_async_every(int on) { g_async_every = on; }
+static int target_skippable(const Surf* s, int depth_cleared) {
+    if (g_async_every) return 1;
+    return snx_vk_redraw_run(&s->redraw, g_vk_present) >= SNX_VK_REDRAW_FRAMES &&
+           (depth_cleared || snx_vk_redraw_cleared_now(&s->redraw, g_vk_present));
+}
+static int targets_skippable(Surf* const* rt, u32 n, const Surf* zt) {
+    int any = zt != NULL, depth_cleared = zt && snx_vk_redraw_cleared_now(&zt->redraw, g_vk_present);
+    if (zt && !target_skippable(zt, 0)) return 0;
+    for (u32 i = 0; i < n; i++) {
+        if (!rt[i]) continue;
+        any = 1;
+        if (!target_skippable(rt[i], depth_cleared)) return 0;
+    }
+    return any;
+}
+/* what the recording thread was last told (rec_async_pass): told again only where a draw's answer differs */
+static int g_async_told;
+static void async_tell(int may_skip) {
+    if (may_skip == g_async_told) return;
+    rec_async_pass(vk_cmd(), may_skip);
+    g_async_told = may_skip;
+}
+
 /* opens a rendering pass on these targets (begun at its first command: rp_record), or keeps the open one if it is the
    same set. zt_ro: the depth target is
    bound read-only, so draws can sample it too (soft particles test against depth they also read). fb: color slots the
@@ -274,6 +306,9 @@ static int render_begin(Surf** rt, Surf* zt, u32 n, int zt_ro, int srgb_write, u
     if (same) g_vk_fb_restarts++; /* only a target's layout changes */
     vk_render_end();
     VkCommandBuffer cb = vk_cmd();
+    for (u32 i = 0; i < n; i++)
+        if (rt[i]) snx_vk_redraw_seen(&rt[i]->redraw, g_vk_present);
+    if (zt) snx_vk_redraw_seen(&zt->redraw, g_vk_present);
     u32 loops = 0;
     VkRenderingAttachmentInfo ca[8];
     VkExtent2D ext = {~0u, ~0u};
@@ -361,6 +396,7 @@ static int render_begin(Surf** rt, Surf* zt, u32 n, int zt_ro, int srgb_write, u
 static void target_written(Surf* s) {
     vk_surf_wrote(s);
     vk_rt_drawn(s);
+    vk_rt_copy_drawn(s);
 }
 /* a draw or clear wrote the depth target, which was undefined (its layout, before the pass, or still) when that is
    pred_undefined. One predicated on the GPU may not have run, and depth is never loaded from memory: until a write
@@ -382,6 +418,7 @@ static int render_begin_empty_area(VkExtent2D ext, u32 layers) {
         g_rp.layers == layers)
         return 1;
     vk_render_end();
+    async_tell(0); /* no attachment: what its draws keep is only what they store, which no target tells */
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, ext}, .layerCount = layers};
     vk_predraw_pass_begin(vk_cmd());
     vk_gpuprof_pass_begin(vk_cmd(), NULL, NULL);
@@ -883,6 +920,10 @@ static void clear_targets(const DsState* ds, const DrawClear* c, const DrawOwner
        or a predicated one (a load op clears the render area, always), or a color clear of some components only */
     int whole = rect.rect.offset.x == 0 && rect.rect.offset.y == 0 && rect.rect.extent.width == g_rp.ext.width &&
                 rect.rect.extent.height == g_rp.ext.height;
+    if (whole && !o->pred && layers == 1) { /* the frame regenerates what it clears whole (targets_skippable) */
+        if (color_clear) snx_vk_redraw_cleared(&g_rp.rt[slot]->redraw, g_vk_present);
+        if (za & VK_IMAGE_ASPECT_DEPTH_BIT) snx_vk_redraw_cleared(&g_rp.zt->redraw, g_vk_present);
+    }
     if (!g_rp.begun && !o->pred && layers == 1 && whole && (!color || color_clear) && (color_clear || za)) {
         if (color_clear) {
             VkRenderingAttachmentInfo* a = &g_rp.ca[slot];
@@ -1384,6 +1425,7 @@ static struct {
     VkDrawCounts n, was;
     u32 epoch; /* the last draw's write tracking epoch */
     u64 present, drawn, kept, dset_new, dset_reused, targets_kept, submits[VK_SUB_N];
+    u64 restrided, restrides; /* the vertex streams restrided so far (restride), and at the last report */
     u32 ww_epoch;
     u64 heap_buffer_calls, heap_buffer_hits, heap_image_calls, heap_image_hits, heap_cb_addresses;
 } g_stats;
@@ -1444,6 +1486,7 @@ static void fs_count_log(const VkDrawCounts* n, const VkDrawCounts* w, u64 prese
         d[VK_FS_TAKE], d[VK_FS_SURFACES], d[VK_FS_EPOCH], d[VK_FS_PRESENT], d[VK_FS_HANDLES], d[VK_FS_QUIET],
         d[VK_FS_UNKEPT_IMAGES], d[VK_FS_UNKEPT_TEXTURES]);
 }
+u64 vk_render_restrided(void) { return g_stats.restrided; }
 void vk_render_stats_log(void) {
     const VkDrawCounts* n = &g_stats.n;
     const VkDrawCounts* w = &g_stats.was;
@@ -1524,6 +1567,12 @@ void vk_render_stats_log(void) {
     LOG("vulkan: constant buffers copied from the CPU in the last %llu presents: %.1f KB a present\n",
         (unsigned long long)presents, (double)g_cb_copied_bytes / 1024.0 / (double)presents);
     g_cb_copied_bytes = 0;
+    if (g_stats.restrided != g_stats.restrides)
+        LOG("vulkan: %llu vertex streams restrided on the GPU in the last %llu presents, a dispatch that ended the "
+            "rendering pass each: their strides are no multiple of their attributes' components, which the device "
+            "reads only with VK_EXT_legacy_vertex_attributes\n",
+            (unsigned long long)(g_stats.restrided - g_stats.restrides), (unsigned long long)presents);
+    g_stats.restrides = g_stats.restrided;
     g_stats.was = g_stats.n;
     g_stats.present = g_vk_present;
     g_stats.drawn = g_vk_drawn;
@@ -3791,8 +3840,8 @@ static VkDescriptorSet stage_set_(const DsState* ds, int stage, VkSh* s, Surf** 
     d.cb_addr = vk_cb_addr_mask(&s->si);
     /* the profiler's zones of a stage's set: its constant buffers, storage buffers, textures and the set itself */
     SNX_ZONE(zcb, "stage set constants");
-    for (int i = 0; i < 18; i++) {
-        if (!(s->si.cbuf_mask & (1u << i))) continue;
+    for (u32 banks = s->si.cbuf_mask & 0x3FFFFu; banks; banks &= banks - 1) { /* the banks the program has */
+        const int i = (int)snx_ctz32(banks);
         u32 sz = cb_range(ds, stage, s, i);
         VkBuffer b;
         u64 o;
@@ -4378,6 +4427,9 @@ static struct {
     int vb_strided;
     VkBuffer vb_buf[33];
     VkDeviceSize vb_off[33], vb_size[33], vb_stride[33];
+    /* the blending set as dynamic state (g_vk.dyn_blend): the targets' count, 0 for none since the last bind */
+    u32 blend_n;
+    VkPipelineColorBlendAttachmentState blend[8];
 } g_dyn;
 #define DYN(field, value, call)                                                                                        \
     do {                                                                                                               \
@@ -4420,6 +4472,7 @@ static void pr_dynamic(VkCommandBuffer cb, const PipeKey* k, int minus_one, int 
     if ((d & VK_DYN_PR_PATCH) && k->tes) DYN(patch, k->patch, rec_CmdSetPatchControlPointsEXT(cb, k->patch));
 }
 u64 g_vk_drawn, g_vk_skipped, g_vk_mesh_draws, g_vk_mesh_drawn, g_vk_mesh_task_compute;
+u64 g_vk_async_early;
 /* draws whose depth the console both clips and clamps (its clamp off), and of them those that write their own depth or
    take a depth bias, whose depth may leave the viewport's range: undefined there without VK_EXT_depth_clip_enable */
 u64 g_vk_depth_apart_draws, g_vk_depth_apart_moved;
@@ -4694,6 +4747,7 @@ static void draw_drop(u32 i) {
     if (i >= DRAW_TABLE) g_draw.tag[(i - DRAW_TABLE) / DRAW_WAYS][(i - DRAW_TABLE) % DRAW_WAYS] = 0;
     if (g_draw.last == i) g_draw.last = 0;
 }
+const VkSh* vk_render_last_fs(void) { return g_draw.fs; }
 void vk_render_draws_forget(void) {
     memset(g_draw.tag, 0, sizeof g_draw.tag);
     draw_forget();
@@ -5396,8 +5450,10 @@ static int draw_key(const DsState* ds, const DrawShaders* sh, const VkSh* fs, Su
         return 0;
     }
     /* Maxwell reads an attribute at any byte, Vulkan only at a multiple of its components' size, which a stride like
-       one game's 69 for 4-byte floats breaks every other vertex: RADV's fetches hung the GPU on them */
-    for (u32 b = 0; b < vi->nbind; b++) {
+       one game's 69 for 4-byte floats breaks every other vertex: RADV's fetches hung the GPU on them. With
+       VK_EXT_legacy_vertex_attributes the device reads them at any byte too (components of 8 bytes excepted, which no
+       attribute here has) */
+    for (u32 b = 0; b < vi->nbind && !g_vk.has_legacy_vertex; b++) {
         u32 st = (u32)pl->stride[b], a = align[b];
         if (!st || a < 2 || !(st % a)) continue;
         pl->guest_stride[b] = st;
@@ -5626,6 +5682,7 @@ static void fetch_records(const VertexPlan* pl, const VkBuffer* vbuf, const VkDe
 }
 static int restride(u64 gva, u64 len, u32 gstride, u32 stride, VkBuffer* buf, VkDeviceSize* off, VkDeviceSize* size) {
     u64 nv = (len + gstride - 1) / gstride, lo = gva & ~3ull, hi = (gva + len + 3) & ~3ull;
+    g_stats.restrided++;
     VkBuffer src;
     u64 at;
     if (nv > 0xFFFFFFFFu || !vk_buf_get_input(lo, hi - lo, 4, &src, &at)) return 0;
@@ -6206,7 +6263,11 @@ static int g_setup_restarts;
 int vk_render_setup_restarts(void) { return g_setup_restarts; }
 static void render_draw_main(const DsState* ds, const DrawCall* dc, DrawOwner* o, const DrawTexture* texture);
 static void render_draw(const DsState* ds, const DrawCall* dc, DrawOwner* o, const DrawTexture* texture) {
+    static u64 serial;
+    const u64 was = g_vk_drawing; /* a draw recorded within another (its slices) */
+    g_vk_drawing = ++serial;      /* the copies of targets it samples (texture.c copy_read) */
     render_draw_main(ds, dc, o, texture);
+    g_vk_drawing = was;
     g_setup_restarts = 0;
 }
 static void render_draw_main(const DsState* ds, const DrawCall* dc, DrawOwner* o, const DrawTexture* texture) {
@@ -6698,6 +6759,30 @@ retry:
                                        (ds->dyn.window_origin & DS_ORIGIN_LOWER_LEFT) != 0, ds->dyn.sprite_origin)
                      : 0;
     if (kept && fs_spec != ke->k.fs_spec) kept = 0;
+    /* async_pipelines: a kept draw whose pipeline a worker still makes is dropped here, before its vertex buffers,
+       storage, sets, per-draw block, indices and pass. The recording thread drops such a draw at its bind
+       (rec_drop_draw), after all of that was made for it. The kept key is this draw's key but for the feedback loop,
+       topology class and polygon mode, which are known only below. So only where those can't differ from the kept
+       key's: feedback is dynamic state (0 in each key), and the draw isn't made into lines or points (edges, which
+       stays 0 below when it is 0 here). Not a draw that captures transform feedback: its buffers' counters go on
+       from what the draws before it bound */
+    if (kept && !check && g_settings.async_pipelines && g_vk.has_feedback_dynamic && !edges && !xfb_on &&
+        targets_skippable(rt, n, zt) && ke->k.topo_class == (mesh ? 0 : topology_class(topology_vk(topology))) &&
+        ke->k.polygon == polygon_mode(&ds->rkey)) {
+        int pending;
+        (void)vk_pipeline_now(ke->pipe, &pending);
+        if (pending) {
+            g_vk_draw_kept++;
+            ke->used = ++g_draw.use;
+            g_draw.last = found;
+            g_draw.fs = fs;
+            g_vk_skipped++;
+            if (g_vk_async_early++ % 1000 == 0)
+                LOG("vulkan: %llu draws skipped before their setup while their pipelines were made (async_pipelines)\n",
+                    (unsigned long long)g_vk_async_early);
+            return;
+        }
+    }
     PipeKey made_k;
     VertexPlan made_pl;
     const PipeKey* k = kept ? &ke->k : &made_k;
@@ -6750,6 +6835,9 @@ retry:
         }
         if (fk.advanced_mask & SH_ALPHA_TO_ONE) made_k.alpha_to_one = 0;
         if (ratio_one_flags && (dc->coverage_mode & 2)) made_k.alpha_to_one = 0;
+        /* only now: a capture's or a save draw's targets, and alpha to coverage, are written where the guest's masks
+           leave nothing, and a target left UNDEFINED that a draw writes is invalid (VUID-vkCmdDraw-pColorAttachments-08963) */
+        if (g_vk.has_unused_attachments) vk_pipe_unwritten_targets(&made_k);
         if (kept && memcmp(&made_pl, pl, sizeof made_pl)) {
             draw_differs("vertex bindings");
             kept = 0;
@@ -7264,6 +7352,10 @@ retry:
         pipe = pe->pipe;
     else
         pipe = vk_pipeline_get_deferred(k);
+    /* the fragment program's words a translation that folds more would hold, counted, and that translation's pipeline
+       for this key made beside the draws once it is made. Before the check below: it can read guest memory */
+    if (fs && !texture && !vk_host_programs(&ds->prog) && g_predraw.phase != 1)
+        vk_shader_fold_draw(ds, fs, ds->prog.code[5], pipe ? k : NULL);
     if (!pipe) {
         draw_images_discard(&images);
         if (late_depth) vk_depth_shadow_cancel();
@@ -7399,6 +7491,7 @@ retry:
                                                   bound) &&
                                   feedback_order(fb, writes, strict_feedback);
     g_rp.rate_want = RATE_KEEP;
+    if (begun) async_tell(!programmable_blend && targets_skippable(rt, n, zt));
     if (!begun) {
         draw_images_discard(&images);
         if (late_depth) vk_depth_shadow_cancel();
@@ -7425,6 +7518,7 @@ retry:
     }
     if (fresh || g_dyn.pipe != pipe) {
         g_dyn.pipe = pipe;
+        g_dyn.blend_n = 0; /* a pipeline with its blend static, or shader objects' bind, set it over */
         rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         /* a mesh pipeline has no topology, restart or vertex input state: the next draw's pipeline that has them
            dynamic takes them again after it (dynamic state set before a pipeline that has it static is lost) */
@@ -7440,6 +7534,16 @@ retry:
         }
     }
     if (g_vk.dyn_pr) pr_dynamic(cb, k, !ds->dyn.depth_mode, fresh);
+    /* the draw's blending, where its pipeline takes it as dynamic state (vk_pipe_blend_key's keys) */
+    if (g_vk.dyn_blend && k->ncolor && !k->advanced.operation) {
+        VkPipelineColorBlendAttachmentState cba[8];
+        vk_pipe_blend(k, cba);
+        if (g_dyn.blend_n != k->ncolor || memcmp(g_dyn.blend, cba, k->ncolor * sizeof *cba)) {
+            g_dyn.blend_n = k->ncolor;
+            memcpy(g_dyn.blend, cba, k->ncolor * sizeof *cba);
+            rec_CmdSetColorBlendState(cb, k->ncolor, cba);
+        }
+    }
     vk_vrs_draw(cb, dc->shading_rate);
     vk_descriptor_heaps_pipeline_state(g_vk.has_descriptor_heaps);
     if (g_vk.has_feedback_dynamic)
