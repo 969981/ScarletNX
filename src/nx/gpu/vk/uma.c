@@ -110,6 +110,7 @@
 #include "nx/runtime/platform/plat.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
+#include "nx/runtime/platform/tracy.h"
 #if defined(__ANDROID__)
 #include <vulkan/vulkan_android.h>
 #endif
@@ -1984,13 +1985,21 @@ static void wait_out_why(const Out* o, int why) {
     const u64 sub = o->sub, t0 = plat_ns();
     atomic_fetch_add_explicit(&g_uma.wait_by[why], 1, memory_order_relaxed);
     g_uma.out_waits++;
+    /* vk_uma_mem_need_cpu's callers (a video decoder's and VIC's picture) hold nothing of the frame across it: the
+       thread that records the frame takes vk_lock meanwhile, where that wait held it up for each picture of a video */
+    const int let_go = why == 2; /* mem-need-cpu */
     if (sub > vk_last_submit()) {
         g_uma.open_waits++;
         g_uma.wait_open[why]++;
         read_soon_add(o->prog);
-        vk_finish();
+        if (let_go)
+            vk_finish_letting_go();
+        else
+            vk_finish();
     } else {
+        const int paused = let_go && vk_lock_pause();
         vk_wait_submit(sub);
+        vk_lock_resume(paused);
         vk_land_through(sub);
     }
     g_uma.wait_ns[why] += plat_ns() - t0;
@@ -2063,6 +2072,9 @@ int vk_uma_publish(u64 cpu, u64 len, VkBuffer src, u64 off) {
     VkBuffer ib;
     u64 io;
     if (!vk_uma_held(cpu, len) || !bind(cpu, len, 1, &ib, &io)) return 0; /* no import made for it */
+    /* a landing the import takes instead of a trap: the bytes copied into it, and why there was no trap */
+    SNX_ZONE_T(z, "vk mem uma publish", "%s", "no owner or trap, import holds the bytes");
+    SNX_ZONE_VALUE(z, len);
     vk_render_end();
     VkCommandBuffer cb = vk_cmd();
     vk_all_barrier_by(VK_BAR_UMA,
