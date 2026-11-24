@@ -605,6 +605,7 @@ VkCommandBuffer vk_cmd(void) {
         }
         vk_rec_begin(f->cbs[f->icb]);
         vk_gpuprof_cb_begin(f->cbs[f->icb]);
+        vk_stamp_cb_begin(f->cbs[f->icb]);
         f->recording = 1;
         g_cb_begun++;
     }
@@ -635,10 +636,9 @@ void vk_stage_report(void) {
     char line[512];
     int at = 0;
     for (u32 r = 0; r < XRING_N; r++)
-        at += snprintf(line + at, sizeof line - (size_t)at, " %s %llu/%llu/%llu", ring[r],
-                       (unsigned long long)(g_xfer[r][XFER_HOST] >> 20),
-                       (unsigned long long)(g_xfer[r][XFER_MAPPED] >> 20),
-                       (unsigned long long)(g_xfer[r][XFER_DEVICE] >> 20));
+        at = snx_appendf(
+            line, sizeof line, at, " %s %llu/%llu/%llu", ring[r], (unsigned long long)(g_xfer[r][XFER_HOST] >> 20),
+            (unsigned long long)(g_xfer[r][XFER_MAPPED] >> 20), (unsigned long long)(g_xfer[r][XFER_DEVICE] >> 20));
     LOG("vulkan: ring MB over 600 presents (in host/mapped device/device memory):%s; the rings hold %llu MiB, %llu "
         "buffers made for them in all, %llu of the device ring's in system memory for want of the device's\n",
         line, (unsigned long long)(vk_ring_bytes() >> 20), (unsigned long long)g_cmd.made,
@@ -1194,6 +1194,7 @@ static void submit(const VkSemaphoreSubmitInfo* xw, const VkSemaphoreSubmitInfo*
     if (xs) s[1] = *xs;
     vk_ck(cb, VK_CK_SUBMIT, (u32)why, 0, 0, 0);
     vk_gpuprof_cb_end(cb, why, atomic_load_explicit(&g_gval, memory_order_relaxed) + 1);
+    vk_stamp_cb_end(cb, atomic_load_explicit(&g_gval, memory_order_relaxed) + 1);
     /* ended and submitted after its commands, on the recording thread (a submission that fails signals the timeline
        from the host there, so waits for it end) */
     vk_rec_submit(up, cb, w, nw, s, xs ? 2u : 1u);
@@ -1210,10 +1211,12 @@ static void submit(const VkSemaphoreSubmitInfo* xw, const VkSemaphoreSubmitInfo*
     g_rec_unsafe--;
     /* results of submissions the GPU has finished land now, so a later release doesn't find them pending */
     u64 done = 0;
-    if (land && VK_OK(vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, &done)))
+    if (land && VK_OK(vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, &done))) {
         land_through(done < atomic_load_explicit(&g_gval, memory_order_relaxed)
                          ? done
                          : atomic_load_explicit(&g_gval, memory_order_relaxed));
+        vk_stamp_fold(done); /* their report timestamps' values, and their queries free again */
+    }
     SNX_ZONE_END(z_submit);
 }
 

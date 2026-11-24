@@ -48,9 +48,11 @@ if(SNX_TEST_SANITIZERS)
     cmake_language(DEFER DIRECTORY "${PROJECT_SOURCE_DIR}" CALL snx_test_sanitize
         # the common code: the platform layer, network, filesystems, LZ4, ZBIC and xxHash, the Vulkan setup the
         # frontends share, the GL layer's state, the launcher's HTTPS and the roots it carries, the zip reader of VPKs
-        # and APKs, the glTF reader of a Mii's parts, the DS's and the 3DS's online services
+        # and APKs, the glTF reader of a Mii's parts, the DS's and the 3DS's online services, the Bluetooth LE scan and
+        # its system backend
         scarletnx-common scarletnx-platform scarletnx-net scarletnx-ldn scarletnx-filesystem snx_demangle snx_lz4
-        snx_zbic snx_xxhash snx_vk_common snx_gl snx_https snx_cacert snx_zip snx_cgltf snx_online
+        snx_zbic snx_xxhash snx_vk_common snx_gl snx_https snx_cacert snx_zip snx_cgltf snx_online snx_ble
+        snx_ble_system
         snx-logscan
         # the recompiler, its backends and what they take of the common code
         snx_recompiler_base snx_llvm snx_arm_llvm snx_arm_decode scarletnx-recompiler scarletnx-recompiler-shared
@@ -937,6 +939,10 @@ if(UNIX)
     snx_test_target(snx-test-common-mounts c23)
     target_link_libraries(snx-test-common-mounts PRIVATE scarletnx-common)
     add_test(NAME common_mounts COMMAND snx-test-common-mounts)
+    add_executable(snx-test-common-appendf common_appendf.c)
+    snx_test_target(snx-test-common-appendf c23)
+    target_link_libraries(snx-test-common-appendf PRIVATE scarletnx-common)
+    add_test(NAME common_appendf COMMAND snx-test-common-appendf)
     add_executable(snx-test-data-dir data_dir.c)
     snx_test_target(snx-test-data-dir c23)
     target_link_libraries(snx-test-data-dir PRIVATE scarletnx-common)
@@ -1357,9 +1363,39 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sailgen/extract.sail"
 add_custom_target(snx_sailgen_extract_test ALL DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/sailgen/extract.sail")
 add_test(NAME sailgen_extract COMMAND "${CMAKE_COMMAND}" -E compare_files --ignore-eol
          "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/extract_expected.sail" "${CMAKE_CURRENT_BINARY_DIR}/sailgen/extract.sail")
+# --sdm reads pdftotext's layout of an instruction page (a footer's page number, a row whose operands a footnote's
+# superscript pushed onto the line above, the stacked tables with a CPUID column) and puts an override's section in
+# place of the page's; the fixture is written for the test, not the manual's text
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sailgen/sdm.pages"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/sailgen"
+    COMMAND snx-sailgen --sdm "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/sdm_fixture.txt"
+            -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/sdm.pages" --overlay "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/sdm_override.sdm"
+    DEPENDS snx-sailgen "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/sdm_fixture.txt"
+            "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/sdm_override.sdm" VERBATIM)
+add_custom_target(snx_sailgen_sdm_test ALL DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/sailgen/sdm.pages")
+add_test(NAME sailgen_sdm COMMAND "${CMAKE_COMMAND}" -E compare_files --ignore-eol
+         "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/sdm_expected.pages" "${CMAKE_CURRENT_BINARY_DIR}/sailgen/sdm.pages")
+# --isel derives the selection from pages in the manual's notation (written for the test): ADD for an addition, SUB
+# for SUBS with Arm's C the negation of CF and Arm's conditions as Intel's condition codes, CMP and SUB for CMP, SHL's
+# loop for LSLV (its count mask Arm's MOD 64), SETcc on a zeroed register for CSET, and a page it can't read, with why
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/sailgen/isel.report"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/sailgen"
+    COMMAND snx-sailgen --isel "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/isel_fixture.pages"
+            --ops "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/isel_fixture.ops" -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/isel.inc"
+            --report "${CMAKE_CURRENT_BINARY_DIR}/sailgen/isel.report"
+    DEPENDS snx-sailgen "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/isel_fixture.pages"
+            "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/isel_fixture.ops" VERBATIM)
+add_custom_target(snx_sailgen_isel_test ALL DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/sailgen/isel.report")
+add_test(NAME sailgen_isel COMMAND "${CMAKE_COMMAND}" -E compare_files --ignore-eol
+         "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/isel_expected.report" "${CMAKE_CURRENT_BINARY_DIR}/sailgen/isel.report")
+# and over more primitives than its evaluations once had room for: every one evaluated
+add_test(NAME sailgen_isel_widths
+         COMMAND "${CMAKE_COMMAND}" "-DSAILGEN=$<TARGET_FILE:snx-sailgen>" "-DDIR=${CMAKE_CURRENT_SOURCE_DIR}/sailgen"
+                 "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/sailgen/widths" -P "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/isel_widths_check.cmake")
+set_tests_properties(sailgen_isel_widths PROPERTIES PASS_REGULAR_EXPRESSION "sailgen_isel_widths: 260 evaluations")
 add_test(NAME sailgen_refused
          COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused.roots"
-                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
+                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/bits.h" --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                  --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h" -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused.inc"
                  "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused.sail")
 set_tests_properties(sailgen_refused PROPERTIES PASS_REGULAR_EXPRESSION
@@ -1369,7 +1405,7 @@ set_tests_properties(sailgen_refused PROPERTIES PASS_REGULAR_EXPRESSION
 foreach(case IN ITEMS register field)
     add_test(NAME sailgen_refused_${case}
              COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_${case}.roots"
-                     --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
+                     --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/bits.h" --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                      --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
                      -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused_${case}.inc"
                      "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_${case}.sail")
@@ -1395,7 +1431,7 @@ set_tests_properties(sailgen_refused_mention_field PROPERTIES PASS_REGULAR_EXPRE
 foreach(case IN ITEMS see pin)
     add_test(NAME sailgen_refused_${case}
              COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_${case}.roots"
-                     --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
+                     --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/bits.h" --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                      --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
                      -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused_${case}.inc"
                      "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_${case}.sail")
@@ -1408,7 +1444,7 @@ set_tests_properties(sailgen_refused_pin PROPERTIES PASS_REGULAR_EXPRESSION
 # refused at the throw
 add_test(NAME sailgen_refused_unpredictable
          COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_unpredictable.roots"
-                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
+                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/bits.h" --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                  --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
                  -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused_unpredictable.inc"
                  "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_unpredictable.sail")
@@ -1417,7 +1453,7 @@ set_tests_properties(sailgen_refused_unpredictable PROPERTIES PASS_REGULAR_EXPRE
 # a struct's field may take a value known when the recompiler runs, not one known only when the guest runs
 add_test(NAME sailgen_refused_struct
          COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_struct.roots"
-                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
+                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/bits.h" --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                  --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
                  -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused_struct.inc"
                  "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_struct.sail")
@@ -1439,7 +1475,7 @@ set_tests_properties(sailgen_refused_action PROPERTIES PASS_REGULAR_EXPRESSION
 foreach(case IN ITEMS op more some sides base state)
     add_test(NAME sailgen_refused_halves_${case}
              COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_halves_${case}.roots"
-                     --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
+                     --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/bits.h" --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                      --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
                      -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused_halves_${case}.inc"
                      "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/halves.sail")
@@ -1458,7 +1494,7 @@ set_tests_properties(sailgen_refused_halves_state PROPERTIES PASS_REGULAR_EXPRES
     "halves.sail:62: error: the register GPR written where a function that calls itself joins what it gives for each half")
 add_test(NAME sailgen_halves
          COMMAND "${CMAKE_COMMAND}" "-DSAILGEN=$<TARGET_FILE:snx-sailgen>"
-                 "-DCORE=${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
+                 "-DBITS=${PROJECT_SOURCE_DIR}/tools/sailgen/bits.h" "-DCORE=${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                  "-DBACKEND=${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
                  "-DDIR=${CMAKE_CURRENT_SOURCE_DIR}/sailgen"
                  "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/sailgen/halves.inc"
@@ -1477,7 +1513,7 @@ add_test(NAME sailgen_extract_lower COMMAND "${CMAKE_COMMAND}" -E compare_files 
          "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/lower_expected.sail" "${CMAKE_CURRENT_BINARY_DIR}/sailgen/lower.sail")
 add_test(NAME sailgen_refused_path
          COMMAND snx-sailgen --generate "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_path.roots"
-                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
+                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/bits.h" --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                  --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
                  -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/refused_path.inc"
                  "${CMAKE_CURRENT_SOURCE_DIR}/sailgen/refused_path.sail")
@@ -1487,7 +1523,7 @@ set_tests_properties(sailgen_refused_path PROPERTIES PASS_REGULAR_EXPRESSION
 # element to the next, or whose element is read after it, stays a loop of elements
 add_test(NAME sailgen_lanes
          COMMAND "${CMAKE_COMMAND}" "-DSAILGEN=$<TARGET_FILE:snx-sailgen>"
-                 "-DCORE=${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
+                 "-DBITS=${PROJECT_SOURCE_DIR}/tools/sailgen/bits.h" "-DCORE=${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                  "-DBACKEND=${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
                  "-DDIR=${CMAKE_CURRENT_SOURCE_DIR}/sailgen"
                  "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/sailgen/lanes.inc"
@@ -1497,7 +1533,7 @@ set_tests_properties(sailgen_lanes PROPERTIES PASS_REGULAR_EXPRESSION
 # and the A64 subsets of src/common/cpu/aarch64/sail/ generate whole, with the NX's fixups
 add_test(NAME sailgen_a64
          COMMAND snx-sailgen --generate "${PROJECT_SOURCE_DIR}/src/common/cpu/aarch64/sail/a64.roots"
-                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
+                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/bits.h" --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                  --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm.h"
                  --profile "${PROJECT_SOURCE_DIR}/src/common/cpu/aarch64/decode/a64.profile"
                  -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/a64_sail.inc"
@@ -1506,7 +1542,7 @@ add_test(NAME sailgen_a64
 # and the AArch32 ones of src/common/cpu/arm/sail/, with the architectures' profile and fixups
 add_test(NAME sailgen_a32
          COMMAND snx-sailgen --generate "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/sail/a32.roots"
-                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
+                 --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/bits.h" --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/core.h"
                  --backend "${PROJECT_SOURCE_DIR}/tools/sailgen/llvm_arm.h"
                  --profile "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/sail/a32.profile"
                  -o "${CMAKE_CURRENT_BINARY_DIR}/sailgen/a32_sail.inc"
@@ -1815,6 +1851,19 @@ if(NOT WIN32)
     target_include_directories(snx-test-alloc-new-shape PRIVATE "${PROJECT_SOURCE_DIR}/src")
     snx_hookgen(snx-test-alloc-new-shape SPEC "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/hooks.hook")
     add_test(NAME alloc_new_shape COMMAND snx-test-alloc-new-shape)
+endif()
+# a game's own allocator (src/nx/hle/hook/alloc.c's alloc_object_call and alloc_kept): a malloc, operator new or delete
+# that calls an allocator object through its table with the object in x0 is one; a PLT stub, a function pointer in a
+# global, a table no object is passed, the object elsewhere or overwritten, a direct call and a virtual call past the
+# function's end are not. A program whose malloc is one has the family off; one whose malloc is the SDK allocator's
+# keeps it, though its operator new and free call objects
+if(NOT WIN32)
+    add_executable(snx-test-alloc-kept alloc_kept.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/alloc.c")
+    snx_test_target(snx-test-alloc-kept gnu23)
+    target_include_directories(snx-test-alloc-kept PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    snx_hookgen(snx-test-alloc-kept SPEC "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/hooks.hook")
+    add_test(NAME alloc_kept_off COMMAND snx-test-alloc-kept off)
+    add_test(NAME alloc_kept_on COMMAND snx-test-alloc-kept on)
 endif()
 # the C library's functions on guest memory (src/nx/hle/hook/libc_std.c): guest addresses back from pointers into an
 # argument, end pointers, strtok's place, div_t and ldiv_t, errno, qsort and bsearch through the guest's comparison
@@ -2264,7 +2313,8 @@ if(TARGET OpenSSL::Crypto AND NOT SNX_TOOLS_ONLY)
 endif()
 
 # Inline software keyboard protocol and applet completion events.
-add_executable(snx-test-am-service am_service.c am_service_stubs.c)
+add_executable(snx-test-am-service am_service.c am_service_stubs.c
+    "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ctrl_request.c")
 snx_test_target(snx-test-am-service gnu23)
 snx_service_swipc(snx-test-am-service hle/services/am.swipc hle/services/vi.swipc) # vi: grc's video proxy
 target_link_libraries(snx-test-am-service PRIVATE snx_test_common) # snx_nacp_aoc_base
@@ -2291,7 +2341,8 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux|FreeBSD")
 endif()
 
 # am.c with a control.nacp: the desired language against its supported languages, its version and save sizes
-add_executable(snx-test-am-nacp am_nacp.c am_service_stubs.c)
+add_executable(snx-test-am-nacp am_nacp.c am_service_stubs.c
+    "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ctrl_request.c")
 snx_test_target(snx-test-am-nacp gnu23)
 snx_service_swipc(snx-test-am-nacp hle/services/am.swipc hle/services/vi.swipc)
 target_link_libraries(snx-test-am-nacp PRIVATE snx_test_common) # snx_nacp_aoc_base
@@ -2375,6 +2426,8 @@ add_test(NAME llvm_dependency COMMAND "${CMAKE_COMMAND}"
 include("${PROJECT_SOURCE_DIR}/cmake/gui_themes.cmake")
 if(TARGET SDL3::SDL3) # F1's and the Shortcuts pages name the runtime's keys as SDL names them
     add_executable(snx-test-overlay overlay.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/overlay.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ctrl_applet.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ctrl_request.c"
         "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/fatal_screen.c"
         "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/prepare_screen.c"
         "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/wait_screen.c"
@@ -2390,6 +2443,17 @@ if(TARGET SDL3::SDL3) # F1's and the Shortcuts pages name the runtime's keys as 
     target_link_libraries(snx-test-overlay PRIVATE scarletnx-common snx_splash m SDL3::SDL3 snx_notice)
     target_include_directories(snx-test-overlay PRIVATE "${PROJECT_BINARY_DIR}/generated")
     add_test(NAME overlay COMMAND snx-test-overlay)
+    # the controller applet's dialog: its request, cards and gestures, and its pictures drawn on the CPU
+    add_executable(snx-test-ctrl-applet ctrl_applet.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ctrl_applet.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/fatal_screen.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ctrl_scan.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ctrl_request.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ui.c" support/ui_raster.c support/ui_shape_ref.c)
+    snx_test_target(snx-test-ctrl-applet gnu23)
+    # the scan's fake alone (ble_scan.h's snx_ble_fake_open): the test never reaches the system's Bluetooth
+    target_link_libraries(snx-test-ctrl-applet PRIVATE scarletnx-common snx_splash snx_ble m SDL3::SDL3)
+    target_include_directories(snx-test-ctrl-applet PRIVATE "${PROJECT_BINARY_DIR}/generated" "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME ctrl_applet COMMAND snx-test-ctrl-applet)
 endif()
 
 # the screens the player waits on (runtime/platform/wait_screen.c): the game closing's from half a second into its
@@ -2503,7 +2567,8 @@ foreach(case old pick cli)
     add_test(NAME options_vk_descriptors_${case} COMMAND snx-test-options-tv-mode --vk-descriptors-${case})
 endforeach()
 # a game's own picks (<name>.picks) over the launcher's and its .ini, under this run's command line: a process each
-foreach(case order menu hand reload clean next perf perf-run)
+foreach(case order menu hand reload clean next perf perf-run kind kind-pick kind-auto kind-cli kind-old0 kind-launcher
+        kind-oldpick)
     add_test(NAME options_picks_${case} COMMAND snx-test-options-tv-mode --picks-${case})
 endforeach()
 
@@ -2521,14 +2586,31 @@ include("${PROJECT_SOURCE_DIR}/cmake/pad_sdl.cmake")
 add_executable(snx-test-connect connect.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/connect.c")
 snx_test_target(snx-test-connect c23)
 add_test(NAME connect COMMAND snx-test-connect)
+# the Joy-Con 2's protocol and one controller's setup on made-up bytes, no Bluetooth (runtime/platform/joycon2_*.c)
+add_executable(snx-test-joycon2 joycon2.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/joycon2_proto.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/joycon2_session.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/joycon2_att.c"
+    "${PROJECT_SOURCE_DIR}/src/common/platform/ble_scan.c") # the launcher's advert check, compared
+snx_test_target(snx-test-joycon2 c23)
+target_link_libraries(snx-test-joycon2 PRIVATE m)
+add_test(NAME joycon2 COMMAND snx-test-joycon2)
 
 add_executable(snx-test-gamepad gamepad.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/backend/gamepad.c"
     "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/connect.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ui.c"
-    "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c")
+    "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/joycon2_sdl.c")
 snx_test_target(snx-test-gamepad gnu23)
 target_link_libraries(snx-test-gamepad PRIVATE scarletnx-common snx_pad_sdl snx_splash m)
 target_include_directories(snx-test-gamepad PRIVATE "${PROJECT_BINARY_DIR}/generated") # ui.c's theme
 add_test(NAME gamepad COMMAND snx-test-gamepad)
+# a Joy-Con 2 as an SDL virtual gamepad, read back through the gamepads' code (runtime/platform/joycon2_sdl.c)
+add_executable(snx-test-joycon2-sdl joycon2_sdl.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/joycon2_sdl.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/backend/gamepad.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/connect.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ui.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c")
+snx_test_target(snx-test-joycon2-sdl gnu23)
+target_link_libraries(snx-test-joycon2-sdl PRIVATE scarletnx-common snx_pad_sdl snx_splash m)
+target_include_directories(snx-test-joycon2-sdl PRIVATE "${PROJECT_BINARY_DIR}/generated")
+add_test(NAME joycon2_sdl COMMAND snx-test-joycon2-sdl)
 
 add_executable(snx-test-fatal-screen fatal_screen.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/fatal_screen.c")
 snx_test_target(snx-test-fatal-screen gnu23)
@@ -3089,6 +3171,12 @@ if(NOT SNX_TOOLS_ONLY)
     snx_test_target(snx-test-vk-surf-layouts gnu23)
     target_link_libraries(snx-test-vk-surf-layouts PRIVATE snx_nx_flags)
     add_test(NAME vk_surf_layouts COMMAND snx-test-vk-surf-layouts)
+    # the timeline of NVN's timestamp reports (gpu/vk/stamp.c) over a model of the queue's timestamp queries, with no
+    # device: a present's submissions back to back, the runtime's own work left out, values that only rise
+    add_executable(snx-test-vk-stamp vk_stamp.c tracy_stubs.c)
+    snx_test_target(snx-test-vk-stamp gnu23)
+    target_link_libraries(snx-test-vk-stamp PRIVATE snx_nx_flags)
+    add_test(NAME vk_stamp COMMAND snx-test-vk-stamp)
     # a draw that binds an owner where it is (gpu/vk/buffer.c buf_get_owned): one that a draw or the page cache wrote
     # in this submission takes a pass end and a barrier first, any other none
     add_executable(snx-test-vk-buffer-owned vk_buffer_owned.c tracy_stubs.c)
@@ -3347,6 +3435,34 @@ if(NOT WIN32)
         add_test(NAME llvm_sail_ir_${part} COMMAND snx-test-llvm-sail-ir --part ${part}/3)
         set_tests_properties(llvm_sail_ir_${part} PROPERTIES TIMEOUT 600)
     endforeach()
+    # sailgen's x86-64 back end (its instruction selection derived from the Intel SDM, cmake/sdm.cmake) against its LLVM
+    # back end: the same registers, flags, next pc and UNDEF from the same random states, word by word, on the host's
+    # BMI1, BMI2 and LZCNT and without them
+    include("${PROJECT_SOURCE_DIR}/cmake/sdm.cmake")
+    if(SNX_X64)
+        add_executable(snx-test-sail-x64 sail_x64.c sail_x64_emit.c llvm_qemu_words.c llvm_steps.c
+                       "${PROJECT_SOURCE_DIR}/src/common/cpu/recompiler/x64/x64_helpers.c"
+                       "${PROJECT_SOURCE_DIR}/src/common/cpu/aarch64/cpu_helpers.c")
+        snx_cpu_helpers_flags(snx-test-sail-x64)
+        snx_test_target(snx-test-sail-x64 gnu23)
+        target_include_directories(snx-test-sail-x64 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(snx-test-sail-x64 PRIVATE snx_llvm snx_driver ${CMAKE_DL_LIBS})
+        snx_decodetree_a64(snx-test-sail-x64)
+        snx_sailgen_a64_x64(snx-test-sail-x64)
+        add_test(NAME sail_x64 COMMAND snx-test-sail-x64)
+        add_test(NAME sail_x64_spill COMMAND snx-test-sail-x64 --pool 3 --states 32)
+        set_tests_properties(sail_x64 sail_x64_spill PROPERTIES TIMEOUT 600)
+        # its A32 blocks (x64_arm.c) against the AArch32 block compiler's LLVM ones: the same words consumed and the
+        # same results from random states, the A32 instructions it makes alone and in rows; again with three host
+        # registers (the values spill) and without BMI1, BMI2 and LZCNT
+        add_executable(snx-test-arm-x64 arm_x64.c)
+        snx_test_target(snx-test-arm-x64 gnu23)
+        target_link_libraries(snx-test-arm-x64 PRIVATE snx_llvm snx_arm_llvm snx_driver ${CMAKE_DL_LIBS})
+        add_test(NAME arm_x64 COMMAND snx-test-arm-x64)
+        add_test(NAME arm_x64_spill COMMAND snx-test-arm-x64 --pool 3 --blocks 2000 --seed 2)
+        add_test(NAME arm_x64_plain COMMAND snx-test-arm-x64 --features 0 --blocks 2000 --seed 3)
+        set_tests_properties(arm_x64 arm_x64_spill arm_x64_plain PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+    endif()
     # the T16 emitters sailgen generates from the Sail against the ones written by hand they replaced
     # (snx_thumb_llvm_block_t16_reference): the same optimized IR halfword by halfword on every profile and memory mode,
     # alone and in an IT block, and the same results run here. Each part takes a sixteenth of its third, spread over
@@ -3718,6 +3834,18 @@ add_executable(snx-test-recompiler-library recompiler_library.c)
 snx_test_target(snx-test-recompiler-library gnu23)
 target_link_libraries(snx-test-recompiler-library PRIVATE scarletnx-recompiler)
 add_test(NAME recompiler_library COMMAND snx-test-recompiler-library)
+# the same run with an inaccessible page kept below every code arena (arena_guard_below.c, preloaded): a call that
+# reads the bytes before an arena's first function faults there in every run, where it faulted only in the runs whose
+# system had mapped nothing below the arena (the function sanitizer's check of an indirect call, SNX_TEST_SANITIZERS)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_library(snx-test-arena-guard-below MODULE arena_guard_below.c)
+    set_target_properties(snx-test-arena-guard-below PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON)
+    target_compile_options(snx-test-arena-guard-below PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(snx-test-arena-guard-below PRIVATE ${CMAKE_DL_LIBS})
+    add_test(NAME recompiler_library_arena_edge COMMAND snx-test-recompiler-library)
+    set_tests_properties(recompiler_library_arena_edge PROPERTIES
+        ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:snx-test-arena-guard-below>")
+endif()
 # the same header from C++, as the embedders include it
 add_executable(snx-test-recompiler-library-cpp recompiler_library_cpp.cpp)
 set_target_properties(snx-test-recompiler-library-cpp PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)
@@ -3725,6 +3853,19 @@ target_compile_options(snx-test-recompiler-library-cpp PRIVATE -Wall -Wextra -We
 target_link_libraries(snx-test-recompiler-library-cpp PRIVATE scarletnx-recompiler Threads::Threads)
 snx_test_sanitize(snx-test-recompiler-library-cpp) # this target is not made through snx_test_target
 add_test(NAME recompiler_library_cpp COMMAND snx-test-recompiler-library-cpp)
+# the x86-64 back end against LLVM, function by function (recompiler_backends.c)
+add_executable(snx-test-recompiler-backends recompiler_backends.c llvm_qemu_words.c)
+snx_test_target(snx-test-recompiler-backends gnu23)
+target_include_directories(snx-test-recompiler-backends PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(snx-test-recompiler-backends PRIVATE scarletnx-recompiler)
+snx_decodetree_a64(snx-test-recompiler-backends)
+add_test(NAME recompiler_backends COMMAND snx-test-recompiler-backends)
+# a division in a loop of enough registers that R10 and R11 hold pins, where DIV moves what RAX and RDX held
+add_test(NAME recompiler_backends_div_pins COMMAND snx-test-recompiler-backends --words d2800070 d503201f d503201f
+         d503201f d503201f d503201f d503201f d503201f d503201f 8b0600ed 1ac50ce5 9ac90d0f f9000f21 f1000610 54fffe61)
+# one where no register of the pool is free when DIV takes RDX from the divisor it holds
+add_test(NAME recompiler_backends_div_divisor COMMAND snx-test-recompiler-backends --words d2800030 f9400ac7 1acc096b
+         d503201f aa0b00cd aa0b000a d503201f d503201f d503201f d503201f 9ac8092e d503201f f9401746 f1000610 54fffe61)
 # what the library's archive needs from outside it: LLVM and the system's libraries alone
 # (tests/recompiler_symbols.cmake). Its program links every object of the archive with those, named here rather than
 # taken from the archive's own link line, which a new library would join. Built by the test, so a library more fails

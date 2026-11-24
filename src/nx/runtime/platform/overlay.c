@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 #include "nx/runtime/platform/overlay.h"
+#include "nx/runtime/platform/ctrl_applet.h"
 #include "nx/runtime/platform/backend.h"
 #include "nx/runtime/platform/fatal_screen.h"
 #include "nx/runtime/platform/gamepad.h"
@@ -102,7 +103,7 @@ static int entry_rows(int e) {
     return n;
 }
 enum { S_SAVE, S_LOAD, S_DELETE, S_BACK, S_COUNT };              /* a slot's page's, the auto slot without Save */
-enum { P_PLAYER, P_SWAP, P_DEADZONE, P_RUMBLE, P_BACKGROUND, P_MAP, P_BACK, P_COUNT }; /* the gamepads' page's */
+enum { P_PLAYER, P_SWAP, P_DEADZONE, P_RUMBLE, P_BACKGROUND, P_MAP, P_ASSIGN, P_BACK, P_COUNT }; /* the gamepads' */
 /* the controls page's items */
 enum {
     C_SHOW,
@@ -137,6 +138,7 @@ static const char* const PADS[P_COUNT] = {SNX_GAMEPAD_PLAYERS,
                                           "gamepad_rumble",
                                           "gamepad_background",
                                           SNX_GAMEPAD_MAP,
+                                          "Assign players",
                                           "Back"};
 /* F1's page: the runtime's keys as set (hotkeys.h; backend/sdl3.c's hotkey and menu_event) and the game's buttons on
    the keyboard (its keymap), a row each with the icon the launcher's F1 box gives what it does (src/gui/main.c's
@@ -854,7 +856,9 @@ static int act(int i, int step) {
         page = PAGE_ASK;
         focus = 1; /* Cancel */
         top = 0;
-    } else if (page == PAGE_PADS && i == P_MAP)
+    } else if (page == PAGE_PADS && i == P_ASSIGN)
+        return OVERLAY_CONTROLLERS; /* the controller applet's dialog, the game paused */
+    else if (page == PAGE_PADS && i == P_MAP)
         map_open();
     else /* Back */
         overlay_back();
@@ -1109,7 +1113,7 @@ static struct {
     } loading;
     /* the settings' notice (overlay_settings_notice) until the game's first frame takes it, under notice_lock */
     struct {
-        char game[1024], global[1024];
+        char game[1024], global[1024], kind[256];
         _Atomic int waiting; /* given, not yet taken: the present reads it unlocked */
     } settings;
 } g_overlay
@@ -1118,11 +1122,12 @@ static struct {
 #endif
 ;
 enum { LOADING_NONE, LOADING_SHOWN, LOADING_LOADED };
-void overlay_settings_notice(const char* game, const char* global) {
+void overlay_settings_notice(const char* game, const char* global, const char* kind) {
     pm_lock(&notice_lock);
     snprintf(g_overlay.settings.game, sizeof g_overlay.settings.game, "%s", game);
     snprintf(g_overlay.settings.global, sizeof g_overlay.settings.global, "%s", global);
-    atomic_store_explicit(&g_overlay.settings.waiting, game[0] || global[0], memory_order_release);
+    snprintf(g_overlay.settings.kind, sizeof g_overlay.settings.kind, "%s", kind);
+    atomic_store_explicit(&g_overlay.settings.waiting, game[0] || global[0] || kind[0], memory_order_release);
     pm_unlock(&notice_lock);
 }
 int overlay_settings_waiting(void) { return atomic_load_explicit(&g_overlay.settings.waiting, memory_order_relaxed); }
@@ -1155,32 +1160,42 @@ static int keys_in(const char* list) {
     for (const char* next; *list; list = next, ++n) key_at(list, &next);
     return n;
 }
-int overlay_settings_lines(const char* game, const char* global, int cols, unsigned icon[OVERLAY_SETTINGS_LINES],
+int overlay_settings_lines(const char* game, const char* global, const char* kind, int cols,
+                           unsigned icon[OVERLAY_SETTINGS_LINES],
                            char text[OVERLAY_SETTINGS_LINES][OVERLAY_COLS_MAX + 1]) {
-    const char* lists[2] = {game, global};
-    const unsigned icons[2] = {GUI_ICON_GAMEPAD_2, GUI_ICON_GLOBE};
+    const char* lists[3] = {game, global, kind};
+    const unsigned icons[3] = {GUI_ICON_GAMEPAD_2, GUI_ICON_GLOBE, GUI_ICON_INFO};
+    /* what the kind's keys are, after them on its last line: no file nor command line gave them */
+    const char* const after[3] = {"", "", ", for this kind of game"};
     int n = 0;
     if (cols > OVERLAY_COLS_MAX) cols = OVERLAY_COLS_MAX;
-    for (int k = 0; k < 2; ++k) {
+    for (int k = 0; k < 3; ++k) {
         const char *at = lists[k], *last = at;
-        int room = OVERLAY_SETTINGS_LINES - n - (!k && global[0]), took = 0;
+        int later = 0, took = 0, first = n;
+        for (int j = k + 1; j < 3; ++j) later += lists[j][0] != 0; /* a line kept for each list after it */
+        int room = OVERLAY_SETTINGS_LINES - n - later, width = cols - (int)strlen(after[k]);
+        if (width < 1) width = cols; /* a line too narrow for the words after the keys: its keys, the words cut */
         for (; *at && room > 0; --room, ++n) {
             last = at;
-            took = line_keys(at, -1, cols, text[n]);
+            took = line_keys(at, -1, width, text[n]);
             icon[n] = icons[k];
             for (int i = 0; i < took; ++i) key_at(at, &at);
         }
-        if (!*at) continue;
-        /* keys left: the last line says how many, as many of its own keys left out as that takes */
-        int left = keys_in(at);
-        for (int keep = took; keep >= 0; --keep) {
-            char more[24];
-            snprintf(more, sizeof more, "+%d more", left + took - keep);
-            line_keys(last, keep, cols, text[n - 1]);
+        if (*at) { /* keys left: the last line says how many, as many of its own keys left out as that takes */
+            int left = keys_in(at);
+            for (int keep = took; keep >= 0; --keep) {
+                char more[24];
+                snprintf(more, sizeof more, "+%d more", left + took - keep);
+                line_keys(last, keep, width, text[n - 1]);
+                size_t used = strlen(text[n - 1]);
+                if (keep && used + 2 + strlen(more) > (size_t)width) continue;
+                snprintf(text[n - 1] + used, (size_t)width + 1 - used, "%s%s", used ? ", " : "", more);
+                break;
+            }
+        }
+        if (n > first && after[k][0]) {
             size_t used = strlen(text[n - 1]);
-            if (keep && used + 2 + strlen(more) > (size_t)cols) continue;
-            snprintf(text[n - 1] + used, (size_t)cols + 1 - used, "%s%s", used ? ", " : "", more);
-            break;
+            if (used < (size_t)cols) snprintf(text[n - 1] + used, (size_t)cols + 1 - used, "%s", after[k]);
         }
     }
     return n;
@@ -1191,7 +1206,8 @@ void overlay_settings_start(u64 now_ns) {
     int n = 0;
     pm_lock(&notice_lock);
     if (atomic_load_explicit(&g_overlay.settings.waiting, memory_order_acquire))
-        n = overlay_settings_lines(g_overlay.settings.game, g_overlay.settings.global, OVERLAY_COLS_MAX, icon, text);
+        n = overlay_settings_lines(g_overlay.settings.game, g_overlay.settings.global, g_overlay.settings.kind,
+                                   OVERLAY_COLS_MAX, icon, text);
     atomic_store_explicit(&g_overlay.settings.waiting, 0, memory_order_relaxed);
     pm_unlock(&notice_lock);
     for (int i = 0; i < n; ++i) {
@@ -2201,6 +2217,12 @@ void overlay_draw(SnxUiList* l, int sw, int sh, u64 now_ns) {
         ui_append_kept(l, &(SnxUiList){g_menu.q, g_menu.n, g_menu.n}, g_menu.version, &g_menu, NULL);
     }
     if (overlay_loading_shown()) loading_draw(l, sw, sh, now_ns);
+    if (!atomic_load_explicit(&shown, memory_order_relaxed) &&
+        ctrl_dialog_shown()) { /* the controller applet's, under the menu */
+        int px, py, scale;
+        overlay_place(sw, sh, &px, &py, &scale);
+        ctrl_dialog_draw(l, sw, sh, scale);
+    }
     toasts_drop(now_ns);
     if (ntoasts) {
         int percent = overlay_display_percent(), first = l->n, i;

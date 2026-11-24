@@ -334,7 +334,7 @@ size_t ini_list_text(const IniSection* sections, int count, char* out, size_t si
     l.at = 0;
     if (size) out[0] = 0;
     for (s = 0; s < count; s++)
-        for (t = 0; t < 3 && sections[s].table[t]; t++) {
+        for (t = 0; t < INI_SECTION_TABLES && sections[s].table[t]; t++) {
             const IniOpt* o;
             for (o = sections[s].table[t]; o->key; o++) {
                 if (o->help)
@@ -397,6 +397,8 @@ static const struct {
                       {"write_tracking_hot",
                        "now write_tracking_hot_pages, whose 2 is Auto (write_tracking_hot's 0, its "
                        "default) and 1 On"},
+                      {"emulated_cores", "now emulated_cores_mode, of the same 0 (Off) and 1 (On) and 2, Auto, which "
+                                         "the 1 a .ini wrote, its default, is"},
                       {"controls_opacity", "the on-screen controls are opaque"},
                       {"controls_alpha", "the on-screen controls are opaque"},
                       {"controls_skin", "the on-screen controls are white shapes, with no skin"},
@@ -432,7 +434,7 @@ const char* ini_deprecated(const char* k) {
 }
 static const struct {
     const char *key, *now;
-} INI_RENAMED[] = {{"vk_descriptors", "vk_descriptors_mode"}, {NULL, NULL}};
+} INI_RENAMED[] = {{"vk_descriptors", "vk_descriptors_mode"}, {"emulated_cores", "emulated_cores_mode"}, {NULL, NULL}};
 const char* ini_renamed(const char* k) {
     int i;
     for (i = 0; INI_RENAMED[i].key; i++)
