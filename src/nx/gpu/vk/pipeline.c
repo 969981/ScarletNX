@@ -31,6 +31,7 @@
 #include "nx/gpu/vk/shader_objects.h"
 #include "nx/gpu/vk/cb_fold.h"
 #include "nx/gpu/vk/cb_windows.h"
+#include "nx/gpu/vk/cb_dynamic.h"
 #include "nx/gpu/vk/internal_spv.h"
 #include "nx/gpu/vk/tess_passthrough.h"
 #include "nx/gpu/vk/texture_arrays.h"
@@ -237,6 +238,14 @@ static struct {
     _Atomic u64 pipe_wait_ns; /* the GPU thread's and the recording thread's waits, added atomically */
     _Atomic u64 pipe_make_ns; /* the workers' time making pipelines, added atomically */
     _Atomic u64 pipe_hits;    /* pipelines the pipeline cache had */
+    /* Pipelines made in under PIPE_FAST_NS, the file's apart (pf.fast). A driver may leave the creation feedback's
+       cache hit bit clear for every pipeline: NVIDIA's (driver d4-10de-00002684) made 963 pipelines of earlier runs in
+       about 1.5 s, where one it compiles takes 80 to 130 ms, and set the bit for none. One made this fast came from a
+       cache, the application's or the driver's own */
+    _Atomic u64 pipe_fast;
+    /* the draws' pipelines made as shader objects (vk_so_make), which no pipeline cache serves: their binaries of
+       earlier runs do. One game's draws were all shader objects, and its stats line read "0 from the cache" */
+    _Atomic u64 pipe_so;
     VkShaderModule null_fs; /* an empty fragment shader for depth-only passes, made when first asked for */
     Pipe* pipeh[PIPEH];
     /* The shaders and pipelines of earlier runs (pipeline_file.c), so that each run doesn't translate the same shaders
@@ -287,6 +296,7 @@ static struct {
         char apart[64];
         /* atomics, written by the GPU thread and the pipeline workers */
         _Atomic u64 made, hits; /* the file's pipelines made, and those the pipeline cache had */
+        _Atomic u64 fast;       /* of them, those made in under PIPE_FAST_NS (pipe_make) */
         _Atomic u32 ship_used;  /* the shipped file's shaders a draw found */
         u32 ship_said;  /* ship_used as vk_pipeline_save last logged it (psave) */
     } pf;
@@ -672,12 +682,13 @@ static VkDescriptorType binding_type(u32 i) {
    has texture arrays: a pool counts them for array_sets of its sets. A driver may make a pool's memory for all it can
    hold when the pool is made: Qualcomm's took 470 MiB for 1024 sets that could all hold the arrays (792 bytes a
    combined image sampler), where most sets have none */
-void vk_pool_sizes(VkDescriptorPoolSize* sz, u32 sets, u32 array_sets) {
-    static const VkDescriptorType ty[VK_POOL_TYPES] = {
-        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE};
+u32 vk_pool_sizes(VkDescriptorPoolSize* sz, u32 sets, u32 array_sets) {
+    static const VkDescriptorType ty[VK_POOL_TYPES - 1] = {
+        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,   VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE};
     int k;
-    for (k = 0; k < VK_POOL_TYPES; k++) {
+    for (k = 0; k < VK_POOL_TYPES - 1; k++) {
         u32 n = ty[k] == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ? 2 : 0; /* auxiliary source/validity fetches */
         u32 arrays = 0, i;
         for (i = 0; i < SNX_VKB_END; i++) {
@@ -689,6 +700,12 @@ void vk_pool_sizes(VkDescriptorPoolSize* sz, u32 sets, u32 array_sets) {
         }
         sz[k] = (VkDescriptorPoolSize){ty[k], n * sets + arrays * array_sets};
     }
+    /* the dynamic constant buffers of the vertex or the fragment set, whichever has more (cb_dynamic.h): a set of any
+       layout takes its uniform buffers from the count above, which counts those slots too. A pool has no size of a
+       type with none (VUID-VkDescriptorPoolSize-descriptorCount-00302) */
+    const u32 v = snx_popcount64(g_cb_dynamic.mask[0]), f = snx_popcount64(g_cb_dynamic.mask[1]);
+    sz[k] = (VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, (v > f ? v : f) * sets};
+    return sz[k].descriptorCount ? VK_POOL_TYPES : VK_POOL_TYPES - 1;
 }
 
 /* The stages that see set s: a layout for each set, the same bindings, each visible to the stage that uses the set
@@ -780,6 +797,11 @@ void vk_pipeline_init(void) {
         if (line[0]) LOG("%s\n", line);
     }
     cbufs_fit_limits();
+    snprintf(g_pipeline.cache_dir, sizeof g_pipeline.cache_dir, "%sshader_cache", g_cachedir);
+    plat_mkdir(g_pipeline.cache_dir);
+    /* which constant buffers the vertex and fragment sets bind as dynamic uniform buffers: from the moves the game's
+       last run kept there, before the set layouts that give them that type */
+    vk_cb_dynamic_choose(g_pipeline.cache_dir);
     /* a stage's textures in a set of their own (shader_vk_tex_set): with plain sets, where all five stage sets are and
        the device binds ten. Descriptor buffers and heaps keep one set a stage */
     g_spirv_translate.split_sets = g_vk_stage_sets == 5 && g_vk.props.limits.maxBoundDescriptorSets >= 10 &&
@@ -877,7 +899,9 @@ void vk_pipeline_init(void) {
             if (i >= SNX_VKB_IMGBUF && i < SNX_VKB_CAPTURE && i - SNX_VKB_IMGBUF >= buffer_slots) continue;
             b[count++] = (VkDescriptorSetLayoutBinding){
                 .binding = i,
-                .descriptorType = binding_type(i),
+                /* the vertex and fragment sets' dynamic constant buffers (cb_dynamic.h) */
+                .descriptorType = s < 2 && i < SNX_VKB_CB + VK_CB_DYNAMIC_SLOTS ? vk_cb_dynamic_type(s, i - SNX_VKB_CB)
+                                                                                : binding_type(i),
                 .descriptorCount = (i == SNX_VKB_TEXARRAY || i == SNX_VKB_TEXDEPTH) ? g_spirv_translate.tex_array : 1,
                 .stageFlags = vk_set_stages(s)};
         }
@@ -977,8 +1001,6 @@ void vk_pipeline_init(void) {
             fatal("vulkan: cannot create compute pipeline layout");
     }
     if (!g_vk_playout) fatal("vulkan: cannot create shader pipeline layout");
-    snprintf(g_pipeline.cache_dir, sizeof g_pipeline.cache_dir, "%sshader_cache", g_cachedir);
-    plat_mkdir(g_pipeline.cache_dir);
     /* the BC7 blocks of earlier ASTC encodes, where ASTC textures are held as BC7 (astc.c): started now, or by
        astc_mode's Auto once it holds them as BC7 (vk_astc_auto_present) */
     g_pipeline.bc7_cache = 1;
@@ -2397,6 +2419,7 @@ void vk_pipeline_lib_warm_stats(u64* made, u64* hit, u64* ms) {
     *hit = atomic_load_explicit(&g_pipeline.plib.warm_hit, memory_order_relaxed);
     *ms = atomic_load_explicit(&g_pipeline.plib.warm_ns, memory_order_relaxed) / 1000000;
 }
+#define PIPE_FAST_NS 5000000ull /* a pipeline made faster than this came from a cache (g_pipeline.pipe_fast) */
 /* e's pipeline, made here. One a draw asked for is kept in the file (pf_pipe_record): once made when the GPU thread
    makes it (record), and when it queues it for a worker otherwise, as the file's tables are the GPU thread's */
 static VkPipeline pipe_make(Pipe* e, int record, int* opt) {
@@ -2422,9 +2445,13 @@ static VkPipeline pipe_make(Pipe* e, int record, int* opt) {
     if (p != PIPE_SO_MADE && (!e->lib[0] || *opt))
         pipe_stats(p, e, *opt ? "optimized" : "whole"); /* a fast link runs unoptimized code */
     if (p == PIPE_SO_MADE) {
+        if (!e->prewarm) atomic_fetch_add_explicit(&g_pipeline.pipe_so, 1, memory_order_relaxed);
         const VkShaderModule modules[5] = {e->k.vs, e->k.tcs, e->k.tes, e->k.gs, e->fs};
         slow_say("a draw's shader objects", modules, plat_ns() - t0, 0);
     } else {
+        if (p && plat_ns() - t0 < PIPE_FAST_NS)
+            atomic_fetch_add_explicit(e->prewarm ? &g_pipeline.pf.fast : &g_pipeline.pipe_fast, 1,
+                                      memory_order_relaxed);
         pipe_slow_say(e, plat_ns() - t0, hit);
         pcache_note();
     }
@@ -4207,6 +4234,11 @@ static void pf_merge(void) {
             p->next = g_pipeline.pipeh[b];
             g_pipeline.pipeh[b] = p;
         }
+}
+void vk_pipeline_fast_stats(u64* fast, u64* early_fast, u64* so) {
+    *so = atomic_load_explicit(&g_pipeline.pipe_so, memory_order_relaxed);
+    *fast = atomic_load_explicit(&g_pipeline.pipe_fast, memory_order_relaxed);
+    *early_fast = atomic_load_explicit(&g_pipeline.pf.fast, memory_order_relaxed);
 }
 void vk_pipeline_prewarm_stats(u64* made, u64* hits, u64* left) {
     *made = atomic_load_explicit(&g_pipeline.pf.made, memory_order_relaxed);

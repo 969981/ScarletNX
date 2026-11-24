@@ -10,6 +10,7 @@
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
 #include "nx/gpu/gpu.h"
+#include "nx/gpu/gpu_queue.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/shading_rate.h"
 #include "nx/runtime/main.h"
@@ -28,6 +29,7 @@
 #include "common/gpu/vk/vk_common.h"
 #include "common/utilities/bits.h"
 #include "common/utilities/spirv_emit.h"
+#include "common/platform/time.h"
 
 int g_vk_preserve_infnan;
 int g_vk_preserve_infnan64;
@@ -50,6 +52,46 @@ static _Atomic u32
    waits for the baton, not the lock, and only those already waiting compete */
 static _Atomic u32 g_vk_waiting; /* threads blocked in pm_lock on g_vklock */
 static _Atomic u32 g_vk_baton;   /* 1: let go to a waiter, which hasn't taken it yet */
+/* For the statistics: where the holder took the lock (the return address of its outermost vk_lock or vk_trylock),
+   and for each such place, the contended waits behind a hold from it, the GPU thread's and the others', and their
+   nanoseconds. A table that keeps the first places it sees */
+static _Atomic uintptr_t g_vk_site;
+typedef struct {
+    _Atomic uintptr_t at;
+    _Atomic u64 n[2], ns[2]; /* [1]: the GPU thread's waits */
+} LockSite;
+#define LOCK_SITES 48
+static LockSite g_lock_site[LOCK_SITES];
+static void lock_site_note(uintptr_t at, int gpu, u64 ns) {
+    for (u32 i = 0; i < LOCK_SITES; i++) {
+        uintptr_t was = atomic_load_explicit(&g_lock_site[i].at, memory_order_relaxed);
+        if (!was &&
+            !atomic_compare_exchange_strong_explicit(&g_lock_site[i].at, &was, at, memory_order_relaxed,
+                                                     memory_order_relaxed) &&
+            was != at)
+            continue;
+        if (was && was != at) continue;
+        atomic_fetch_add_explicit(&g_lock_site[i].n[gpu], 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_lock_site[i].ns[gpu], ns, memory_order_relaxed);
+        return;
+    }
+}
+void vk_lock_log(void) {
+    for (u32 i = 0; i < LOCK_SITES; i++) {
+        uintptr_t at = atomic_load_explicit(&g_lock_site[i].at, memory_order_relaxed);
+        if (!at) break;
+        u64 n0 = atomic_exchange_explicit(&g_lock_site[i].n[0], 0, memory_order_relaxed),
+            n1 = atomic_exchange_explicit(&g_lock_site[i].n[1], 0, memory_order_relaxed),
+            ns0 = atomic_exchange_explicit(&g_lock_site[i].ns[0], 0, memory_order_relaxed),
+            ns1 = atomic_exchange_explicit(&g_lock_site[i].ns[1], 0, memory_order_relaxed);
+        if (!n0 && !n1) continue;
+        /* the place as an offset from vk_lock itself, which the symbols of the runtime turn into a line */
+        LOG("vulkan: vk_lock held from vk_lock%+lld: the GPU thread waited %llu times (%.3f ms), others %llu times "
+            "(%.3f ms) in the last 600 presents\n",
+            (long long)((intptr_t)at - (intptr_t)(uintptr_t)&vk_lock), (unsigned long long)n1, (double)ns1 / 1e6,
+            (unsigned long long)n0, (double)ns0 / 1e6);
+    }
+}
 static void vk_took(void) {
     atomic_store_explicit(&g_vk_owner, plat_tid(), memory_order_relaxed);
     if (atomic_load_explicit(&g_vk_baton, memory_order_relaxed)) {
@@ -59,8 +101,11 @@ static void vk_took(void) {
 }
 void vk_lock(void) {
     if (!t_vkdepth++) {
+        uintptr_t site = (uintptr_t)__builtin_return_address(0);
         int got = !atomic_load_explicit(&g_vk_baton, memory_order_acquire) && pm_trylock(&g_vklock);
         if (!got) { /* held: the GPU thread says so for the stall report */
+            uintptr_t holder = atomic_load_explicit(&g_vk_site, memory_order_relaxed);
+            u64 t_wait = plat_ns();
             /* Only a contended acquisition gets a zone. */
             SNX_ZONE(z_wait, "vk lock wait");
             gpu_wait_note("vk_lock, which another thread holds", 0);
@@ -72,12 +117,20 @@ void vk_lock(void) {
                 atomic_fetch_sub_explicit(&g_vk_waiting, 1, memory_order_seq_cst);
             }
             gpu_wait_note(NULL, 0);
+            lock_site_note(holder, gpu_on_thread(), plat_ns() - t_wait);
         }
         vk_took();
+        atomic_store_explicit(&g_vk_site, site, memory_order_relaxed);
+        /* With gpu_split, the front end calls the renderer once the queue is empty (gpu_renderer_now). A guest memory
+           write in that call went to the queue, and a big one waited for the renderer thread to run the queue first,
+           with this lock held. The writes queued before it waited for this lock in gmem_before_write: one game's
+           NVN copies locked up so at random. Under the lock this thread is the renderer, and its writes go to memory */
+        gq_direct(1);
     }
 }
 /* lets go of this thread's last hold, then signals the event slots its releases under it reached */
 static void vk_let_go(void) {
+    gq_direct(0);
     atomic_store_explicit(&g_vk_owner, 0, memory_order_relaxed);
     if (atomic_load_explicit(&g_vk_waiting, memory_order_seq_cst))
         atomic_store_explicit(&g_vk_baton, 1, memory_order_release);
@@ -96,7 +149,10 @@ void vk_unlock(void) {
 }
 int vk_trylock(void) {
     if (!t_vkdepth && !pm_trylock(&g_vklock)) return 0;
-    if (!t_vkdepth++) vk_took();
+    if (!t_vkdepth++) {
+        vk_took();
+        atomic_store_explicit(&g_vk_site, (uintptr_t)__builtin_return_address(0), memory_order_relaxed);
+    }
     return 1;
 }
 u32 vk_lock_owner(void) { return atomic_load_explicit(&g_vk_owner, memory_order_relaxed); }
@@ -944,6 +1000,7 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     /* VK_EXT_shader_atomic_float: RED.ADD.F32 in one instruction (g_spirv_translate.float_atomic_add) */
     int has_atomic_float = 0;
     int has_fault = 0; /* VK_EXT_device_fault: what the GPU reports of a fault, at a lost device */
+    int has_diag = 0;  /* VK_NV_device_diagnostics_config, with vk_checkpoints alone */
     int has_pageable = 0;          /* VK_EXT_pageable_device_local_memory, and VK_EXT_memory_priority that it needs */
     /* VK_KHR_pipeline_executable_properties: the drivers' statistics of each pipeline, for pipeline_stats only */
     int has_exec = 0;
@@ -995,6 +1052,9 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         g_vk.has_nv_checkpoints =
             g_settings.gpu_checkpoints && snx_vk_choice_has(c, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
         has_fault = snx_vk_choice_has(c, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        /* vk_checkpoints alone, as the checkpoints: the driver keeps more of what a fault needs (shader debug info,
+           what each resource is, its own checkpoints), at a cost of speed */
+        has_diag = g_settings.gpu_checkpoints && snx_vk_choice_has(c, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
         has_so = snx_vk_choice_has(c, VK_EXT_SHADER_OBJECT_EXTENSION_NAME);
         has_exec = g_settings.pipeline_stats[0] &&
                    snx_vk_choice_has(c, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
@@ -1213,6 +1273,8 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT};
     VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     VkPhysicalDeviceFaultFeaturesEXT qfault = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    VkPhysicalDeviceDiagnosticsConfigFeaturesNV qdiag = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV};
     VkPhysicalDeviceMemoryPriorityFeaturesEXT qpriority = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT};
     VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT qpageable = {
@@ -1341,6 +1403,7 @@ static bool choose_device(SnxVkChoice* c, void* user) {
                            has_coop ? &qcoop : NULL,
                            has_atomic_float ? &qatomic_float : NULL,
                            has_fault ? &qfault : NULL,
+                           has_diag ? &qdiag : NULL,
                            has_pageable ? &qpriority : NULL,
                            has_pageable ? &qpageable : NULL,
                            has_exec ? &qexec : NULL,
@@ -1431,6 +1494,7 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     g_vk.has_vertex_robustness2 = qpipeline.pipelineRobustness && qrobust.robustBufferAccess2 && !g_vk.robust_buffer2;
     g_vk.has_cond_render = has_cond && qcond.conditionalRendering;
     g_vk.has_fault = has_fault && qfault.deviceFault;
+    g_vk.has_nv_diag_config = has_diag && qdiag.diagnosticsConfig;
     g_vk.has_pageable = has_pageable && qpriority.memoryPriority && qpageable.pageableDeviceLocalMemory;
     g_vk.has_exec_stats = has_exec && qexec.pipelineExecutableInfo;
     g_vk.has_provoking_last = has_provoking && qprov.provokingVertexLast;
@@ -2097,6 +2161,20 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         chain = &ffault;
         snx_vk_choice_enable(c, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     }
+    /* vk_checkpoints=1 on NVIDIA: the driver keeps shader debug info and what each resource is, and sets its own
+       checkpoints, for what a lost device's fault (vk_checkpoint_dump) and the checkpoints report */
+    VkPhysicalDeviceDiagnosticsConfigFeaturesNV fdiag = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV,
+        .pNext = chain,
+        .diagnosticsConfig = VK_TRUE};
+    VkDeviceDiagnosticsConfigCreateInfoNV cdiag = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV,
+        .pNext = &fdiag,
+        .flags = VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_DEBUG_INFO_BIT_NV |
+                 VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_RESOURCE_TRACKING_BIT_NV |
+                 VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV};
+    if (g_vk.has_nv_diag_config && snx_vk_choice_enable(c, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME))
+        chain = &cdiag;
     /* the GPU's own memory that the driver may move to system memory when it is short, the lowest priority first */
     VkPhysicalDeviceMemoryPriorityFeaturesEXT fpriority = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT,

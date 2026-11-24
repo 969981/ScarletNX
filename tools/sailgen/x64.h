@@ -137,6 +137,9 @@ enum {
     SGX_K_PSET        /* the host register imm = in[0] */
 };
 
+/* a machine instruction's inputs at most (CASP's six): its fixed registers, the loops that place them and the
+   registers an encoding reads are this long */
+#define SGX_MACHINE_IN 6
 typedef struct {
     unsigned char kind, cc, w, dead;
     unsigned char op; /* SGX_K_MACHINE's kind of instruction */
@@ -152,7 +155,7 @@ typedef struct {
     int flags_from; /* the instruction whose flags a SETCC, STORE_FLAG or cc form reads */
     const SgXSel* fsel; /* whose map of Arm's flags its flags follow (sel's, or the ANDS candidate of its AND) */
     const SgXSel* alt;  /* the same flags without the result (CMP for SUBS), for a result nothing reads */
-    signed char fixed[5]; /* the machine's instructions: the host register in[k] must be in, -1 any */
+    signed char fixed[SGX_MACHINE_IN]; /* the machine's instructions: the host register in[k] must be in, -1 any */
     unsigned char side;   /* a selected form that changes memory (a guest store): kept though nothing reads it */
     unsigned char calls;  /* the machine's: it calls out (the caller-saved registers are spilled around it) */
     unsigned char cadd; /* an addition of the constant cadd_k to in[0] (its flags or not): what sgx_optimize folds
@@ -2737,9 +2740,11 @@ static inline void sgx_assemble_cold(SgXAsm* a, int at) {
                 sgx_byte(c, (unsigned char)(0x80 | (dst & 7) << 3 | 3));
                 sgx_imm(c, i->disp, 4);
             } else if (k + 1 == i->ckat) {
-                if (dst >= 8) sgx_byte(c, 0x41); /* mov dst32, imm32 */
+                /* mov dst32, imm32, or where the constant has bits past 32 (an AArch32 helper's param) mov dst, imm64 */
+                int wide = ((SnxU64)i->imm >> 32) != 0;
+                if (dst >= 8 || wide) sgx_byte(c, (unsigned char)(0x40 | (wide ? 8 : 0) | (dst >= 8)));
                 sgx_byte(c, (unsigned char)(0xB8 | (dst & 7)));
-                sgx_imm(c, i->imm, 4);
+                sgx_imm(c, i->imm, wide ? 8 : 4);
             } else if (vv->cls) {
                 if (vv->reg >= 0) {
                     const SgXVForm* f = i->cw32 >> k & 1 ? &sgx_v_movd_rx : &sgx_v_movq_rx;
@@ -2781,6 +2786,8 @@ static inline void sgx_assemble_cold(SgXAsm* a, int at) {
             sgx_byte(c, 0xFF);
             sgx_byte(c, 0xD0);
         }
+        /* the pins back before the result, whose register may be one of them (sgx_pin_target's) */
+        if (a->pin_cs) a->pin_cs(a->machine, 0);
         if (i->vflags == 2)
             sgx_vmem(a, &sgx_v_movdqu_ld, outreg, SGX_RSP, 8 * argslot[0]);
         else if (cls) {
@@ -2794,7 +2801,6 @@ static inline void sgx_assemble_cold(SgXAsm* a, int at) {
             if (saved_g[k] && x->v[a->owner[k]].last > at) sgx_mov_mem(a, 1, 64, k, SGX_RSP, 8 * gslot[k]);
             if (saved_x[k]) sgx_vmem(a, &sgx_v_movdqu_ld, k, SGX_RSP, 8 * xslot[k]);
         }
-        if (a->pin_cs) a->pin_cs(a->machine, 0);
         sgx_byte(c, 0xE9); /* jmp back */
         sgx_cjump(a, c->n, back, 1);
         sgx_imm(c, 0, 4);
@@ -2856,7 +2862,7 @@ static inline void sgx_assemble_region(SgXAsm* a, SgX* x) {
         a->next_call[i] = !x->ins[i].dead && (x->ins[i].calls || x->ins[i].kind == SGX_K_MACHINE) ? i : a->next_call[i + 1];
     for (i = 0; i < x->n; ++i) {
         SgXIns* s = &x->ins[i];
-        unsigned char r[5] = {0, 0, 0, 0, 0};
+        unsigned char r[SGX_MACHINE_IN] = {0};
         if (s->dead) continue;
         switch (s->kind) {
         case SGX_K_SEL: sgx_assemble_sel(a, i); break;
@@ -2962,7 +2968,7 @@ static inline void sgx_assemble_region(SgXAsm* a, SgX* x) {
                     if (a->owner[k] > 0) sgx_spill(a, k);
                 for (k = 0; k < 16; ++k) /* every XMM register is caller-saved: what is read after, in its slot */
                     sgx_xspill(a, k, i);
-                for (k = 0; k < 5; ++k)
+                for (k = 0; k < SGX_MACHINE_IN; ++k)
                     if (s->in[k]) {
                         SgXV* vv = &x->v[s->in[k]];
                         int fr = s->fixed[k] >= 0 ? s->fixed[k] : sgx_arg_free(a, held);
@@ -2987,7 +2993,7 @@ static inline void sgx_assemble_region(SgXAsm* a, SgX* x) {
                 }
                 break;
             }
-            for (k = 0; k < 5; ++k)
+            for (k = 0; k < SGX_MACHINE_IN; ++k)
                 if (s->in[k] && s->fixed[k] >= 0) {
                     int fr = s->fixed[k];
                     int v = s->in[k], from = sgx_in_reg(a, v, i, held | (1u << fr));

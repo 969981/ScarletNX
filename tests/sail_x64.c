@@ -41,6 +41,10 @@ static struct {
     int jumping;
     unsigned char* memory[3]; /* the LLVM side's, the x86-64 side's, the bytes both start from */
     unsigned sev, wfe;
+    /* what run allocates, which main frees after every one of its ways out */
+    u32* rows;
+    size_t (*offset)[2]; /* and the words after them */
+    void* sequences;
 } g_test;
 
 static u64 rnd(void) {
@@ -177,10 +181,69 @@ static void ldst_start(CPU* c, u32 word, unsigned s) {
 }
 
 typedef u64 (*Step)(CPU* c);
+/* A step is generated code, with no type signature before its entry, which the function sanitizer's check of an
+   indirect call reads: the 8 bytes before the callee, below the mapping for the first one. So the call is unchecked */
+[[clang::no_sanitize("function")]] static u64 run_step(Step step, CPU* c) { return step(c); }
 
 /* FPCR.FZ set, as many games run: operands and results the host's arithmetic gives exactly, an exact zero among them,
    take the inline code with no helper call (snx_x64_fp_calls); a denormal operand, which FZ flushes, takes the helper
    and its IDC. FPSR's IXC is set first, as the inline code needs where an operation may be inexact */
+/* CASP X0, X1, X2, X3, [X4] of doublewords (LOCK CMPXCHG16B, the new pair from R8 and R9): where memory holds X0:X1
+   it takes X2:X3, X3 the machine instruction's sixth input; else it keeps its pair; X0:X1 the old pair either way.
+   Made on this host and the plain one, with every register and with three (spills) */
+static size_t check_casp(void) {
+    static const u64 old[2] = {0x1111111111111111ull, 0x2222222222222222ull};
+    unsigned char* code = (unsigned char*)mmap(NULL, CODE_MAX, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    RtAPI rt = {.undef = on_undef, .sev = on_sev, .wfe = on_wfe, .cas128 = snx_runtime_cas128};
+    size_t failures = 0;
+    int pool = snx_x64_pool();
+    if (code == MAP_FAILED) {
+        fprintf(stderr, "FAIL: CASP: no memory for the code\n");
+        return 1;
+    }
+    for (int variant = 0; variant < 4; ++variant) {
+        unsigned features = variant & 1 ? SNX_X64_BASELINE : host_features();
+        snx_x64_set_pool(variant & 2 ? 3 : pool);
+        if (mprotect(code, CODE_MAX, PROT_READ | PROT_WRITE) ||
+            !snx_x64_step(0x48207C82u, 0x1000, TARGET, features, code, CODE_MAX) ||
+            mprotect(code, CODE_MAX, PROT_READ | PROT_EXEC)) {
+            fprintf(stderr, "FAIL: CASP X0, X1, X2, X3, [X4]: not made (variant %d)\n", variant);
+            ++failures;
+            continue;
+        }
+        for (int match = 0; match < 2; ++match) {
+            CPU c;
+            u64 now[2];
+            unsigned char* at = g_test.memory[0] + MEMORY_ZERO + 0x1000;
+            memcpy(at, old, sizeof old);
+            memset(&c, 0, sizeof c);
+            c.x[0] = match ? old[0] : 0x9999999999999999ull;
+            c.x[1] = old[1];
+            c.x[2] = 0x3333333333333333ull;
+            c.x[3] = 0x4444444444444444ull;
+            c.x[4] = 0x1000;
+            c.mem = g_test.memory[0] + MEMORY_ZERO;
+            c.rt = &rt;
+            c.pc = 0x1000;
+            run_step((Step)(void*)code, &c);
+            memcpy(now, at, sizeof now);
+            u64 want0 = match ? c.x[2] : old[0], want1 = match ? 0x4444444444444444ull : old[1];
+            if (now[0] != want0 || now[1] != want1 || c.x[0] != old[0] || c.x[1] != old[1]) {
+                fprintf(stderr,
+                        "FAIL: CASP %s (variant %d): memory %016llx %016llx (want %016llx %016llx), X0 %016llx X1 "
+                        "%016llx (want the old pair)\n",
+                        match ? "where memory matches" : "where it doesn't", variant, (unsigned long long)now[0],
+                        (unsigned long long)now[1], (unsigned long long)want0, (unsigned long long)want1,
+                        (unsigned long long)c.x[0], (unsigned long long)c.x[1]);
+                ++failures;
+            }
+        }
+    }
+    snx_x64_set_pool(pool);
+    munmap(code, CODE_MAX);
+    printf("CASP of doublewords, 4 ways made, matching and not: %zu failures\n", failures);
+    return failures;
+}
 static size_t check_fz_hot(void) {
     static const struct {
         u32 word;
@@ -229,7 +292,7 @@ static size_t check_fz_hot(void) {
         c.fpsr = 0x10;     /* IXC */
         c.pc = 0x1000;
         calls = snx_x64_fp_calls();
-        ((Step)(void*)code)(&c);
+        run_step((Step)(void*)code, &c);
         cold = snx_x64_fp_calls() != calls;
         got = cases[k].word == 0x1E222020u ? (u64)(c.n << 3 | c.z << 2 | c.cf << 1 | c.vf) : c.v[0].d[0];
         /* FMADD is the helper's on a host without FMA */
@@ -247,10 +310,10 @@ static size_t check_fz_hot(void) {
     return failures;
 }
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     unsigned states = 64, samples = 3, sequences = 4000, i, k;
     unsigned hosts[2];
-    u32 *rows = NULL, *words;
+    u32 *rows, *words;
     size_t count, n = 0, failures = 0, unmade = 0, compared = 0, bytes = 0, made = 0, plain_unmade = 0;
     unsigned char* code;
     size_t code_at = 0, code_cap = (size_t)1 << 26;
@@ -302,6 +365,7 @@ int main(int argc, char** argv) {
         if (g_test.memory[k] == MAP_FAILED) return 1;
     }
     failures += check_fz_hot();
+    failures += check_casp();
     for (i = 0; i < MEMORY_SIZE; ++i) g_test.memory[2][i] = (unsigned char)rnd();
     memcpy(g_test.memory[0], g_test.memory[2], MEMORY_SIZE);
     memcpy(g_test.memory[1], g_test.memory[2], MEMORY_SIZE);
@@ -311,10 +375,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     /* the words: each row's samples, and each with Rd, Rn and Rm 31 */
-    count = lqd_row_words(samples, rnd, &rows);
-    words = (u32*)malloc(sizeof(u32) * (count * 8 + 1));
-    offset = malloc(sizeof *offset * (count * 8 + 1));
-    if (!words || !offset) return 1;
+    count = lqd_row_words(samples, rnd, &g_test.rows);
+    rows = g_test.rows;
+    /* the offsets of the words' code, then the words: one block */
+    offset = g_test.offset = malloc((sizeof *offset + sizeof *words) * (count * 8 + 1));
+    if (!offset) return 1;
+    words = (u32*)(offset + count * 8 + 1);
     for (i = 0; i < count; ++i) {
         static const u32 fields[3] = {0x1fu, 0x1fu << 5, 0x1fu << 16};
         const char* name = op_name(rows[i]);
@@ -359,7 +425,6 @@ int main(int argc, char** argv) {
             }
         }
     }
-    free(rows);
     if (mprotect(code, code_cap, PROT_READ | PROT_EXEC)) {
         fprintf(stderr, "FAIL: the code can't be made executable\n");
         return 1;
@@ -407,7 +472,7 @@ int main(int argc, char** argv) {
                 next[0] = set.steps[i](&end[0]);
                 undef[0] = g_test.undef + 16 * g_test.sev + 256 * g_test.wfe;
                 g_test.undef = g_test.sev = g_test.wfe = 0;
-                next[1] = x64(&end[1]);
+                next[1] = run_step(x64, &end[1]);
                 undef[1] = g_test.undef + 16 * g_test.sev + 256 * g_test.wfe;
                 ++compared;
                 {
@@ -448,6 +513,7 @@ int main(int argc, char** argv) {
         Seq* seq = (Seq*)malloc(sizeof(Seq) * sequences);
         size_t q, nseq = 0, steps = 0;
         if (!seq) return 1;
+        g_test.sequences = seq;
         if (mprotect(code, code_cap, PROT_READ | PROT_WRITE)) return 1;
         for (q = 0; q < sequences; ++q) {
             Seq* sq = &seq[nseq];
@@ -512,7 +578,7 @@ int main(int argc, char** argv) {
                 for (j = 0; j < seq[q].count; ++j) next[0] = set.steps[seq[q].first + j](&end[0]);
                 undef[0] = g_test.undef + 16 * g_test.sev + 256 * g_test.wfe;
                 g_test.undef = g_test.sev = g_test.wfe = 0;
-                next[1] = x64(&end[1]);
+                next[1] = run_step(x64, &end[1]);
                 undef[1] = g_test.undef + 16 * g_test.sev + 256 * g_test.wfe;
                 ++compared;
                 if (next[0] != next[1] || undef[0] != undef[1] || memcmp(end[0].x, end[1].x, sizeof end[0].x) ||
@@ -538,10 +604,16 @@ int main(int argc, char** argv) {
         }
         llvm_steps_end(&set);
         printf("sail_x64: %zu blocks of 2 to 4 words\n", nseq);
-        free(seq);
     }
     printf("sail_x64: %zu words made (%zu bytes of x86-64 on this host's features, %.1f a word; %zu of them not without "
            "BMI1, BMI2 and LZCNT), %zu runs, %zu failures (%zu words not made)\n",
            made, bytes, made ? (double)bytes / (double)made : 0.0, plain_unmade, compared, failures, unmade);
     return failures ? 1 : 0;
+}
+int main(int argc, char** argv) {
+    int rc = run(argc, argv);
+    free(g_test.rows);
+    free(g_test.offset);
+    free(g_test.sequences);
+    return rc;
 }

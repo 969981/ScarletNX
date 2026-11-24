@@ -139,6 +139,10 @@ typedef struct Renderer {
     void (*cs_mem_need)(u64 a, u64 n);
     /* 0 when no pending result or queued release covers [a, a + n): a read needs none of the mem_need hooks */
     int (*mem_pending)(u64 a, u64 n);
+    /* 1 when results of the GPU over the GPU range [a, a + n) are not in guest memory yet: pending results, queued
+       releases, render targets not written back, which a change of the range's mapping lands there first. Any thread.
+       Optional */
+    int (*gpu_holds)(u64 a, u64 n);
     void (*gfx_mem_need)(u64 a, u64 n);
     void (*before_syncwait)(void); /* the stream is about to wait on a syncpoint: flush everything in flight */
     void (*stream_incr)(u32 id);   /* a syncpoint increment in the stream, after everything before it is done */
@@ -273,7 +277,52 @@ extern const Renderer* g_renderer;
 
 /* shared state (gpu/renderer.c) */
 extern int g_renderer_up; /* the renderer started */
-extern u64 g_draws;
+extern u64 g_draws; /* the draws given to the renderer (gpu_draw), for the counters a report makes up */
+/* the front end's draw and dispatch: what the front end counts and holds back is done here, on its side, and the
+   renderer's call does only the renderer's work */
+void gpu_draw(const DsState* ds, const DrawCall* dc, DrawOwner* o);
+void gpu_clear(const DsState* ds, const DrawClear* c, const DrawOwner* o);
+void gpu_draw_texture(const DsState* ds, const DrawTexture* t);
+void gpu_discard(const DsState* ds, u32 targets);
+/* the front end changed len bytes at off of ds's inline group (DsState.inl), which had the generation before: the
+   next draw record of ds sends those bytes in place of the whole group. A change of more ranges names the first with
+   the old generation and the others with the new one */
+void gpu_ds_inline_changed(const DsState* ds, u64 before, u32 off, u32 len);
+void gpu_dispatch(const DispatchState* d);
+/* the state's copies start over after a state load (gpu.c) */
+void gpu_draw_states_reset(void);
+/* the renderer's calls without a result, queued in their order */
+void gpu_method_barrier(int kind);
+void gpu_stream_incr(u32 id);
+/* on the front end: release_value(id) with the increments still queued for the renderer counted, with no drain */
+u32 gpu_release_value(u32 id);
+void gpu_stream_end(void);
+void gpu_mem_seen(void);
+void gpu_ready(void);
+void gpu_stream_run(int on);
+void gpu_samples_reset(u32 owner);
+void gpu_samples_enable(u32 owner, int on);
+void gpu_predicate_drop(u32 pred);
+/* the renderer's side: 1 when owner's draws are off, 0 when on (with *pred the GPU's predicate, 0 for none), -1 when
+   no render enable of the 3D engine decided it (maxwell/engines.c); and every decision dropped */
+int gpu_render_state(u32 owner, u32* pred);
+/* NVN's SetRenderEnable (modes 2, 3) and SetRenderEnableConditional (0, 1) for owner's draws, decided on the
+   renderer's side as the 3D engine's render enable is (maxwell/engines.c) */
+void gpu_render_enable_nvn(u32 owner, u32 mode, u64 a);
+/* a samples-passed report at a of owner: the renderer's count when counted and it has one, else value, with ticks */
+void gpu_report_samples(u32 owner, u64 a, int counted, u64 value);
+/* a transform feedback control of the owner of ds (renderer.h xfb_control), in its place among the draws */
+void gpu_xfb_control(const DsState* ds, DrawOwner* o, u64 control, u32 what, u32 stride);
+void gpu_render_states_reset(void);
+/* the renderer for any other call of the front end: after every queued record */
+const Renderer* gpu_renderer_now_at(const char* file, int line);
+#define gpu_renderer_now() gpu_renderer_now_at(__FILE__, __LINE__) /* counted by where it is asked (gq_drain_at) */
+/* The shading rate id (Renderer.shading_rate) for the draws after it, from a record in its place in the queue: the
+   renderer's side keeps the id of its last call, and a draw that gives GPU_RATE_LAST in DrawCall.shading_rate takes
+   it there. The draws after the call run after it, so each takes the id the call gave, as the front end would have
+   had it after a drain. 0 with no shading_rate in the renderer */
+#define GPU_RATE_LAST 0xffffffffu
+u32 gpu_shading_rate(const GpuShadingRate* r);
 extern _Atomic int g_cs_any;      /* compute results are pending somewhere */
 extern _Atomic int g_gfx_any;     /* graphics storage-buffer results are pending somewhere */
 extern _Atomic int g_gfx_img_any; /* graphics storage-image results are pending somewhere */

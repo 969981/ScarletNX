@@ -1641,7 +1641,9 @@ setting GPU checkpoints
     startup
     words Off|On
     help 1 = records what the GPU is doing as it goes (VK_NV_device_diagnostic_checkpoints), and when the device is
-    help lost logs the work each queue reached. Where the driver has no such extension it is only a warning. Off, the
+    help lost logs the work each queue reached. On NVIDIA the driver also keeps shader debug info and what each
+    help resource is (VK_NV_device_diagnostics_config), which costs speed. Where the driver has no such extension it is
+    help only a warning. Off, the
     help device is made without it, so a RenderDoc capture also replays on a driver that lacks it
 setting Vulkan hidden commands
     label Hide Vulkan commands
@@ -1679,7 +1681,9 @@ setting Guest memory
     help AHardwareBuffers), as the console's GPU does: for a GPU that shares system memory. On a discrete GPU it goes
     help across the bus. 0 = 2 on a GPU that shares system memory, but never the moves into AHardwareBuffers (unless
     help uma_memory=2), and on a discrete GPU whose host imports cost every submission (amdgpu's) through Linux's
-    help dma-bufs (uma_memory), else 1. A 3DS game takes it too, for the
+    help dma-bufs (uma_memory), and on Windows on a discrete GPU with resizable BAR and host imports where the GPU
+    help mirror can be (sparse residency of buffers): what the GPU only reads is copied there (uma_copies), and what
+    help it writes stays in its own memory or in the mirror. Else 1. A 3DS game takes it too, for the
     help board's RAM: 1 = the GPU works on a copy of it in its own memory, 2 = on the RAM in place
     help (docs/platforms/3ds/README.md)
 setting Guest memory in place
@@ -1703,9 +1707,10 @@ setting Guest buffers copied
     words Auto|In place|Copied
     help Where guest memory is read in place (vk_memory), whether vertices, indices and constant buffers are read there
     help too. 0 = copied on a driver that takes every import's pages again at each submission (amdgpu's: RADV, AMDVLK,
-    help AMD's on Linux), where each import costs every submission, but read in place on a discrete GPU, which takes
-    help guest memory through dma-bufs only, and read in place elsewhere. 1 = read in place.
-    help 2 = copied. A dispatch's storage ranges and what the GPU writes stay in place either way
+    help AMD's on Linux), where each import costs every submission, and on a discrete GPU that imports host memory,
+    help whose reads cross the bus: there read-only storage is copied too. Read in place on a discrete GPU through
+    help dma-bufs, and elsewhere. 1 = read in place. 2 = copied, and read-only storage too on a discrete GPU. What the
+    help GPU writes, and a range a write in place is pending over, stay in place either way
 setting Buffer copy stats
     key vk_buffer_stats
     int 0 1
@@ -1809,6 +1814,18 @@ setting Constant buffer windows
     help ranges of 64 KiB and its descriptors are not in heaps, but not on lavapipe, whose linear rasterizer smashes its
     help stack with them. 1 = windows on lavapipe too, which needs Mesa's LP_PERF=no_rast_linear (a test runs it so);
     help a GPU that can't take them binds them one by one and says why. 0 = each constant buffer bound one by one
+setting Dynamic constant buffers
+    key vk_dynamic_cbufs
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help 1 = with descriptor sets (not descriptor buffers or heaps), the vertex and fragment programs' constant buffers
+    help that move most are dynamic uniform buffers: their offsets go with the bind of the set, not in it, so a draw
+    help whose constant buffers moved can keep its set. The device's limit on dynamic uniform buffers caps how many.
+    help The game's moves of each constant buffer are kept in its shader cache when it closes (<game>.vkcbmoves), and
+    help the next start chooses from them. 0 = every constant buffer is a plain uniform buffer. On Android it stays
+    help off for now: Turnip keeps dynamic buffers in the descriptor set the runtime takes for a fifth (#2780)
 setting Indirect copies
     key vk_copy_indirect
     int 0 1
@@ -1832,6 +1849,15 @@ setting Vulkan recording thread
     startup
     words Off|On
     help 1 = Vulkan commands are recorded on a thread of their own; 0 = on the GPU thread, as they are made
+setting GPU split
+    key gpu_split
+    int 0 2
+    default 2
+    startup
+    words Off|On|Auto
+    help 1 = the renderer sets up draws on a thread of its own, while the GPU thread reads the game's commands ahead
+    help of it (gpu/gpu_queue.c). 0 = the GPU thread does both, one after the other. 2 = each, as it measures faster:
+    help the game's work a present on the two threads against on one, with the other tried for a moment now and then
 setting Compute dispatches
     key compute
     int 0 1
@@ -1887,6 +1913,20 @@ setting Vulkan allocation cap
     startup
     help The largest Vulkan allocation in MiB, below the device's own (larger images in pieces with sparse binding),
     help to test the pieces on a driver that takes anything (lavapipe). 0 = the default
+setting Early copy back
+    key vk_early_copy_back
+    int 0 1
+    default 1
+    words Off|On
+    help 1 = a render target result that the game read back in the last 1200 presents is also copied to system memory
+    help as it is made, so the game's next read of it copies those bytes with no readback of its own (discrete GPUs)
+setting Early landing
+    key vk_early_landing
+    int 0 1
+    default 1
+    words Off|On
+    help 1 = a result copied back early lands in guest memory on a thread of its own as soon as the GPU has made it,
+    help so the game's read of it finds the bytes there and does not stop to land them
 setting Submit every
     key vk_submit_every
     int 0 65536
@@ -2343,6 +2383,7 @@ setting @VK_KHR_video_decode_h264
 setting @VK_KHR_video_decode_queue
 setting @VK_KHR_video_queue
 setting @VK_NV_device_diagnostic_checkpoints
+setting @VK_NV_device_diagnostics_config
 setting @VK_NV_fragment_coverage_to_color
 setting @VK_NV_framebuffer_mixed_samples
 setting @VK_NV_low_latency2
@@ -2443,14 +2484,15 @@ setting Unit size
     help on its own, and a smaller one takes less memory at once, which a phone needs (Android's allocator ran out at
     help 90000 on several threads, and iOS ends an app at its limit). A game made already keeps its units until it is
     help recompiled
-setting Unit cache limit
-    key unit_cache_gb
-    int 0 100000
-    default 0
-    words No limit|# GB
-    help The most the cache of compiled code units may hold, in GB: units/ of the cache folder, where every recompile
-    help finds the units it compiled before. Past it the units reused longest ago are removed. 0 = no limit. Either
-    help way the cache always leaves a tenth of its disk free, at most 10 GB, removing its oldest units for a new one
+setting Unit cache ceiling
+    key unit_cache_ceil_mb
+    int 0 1048576
+    default 512
+    words Off|# MB
+    help The most memory, in MB, the x86-64 back end's code units are held in while ScarletNX runs, so that a unit
+    help made again (an NRO a game loads again, the launcher's next recompile) is copied rather than made. They take a
+    help hundredth of the machine's memory at most, and this ceiling over that; the ones used longest ago go first. 0 =
+    help none held. Nothing is kept on the disk
 
 # LLVM's own: every pass of its pipelines for -O0 to -Oz, on unless turned off, and each option LLVM's C API sets on the
 # pass builder and the target machine, LLVM's own value until it is set

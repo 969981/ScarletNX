@@ -1808,7 +1808,7 @@ if(NOT WIN32)
     add_test(NAME alloc_vector COMMAND snx-test-alloc-vector)
 endif()
 # the sync family's clocks (src/nx/hle/hook/sync.c) against the game's (src/nx/runtime/clock.c): steady_clock stopped
-# by a pause and set by a state's load, system_clock the host's
+# by a pause and set by a state's load, system_clock the host's; and the cond_var family's C library waits
 add_executable(snx-test-sync-clock sync_clock.c "${PROJECT_SOURCE_DIR}/src/nx/hle/hook/sync.c"
                "${PROJECT_SOURCE_DIR}/src/nx/runtime/clock.c")
 snx_test_target(snx-test-sync-clock gnu23)
@@ -1901,7 +1901,7 @@ snx_hookgen(snx-test-nvn-commands SPEC "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn
 add_test(NAME nvn_commands COMMAND snx-test-nvn-commands)
 # nvn's constant banks and sprite origin against the game's driver: nvn_draw_init, a program's bind
 # and a draw's dynamic state, through the public records
-add_executable(snx-test-nvn-draw-banks nvn_draw_banks.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_draw.c"
+add_executable(snx-test-nvn-draw-banks nvn_draw_banks.c "${PROJECT_SOURCE_DIR}/tests/support/gpu_front_stub.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_draw.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_state.c")
 snx_test_target(snx-test-nvn-draw-banks gnu23)
 target_include_directories(snx-test-nvn-draw-banks PRIVATE "${PROJECT_SOURCE_DIR}/src")
@@ -1914,7 +1914,7 @@ target_include_directories(snx-test-nvn-advanced-blend PRIVATE "${PROJECT_SOURCE
 target_link_libraries(snx-test-nvn-advanced-blend PRIVATE m)
 add_test(NAME nvn_advanced_blend COMMAND snx-test-nvn-advanced-blend)
 # nvn's copies between textures of two formats: the 2D engine's converting blit, as the game's driver copies
-add_executable(snx-test-nvn-copy-formats nvn_copy_formats.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_copy.c"
+add_executable(snx-test-nvn-copy-formats nvn_copy_formats.c "${PROJECT_SOURCE_DIR}/tests/support/gpu_front_stub.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_copy.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_state.c")
 snx_test_target(snx-test-nvn-copy-formats gnu23)
 target_include_directories(snx-test-nvn-copy-formats PRIVATE "${PROJECT_SOURCE_DIR}/src")
@@ -1922,7 +1922,7 @@ target_link_libraries(snx-test-nvn-copy-formats PRIVATE m)
 snx_hookgen(snx-test-nvn-copy-formats SPEC "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn.hook" PREFIX nvn NAME gpu/nvn/nvn.hook A32)
 add_test(NAME nvn_copy_formats COMMAND snx-test-nvn-copy-formats)
 # a window's present transform against the game's driver: lower left is queued to vi flipped
-add_executable(snx-test-nvn-present-flip nvn_present_flip.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_queue.c"
+add_executable(snx-test-nvn-present-flip nvn_present_flip.c "${PROJECT_SOURCE_DIR}/tests/support/gpu_front_stub.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_queue.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_state.c")
 snx_test_target(snx-test-nvn-present-flip gnu23)
 target_include_directories(snx-test-nvn-present-flip PRIVATE "${PROJECT_SOURCE_DIR}/src")
@@ -1944,14 +1944,26 @@ add_test(NAME nvn_nvrm_sync COMMAND snx-test-nvn-nvrm-sync)
 add_executable(snx-test-nvn-queue-lifetime nvn_queue_lifetime.c
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_replay.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_state.c" "${PROJECT_SOURCE_DIR}/src/nx/hle/hle.c"
-    own_stub.c)
+    own_stub.c "${PROJECT_SOURCE_DIR}/tests/support/gpu_front_stub.c")
 snx_test_target(snx-test-nvn-queue-lifetime gnu23)
 add_dependencies(snx-test-nvn-queue-lifetime snx_settings)
 target_include_directories(snx-test-nvn-queue-lifetime PRIVATE "${PROJECT_SOURCE_DIR}/src" "${PROJECT_BINARY_DIR}/settingsgen")
 add_test(NAME nvn_queue_lifetime COMMAND snx-test-nvn-queue-lifetime)
+# the replay with gpu_split's renderer thread: a fence and a present reach the renderer after the draws before them (its platform
+# stand-ins are pthreads)
+add_executable(snx-test-nvn-replay-split nvn_replay_split.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_replay.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_state.c" "${PROJECT_SOURCE_DIR}/src/nx/hle/hle.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/gpu/renderer.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/gpu_queue.c" own_stub.c)
+snx_test_target(snx-test-nvn-replay-split gnu23)
+target_compile_options(snx-test-nvn-replay-split PRIVATE -Wno-missing-field-initializers) # renderer.c's records
+add_dependencies(snx-test-nvn-replay-split snx_settings)
+target_link_libraries(snx-test-nvn-replay-split PRIVATE scarletnx-platform) # gpu_queue.c times the waits
+target_include_directories(snx-test-nvn-replay-split PRIVATE "${PROJECT_SOURCE_DIR}/src" "${PROJECT_BINARY_DIR}/settingsgen")
+add_test(NAME nvn_replay_split COMMAND snx-test-nvn-replay-split)
+set_tests_properties(nvn_replay_split PROPERTIES TIMEOUT 30) # a wait in the queue that never ends would hang ctest
 # the NVN functions of API 53 and 55 nvn took over last, by family: records and their replay into the draw
 # state (nvn_cmd.c, nvn_draw.c), the objects' getters and setters (nvn_object.c) and the queue and window (nvn_queue.c)
-add_executable(snx-test-nvn-names nvn_names.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_cmd.c"
+add_executable(snx-test-nvn-names nvn_names.c "${PROJECT_SOURCE_DIR}/tests/support/gpu_front_stub.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_cmd.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_draw.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_object.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_queue.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_tex.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_tic.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_state.c"
@@ -2814,9 +2826,6 @@ add_test(NAME android_manifest COMMAND "${CMAKE_COMMAND}" "-DSRC=${PROJECT_SOURC
 # every SNX_ variable a preset of CMakePresets.json sets is one the build reads
 add_test(NAME preset_variables COMMAND "${CMAKE_COMMAND}" "-DSRC=${PROJECT_SOURCE_DIR}" -P
          "${CMAKE_CURRENT_SOURCE_DIR}/preset_variables_test.cmake")
-# LLVM's revision for the unit cache's key, read by CMake from its C++ header (cmake/llvm_revision.cmake)
-add_test(NAME llvm_revision COMMAND "${CMAKE_COMMAND}" "-DSRC=${PROJECT_SOURCE_DIR}"
-         "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/llvm-revision-test" -P "${CMAKE_CURRENT_SOURCE_DIR}/llvm_revision_test.cmake")
 
 # hid's shared memory layout (src/nx/hle/services/hid_layout.h) is checked against Eden's declarations at a pinned
 # revision by check_hid_layout.py, run by hand: `python3 tests/check_hid_layout.py --eden <an Eden checkout>`. It
@@ -3537,8 +3546,7 @@ snx_test_target(snx-test-aot-variants gnu23)
 target_link_libraries(snx-test-aot-variants PRIVATE snx_driver_llvm ${CMAKE_DL_LIBS})
 add_test(NAME aot_variants COMMAND snx-test-aot-variants)
 set_tests_properties(aot_variants PROPERTIES TIMEOUT 120)
-# the code units' cache (nx/loader/unit_cache.c) under the LLVM module builds, a 32-bit game's too: reuse, keys, broken
-# objects, the limit
+# the x86-64 back end's units held in memory (x64_cache.h) under the module build: reuse, room, the limit
 add_executable(snx-test-unit-cache unit_cache.c)
 snx_test_target(snx-test-unit-cache gnu23)
 target_link_libraries(snx-test-unit-cache PRIVATE snx_driver_llvm ${CMAKE_DL_LIBS})
@@ -3866,6 +3874,13 @@ add_test(NAME recompiler_backends_div_pins COMMAND snx-test-recompiler-backends 
 # one where no register of the pool is free when DIV takes RDX from the divisor it holds
 add_test(NAME recompiler_backends_div_divisor COMMAND snx-test-recompiler-backends --words d2800030 f9400ac7 1acc096b
          d503201f aa0b00cd aa0b000a d503201f d503201f d503201f d503201f 9ac8092e d503201f f9401746 f1000610 54fffe61)
+# FMLA of a vector in a loop on a host with AVX and F16C but no FMA (0x800, FMA alone, taken away), where it is a cold
+# call always taken: its result stays in the destination's pin, past the pins' reload
+add_test(NAME recompiler_backends_cold_pin COMMAND snx-test-recompiler-backends --without 0x800 --states 40 --words
+         d2800030 4ee1d41f 4f821bff 9a8211c3 0f406000 f1000610 54ffff61)
+# random functions on a host of SSE4.2: no BMI1, BMI2, LZCNT, F16C, AVX or FMA
+add_test(NAME recompiler_backends_plain COMMAND snx-test-recompiler-backends --without 0xd07 --seed 209458
+         --functions 1200)
 # what the library's archive needs from outside it: LLVM and the system's libraries alone
 # (tests/recompiler_symbols.cmake). Its program links every object of the archive with those, named here rather than
 # taken from the archive's own link line, which a new library would join. Built by the test, so a library more fails
@@ -3933,6 +3948,11 @@ add_executable(snx_codegen_test codegen_test.c llvm_steps.c)
 snx_test_target(snx_codegen_test c23)
 target_link_libraries(snx_codegen_test PRIVATE snx_llvm snx_driver ${CMAKE_DL_LIBS})
 add_test(NAME native_codegen COMMAND snx_codegen_test)
+# what an x86-64 unit's object is made from, which the unit cache keys it by (x64_unit_facts.c)
+add_executable(snx-test-x64-unit-facts x64_unit_facts.c)
+snx_test_target(snx-test-x64-unit-facts gnu23)
+target_link_libraries(snx-test-x64-unit-facts PRIVATE snx_llvm snx_driver ${CMAKE_DL_LIBS})
+add_test(NAME x64_unit_facts COMMAND snx-test-x64-unit-facts)
 
 # NCE's patcher (src/nx/runtime/nce/nce_patch.c) on a synthetic module: the words that Eden's patcher changes, found
 # in the code and kept where the code reads them as data, and the words of their stubs. Words only, on any host
@@ -4280,13 +4300,36 @@ if(NOT WIN32)
 endif()
 add_test(NAME audio_clock COMMAND snx-test-audio-clock)
 
-add_executable(snx-test-render-enable render_enable.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/engines.c"
+# gpu/renderer.c's side of the front end with a stand-in renderer and no device: the copy of each draw state that the
+# renderer reads, and what the front end counts and holds back
+add_executable(snx-test-gpu-records gpu_records.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/gpu_queue.c")
+snx_test_target(snx-test-gpu-records gnu23)
+target_compile_options(snx-test-gpu-records PRIVATE -Wno-missing-field-initializers) # renderer.c's records, as -Wextra sees them
+target_include_directories(snx-test-gpu-records PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(snx-test-gpu-records PRIVATE scarletnx-common scarletnx-platform) # gpu_split's thread
+add_test(NAME gpu_records COMMAND snx-test-gpu-records)
+# the same records on gpu_split's renderer thread
+add_test(NAME gpu_records_split COMMAND snx-test-gpu-records split)
+set_tests_properties(gpu_records_split PROPERTIES TIMEOUT 30) # a wait in the queue that never ends would hang ctest
+
+# gpu/gpu_queue.c's ring with stand-ins for the work of its records, with no device and no gpu.c: the records run in
+# their order with their bytes, also when the ring wraps
+add_executable(snx-test-gpu-queue gpu_queue_records.c)
+snx_test_target(snx-test-gpu-queue gnu23)
+target_include_directories(snx-test-gpu-queue PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(snx-test-gpu-queue PRIVATE scarletnx-common scarletnx-platform) # gpu_split's thread
+add_test(NAME gpu_queue COMMAND snx-test-gpu-queue)
+# the same ring with gpu_split's renderer thread running its records
+add_test(NAME gpu_queue_split COMMAND snx-test-gpu-queue split)
+set_tests_properties(gpu_queue_split PROPERTIES TIMEOUT 30)
+
+add_executable(snx-test-render-enable render_enable.c "${PROJECT_SOURCE_DIR}/tests/support/gpu_front_stub.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/engines.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/maxwell3d.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/write_pages.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/draw_state.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/draw_state.c")
 snx_test_target(snx-test-render-enable gnu23)
 add_test(NAME render_enable COMMAND snx-test-render-enable)
 
-add_executable(snx-test-draw-state-groups draw_state_groups.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/engines.c"
+add_executable(snx-test-draw-state-groups draw_state_groups.c "${PROJECT_SOURCE_DIR}/tests/support/gpu_front_stub.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/engines.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/maxwell3d.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/write_pages.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/draw_state.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/draw_state.c")
 snx_test_target(snx-test-draw-state-groups gnu23)
@@ -4296,13 +4339,13 @@ add_executable(snx-test-clear-flags clear_flags.c)
 snx_test_target(snx-test-clear-flags gnu23)
 add_test(NAME clear_flags COMMAND snx-test-clear-flags)
 
-add_executable(snx-test-instance-array instance_array.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/engines.c"
+add_executable(snx-test-instance-array instance_array.c "${PROJECT_SOURCE_DIR}/tests/support/gpu_front_stub.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/engines.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/maxwell3d.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/write_pages.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/draw_state.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/draw_state.c")
 snx_test_target(snx-test-instance-array gnu23)
 add_test(NAME instance_array COMMAND snx-test-instance-array)
 
-add_executable(snx-test-draw-texture draw_texture.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/engines.c"
+add_executable(snx-test-draw-texture draw_texture.c "${PROJECT_SOURCE_DIR}/tests/support/gpu_front_stub.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/engines.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/maxwell3d.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/write_pages.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/draw_state.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/draw_state.c")
 snx_test_target(snx-test-draw-texture gnu23)
@@ -4314,19 +4357,22 @@ target_link_libraries(snx-test-vk-draw-texture-blit PRIVATE m)
 add_test(NAME vk_draw_texture_blit COMMAND snx-test-vk-draw-texture-blit)
 
 # gpu.c's queue over the real puller, 3D engine and macros: a channel waiting on a semaphore, a syncpoint, a fence or
-# inside a macro lets the others run, and goes on where it stopped (its platform stand-ins are pthreads)
-if(UNIX)
-    add_executable(snx-test-gpu-park gpu_park.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/gpu.c"
-        "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/engines.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/maxwell3d.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/write_pages.c"
-        "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/draw_state.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/draw_state.c"
-        "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/mme.c"
-        "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/dma.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/blocklinear.c"
-        support/dma_ref.c own_stub.c)
-    snx_test_target(snx-test-gpu-park gnu23)
-    target_link_libraries(snx-test-gpu-park PRIVATE scarletnx-common) # gpu.c says why a thread did not start
-        add_test(NAME gpu_park COMMAND snx-test-gpu-park)
-    set_tests_properties(gpu_park PROPERTIES TIMEOUT 30) # a deadlock in the queue would otherwise hang ctest
-endif()
+# inside a macro lets the others run, and goes on where it stopped (its platform stand-ins are pthreads, and Windows'
+# own locks for the platform's types there)
+add_executable(snx-test-gpu-park gpu_park.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/gpu.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/gpu_queue.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/engines.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/maxwell3d.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/write_pages.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/draw_state.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/draw_state.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/mme.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/dma.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/blocklinear.c"
+    support/dma_ref.c support/gpu_front_stub.c own_stub.c)
+snx_test_target(snx-test-gpu-park gnu23)
+target_compile_definitions(snx-test-gpu-park PRIVATE SNX_TEST_GPU_QUEUE) # the real gq_call, not the stub's
+target_link_libraries(snx-test-gpu-park PRIVATE scarletnx-common) # gpu.c says why a thread did not start
+add_test(NAME gpu_park COMMAND snx-test-gpu-park)
+set_tests_properties(gpu_park PROPERTIES TIMEOUT 30) # a deadlock in the queue would otherwise hang ctest
+# the same queue with gpu_split's renderer thread running its records
+add_test(NAME gpu_park_split COMMAND snx-test-gpu-park split)
+set_tests_properties(gpu_park_split PROPERTIES TIMEOUT 30)
 
 # the shader programs a game ships, found in containers built by the test (gpu/shader/shipped.c)
 add_executable(snx-test-shipped-shaders shipped_shaders.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/shader/shipped.c")
@@ -4537,6 +4583,10 @@ endif() # SNX_BUILD_NX
 add_executable(snx-test-rt-bands rt_bands.c)
 snx_test_target(snx-test-rt-bands gnu23)
 add_test(NAME rt_bands COMMAND snx-test-rt-bands)
+# whether a guest write covers a render target (vk/rt_cover.h): every byte from its first to its last, nothing wraps
+add_executable(snx-test-rt-cover rt_cover.c)
+snx_test_target(snx-test-rt-cover 23)
+add_test(NAME rt_cover COMMAND snx-test-rt-cover)
 # dist/icons/ is what scripts/make-icons.py draws from dist/wimsy.svg: a changed SVG fails until it runs again
 if(Python3_Interpreter_FOUND)
     add_test(NAME dist_icons COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/make-icons.py" --check)
@@ -4557,6 +4607,7 @@ snx_test_target(snx-test-write-pages gnu23)
 add_test(NAME write_pages COMMAND snx-test-write-pages)
 add_executable(snx-test-memory-own-cut memory_own_cut.c)
 snx_test_target(snx-test-memory-own-cut gnu23)
+target_link_libraries(snx-test-memory-own-cut PRIVATE scarletnx-platform) # own.c's landing times (plat_ns)
 add_test(NAME memory_own_cut COMMAND snx-test-memory-own-cut)
 add_executable(snx-test-draw-state-mx draw_state_mx.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/draw_state.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/draw_state.c")
 snx_test_target(snx-test-draw-state-mx c23)
@@ -4993,8 +5044,8 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     snx_test_target(snx-test-shader-advanced-blend gnu23)
     add_test(NAME shader_advanced_blend COMMAND snx-test-shader-advanced-blend)
 endif()
-# these recompile with --repo of the checkout, which keeps the code units (nx/loader/unit_cache.c) in the user's cache
-# folder: a folder of the build tree's instead, where XDG names it
+# these recompile with --repo of the checkout, whose cache folder (the extractions' work/) is the user's: a folder of
+# the build tree's instead, where XDG names it
 foreach(snx_test native_recompiler llvm_module nro_modules plt_calls nx_runtime_homebrew nx_runtime_homebrew_64k_pages)
     if(TEST ${snx_test})
         set_property(TEST ${snx_test} APPEND PROPERTY ENVIRONMENT "XDG_CACHE_HOME=${CMAKE_CURRENT_BINARY_DIR}/xdg-cache")

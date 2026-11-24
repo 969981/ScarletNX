@@ -20,6 +20,7 @@
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
 #include "nx/runtime/platform/tracy.h"
+#include "common/platform/time.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/ledger.h"
 #include "nx/gpu/vk/pagespace.h"
@@ -917,7 +918,27 @@ static void out_free(GfxOut* o) {
     out_block_free(o);
 }
 /* The frame fence has signaled. Its stage allocations still exist here; cmd.c frees them only after this call. */
+/* for the statistics, under vk_lock: vk_buf_frame_done's calls, and the nanoseconds of its parts (the walk of g_out,
+   the landing of the results, the retire of the dispatches' logs, vk_mirror_done, vk_uma_frame_done) */
+enum { TAIL_WALK, TAIL_LAND, TAIL_RETIRE, TAIL_MIRROR, TAIL_UMA, TAIL_N };
+static u64 g_tail_calls, g_tail_ns[TAIL_N];
+void vk_buf_frame_done_log(void) {
+    vk_lock();
+    u64 calls = g_tail_calls, ns[TAIL_N];
+    memcpy(ns, g_tail_ns, sizeof ns);
+    g_tail_calls = 0;
+    memset(g_tail_ns, 0, sizeof g_tail_ns);
+    vk_unlock();
+    if (calls)
+        LOG("vulkan: the landings of finished submissions over the last 600 presents: %llu calls, %.2f ms finding the "
+            "outputs, %.2f ms landing them, %.2f ms retiring logs, %.2f ms in the mirror's done, %.2f ms in the UMA "
+            "done\n",
+            (unsigned long long)calls, (double)ns[TAIL_WALK] / 1e6, (double)ns[TAIL_LAND] / 1e6,
+            (double)ns[TAIL_RETIRE] / 1e6, (double)ns[TAIL_MIRROR] / 1e6, (double)ns[TAIL_UMA] / 1e6);
+}
 void vk_buf_frame_done(u64 frame) {
+    u64 t_part = plat_ns(), t_next;
+    g_tail_calls++;
     GfxOut *done = NULL, *done_tail = NULL;
     for (GfxOut** pp = &g_out; *pp;) {
         GfxOut* o = *pp;
@@ -938,6 +959,9 @@ void vk_buf_frame_done(u64 frame) {
     for (GfxOut* o = g_out; o; o = o->next) g_out_tail = o;
     atomic_store_explicit(&g_gfx_any, g_out != NULL || done != NULL, memory_order_relaxed);
     DevMem invalidated = 0;
+    t_next = plat_ns();
+    g_tail_ns[TAIL_WALK] += t_next - t_part;
+    t_part = t_next;
     t_buffer.out_landing++;
     while (done) {
         GfxOut* o = done;
@@ -976,6 +1000,9 @@ void vk_buf_frame_done(u64 frame) {
         out_free(o);
     }
     t_buffer.out_landing--;
+    t_next = plat_ns();
+    g_tail_ns[TAIL_LAND] += t_next - t_part;
+    t_part = t_next;
     /* the dispatches' references to their logs, of the submits done (the results' own, just dropped, came first) */
     u32 kept = 0;
     for (u32 i = 0; i < g_nretire; i++)
@@ -984,9 +1011,16 @@ void vk_buf_frame_done(u64 frame) {
         else
             g_retire[kept++] = g_retire[i];
     g_nretire = kept;
+    t_next = plat_ns();
+    g_tail_ns[TAIL_RETIRE] += t_next - t_part;
+    t_part = t_next;
     vk_mirror_done(frame);
+    t_next = plat_ns();
+    g_tail_ns[TAIL_MIRROR] += t_next - t_part;
+    t_part = t_next;
     atomic_store_explicit(&g_gfx_any, g_out != NULL, memory_order_relaxed);
     vk_uma_frame_done(frame);
+    g_tail_ns[TAIL_UMA] += plat_ns() - t_part;
 }
 /* At the frame's submit: its storage results are copied into host-cached memory (vk_stage_back), where landing them
    compares bytes quickly, or takes a logged one's runs. A result whose copy can't be allocated is read where the
@@ -2748,7 +2782,7 @@ static int keep_new(u64 gva, u32 len, u64 align, int ordered, VkBuffer* buf, u64
     int paged = ((gva | len) & 0xFFF) != 0; /* not whole pages: the page cache keeps it, where there is one */
     if (!own_traps())
         why = KF_TRAPS_OFF;
-    else if (vk_uma())
+    else if (vk_uma() && !vk_uma_storage_copied()) /* the hybrid stages storage as the copies' path does */
         why = KF_UMA;
     else if (!len)
         why = KF_EMPTY;
@@ -2932,7 +2966,7 @@ static int back_record(GfxOut* o) {
     }
     vk_render_end();
     VkCommandBuffer cb = vk_cmd();
-    vk_all_barrier(cb); /* the program's writes, and what read or wrote the bytes before it, first */
+    vk_all_barrier_by(VK_BAR_BUFFER, cb); /* the program's writes, and what read or wrote the bytes before it, first */
     int ok = 1;
     for (i = 0; i < n && ok; i++) {
         u32 from = (u32)(p[i].cpu - o->cpu), to = from + (u32)p[i].len;
@@ -2941,7 +2975,7 @@ static int back_record(GfxOut* o) {
         else
             ok = vk_wlog_merge(w->log, w->part, from, to, o->buf, o->off, p[i].res->buf, p[i].res_off);
     }
-    vk_all_barrier(cb); /* and what reads or writes them next, after it */
+    vk_all_barrier_by(VK_BAR_BUFFER, cb); /* and what reads or writes them next, after it */
     if (!ok) {          /* out of descriptors: the bytes merged so far are the ones its landing writes there too */
         back_unref(p, n);
         return 0;
@@ -3022,9 +3056,15 @@ static int copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered)
     }
     /* with unified memory the shader writes guest memory where it is, with nothing to land: not over bytes the GPU
        holds elsewhere (owned, a compute or storage image result, a queued release), which land first as before. Its
-       barriers go by page (uma.c's order) whether or not the front end gives its own (ordered 0): more than NVN asks
-       for, never fewer. What refuses it is counted (vk_uma_refused) */
-    if (vk_uma()) {
+       barriers go by page (uma.c's order). Where the front end gives its own (ordered 0), a write over this
+       submission's reads and writes waits for one of those, as here; a read of a write gets its barrier. What refuses
+       it is counted (vk_uma_refused).
+       Not on a discrete GPU with host imports, where read-only storage is copied too (vk_uma_storage_copied): there
+       each store and each later read of the bytes crosses the bus. One game's world, whose draws wrote 189 storage
+       ranges a present (20 MB), had the GPU busy 34 to 88 ms a present in its passes and ran at 16 to 18 frames a
+       second, against 42 to 54 with these writes in the GPU's memory as below. The GPU mirror takes the writes of the programs
+       that log them before this (compute.c's mirror_plan) */
+    if (vk_uma() && !vk_uma_storage_copied()) {
         int why = pending                 ? VK_UMA_REFUSED_RESULT
                   : range_owned(gva, len) ? VK_UMA_REFUSED_OWNED
                   : atomic_load_explicit(&g_cs_any, memory_order_relaxed) && vk_compute_pending(gva, len)
@@ -3035,7 +3075,7 @@ static int copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered)
                                                  : -1;
         if (why >= 0)
             vk_uma_refused(why);
-        else if (vk_uma_write(gva, len, bind_align, buf, off))
+        else if (vk_uma_write(gva, len, bind_align, ordered, buf, off))
             return 1;
     }
     /* a logged result has no original bytes: its input goes straight into the buffer the shader writes */
@@ -3408,7 +3448,7 @@ static int atlas_fill(DrawPage* p, size_t unique, u8* ptr, VkBuffer atlas, u64 a
    are those of the fast path's blk bit and of copy_writable (fast_check's list), asked without landing anything. 1
    when bound in place, else 0 with the reason (VK_ALIAS_*) in *why */
 static int alias_in_place(VkDrawStorage* draw, const u8 active[VK_DRAW_STAGES * 16], int* why) {
-    if (!vk_uma() || g_settings.guest_buffers_copied == 2) {
+    if (!vk_uma() || g_settings.guest_buffers_copied == 2 || vk_uma_storage_copied()) {
         *why = VK_ALIAS_OFF;
         return 0;
     }
@@ -3460,7 +3500,7 @@ static int alias_in_place(VkDrawStorage* draw, const u8 active[VK_DRAW_STAGES * 
                 vk_release_pending(gva, len) || range_owned(gva, len))
                 fail = pass ? VK_ALIAS_READ : VK_ALIAS_WRITE;
             else if (!(pass ? vk_uma_get(gva, len, align, &buf[k], &off[k])
-                            : vk_uma_write(gva, len, align, &buf[k], &off[k])))
+                            : vk_uma_write(gva, len, align, 1, &buf[k], &off[k])))
                 fail = pass ? VK_ALIAS_READ : VK_ALIAS_WRITE;
             else if (buf[k] != region || off[k] != base + (cpu[k] - lo))
                 fail = VK_ALIAS_SPLIT;
@@ -4011,7 +4051,7 @@ static int buf_get_owned(u32 i, Vb* e, u64 gva, u64 len, int strict, u32 epoch, 
         if ((res->borrowed || res->by == VK_OWN_BY_DRAW) &&
             atomic_load_explicit(&res->written, memory_order_acquire) == vk_submit_number()) {
             vk_render_end();
-            vk_all_barrier(vk_cmd());
+            vk_all_barrier_by(VK_BAR_BUFFER, vk_cmd());
         }
         sb = ((const VkOwnRes*)o[0].res)->buf;
         so = o[0].res_off;
@@ -4123,7 +4163,8 @@ static int buf_get_(u64 gva, u64 len, VkBuffer* buf, u64* off, int strict, u64 a
        result of any kind, a storage image, a queued release, the mirror's writes, a page the runtime wrote: its blk
        bit) is guest memory itself: bound in place with none of the checks below (uma.c's vk_uma_read). A
        blk page, or a range in no region, takes them */
-    const int dear = (inplace & IN_DEAR) && vk_uma_imports_dear() && !(inplace & IN_FAST);
+    /* read-only storage (IN_FAST) is dear too where it is copied (a discrete GPU: vk_uma_storage_copied) */
+    const int dear = (inplace & IN_DEAR) && vk_uma_imports_dear() && (!(inplace & IN_FAST) || vk_uma_storage_copied());
     if ((inplace & 3) && vk_uma() && !g_buffer.chain_only && !dear && vk_uma_read(gva, len, align, buf, off)) {
         g_buf_kind = 16;
         if (g_settings.draw_state_check) fast_check(gva, len, *buf, *off, strict, align, inplace);
@@ -4634,7 +4675,9 @@ int vk_buf_get_strict(u64 gva, u64 len, VkBuffer* buf, u64* off) {
         !vk_release_pending(gva, len)) {
         u64 align = g_vk.props.limits.minStorageBufferOffsetAlignment;
         g_buffer.lk = LK_STRICT;
-        const int got = buf_get(gva, len, buf, off, 1, align ? align : 1, IN_TRY);
+        /* a dispatch's read-only storage: copied as vertices are where storage is (a discrete GPU), else in place */
+        const int got = buf_get(gva, len, buf, off, 1, align ? align : 1,
+                                IN_TRY | (vk_uma_storage_copied() ? IN_DEAR | IN_FAST : 0));
         g_buffer.lk = LK_OTHER;
         return got;
     }
@@ -4722,9 +4765,11 @@ void vk_buf_order_request(int writes_only) {
     /* One later dependency covers every earlier point. Readbacks and surface consumers retain their own orders. */
     if (vk_buf_order_pending(writes_only)) g_buffer.order.required = 1;
     vk_pages_order_request();
+    vk_uma_order_request();
 }
 void vk_buf_ordered(void) {
     vk_pages_ordered();
+    vk_uma_ordered();
     g_buffer.order.owner_reads_ordered = g_buffer.order.owner_reads; /* the renderer's barrier is from all commands */
     g_buffer.order.submit = vk_submit_number();
     g_buffer.order.work = g_vk_drawn + g_vk_dispatches;

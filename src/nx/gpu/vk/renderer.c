@@ -27,6 +27,7 @@
 #include "nx/runtime/platform/overlay.h"
 #include "nx/runtime/platform/prepare_screen.h"
 #include "nx/runtime/guest_stats.h"
+#include "nx/gpu/vk/cb_dynamic.h"
 #include "nx/gpu/vk/host_program.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/shader_objects.h"
@@ -37,6 +38,7 @@
 #include "nx/gpu/vk/hdr_swapchain.h"
 #include "nx/gpu/vk/resource_stats.h"
 #include "nx/gpu/vk/tex_report.h"
+#include "nx/gpu/gpu_queue.h"
 #include "nx/memory/mem.h"
 #include "nx/memory/own.h"
 #include "nx/gpu/vk/pending_pages.h"
@@ -65,18 +67,23 @@ static int before_write_needed(u64 gva, u64 size) {
     pend_unlock();
     return hit;
 }
-static void vkr_before_write(u64 gva, u64 size) {
+static void vkr_before_write(u64 gva, u64 size, int whole) {
     if (!before_write_needed(gva, size)) return;
     vk_lock();
-    if (size) vk_release_need(gva, size);
-    vk_buf_before_write(gva, size);
-    if (size) vk_uma_before_write(gva, size); /* what reads it in place runs first */
-    if (size)
+    const char* was = g_vk_finish_who;
+    if (size) {
+        vk_release_need(gva, size);
+        vk_buf_before_write(gva, size);
+        vk_uma_before_write(gva, size); /* what reads it in place runs first */
+        g_vk_finish_who = "a guest write over a storage image's bytes";
         vk_gfx_image_mem_need(gva, size);
-    else
+    } else
         vk_gfx_image_land();
+    g_vk_finish_who = "a guest write over a compute result's bytes";
     vk_compute_before_write(gva, size);
-    vk_rt_before_write(gva, size);
+    g_vk_finish_who = "a guest write over a render target's bytes";
+    vk_rt_before_write(gva, size, whole);
+    g_vk_finish_who = was;
     vk_unlock();
 }
 /* pending compute and graphics results, storage images and queued releases all count their pages in g_pend_any
@@ -95,11 +102,20 @@ static int vkr_mem_pending(u64 gva, u64 size) {
     pend_unlock();
     return hit;
 }
+static int vkr_gpu_holds(u64 gva, u64 size) {
+    pend_lock();
+    int hit = pend_hit(&g_pend_any, gva, size) || vk_rt_pages_hit(gva, size);
+    pend_unlock();
+    return hit;
+}
 static void vkr_gfx_mem_need(u64 gva, u64 size) {
     vk_mirror_mem_need(gva, size); /* the GPU mirror's programs' writes there landed */
     vk_buf_mem_need(gva, size);
     vk_uma_mem_need(gva, size); /* the in-place writes there done */
+    const char* was = g_vk_finish_who;
+    g_vk_finish_who = "a read of guest memory a storage image covers";
     vk_gfx_image_mem_need(gva, size);
+    g_vk_finish_who = was;
 }
 /* the GPU range a mapping change is changing, from its begin to its end (size 0 for a change of guest memory) */
 static u64 g_mapping_gva, g_mapping_size;
@@ -186,8 +202,9 @@ static void vkr_mapping_begin(u64 gva, u64 size, int kind) {
         vk_mirror_mem_need(gva, size);
         vk_gfx_image_mem_need(gva, size);
         vk_compute_mem_need_map(gva, size);
-        /* Images still describe the old backing until the page table changes. */
-        vk_rt_before_write(gva, size);
+        /* Images still describe the old backing until the page table changes: the targets there go to memory, and
+           none is dropped, as nothing says every byte of them is written */
+        vk_rt_before_write(gva, size, 0);
     }
     pend_lock();
 }
@@ -254,10 +271,6 @@ static void vkr_clear(const DsState* ds, const DrawClear* c, const DrawOwner* o)
     vk_unlock();
 }
 static void vkr_draw(const DsState* ds, const DrawCall* dc, DrawOwner* o) {
-    /* a draw predicated on the GPU (gpu.h render_pred) counts too: whether it runs isn't known here without the wait
-       the predicate is there to avoid, and the counters made up from this (maxwell/engines.c counter_report) only
-       stand in for what the console counts, growing with the work given */
-    g_draws++;
     vk_lock();
     vk_render_draw(ds, dc, o);
     vk_unlock();
@@ -366,6 +379,7 @@ static void vkr_method_barrier(int kind)
 	/* Surface and copy consumers retain their own dependencies. NVN's points need an additional buffer
 	 * barrier only after a shader write or a pending read that a later in-place writer could overwrite. */
 	if ((kind == 6 || kind == 7) && !vk_buf_order_pending(kind == 7)) {
+		vk_uma_order_request(); /* the writes in place: at the next write over them (uma.c's order) */
 		vk_unlock();
 		return;
 	}
@@ -423,9 +437,12 @@ static void* vkr_nvdec_hw_device(u32 codec) { return vk_nvdec_hw_device(codec); 
 static int vkr_dma_copy(const GpuDmaOp* o) { return vk_dma_copy(o); }         /* it takes vk_lock */
 static int vkr_blit_mem(const GpuBlit* b) { return vk_blit_mem(b); }          /* it takes vk_lock */
 static void vkr_rt_flush(u64 gva) {
+    const char* was = g_vk_finish_who;
     vk_lock();
+    g_vk_finish_who = "the front end's flush of a target";
     vk_gfx_image_mem_need(gva, 1);
     vk_rt_flush(gva);
+    g_vk_finish_who = was;
     vk_unlock();
 }
 static void vkr_rt_reload(u64 gva) {
@@ -435,7 +452,6 @@ static void vkr_rt_reload(u64 gva) {
 }
 static void vkr_dispatch(const DispatchState* d) {
     if (!g_settings.compute_dispatches) return;
-    r3d_pending_flush(); /* a merged draw the front end is holding comes first */
     vk_lock();
     vk_dispatch(d);
     vk_unlock();
@@ -658,9 +674,14 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
     SNX_ZONE(z_show, "vk show");
     static u32 res_mark;           /* the present the CPU resource window began at */
     static int res_have;           /* the first window only starts the count: what ran before it is not a steady frame */
+    /* a target dropped for a guest write over it holds nothing to show, as surf_read says: the frame is the layer's,
+       and of the kind this frame had, so that a refresh of an HDR frame keeps the swapchain it needs. A frame with no
+       source of its own (none yet, or none of the size asked) keeps the layer's kind */
+    int void_frame = src && src->layout == VK_IMAGE_LAYOUT_UNDEFINED;
+    if (void_frame) src = NULL;
     if (transform & 4) { u32 w = fw; fw = fh; fh = w; }
     /* the size the swapchain was made for, not the extent the surface clamped it to: that can stay different */
-    int ww, wh, kind = src ? frame_kind(hdr) : g_sc_kind, shown = backend_window_shown();
+    int ww, wh, kind = (src || void_frame) && hdr ? frame_kind(hdr) : g_sc_kind, shown = backend_window_shown();
     backend_window_size(&ww, &wh);
     if (shown && (g_lost || backend_window_generation() != g_generation)) {
         vk_finish();
@@ -848,6 +869,7 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
         resource_was = resource_is;
         last_present_ns = now_ns;
         g_vk_present++;
+        gq_present();
         atomic_fetch_add_explicit(&g_vk_texture_epoch, 1,
                                   memory_order_relaxed); /* a frame's snapshots never outlive it */
         {
@@ -877,6 +899,7 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
         }
         if (g_vk_present == 1 || g_vk_present % 600 == 0) {
             guest_stats_log(now_ns, g_vk_present);
+            gq_stats_log(g_vk_present == 1 ? 0 : 600);
             ipc_stats_log(now_ns);
         }
         vk_mem_present();
@@ -950,15 +973,18 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
             {
                 u64 pipes, hits, make_ms, pipe_ms, shaders, shader_ms, uploads, upload_bytes, partial, partial_bytes;
                 vk_pipeline_stats(&pipes, &hits, &make_ms, &pipe_ms, &shaders, &shader_ms);
+                u64 fast, early_fast, so;
+                vk_pipeline_fast_stats(&fast, &early_fast, &so);
                 vk_tex_stats(&uploads, &upload_bytes);
                 vk_tex_partial_stats(&partial, &partial_bytes);
-                LOG("vulkan: %llu shaders translated (%llu ms), %llu pipelines made (%llu from the cache, %llu ms "
-                    "making, %llu ms waited for), %llu render targets made, %llu texture uploads (%llu MB), %llu of "
+                LOG("vulkan: %llu shaders translated (%llu ms), %llu pipelines made (%llu of them shader "
+                    "objects, which no pipeline cache serves; %llu from the cache by the driver's word, %llu in under "
+                    "5 ms; %llu ms making, %llu ms waited for), %llu render targets made, %llu texture uploads (%llu MB), %llu of "
                     "them some blocks alone (%llu MB); %llu frames over 50 ms in the last 600, the slowest %llu ms\n",
                     (unsigned long long)shaders, (unsigned long long)shader_ms, (unsigned long long)pipes,
-                    (unsigned long long)hits, (unsigned long long)make_ms, (unsigned long long)pipe_ms,
-                    (unsigned long long)vk_rt_made(), (unsigned long long)uploads,
-                    (unsigned long long)(upload_bytes >> 20), (unsigned long long)partial,
+                    (unsigned long long)so, (unsigned long long)hits, (unsigned long long)fast,
+                    (unsigned long long)make_ms, (unsigned long long)pipe_ms, (unsigned long long)vk_rt_made(),
+                    (unsigned long long)uploads, (unsigned long long)(upload_bytes >> 20), (unsigned long long)partial,
                     (unsigned long long)(partial_bytes >> 20), (unsigned long long)slow_frames,
                     (unsigned long long)(slowest_ns / 1000000));
                 vk_tex_check_log();
@@ -1064,9 +1090,9 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
                 u64 early_made, early_hits, early_left;
                 vk_pipeline_prewarm_stats(&early_made, &early_hits, &early_left);
                 if (early_made || early_left)
-                    LOG("vulkan: %llu pipelines of earlier runs made in the background (%llu from the cache), %llu "
-                        "still to make\n",
-                        (unsigned long long)early_made, (unsigned long long)early_hits,
+                    LOG("vulkan: %llu pipelines of earlier runs made in the background (%llu from the cache by the "
+                        "driver's word, %llu in under 5 ms), %llu still to make\n",
+                        (unsigned long long)early_made, (unsigned long long)early_hits, (unsigned long long)early_fast,
                         (unsigned long long)early_left);
             }
             {
@@ -1090,6 +1116,11 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
             }
             vk_ledger_log();
             vk_own_log();
+            vk_all_barrier_log();
+            vk_dma_log();
+            vk_buf_frame_done_log();
+            vk_lock_log();
+            vk_mirror_diff_log();
             {
                 /* what the caches hold, which vk_mem_trim keeps within the budget */
                 u32 nrt, ntex, nbuf, parked, none;
@@ -1181,13 +1212,47 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
             own_landings_by(by);
             LOG("vulkan: GPU-owned guest memory landed for the CPU %llu times (%llu for the runtime's own access, "
                 "%llu for a read of the game's code, %llu for a write of it), render targets written back for an "
-                "engine %llu times; block linear targets watched %llu times, published for a CPU access %llu times "
-                "and at a release %llu times\n",
+                "engine %llu times, %llu dropped for a guest write over all of them; block linear targets watched "
+                "%llu times, published for a CPU access %llu times and at a release %llu times\n",
                 (unsigned long long)own_landings(), (unsigned long long)by[OWN_BY_RUNTIME],
                 (unsigned long long)by[OWN_BY_READ], (unsigned long long)by[OWN_BY_WRITE],
-                (unsigned long long)g_vk_rt_readbacks,
+                (unsigned long long)g_vk_rt_readbacks, (unsigned long long)g_vk_rt_dropped,
                 (unsigned long long)g_vk_rt_watch.arms, (unsigned long long)g_vk_rt_watch.hits,
                 (unsigned long long)g_vk_rt_watch.publishes);
+            /* the command stream's own writes to guest memory, and the landings that they forced (gpu.c) */
+            static const char* const inline_kind[GPU_INLINE_N] = {
+                "inline-to-memory pitch linear", "inline-to-memory block linear", "NVN uniform buffer updates"};
+            static u64 inline_was[GPU_INLINE_N][5];
+            for (u32 k = 0; k < GPU_INLINE_N; k++) {
+                const GpuInlineStat* st = &g_gpu_inline[k];
+                u64 now[5] = {atomic_load_explicit(&st->n, memory_order_relaxed),
+                              atomic_load_explicit(&st->bytes, memory_order_relaxed),
+                              atomic_load_explicit(&st->forced, memory_order_relaxed),
+                              atomic_load_explicit(&st->forced_bytes, memory_order_relaxed),
+                              atomic_load_explicit(&st->forced_ns, memory_order_relaxed)};
+                if (now[0] != inline_was[k][0])
+                    LOG("vulkan: %s: %llu writes (%.2f MB), %llu landings while they wrote (%.2f MB, %.2f ms)\n",
+                        inline_kind[k], (unsigned long long)(now[0] - inline_was[k][0]),
+                        (double)(now[1] - inline_was[k][1]) / 1048576.0,
+                        (unsigned long long)(now[2] - inline_was[k][2]),
+                        (double)(now[3] - inline_was[k][3]) / 1048576.0, (double)(now[4] - inline_was[k][4]) / 1e6);
+                for (u32 j = 0; j < 5; j++) inline_was[k][j] = now[j];
+            }
+            static u64 rcond_was[GPU_RCOND_N + 1];
+            u64 rcond[GPU_RCOND_N + 1], rcond_any = 0;
+            for (u32 k = 0; k < GPU_RCOND_N; k++)
+                rcond[k] = atomic_load_explicit(&g_gpu_rcond[k], memory_order_relaxed);
+            rcond[GPU_RCOND_N] = atomic_load_explicit(&g_gpu_rcond_cpu_ns, memory_order_relaxed);
+            for (u32 k = 0; k < GPU_RCOND_N; k++) rcond_any |= rcond[k] - rcond_was[k];
+            if (rcond_any)
+                LOG("vulkan: NVN render enables: %llu of a fixed mode, %llu the renderer knew, %llu left to the GPU, "
+                    "%llu read on the CPU (%.3f ms)\n",
+                    (unsigned long long)(rcond[GPU_RCOND_FIXED] - rcond_was[GPU_RCOND_FIXED]),
+                    (unsigned long long)(rcond[GPU_RCOND_KNOWN] - rcond_was[GPU_RCOND_KNOWN]),
+                    (unsigned long long)(rcond[GPU_RCOND_GPU] - rcond_was[GPU_RCOND_GPU]),
+                    (unsigned long long)(rcond[GPU_RCOND_CPU] - rcond_was[GPU_RCOND_CPU]),
+                    (double)(rcond[GPU_RCOND_N] - rcond_was[GPU_RCOND_N]) / 1e6);
+            for (u32 k = 0; k <= GPU_RCOND_N; k++) rcond_was[k] = rcond[k];
         }
     }
     /* Offscreen frames still submit and advance the frame ring. g_last remains available for readback. */
@@ -1400,6 +1465,10 @@ static const u8* surf_read_direct(Surf* s, u32 x, u32 y, u32 w, u32 h, u32 trans
     return sized;
 }
 static const u8* surf_read(Surf* s, u32 x, u32 y, u32 w, u32 h, u32 transform, u32 dw, u32 dh) {
+    /* an image dropped for a guest write over it holds none of its bytes: its pixels now are memory's, and a copy of
+       the image would show what is not the target's any more. The present resolves the frame through vk_rt_for_cpu,
+       which loads such a target; this reads the one kept (g_last) */
+    if (s->layout == VK_IMAGE_LAYOUT_UNDEFINED) return NULL;
     /* blit to an RGBA8 image, whatever the target's format, then read that back. sRGB to sRGB, so the bytes stay
        encoded as the display shows them */
     VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -1600,6 +1669,7 @@ static void vkr_reset(void) {
    (pipeline_file.h), then the driver's pipeline cache as at its quiet times */
 static void vk_save(int at_exit) {
     if (at_exit) vk_pipeline_file_save();
+    if (at_exit) vk_cb_dynamic_save(); /* the constant buffers' moves, which the next start chooses from */
     vk_pipeline_save(at_exit);
 }
 const Renderer vk_renderer = {
@@ -1634,6 +1704,7 @@ const Renderer vk_renderer = {
     .dispatch = vkr_dispatch,
     .cs_mem_need = vk_compute_mem_need,
     .mem_pending = vkr_mem_pending,
+    .gpu_holds = vkr_gpu_holds,
     .gfx_mem_need = vkr_gfx_mem_need,
     .before_syncwait = vkr_before_syncwait,
     .stream_incr = vkr_stream_incr,

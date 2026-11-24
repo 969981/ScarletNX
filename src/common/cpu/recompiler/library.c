@@ -22,7 +22,7 @@
 #include "common/cpu/recompiler/llvm/link.h"
 #include "common/cpu/recompiler/llvm/code_loader.h"
 #include "common/cpu/recompiler/llvm/objects_pack.h"
-#include "common/cpu/recompiler/x64/x64_codegen.h"
+#include "common/cpu/recompiler/x64/x64_cache.h"
 #include "common/cpu/recompiler/workers.h"
 #include "common/utilities/endian.h"
 #include "common/platform/time.h"
@@ -689,12 +689,15 @@ static int llvm_unit(Queue* q, size_t index, char* error, size_t error_size) {
     if (q->r->x64 && !q->r->keep_ir && u->last > u->first) {
         /* the x86-64 back end first: LLVM makes only what it can't (and all of it where the IR is to be kept) */
         SnxX64Options options = {0};
+        options.llvm_at = snx_ir_dump_pc();
         made = (unsigned char*)calloc(u->last - u->first, 1);
         if (!made) {
             snprintf(error, error_size, "out of memory");
             return -1;
         }
-        if (snx_x64_object(q->codegen, u->first, u->last, &options, made, &u->x64, &u->x64_size, error, error_size)) {
+        int reused = 0;
+        if (snx_x64_cached_object(q->codegen, u->first, u->last, &options, made, &u->x64, &u->x64_size, &reused, error,
+                                  error_size)) {
             free(made);
             return -1;
         }

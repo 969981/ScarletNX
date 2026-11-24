@@ -1696,8 +1696,10 @@ void vk_dispatch(const DispatchState* d) {
     /* dispatches that read textures run on the graphics queue, after what was recorded before them. Inputs that
        pending compute results overlap land those first, before anything is put in the arena. With unified memory every
        dispatch does: its storage buffers are read and written in place (uma.c), in order with the draws on one queue,
-       with nothing to land, as #690 has it */
-    int gfx = vk_uma() || p->si.ntex > 0 || p->si.nimg > 0, overlap = 0, retries = 0;
+       with nothing to land, as #690 has it. Not where storage is copied under unified memory (a discrete GPU with
+       host imports, vk_uma_storage_copied): there a dispatch's writable storage is a staged result as on the copies'
+       path (buffer.c's copy_writable), and the compute queue's batches run it alongside the draws, as there */
+    int gfx = (vk_uma() && !vk_uma_storage_copied()) || p->si.ntex > 0 || p->si.nimg > 0, overlap = 0, retries = 0;
     /* so does an indirect one: its grid is read where the graphics queue's buffers hold guest memory (vk_buf_get) */
     gfx = gfx || d->indirect != 0;
     /* and one whose storage buffers are in the GPU mirror, which the graphics queue's submits bring up to date and
@@ -2386,7 +2388,8 @@ rebind:
         cb = g_ccb;
     }
     vkUpdateDescriptorSets(g_vk.dev, nw, w, 0, NULL);
-    if (resident) vk_all_barrier(cb); /* the copies into its buffers, and earlier work on them, before it */
+    if (resident)
+        vk_all_barrier_by(VK_BAR_COMPUTE, cb); /* the copies into its buffers, and earlier work on them, before it */
     /* its queue's shared memory buffer, after the dispatch before that used it */
     if (spill.buffer) {
         VkMemoryBarrier2 smb = {
@@ -2412,9 +2415,9 @@ rebind:
     if (d->indirect && cb0_buf && cb0_range >= 0x20c) {
         /* the grid into bank 0's dispatch size too, on the GPU, after whatever wrote it */
         VkBufferCopy gc = {grid_off, cb0_off + 0x200, 12};
-        vk_all_barrier(cb);
+        vk_all_barrier_by(VK_BAR_COMPUTE, cb);
         rec_CmdCopyBuffer(cb, grid_buf, cb0_buf, 1, &gc);
-        vk_all_barrier(cb);
+        vk_all_barrier_by(VK_BAR_COMPUTE, cb);
     }
     if (mir) { /* after the earlier programs' writes of the mirror, which it may read or write again */
         VkMemoryBarrier2 mmb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
@@ -2460,7 +2463,7 @@ rebind:
         }
     }
     if (resident) {
-        vk_all_barrier(cb); /* its writes before what reads them next */
+        vk_all_barrier_by(VK_BAR_COMPUTE, cb); /* its writes before what reads them next */
         for (int i = 0; i < ng; i++) {
             if (!(((p->si.gbuf_wmask >> i) & 1) && sa[i])) continue;
             if (made[i])
@@ -2512,8 +2515,11 @@ rebind:
            Where guest memory is copied, a dispatch that staged no result for the host waits the same way: its storage
            images are published over their guest bytes, GPU-owned, and a CPU access to them submits what is open
            first (owned.c's own_wait). Submitted each, a scene that fills its compute textures a level a dispatch made
-           129 submissions a present on a discrete GPU, the graphics queue idle 2.4 ms a present between them */
-        if ((vk_uma() || !staged) && !vk_uma_read_soon(p->key)) {
+           129 submissions a present on a discrete GPU, the graphics queue idle 2.4 ms a present between them. Where
+           unified memory stages storage as the copies' path does (vk_uma_storage_copied), a dispatch that staged a
+           result submits as there: held for the next, one game's world submitted on the 1 ms timer, with the GPU idle
+           2.25 ms a present waiting for those commands, and ran at 74 frames a second against 85 */
+        if (((vk_uma() && !vk_uma_storage_copied()) || !staged) && !vk_uma_read_soon(p->key)) {
             g_vk_cs_open = vk_submit_number();
             g_vk_cs_left++;
             return;

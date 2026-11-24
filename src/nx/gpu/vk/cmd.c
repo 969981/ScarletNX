@@ -367,7 +367,12 @@ void vk_wait_semaphore(VkSemaphore sem, u64 value) {
             return;
         }
         u64 now = 0;
-        if (!VK_OK(vkGetSemaphoreCounterValue(g_vk.dev, sem, &now))) return;
+        VkResult rn = vkGetSemaphoreCounterValue(g_vk.dev, sem, &now);
+        if (rn == VK_ERROR_DEVICE_LOST) { /* the wait's own way: taken as done, the caller lands what never ran */
+            VK_OK(rn);
+            vk_lost_stop("vulkan: the GPU device was lost (driver reset or crash)");
+        }
+        if (!VK_OK(rn)) return;
         if (now != seen) { /* the GPU finished more: a long wait, not a stopped GPU */
             seen = now;
             moved = plat_ns();
@@ -445,12 +450,35 @@ int vk_host_wait(const VkHostTimeline* t, u64 value) {
 }
 
 u64 g_vk_wait_ns[VK_WAIT_N], g_vk_waits[VK_WAIT_N]; /* the GPU thread's alone, which writes them */
+void vk_lost_stop(const char* msg) {
+    /* two threads can see one loss at once (a timeline read and a mirror batch's check): the second waits here for the
+       first's whole report, where its own stop ended the game while the first still wrote it */
+    static PMutex lk = PMUTEX_INIT;
+    pm_lock(&lk);
+    vk_checkpoint_dump("device lost"); /* the driver's fault, and the draw or dispatch that each queue reached */
+    vk_ck_report();                    /* the pieces of work of checkpoints.c (vk_checkpoints=1) */
+    fatal("%s", msg);
+}
+static void gsem_lost(void) { vk_lost_stop("vulkan: the GPU device was lost (driver reset or crash)"); }
+/* The graphics timeline read: 1 with the submissions done in *done. A lost device stops the game here, as
+   vk_wait_semaphore's wait does: past the submissions made it can only be one, as a driver gives a lost device's
+   timeline as 2^64 - 1. Taken as every submission done, the landings read outputs the GPU never wrote (a mirror
+   batch's page numbers, one game's copy past guest memory) before anything said the device was lost */
+static int gsem_done(u64* done) {
+    VkResult r = vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, done);
+    /* one past the last: submit() hands the recording thread a submission before it counts it in g_gval, and the GPU
+       may finish it meanwhile (submit() makes one at a time) */
+    if (r == VK_ERROR_DEVICE_LOST ||
+        (r == VK_SUCCESS && *done > atomic_load_explicit(&g_gval, memory_order_relaxed) + 1))
+        gsem_lost();
+    return VK_OK(r);
+}
 /* kind: VK_WAIT_*, for the statistics */
 static void timeline_wait(u64 value, int kind) {
     u64 t0 = plat_ns(), done = 0;
     SNX_ZONE_C(z_wait, "vk timeline wait", 0xb05252);
     /* a wait for work already done is no stall */
-    if (VK_OK(vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, &done)) && done >= value) return;
+    if (gsem_done(&done) && done >= value) return;
     int mine = gpu_wait_note("a graphics submission", value);
     if (mine) vk_gpuprof_waited(value, kind);
     SNX_ZONE_V(z, "timeline wait", value);
@@ -557,7 +585,7 @@ int vk_cmd_ready(void) {
     const Frame* f = &g_fr[g_cur];
     u64 last = f->last > f->hold ? f->last : f->hold, done = 0;
     if (f->recording || !f->fresh || !last) return 1;
-    return vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, &done) == VK_SUCCESS && done >= last;
+    return gsem_done(&done) && done >= last;
 }
 
 static u64 g_cmd_uses;
@@ -834,7 +862,7 @@ static u32 chunk_take(u32 ring, u64 size, int big, int bar, u32 slot) {
 #define STREAM_BIG_IDLE 8u
 static u64 stream_done(void) {
     u64 done = 0;
-    if (g_gsem) VK_OK(vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, &done));
+    if (g_gsem) gsem_done(&done);
     return done;
 }
 /* a chunk of the stream of size bytes, or a big buffer of size or more (big), that no work reads: the pool's best
@@ -1211,7 +1239,7 @@ static void submit(const VkSemaphoreSubmitInfo* xw, const VkSemaphoreSubmitInfo*
     g_rec_unsafe--;
     /* results of submissions the GPU has finished land now, so a later release doesn't find them pending */
     u64 done = 0;
-    if (land && VK_OK(vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, &done))) {
+    if (land && gsem_done(&done)) {
         land_through(done < atomic_load_explicit(&g_gval, memory_order_relaxed)
                          ? done
                          : atomic_load_explicit(&g_gval, memory_order_relaxed));
@@ -1305,7 +1333,7 @@ int vk_submit_upload_wait(int let_go, u64 upto) {
     const u64 gval = atomic_load_explicit(&g_gval, memory_order_relaxed);
     const u64 at = upto && upto < gval ? upto : gval;
     u64 done = 0;
-    if (upto && VK_OK(vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, &done)) && done >= at) return 0; /* no wait */
+    if (upto && gsem_done(&done) && done >= at) return 0; /* no wait */
     int paused = 0;
     if (let_go && !g_rec_unsafe && !g_landing && !g_letting_go) {
         g_letting_go = 1;
@@ -1328,9 +1356,11 @@ void vk_submit_after(VkSemaphore sem, u64 wait, u64 signal) {
                                          .value = signal, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
 }
 
+_Thread_local const char* g_vk_finish_who;
 u64 g_vk_finishes, g_vk_finish_ns;
-/* the finishes since the last stats by their call site (a file's literal and a line), with their time, under vk_lock
-   as vk_finish is: one game made nine a frame, a round trip each with the GPU idle after it */
+/* the finishes since the last stats by their call site (a file's literal and a line, or the reason the renderer gave
+   in g_vk_finish_who, which has no line of the caller's), with their time, under vk_lock as vk_finish is: one game made
+   nine a frame, a round trip each with the GPU idle after it */
 #define FINISH_SITES 32
 static struct {
     const char* file;
@@ -1382,9 +1412,15 @@ void vk_finishes_log(void) {
             if (g_finish_sites[i].n && (best == FINISH_SITES || g_finish_sites[i].n > g_finish_sites[best].n)) best = i;
         if (best == FINISH_SITES) break;
         const char* f = strrchr(g_finish_sites[best].file, '/');
-        LOG("vulkan:   %llu finishes (%.0f%%, %.0f ms) at %s:%d\n", (unsigned long long)g_finish_sites[best].n,
-            100.0 * (double)g_finish_sites[best].n / (double)total, (double)g_finish_sites[best].ns / 1e6,
-            f ? f + 1 : g_finish_sites[best].file, g_finish_sites[best].line);
+        /* a reason the renderer gave (g_vk_finish_who) has no line of the caller's: the site is that reason alone */
+        if (g_finish_sites[best].line)
+            LOG("vulkan:   %llu finishes (%.0f%%, %.0f ms) at %s:%d\n", (unsigned long long)g_finish_sites[best].n,
+                100.0 * (double)g_finish_sites[best].n / (double)total, (double)g_finish_sites[best].ns / 1e6,
+                f ? f + 1 : g_finish_sites[best].file, g_finish_sites[best].line);
+        else
+            LOG("vulkan:   %llu finishes (%.0f%%, %.0f ms), %s\n", (unsigned long long)g_finish_sites[best].n,
+                100.0 * (double)g_finish_sites[best].n / (double)total, (double)g_finish_sites[best].ns / 1e6,
+                g_finish_sites[best].file);
         g_finish_sites[best].n = 0;
     }
     for (u32 i = 0; i < FINISH_SITES && g_finish_sites[i].file; i++) g_finish_sites[i].n = g_finish_sites[i].ns = 0;
@@ -1514,7 +1550,13 @@ VkSemaphore vk_gfx_timeline(void) { return g_gsem; }
 void vk_submit_progress(u64* submitted, u64* done) {
     *submitted = atomic_load_explicit(&g_gval, memory_order_relaxed);
     *done = 0;
-    if (g_gsem) VK_OK(vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, done));
+    if (g_gsem) gsem_done(done);
+}
+/* vk_submit_progress for the lost device's report: a raw read, where gsem_done would stop before the report */
+void vk_submit_progress_raw(u64* submitted, u64* done) {
+    *submitted = atomic_load_explicit(&g_gval, memory_order_relaxed);
+    *done = 0;
+    if (g_gsem) vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, done);
 }
 void vk_wait_submit(u64 value) { timeline_wait(value, VK_WAIT_SUBMIT); }
 void vk_land_through(u64 value) {
@@ -1537,7 +1579,7 @@ VkDescriptorPool vk_desc_pool_new(u32 array_sets) {
         said[3]; /* the line of each kind of pool once: compute's, a frame's, a frame's for more arrays */
     VkDescriptorPoolSize sz[VK_POOL_TYPES];
     VkDescriptorPoolCreateInfo ci = {0};
-    vk_pool_sizes(sz, 1024, array_sets);
+    const u32 types = vk_pool_sizes(sz, 1024, array_sets);
     if (!atomic_exchange_explicit(&said[!array_sets                        ? 0
                                         : array_sets == VK_POOL_ARRAY_SETS ? 1
                                                                            : 2],
@@ -1545,13 +1587,13 @@ VkDescriptorPool vk_desc_pool_new(u32 array_sets) {
         char arrays[96]; /* the arrays the sets hold, which a device without them leaves out (vk_pool_sizes) */
         snx_vk_pool_arrays_text(arrays, sizeof arrays, array_sets, vk_texture_array_elements());
         LOG("vulkan: descriptor pools of 1024 sets, %s: %u uniform and %u storage buffers, %u combined image samplers, "
-            "%u storage images, %u texel buffers, %u sampled images\n",
+            "%u storage images, %u texel buffers, %u sampled images, %u dynamic uniform buffers\n",
             arrays, sz[0].descriptorCount, sz[1].descriptorCount, sz[2].descriptorCount, sz[3].descriptorCount,
-            sz[4].descriptorCount, sz[5].descriptorCount);
+            sz[4].descriptorCount, sz[5].descriptorCount, sz[6].descriptorCount);
     }
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     ci.maxSets = 1024;
-    ci.poolSizeCount = VK_POOL_TYPES;
+    ci.poolSizeCount = types;
     ci.pPoolSizes = sz;
     VkDescriptorPool p = VK_NULL_HANDLE;
     if (VK_OK(vkCreateDescriptorPool(g_vk.dev, &ci, NULL, &p)))

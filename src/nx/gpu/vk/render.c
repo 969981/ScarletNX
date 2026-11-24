@@ -23,10 +23,12 @@
 #include "nx/memory/mem.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/gpu/vk/vk.h"
+#include "common/platform/time.h"
 #include "nx/gpu/vk/pagespace.h"
 #include "nx/gpu/vk/ledger.h"
 #include "nx/gpu/vk/pipeline_parts.h"
 #include "nx/gpu/vk/descriptors.h"
+#include "nx/gpu/vk/cb_dynamic.h"
 #include "nx/gpu/vk/descriptor_heaps.h"
 #include "nx/gpu/vk/capture.h"
 #include "nx/gpu/vk/depth_shadow.h"
@@ -1431,6 +1433,10 @@ static struct {
 } g_stats;
 /* the bytes of the constant buffers that cb_get copied from the CPU (VK_CB_COPIED) since the last statistics line */
 static u64 g_cb_copied_bytes;
+/* for the statistics (the GPU plan's M12m): the nanoseconds of those copies, timed one in CB_TIME_EVERY and taken as
+   that many, so that the clock reads cost the copies little */
+#define CB_TIME_EVERY 16u
+static u64 g_cb_copied_ns;
 static u64 g_cb_padded; /* constant buffers by address padded with zeros past a short binding (cb_pad) */
 void vk_draw_counts(VkDrawCounts* c) {
     *c = g_stats.n;
@@ -1458,6 +1464,66 @@ enum {
     MEMO_CAUSES
 };
 static u64 g_memo_miss[MEMO_CAUSES];
+/* For the statistics (the GPU plan's C-b): why draw_holds said no, by its first failed check, and the draws that
+   found no entry of their key in the table (HOLD_NONE) */
+enum {
+    HOLD_PATH,
+    HOLD_SHADER_GEN,
+    HOLD_FOLD,
+    HOLD_HEAPS,
+    HOLD_KEY,
+    HOLD_VFORMAT,
+    HOLD_XFB,
+    HOLD_WINDOW,
+    HOLD_SWIZZLE,
+    HOLD_CHOSEN,
+    HOLD_CB,
+    HOLD_NONE,
+    HOLD_N
+};
+static u64 g_hold_fail[HOLD_N];
+static int hold_no(int why) {
+    g_hold_fail[why]++;
+    return 0;
+}
+static u64 g_dset_offset_only; /* desc_set_cached's count for the GPU plan's M3b, below */
+/* The index buffer a command buffer has bound (the GPU plan's B3): a draw of the same buffer and index type at a
+   later offset by a whole number of indices draws from that binding, its first index moved by them, instead of
+   binding the buffer again at its own offset. The GPU reads the same indices: firstIndex counts from the binding's
+   offset, and the binding holds to the buffer's end either way. A racing game bound it about 1,700 times a present,
+   once for each indexed draw. begun is vk_cb_begun's count when it was bound: a command buffer begun again (a handle
+   used again) binds anew. Draws with records of the guest's (indirect) hold their own first index, and keep the
+   binding only at the same offset */
+static struct {
+    u32 begun;
+    VkCommandBuffer cb;
+    VkBuffer buf;
+    VkDeviceSize at;
+    VkIndexType type;
+} g_ib;
+static u64 g_ib_binds, g_ib_kept; /* for the statistics */
+static u32 index_bind(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize at, VkIndexType type, int may_move) {
+    const u32 size = type == VK_INDEX_TYPE_UINT32 ? 4 : type == VK_INDEX_TYPE_UINT16 ? 2 : 1;
+    if (g_ib.cb == cb && g_ib.begun == vk_cb_begun() && g_ib.buf == buf && g_ib.type == type && at >= g_ib.at &&
+        (at == g_ib.at || (may_move && (at - g_ib.at) % size == 0 && (at - g_ib.at) / size < (1u << 30)))) {
+        g_ib_kept++;
+        return (u32)((at - g_ib.at) / size);
+    }
+    rec_CmdBindIndexBuffer(cb, buf, at, type);
+    g_ib.begun = vk_cb_begun();
+    g_ib.cb = cb;
+    g_ib.buf = buf;
+    g_ib.at = at;
+    g_ib.type = type;
+    g_ib_binds++;
+    return 0;
+}
+/* desc_set_cached's counts for the GPU plan's M3c, [0] the stages' sets, [1] their texture sets (split sets): the new
+   sets, and those of them whose writes an earlier frame's set had */
+static u64 g_dset_new_kind[2], g_dset_earlier[2];
+#define DSET_BIND_MAX 64u
+static u64 g_dset_moved[2 * DS_GFX_STAGES][DSET_BIND_MAX];
+static u32 g_dset_moved_type[2 * DS_GFX_STAGES][DSET_BIND_MAX];
 static void memo_miss_log(u64 presents) {
     static u64 was[MEMO_CAUSES];
     u64 d[MEMO_CAUSES];
@@ -1511,6 +1577,44 @@ void vk_render_stats_log(void) {
         (unsigned long long)(n->hashed - w->hashed), (double)(submits - was_submits) / (double)presents,
         (double)(periodic - g_stats.submits[VK_SUB_PERIODIC]) / (double)presents,
         (double)(u32)(epoch - g_stats.ww_epoch) / (double)presents, (double)(n->epochs - w->epochs) / (double)presents);
+    LOG("vulkan: kept draws' checks that failed in the last %llu presents: path %llu, shader generation %llu, "
+        "folds %llu, heaps %llu, owner, topology or epoch %llu, vertex format %llu, capture %llu, window %llu, "
+        "swizzle %llu, translation chosen %llu, constant buffer words %llu; no entry of the key %llu\n",
+        (unsigned long long)presents, (unsigned long long)g_hold_fail[HOLD_PATH],
+        (unsigned long long)g_hold_fail[HOLD_SHADER_GEN], (unsigned long long)g_hold_fail[HOLD_FOLD],
+        (unsigned long long)g_hold_fail[HOLD_HEAPS], (unsigned long long)g_hold_fail[HOLD_KEY],
+        (unsigned long long)g_hold_fail[HOLD_VFORMAT], (unsigned long long)g_hold_fail[HOLD_XFB],
+        (unsigned long long)g_hold_fail[HOLD_WINDOW], (unsigned long long)g_hold_fail[HOLD_SWIZZLE],
+        (unsigned long long)g_hold_fail[HOLD_CHOSEN], (unsigned long long)g_hold_fail[HOLD_CB],
+        (unsigned long long)g_hold_fail[HOLD_NONE]);
+    memset(g_hold_fail, 0, sizeof g_hold_fail);
+    LOG("vulkan: index buffer binds in the last %llu presents: %llu, and %llu draws kept the last binding\n",
+        (unsigned long long)presents, (unsigned long long)g_ib_binds, (unsigned long long)g_ib_kept);
+    g_ib_binds = g_ib_kept = 0;
+    static u64 dset_new_was;
+    LOG("vulkan: new descriptor sets in the last %llu presents: %llu, %llu of them the same as a set of the frame but "
+        "for their buffers' offsets\n",
+        (unsigned long long)presents, (unsigned long long)(g_vk_dset_new - dset_new_was),
+        (unsigned long long)g_dset_offset_only);
+    dset_new_was = g_vk_dset_new;
+    g_dset_offset_only = 0;
+    LOG("vulkan: new descriptor sets in the last %llu presents by kind: %llu of the stages' (%llu an earlier frame made), "
+        "%llu texture sets (%llu an earlier frame made)\n",
+        (unsigned long long)presents, (unsigned long long)g_dset_new_kind[0], (unsigned long long)g_dset_earlier[0],
+        (unsigned long long)g_dset_new_kind[1], (unsigned long long)g_dset_earlier[1]);
+    memset(g_dset_new_kind, 0, sizeof g_dset_new_kind);
+    memset(g_dset_earlier, 0, sizeof g_dset_earlier);
+    char line[1024];
+    size_t at = 0;
+    for (u32 st = 0; st < 2 * DS_GFX_STAGES; st++)
+        for (u32 b = 0; b < DSET_BIND_MAX; b++) {
+            if (g_dset_moved[st][b] < presents / 2 || at >= sizeof line) continue; /* a binding that moves seldom */
+            int w = snprintf(line + at, sizeof line - at, " %u/%u (type %u) %llu", st, b, g_dset_moved_type[st][b],
+                             (unsigned long long)g_dset_moved[st][b]);
+            if (w > 0) at += (size_t)w < sizeof line - at ? (size_t)w : sizeof line - at - 1;
+        }
+    if (at) LOG("vulkan: new sets' buffer offsets that moved, by stage set/binding:%s\n", line);
+    memset(g_dset_moved, 0, sizeof g_dset_moved);
     LOG("vulkan: lookups in the last %llu presents: constant buffers %llu inline kept, %llu inline staged, %llu kept, "
         "%llu kept after the pending check, %llu copied from the CPU, %llu from the buffer cache, %llu pending, %llu of "
         "the kept ones past their submission; textures %llu kept, %llu resolved again, %llu past the pools, %llu views "
@@ -1564,9 +1668,11 @@ void vk_render_stats_log(void) {
         (double)(n->top[VK_TOP_SCANNED] - w->top[VK_TOP_SCANNED]) / (double)presents,
         (double)(n->top_indices - w->top_indices) / (double)presents,
         (double)(n->top[VK_TOP_UNKNOWN] - w->top[VK_TOP_UNKNOWN]) / (double)presents);
-    LOG("vulkan: constant buffers copied from the CPU in the last %llu presents: %.1f KB a present\n",
-        (unsigned long long)presents, (double)g_cb_copied_bytes / 1024.0 / (double)presents);
-    g_cb_copied_bytes = 0;
+    LOG("vulkan: constant buffers copied from the CPU in the last %llu presents: %.1f KB a present, %.3f ms a "
+        "present\n",
+        (unsigned long long)presents, (double)g_cb_copied_bytes / 1024.0 / (double)presents,
+        (double)g_cb_copied_ns / 1e6 / (double)presents);
+    g_cb_copied_bytes = g_cb_copied_ns = 0;
     if (g_stats.restrided != g_stats.restrides)
         LOG("vulkan: %llu vertex streams restrided on the GPU in the last %llu presents, a dispatch that ended the "
             "rendering pass each: their strides are no multiple of their attributes' components, which the device "
@@ -2876,6 +2982,7 @@ static int cb_get(const DsState* ds, int stage, int i, u32 sz, u64 align, VkBuff
     u32 life = CB_OWN; /* the buffer cache's own buffer, or else what lives for the submission */
     if (a && !pending && (!vk_uma() || vk_uma_imports_dear()) && !vk_mirror_pending(a, sz) && !vk_mirror_holds(a, sz) &&
         gmmu_run(a, sz, &cpu) == sz) {
+        u64 t_copy = g_stats.n.cb[VK_CB_COPIED] % CB_TIME_EVERY ? 0 : plat_ns();
         u8* p = vk_stage_upload(sz, vk_stage_align(), buf, off);
         if (!p) return 0;
         life = CB_FRAME;
@@ -2885,6 +2992,7 @@ static int cb_get(const DsState* ds, int stage, int i, u32 sz, u64 align, VkBuff
             if (!vk_buf_get_uniform_at(a, sz, align, buf, off)) return 0;
             life = CB_OWN;
         }
+        if (t_copy) g_cb_copied_ns += (plat_ns() - t_copy) * CB_TIME_EVERY;
         g_stats.n.cb[VK_CB_COPIED]++;
         g_cb_copied_bytes += sz;
     } else if (!(a ? vk_buf_get_uniform_at(a, sz, align, buf, off) : vk_buf_copy(a, sz, buf, off)))
@@ -2916,10 +3024,10 @@ static int cb_pad(VkBuffer* b, u64* o, u32 sz, u32 need) {
     memset(p, 0, need);
     vk_render_end(); /* the copy happens outside rendering passes */
     VkCommandBuffer cb = vk_cmd();
-    vk_all_barrier(cb); /* what wrote the bytes, before the copy reads them */
+    vk_all_barrier_by(VK_BAR_RENDER, cb); /* what wrote the bytes, before the copy reads them */
     VkBufferCopy c = {*o, po, sz};
     rec_CmdCopyBuffer(cb, *b, pb, 1, &c);
-    vk_all_barrier(cb); /* the copy, before the draw reads the block */
+    vk_all_barrier_by(VK_BAR_RENDER, cb); /* the copy, before the draw reads the block */
     *b = pb;
     *o = po;
     g_cb_padded++;
@@ -3481,6 +3589,50 @@ static struct {
         u64 key[512];
     } last[2 * DS_GFX_STAGES]; /* with split sets, each stage's texture set past them (stage_set_) */
 } g_dset;
+/* For the statistics (the GPU plan's M3b): of the new sets, those whose writes equal a set's made in the same frame but
+   for the offsets of their buffers, which dynamic offsets would take from the set (VK_DESCRIPTOR_TYPE_*_DYNAMIC): a
+   table of the frame's keys with the buffers' offsets zeroed, written over as the cache is */
+/* and by stage set and binding (g_dset_moved), the buffer writes of new sets whose offset differs from that binding's
+   last one, with its type: which bindings dynamic offsets would have to cover */
+static void dset_moved_note(int stage, const VkWriteDescriptorSet* w, u32 count) {
+    static u64 last[2 * DS_GFX_STAGES][DSET_BIND_MAX];
+    if ((u32)stage >= 2 * DS_GFX_STAGES) return;
+    for (u32 i = 0; i < count; i++) {
+        if (!w[i].pBufferInfo || w[i].descriptorCount != 1 || w[i].dstBinding >= DSET_BIND_MAX) continue;
+        u64 off = w[i].pBufferInfo[0].offset;
+        if (last[stage][w[i].dstBinding] != off) {
+            g_dset_moved[stage][w[i].dstBinding]++;
+            g_dset_moved_type[stage][w[i].dstBinding] = (u32)w[i].descriptorType;
+        }
+        last[stage][w[i].dstBinding] = off;
+    }
+}
+static void dset_offset_note(u64* key, size_t words, const VkWriteDescriptorSet* w, u32 count, u64 frame) {
+    static struct {
+        u64 h, frame;
+    } seen[1u << 14];
+    size_t n = 1; /* the layout's word, then each write as vk_descriptor_key puts it */
+    for (u32 i = 0; i < count; i++) {
+        const VkBufferViewCreateInfo* view = w[i].pNext;
+        int address = w[i].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER && w[i].descriptorCount == 1 &&
+                      !w[i].pBufferInfo && !w[i].pImageInfo && view &&
+                      view->sType == VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO && !view->pNext;
+        n += 2;
+        if (address) {
+            n += 4;
+            continue;
+        }
+        for (u32 j = 0; j < w[i].descriptorCount; j++, n += 3)
+            if (w[i].pBufferInfo && n + 1 < words) key[n + 1] = 0;
+    }
+    u64 hash[2];
+    vk_hash128(key, words * sizeof *key, hash);
+    u32 slot = (u32)(hash[0] >> 50);
+    if (seen[slot].frame == frame && seen[slot].h == hash[1])
+        g_dset_offset_only++;
+    else
+        seen[slot].h = hash[1], seen[slot].frame = frame;
+}
 static VkDescriptorSet desc_set_cached(VkDescriptorSetLayout layout, DescWrites* d, int stage) {
     /* Two ways share one cache line on 64-bit hosts. A collision need not discard a live descriptor set.
        Both ways remain scoped to the frame whose pools and resources keep the sets alive, and to the forgets of
@@ -3513,6 +3665,13 @@ static VkDescriptorSet desc_set_cached(VkDescriptorSetLayout layout, DescWrites*
             set = bucket[i].set;
         }
     if (!set) {
+        /* for the statistics (the GPU plan's M3c): a set an earlier frame made with these writes */
+        for (u32 i = 0; i < 2; i++)
+            if (bucket[i].frame != frame && bucket[i].h1 == hash[0] && bucket[i].h2 == hash[1]) {
+                g_dset_earlier[(u32)stage >= DS_GFX_STAGES]++;
+                break;
+            }
+        g_dset_new_kind[(u32)stage >= DS_GFX_STAGES]++;
         DescSetEntry* e = bucket[0].frame != frame   ? &bucket[0]
                           : bucket[1].frame != frame ? &bucket[1]
                                                      : &bucket[hash[1] >> 63];
@@ -3521,6 +3680,8 @@ static VkDescriptorSet desc_set_cached(VkDescriptorSetLayout layout, DescWrites*
         if (!set) return VK_NULL_HANDLE;
         g_vk_dset_new++;
         *e = (DescSetEntry){hash[0], hash[1], frame, set};
+        dset_moved_note(stage, d->w, d->n);
+        dset_offset_note(key, words, d->w, d->n, frame); /* last: it zeroes the key's offsets */
     }
     if (keep) {
         g_dset.last[stage].frame = frame;
@@ -3624,6 +3785,36 @@ typedef struct {
 #define CB_WINDOW_WORDS 18
 static CbWindow g_cb_windows[2][19];
 static u16 g_cb_offsets[2][19]; /* the draw's offsets, by the stage's set (0 vertex, 1 fragment) and bank */
+/* the draw's dynamic offsets of the constant buffers that the vertex and fragment sets bind as dynamic uniform buffers
+   (cb_dynamic.h), by the stage's set and slot: 0 for a slot the program has not, whose descriptor no draw reads */
+static u32 g_cb_dyn[2][VK_CB_DYNAMIC_SLOTS];
+static u64 g_cb_dyn_misaligned; /* those not a multiple of minUniformBufferOffsetAlignment, which none should be */
+/* the write of constant buffer slot i of the stage's set vs_fs, range bytes at off of b. A dynamic slot's descriptor
+   takes off's 4 GiB, and the bind the rest (g_cb_dyn): the GPU reads the same bytes, and a set whose buffers only moved
+   is the same set (desc_set_cached's key holds the descriptor's offset) */
+static void dw_cbuf(DescWrites* d, VkDescriptorSet set, int vs_fs, int i, VkBuffer b, u64 off, u64 range) {
+    vk_cb_dynamic_move(vs_fs, (u32)i, off);
+    const VkDescriptorType type = vk_cb_dynamic_type(vs_fs, (u32)i);
+    if (type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
+        /* the same rule as a descriptor's own offset (VUID-VkWriteDescriptorSet-descriptorType-00327 and
+           VUID-vkCmdBindDescriptorSets-pDynamicOffsets-01971): cb_get, cb_pad and cb_window_place align them */
+        const u64 align = g_vk.props.limits.minUniformBufferOffsetAlignment;
+        if (align && off % align && !g_cb_dyn_misaligned++)
+            WARN("vulkan: constant buffer %d of set %d at offset %llu, not a multiple of the device's %llu\n", i, vs_fs,
+                 (unsigned long long)off, (unsigned long long)align);
+        g_cb_dyn[vs_fs][i] = (u32)off;
+        off &= ~(u64)UINT32_MAX;
+    }
+    dw_buffer(d, set, SNX_VKB_CB + (u32)i, type, b, off, range);
+}
+/* the dynamic offsets of set 0 (vertex) and, with fs, set 1 (fragment) into dyn, in the order of set and binding: the
+   count */
+static u32 cb_dyn_offsets(u32* dyn, int fs) {
+    u32 n = 0;
+    for (int s = 0; s < 1 + !!fs; s++)
+        for (u32 m = g_cb_dynamic.mask[s]; m; m &= m - 1) dyn[n++] = g_cb_dyn[s][snx_ctz32(m)];
+    return n;
+}
 static int cb_window_place(int vs_fs, int bank, VkBuffer b, u64 o, u32 sz, u64* base, u64* range) {
     CbWindow* w = &g_cb_windows[vs_fs][bank];
     const u64 frame = vk_frame_id() + 1;
@@ -3840,6 +4031,7 @@ static VkDescriptorSet stage_set_(const DsState* ds, int stage, VkSh* s, Surf** 
     d.cb_addr = vk_cb_addr_mask(&s->si);
     /* the profiler's zones of a stage's set: its constant buffers, storage buffers, textures and the set itself */
     SNX_ZONE(zcb, "stage set constants");
+    if ((u32)shader_vk_set(s->stage) < 2) memset(g_cb_dyn[shader_vk_set(s->stage)], 0, sizeof g_cb_dyn[0]);
     for (u32 banks = s->si.cbuf_mask & 0x3FFFFu; banks; banks &= banks - 1) { /* the banks the program has */
         const int i = (int)snx_ctz32(banks);
         u32 sz = cb_range(ds, stage, s, i);
@@ -3866,7 +4058,7 @@ static VkDescriptorSet stage_set_(const DsState* ds, int stage, VkSh* s, Surf** 
             return VK_NULL_HANDLE;
         if (placed) {
             g_cb_offsets[vs_fs][i] = (u16)((o - base) >> 4);
-            dw_buffer(&d, set, SNX_VKB_CB + i, vk_cbuf_type((u32)i), b, base, (u32)range);
+            dw_cbuf(&d, set, vs_fs, i, b, base, (u32)range);
         } else {
             if (vs_fs < 2) g_cb_offsets[vs_fs][i] = 0;
             /* by address (with heaps, which take no windows), every byte the shader reads is in the binding: past a
@@ -3874,7 +4066,7 @@ static VkDescriptorSet stage_set_(const DsState* ds, int stage, VkSh* s, Surf** 
             if ((d.cb_addr >> i & 1) && sz < vk_cb_range(s->si.cbuf_max[i]) &&
                 !cb_pad(&b, &o, sz, vk_cb_range(s->si.cbuf_max[i])))
                 return VK_NULL_HANDLE;
-            dw_buffer(&d, set, SNX_VKB_CB + i, vk_cbuf_type((u32)i), b, o, sz);
+            dw_cbuf(&d, set, vs_fs, i, b, o, sz);
         }
     }
     if (s->si.root_max) {
@@ -4408,6 +4600,8 @@ static struct {
     VkPipeline pipe;
     VkPipelineLayout layout; /* the one sets were bound through: another may disturb them */
     VkDescriptorSet sets[11]; /* 5 to 9: the stages' texture sets with split sets; the texture table at table_set */
+    u32 ndyn, dyn[2 * VK_CB_DYNAMIC_SLOTS]; /* the dynamic offsets sets 0 and 1 were bound with (cb_dyn_offsets) */
+    u64 dyn_passes, dyn_clears; /* g_vk_passes and g_vk_clear_cmds when they were: the driver's own draws since */
     u64 set_binds; /* vk_rec_set_binds when sets were: a set bound the old way since unbinds descriptor buffers */
     u32 fb, cull, front, topo, restart, discard, bias_on, dt, dw, dcmp, dbounds, st;
     u32 polygon, clamp, clip, provoking, conservative, patch; /* g_vk.dyn_pr's, as PipeKey holds them */
@@ -4842,26 +5036,26 @@ static int vertex_format_holds(const DsVertexFormat* f, const DrawKept* e) {
 static int draw_holds(DrawKept* e, const DsState* ds, u32 topology, int mesh, u32 epoch) {
     const DrawShaders* s = &e->sh;
     /* a draw's path, as draw_shaders' mesh argument: 1 mesh, 2 the compute-task path (sm86.h) */
-    if (!s->vs || (int)(s->mesh | (s->task_compute ? 2 : 0)) != mesh) return 0;
-    if (e->shader_generation != g_vk.shader_generation) return 0;
-    if (e->fold_gen != vk_shader_fold_gen()) return 0; /* a translation came that a lookup may take instead */
-    if (e->k.heaps != (u32)g_vk.has_descriptor_heaps) return 0;
-    if (e->key.owner != ds->owner || e->key.topology != topology || e->epoch != epoch) return 0;
+    if (!s->vs || (int)(s->mesh | (s->task_compute ? 2 : 0)) != mesh) return hold_no(HOLD_PATH);
+    if (e->shader_generation != g_vk.shader_generation) return hold_no(HOLD_SHADER_GEN);
+    if (e->fold_gen != vk_shader_fold_gen()) return hold_no(HOLD_FOLD); /* a translation came that a lookup may take */
+    if (e->k.heaps != (u32)g_vk.has_descriptor_heaps) return hold_no(HOLD_HEAPS);
+    if (e->key.owner != ds->owner || e->key.topology != topology || e->epoch != epoch) return hold_no(HOLD_KEY);
     if (e->gen[DS_VFORMAT] != ds->gen[DS_VFORMAT]) { /* the vertex format changed: what the state read may not have */
-        if (!vertex_format_holds(&ds->vfmt, e)) return 0;
+        if (!vertex_format_holds(&ds->vfmt, e)) return hold_no(HOLD_VFORMAT);
         e->gen[DS_VFORMAT] = ds->gen[DS_VFORMAT];
     }
-    if (s->xfb_on != xfb_wanted(ds->prog.xfb_on)) return 0; /* capture began or ended, or its counters were made */
-    if (s->window_xy != !ds->vp.transform_on) return 0; /* the viewports' group keys no shader otherwise */
-    if (s->swizzle != vk_viewport_swizzle_key(&ds->vp)) return 0;
+    if (s->xfb_on != xfb_wanted(ds->prog.xfb_on)) return hold_no(HOLD_XFB); /* capture began or ended */
+    if (s->window_xy != !ds->vp.transform_on) return hold_no(HOLD_WINDOW);  /* the viewports' group keys no shader */
+    if (s->swizzle != vk_viewport_swizzle_key(&ds->vp)) return hold_no(HOLD_SWIZZLE);
     const VkSh* used[6];
     used_shaders(e, used);
     for (int i = 0; i < 6; i++) {
         if (!used[i]) continue;
         if (e->not_top >> i & 1) {
-            if (!vk_shader_chosen(ds, used[i])) return 0;
+            if (!vk_shader_chosen(ds, used[i])) return hold_no(HOLD_CHOSEN);
         } else if (used[i]->cbr.n && !vk_shader_cb_hold(ds, used[i]))
-            return 0;
+            return hold_no(HOLD_CB);
     }
     return 1;
 }
@@ -4891,14 +5085,16 @@ static u32 draw_find(const DsState* ds, u32 topology, int mesh, u32 epoch, int c
     draw_memo_key(ds, topology, mesh, check, key);
     *have = 1;
     u64 mix = draw_key_mix(key);
-    u32 set = draw_key_set(mix), found = 0;
+    u32 set = draw_key_set(mix), found = 0, met = 0;
     for (u32 w = 0; w < DRAW_WAYS; w++) {
         u32 i = DRAW_TABLE + set * DRAW_WAYS + w;
         DrawKept* e = &g_draw.e[i];
         if (g_draw.tag[set][w] != mix || memcmp(&e->key, key, sizeof *key)) continue;
+        met = 1;
         if (found && (i32)(e->used - g_draw.e[found].used) < 0) continue; /* the latest of those that hold */
         if (draw_holds(e, ds, topology, mesh, epoch)) found = i;
     }
+    if (!met) g_hold_fail[HOLD_NONE]++;
     if (!found) return 0;
     DrawKept* e = &g_draw.e[found];
     for (u32 i = 0; i < DRAW_KEY_GROUPS; i++) e->gen[g_draw_groups[i]] = ds->gen[g_draw_groups[i]];
@@ -4917,6 +5113,39 @@ static u32 draw_slot(const DrawKey* key, u32 found) {
     if (g_draw.tag[set][w]) g_stats.n.evicted++;
     g_draw.tag[set][w] = mix;
     return DRAW_TABLE + set * DRAW_WAYS + w;
+}
+/* What a draw made, kept in the table for later draws: in the entry found when it didn't hold, else in a way of its
+   key's set. pipe: VK_NULL_HANDLE for a draw that drew with none of its own (a feedback draw's probe, render_draw_main),
+   and the draw that takes the entry makes it from the entry's key. The entry */
+static u32 draw_keep(const DsState* ds, const DrawKey* key, u32 found, u32 epoch, const DrawShaders* sh,
+                     const FsKey* fk, VkSh* fs, const TargetFormats* tf, const VertexPlan* pl, const PipeKey* k,
+                     VkPipeline pipe) {
+    u32 slot = draw_slot(key, found);
+    DrawKept* e = &g_draw.e[slot];
+    e->key = *key;
+    g_stats.n.made++;
+    e->epoch = epoch;
+    e->used = ++g_draw.use;
+    e->shader_generation = g_vk.shader_generation;
+    /* the translations as they are after this draw's lookups, which can have made some */
+    e->fold_gen = vk_shader_fold_gen();
+    e->sh = *sh;
+    e->fkey = *fk;
+    e->fs = fs;
+    const VkSh* used[6];
+    used_shaders(e, used);
+    e->not_top = 0;
+    for (int i = 0; i < 6; i++)
+        if (used[i] && !vk_shader_fold_top(used[i])) e->not_top |= 1u << i;
+    e->tf = *tf;
+    if (pl != &e->plan) e->plan = *pl;
+    if (k != &e->k) e->k = *k;
+    e->pipe = pipe;
+    memcpy(e->gen, ds->gen, sizeof e->gen);
+    e->vfmt = ds->vfmt;
+    e->vstreams = 0;
+    for (u32 m = sh->vs->si.in_mask; m; m &= m - 1) e->vstreams |= 1u << ds->vfmt.stream[snx_ctz32(m)];
+    return slot;
 }
 static int draw_shaders_same(const DrawShaders* a, const DrawShaders* b) {
     return a->vs == b->vs && a->tcs == b->tcs && a->tes == b->tes && a->gs == b->gs && a->fs0 == b->fs0 &&
@@ -7128,6 +7357,15 @@ retry:
                           : ds->rkey.alpha_to_coverage                                   ? "takes alpha to coverage"
                                                                                          : "";
         if (why && !*why) {
+            /* the probe keeps what it made, as a draw that drew does: the two draws have states of their own and keep
+               none, so the same draw's probe made its programs, plan and key again each time. With no pipeline: the
+               probe made none, and a draw that takes the entry in place makes it */
+            if (own && kept)
+                ke->used = ++g_draw.use;
+            else if (own) {
+                if (!have_key) draw_memo_key(ds, draw_topo, mesh_path, 0, &key);
+                draw_keep(ds, &key, found, epoch, &sh, &fk, fs, &tf, pl, k, VK_NULL_HANDLE);
+            }
             draw_images_discard(&images);
             why = predraw_run(ds, dc, o, free, fs);
             if (!why) return;
@@ -7339,6 +7577,7 @@ retry:
     VkPipeline pipe;
     const DrawKept* pe = ke ? ke : g_draw.last ? &g_draw.e[g_draw.last] : NULL;
     if (kept) {
+        if (!ke->pipe) ke->pipe = vk_pipeline_get_deferred(k); /* an entry a feedback draw's probe kept has none yet */
         pipe = ke->pipe;
         if (check) {
             VkPipeline made = vk_pipeline_get_deferred(k);
@@ -7384,32 +7623,7 @@ retry:
         draw_forget(); /* a draw with save attachments keeps nothing for the next draw (it has other targets) */
     else if (pipe && own) {
         if (!have_key) draw_memo_key(ds, draw_topo, mesh_path, 0, &key);
-        u32 slot = draw_slot(&key, found);
-        DrawKept* e = &g_draw.e[slot];
-        e->key = key;
-        g_stats.n.made++;
-        e->epoch = epoch;
-        e->used = ++g_draw.use;
-        e->shader_generation = g_vk.shader_generation;
-        /* the translations as they are after this draw's lookups, which can have made some */
-        e->fold_gen = vk_shader_fold_gen();
-        e->sh = sh;
-        e->fkey = fk;
-        e->fs = fs;
-        const VkSh* used[6];
-        used_shaders(e, used);
-        e->not_top = 0;
-        for (int i = 0; i < 6; i++)
-            if (used[i] && !vk_shader_fold_top(used[i])) e->not_top |= 1u << i;
-        e->tf = tf;
-        if (pl != &e->plan) e->plan = *pl;
-        if (k != &e->k) e->k = *k;
-        e->pipe = pipe;
-        memcpy(e->gen, ds->gen, sizeof e->gen);
-        e->vfmt = ds->vfmt;
-        e->vstreams = 0;
-        for (u32 m = vs->si.in_mask; m; m &= m - 1) e->vstreams |= 1u << ds->vfmt.stream[snx_ctz32(m)];
-        g_draw.last = slot;
+        g_draw.last = draw_keep(ds, &key, found, epoch, &sh, &fk, fs, &tf, pl, k, pipe);
     }
     /* the color slots the draw writes */
     u32 writes = 0;
@@ -7555,22 +7769,37 @@ retry:
         memset(g_dyn.sets, 0, sizeof g_dyn.sets);
         g_dyn.layout = layout;
     }
-    if (fresh || g_dyn.sets[0] != vset || (fs && g_dyn.sets[1] != fset)) {
+    /* the dynamic constant buffers' offsets: a set the same as the last draw's is bound again where they moved */
+    u32 dyn[2 * VK_CB_DYNAMIC_SLOTS];
+    const u32 ndyn = cb_dyn_offsets(dyn, fs != NULL);
+    /* RADV (Mesa 26.2.6) draws a pass's clears and a clear command with a pipeline of its own, then binds the draw's
+       shader objects again, and marks the dynamic buffers to be sent to the shaders only where the pipeline it leaves
+       had some: its own has none. The next draw's shaders then read their constant buffers through the register its
+       draw left, a clear's 1.0f taken as an address, and the device is lost. A bind of the sets marks them: with
+       shader objects, sets 0 and 1 are bound again in each pass and after a clear command */
+    const int driver_drew =
+        g_vk.has_shader_objects && ndyn && (g_dyn.dyn_passes != g_vk_passes || g_dyn.dyn_clears != g_vk_clear_cmds);
+    if (fresh || g_dyn.sets[0] != vset || (fs && g_dyn.sets[1] != fset) || g_dyn.ndyn != ndyn ||
+        memcmp(g_dyn.dyn, dyn, ndyn * sizeof *dyn) || driver_drew) {
         g_dyn.sets[0] = vset;
         g_dyn.sets[1] = fs ? fset : VK_NULL_HANDLE;
-        vk_descriptors_bind(cb, layout, 0, fs ? 2 : 1, sets);
+        g_dyn.ndyn = ndyn;
+        g_dyn.dyn_passes = g_vk_passes;
+        g_dyn.dyn_clears = g_vk_clear_cmds;
+        memcpy(g_dyn.dyn, dyn, ndyn * sizeof *dyn);
+        vk_descriptors_bind(cb, layout, 0, fs ? 2 : 1, sets, ndyn, dyn);
     }
     for (b = 0; b < 3; b++)
         if (bset[b] && (fresh || g_dyn.sets[2 + b] != bset[b])) {
             g_dyn.sets[2 + b] = bset[b];
-            vk_descriptors_bind(cb, layout, (u32)b + 2, 1, &bset[b]);
+            vk_descriptors_bind(cb, layout, (u32)b + 2, 1, &bset[b], 0, NULL);
         }
     /* split sets: each present stage's texture set, five after its buffers' (shader_vk_tex_set) */
     for (u32 t = 0; t < 5 && g_spirv_translate.split_sets; t++) {
         const int present = t == 0 || (t == 1 ? fs != NULL : bset[t - 2] != VK_NULL_HANDLE);
         if (present && g_stage_tex_set[t] && (fresh || g_dyn.sets[5 + t] != g_stage_tex_set[t])) {
             g_dyn.sets[5 + t] = g_stage_tex_set[t];
-            vk_descriptors_bind(cb, layout, 5 + t, 1, &g_stage_tex_set[t]);
+            vk_descriptors_bind(cb, layout, 5 + t, 1, &g_stage_tex_set[t], 0, NULL);
         }
     }
     /* the texture table, after the stages' sets (table.c) */
@@ -7579,7 +7808,7 @@ retry:
         const u32 at = g_spirv_translate.table_set;
         if (fresh || g_dyn.sets[at] != table) {
             g_dyn.sets[at] = table;
-            vk_descriptors_bind(cb, layout, at, 1, &table);
+            vk_descriptors_bind(cb, layout, at, 1, &table, 0, NULL);
         }
     }
     /* a program that fetches its own attributes takes an empty layout: its pipeline has the layout static and ignores
@@ -7918,11 +8147,11 @@ retry:
     else if (mesh)
         rec_CmdDrawMeshTasks(cb, count);
     else if (dc->indirect) {
-        if (indexed) rec_CmdBindIndexBuffer(cb, ibuf, ioff, itype);
+        if (indexed) index_bind(cb, ibuf, ioff, itype, 0); /* the guest's records hold their first index */
         draw_indirect(cb, indexed, abuf, aoff, cntbuf, cntoff, dc->draw_count, astride);
     } else if (indexed) {
-        rec_CmdBindIndexBuffer(cb, ibuf, ioff, itype);
-        rec_CmdDrawIndexed(cb, icount, instances, 0, voffset, base_instance);
+        const u32 first_index = index_bind(cb, ibuf, ioff, itype, 1);
+        rec_CmdDrawIndexed(cb, icount, instances, first_index, voffset, base_instance);
     } else
         rec_CmdDraw(cb, count, instances, first, base_instance);
     pred_end(cb, o->pred);
