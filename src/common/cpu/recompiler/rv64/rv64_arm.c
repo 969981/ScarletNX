@@ -16,7 +16,7 @@
 
 #if !defined(_WIN32)
 /* the ELF RISC-V relocations the blocks have (the RISC-V ELF psABI's numbers) */
-enum { RV_EM = 243, RV_R_64 = 2, RV_R_CALL_PLT = 19 };
+enum { RV_EM = 243, RV_R_32_PCREL = 57, RV_R_CALL_PLT = 19 };
 #define MG_ARM_INC         "a32_rv64.inc"
 #define MG_ARM             SnxRv64Arm
 #define MG_ARM_NEXT        SnxRv64ArmNext
@@ -28,8 +28,9 @@ enum { RV_EM = 243, RV_R_64 = 2, RV_R_CALL_PLT = 19 };
 #define MG_ARM_ELF_FLAGS   0x5 /* RVC, the LP64D float ABI */
 #define MG_ARM_CALL_RELOC  RV_R_CALL_PLT
 #define MG_ARM_R_TAIL      RV_R_CALL_PLT
-#define MG_ARM_R_ABS64     RV_R_64
+#define MG_ARM_R_LITERAL   RV_R_32_PCREL
 #define MG_ARM_ENTRY_EXIT  "snx_rv64_a32_entry_exit"
+#define MG_ARM_THUMB_ENTRY "snx_rv64_thumb_entry"
 #define MG_ARM_LOAD_FENCE  1 /* a load is no acquire: a FENCE after it */
 #define MG_ARM_FP_HOT      0
 
@@ -50,11 +51,19 @@ enum { RV_EM = 243, RV_R_64 = 2, RV_R_CALL_PLT = 19 };
 int snx_rv64_arm_available(void) { return 0; }
 SnxRv64Arm* snx_rv64_arm_new(void) { return NULL; }
 void snx_rv64_arm_free(SnxRv64Arm* c) { (void)c; }
+int snx_rv64_arm_options(SnxRv64Arm* c, const SnxArmCodegenOptions* options) {
+    (void)c, (void)options;
+    return -1;
+}
 int snx_rv64_arm_block(SnxRv64Arm* c, const char* name, const unsigned char* code, size_t count, uint32_t pc,
                        size_t* consumed, SnxRv64ArmNext next, void* user) {
     (void)c, (void)name, (void)code, (void)count, (void)pc, (void)next, (void)user;
     *consumed = 0;
     return 0;
+}
+int snx_rv64_arm_thumb_block(SnxRv64Arm* c, const char* name, const unsigned char* code, size_t count, uint32_t pc,
+                             size_t* consumed, SnxRv64ArmNext next, void* user) {
+    return snx_rv64_arm_block(c, name, code, count, pc, consumed, next, user);
 }
 const char* snx_rv64_arm_why(const SnxRv64Arm* c) {
     (void)c;

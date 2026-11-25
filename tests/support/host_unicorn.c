@@ -90,6 +90,7 @@ struct HostUc {
     size_t nregions;
     void (*swap)(void* user); /* a big-endian architecture's (hostuc_swapper) */
     void* swap_user;
+    uint64_t sp; /* the entry's */
 };
 static void swap(HostUc* u) {
     if (u->a->big && u->swap) u->swap(u->swap_user);
@@ -104,8 +105,19 @@ static void put_word(const Arch* a, unsigned char* p, uint32_t w) {
 
 const char* hostuc_name(HostUcArch arch) { return g_arch[arch].name; }
 
-static void* page_alloc(size_t size) {
-    void* p = mmap(NULL, (size + PAGE - 1) & ~(size_t)(PAGE - 1), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+void* hostuc_pages(size_t size) {
+    size_t bytes = (size + PAGE - 1) & ~(size_t)(PAGE - 1);
+    void* p;
+#ifdef MAP_FIXED_NOREPLACE
+    uint64_t at = 0x10000000, step = bytes > (1u << 24) ? bytes : 1u << 24;
+    for (; at + bytes <= 0x100000000ull; at += step) {
+        p = mmap((void*)(uintptr_t)at, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED_NOREPLACE, -1,
+                 0);
+        if (p == (void*)(uintptr_t)at) return p;
+        if (p != MAP_FAILED) munmap(p, bytes); /* a kernel without the flag takes it as a hint */
+    }
+#endif
+    p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     return p == MAP_FAILED ? NULL : p;
 }
 int hostuc_map(HostUc* u, void* p, size_t size) {
@@ -125,11 +137,64 @@ int hostuc_map(HostUc* u, void* p, size_t size) {
     return 0;
 }
 
+/* ---- what a callee of AAPCS64 keeps ---- */
+
+/* X19 to X29, and X18, the platform's; the low halves of V8 to V15 */
+#define KEPT_X 12
+#define KEPT_D 8
+static int x_reg(unsigned n) { /* X29 and X30 are apart in Unicorn's numbers */
+    return n == 29 ? UC_ARM64_REG_X29 : n == 30 ? UC_ARM64_REG_X30 : UC_ARM64_REG_X0 + (int)n;
+}
+static uint64_t mark_x(unsigned n) { return 0x5151000000000000ull + n * 0x0101010101ull; }
+static uint64_t mark_d(unsigned n) { return 0x6262000000000000ull + n * 0x0303030303ull; }
+static void mark_kept(HostUc* u) {
+    unsigned k;
+    for (k = 0; k < KEPT_X; ++k) {
+        uint64_t v = mark_x(18 + k);
+        uc_reg_write(u->uc, x_reg(18 + k), &v);
+    }
+    for (k = 0; k < KEPT_D; ++k) {
+        uint64_t v[2] = {mark_d(8 + k), 0xBAD0BAD1BAD2BAD3ull};
+        uc_reg_write(u->uc, UC_ARM64_REG_V8 + (int)k, v);
+    }
+}
+/* what came back changed of what the entry marked, and its stack pointer: 0 for nothing, said */
+static int kept_changed(HostUc* u) {
+    int bad = 0;
+    unsigned k;
+    uint64_t v, sp;
+    for (k = 0; k < KEPT_X; ++k) {
+        uc_reg_read(u->uc, x_reg(18 + k), &v);
+        if (v != mark_x(18 + k))
+            bad = 1, fprintf(stderr, "%s: X%u came back %llx, was %llx\n", u->a->name, 18 + k, (unsigned long long)v,
+                             (unsigned long long)mark_x(18 + k));
+    }
+    for (k = 0; k < KEPT_D; ++k) {
+        uint64_t q[2];
+        uc_reg_read(u->uc, UC_ARM64_REG_V8 + (int)k, q);
+        if (q[0] != mark_d(8 + k))
+            bad = 1, fprintf(stderr, "%s: D%u came back %llx, was %llx\n", u->a->name, 8 + k, (unsigned long long)q[0],
+                             (unsigned long long)mark_d(8 + k));
+    }
+    uc_reg_read(u->uc, u->a->sp, &sp);
+    if (sp != u->sp) bad = 1, fprintf(stderr, "%s: SP came back %lld off\n", u->a->name, (long long)(sp - u->sp));
+    return bad;
+}
+
+/* ---- the traps ---- */
+
 /* the native function of a trap the code reached, with the first six arguments (System V passes them the same way, a
    function of fewer ignoring the rest), its result into the result register (both halves of a wide one); the trap's
    return goes back */
 typedef uint64_t (*Native)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 typedef HostUcPair (*NativeWide)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+/* the call's type is not the function's: the function sanitizer's check of it is off, as arm_x64.c's run_block's */
+[[clang::no_sanitize("function")]] static uint64_t call_native(void* fn, const uint64_t* a) {
+    return ((Native)fn)(a[0], a[1], a[2], a[3], a[4], a[5]);
+}
+[[clang::no_sanitize("function")]] static HostUcPair call_wide(void* fn, const uint64_t* a) {
+    return ((NativeWide)fn)(a[0], a[1], a[2], a[3], a[4], a[5]);
+}
 static void on_trap(uc_engine* uc, uint64_t address, uint32_t size, void* user) {
     HostUc* u = (HostUc*)user;
     unsigned k = (unsigned)((address - (uint64_t)(uintptr_t)u->trap) / 16), i;
@@ -146,11 +211,11 @@ static void on_trap(uc_engine* uc, uint64_t address, uint32_t size, void* user) 
         }
     swap(u); /* the C's numbers while it runs */
     if (u->wide[k]) {
-        HostUcPair w = ((NativeWide)u->fn[k])(a[0], a[1], a[2], a[3], a[4], a[5]);
+        HostUcPair w = call_wide(u->fn[k], a);
         r = w.lo;
         uc_reg_write(uc, u->a->result[1], &w.hi);
     } else
-        r = ((Native)u->fn[k])(a[0], a[1], a[2], a[3], a[4], a[5]);
+        r = call_native(u->fn[k], a);
     swap(u);
     uc_reg_write(uc, u->a->result[0], &r);
 }
@@ -166,10 +231,10 @@ static int la_trap(La64* c, void* user) {
         return -1;
     }
     if (u->wide[k]) {
-        HostUcPair w = ((NativeWide)u->fn[k])(c->r[4], c->r[5], c->r[6], c->r[7], c->r[8], c->r[9]);
+        HostUcPair w = call_wide(u->fn[k], &c->r[4]);
         c->r[4] = w.lo, c->r[5] = w.hi;
     } else
-        c->r[4] = ((Native)u->fn[k])(c->r[4], c->r[5], c->r[6], c->r[7], c->r[8], c->r[9]);
+        c->r[4] = call_native(u->fn[k], &c->r[4]);
     c->pc = c->r[1];
     return 1;
 }
@@ -187,8 +252,8 @@ HostUc* hostuc_new(HostUcArch arch, size_t code_cap) {
             hostuc_free(u);
             return NULL;
         }
-        u->code = (unsigned char*)page_alloc(code_cap + PAGE);
-        u->stack = (unsigned char*)page_alloc(STACK_SIZE);
+        u->code = (unsigned char*)hostuc_pages(code_cap + PAGE);
+        u->stack = (unsigned char*)hostuc_pages(STACK_SIZE);
         if (!u->code || !u->stack || hostuc_map(u, u->code, code_cap + PAGE) || hostuc_map(u, u->stack, STACK_SIZE)) {
             hostuc_free(u);
             return NULL;
@@ -218,8 +283,8 @@ HostUc* hostuc_new(HostUcArch arch, size_t code_cap) {
             return NULL;
         }
     }
-    u->code = (unsigned char*)page_alloc(code_cap + PAGE);
-    u->stack = (unsigned char*)page_alloc(STACK_SIZE);
+    u->code = (unsigned char*)hostuc_pages(code_cap + PAGE);
+    u->stack = (unsigned char*)hostuc_pages(STACK_SIZE);
     if (!u->code || !u->stack || hostuc_map(u, u->code, code_cap + PAGE) || hostuc_map(u, u->stack, STACK_SIZE)) {
         hostuc_free(u);
         return NULL;
@@ -260,7 +325,7 @@ void hostuc_free(HostUc* u) {
 }
 
 void* hostuc_alloc(HostUc* u, size_t size) {
-    void* p = page_alloc(size);
+    void* p = hostuc_pages(size);
     if (!p || hostuc_map(u, p, size)) return NULL;
     return p;
 }
@@ -317,14 +382,14 @@ uint64_t hostuc_symbol(HostUc* u, const char* name) {
 /* the bytes a relocation of the architecture's type writes, where they're a number of its order (a big-endian one's
    turned over around snx_elf_relocate, which writes this host's): 0 for a type not known here */
 static unsigned reloc_bytes(unsigned em, unsigned type) {
-    if (em == EM_PPC64) return type == SNX_PPC_ADDR64 ? 8 : 0;
-    if (em == EM_MIPS) return type == SNX_MIPS_64 ? 8 : 0;
-    if (em == EM_S390) return type == 22 /* R_390_64 */ ? 8 : type == 19 /* R_390_PC32DBL */ ? 4 : 0;
+    if (em == EM_PPC64) return type == SNX_PPC_ADDR64 || type == SNX_PPC_REL64 ? 8 : 0;
+    if (em == EM_MIPS) return type == SNX_MIPS_64 ? 8 : type == SNX_MIPS_PC32 ? 4 : 0;
+    if (em == EM_S390) return type == SNX_390_64 || type == SNX_390_PC64 ? 8 : type == SNX_390_PC32DBL ? 4 : 0;
     return 0;
 }
 static int load(HostUc* u, const unsigned char* object, size_t size, char* error, size_t error_size);
-/* the object's sections laid out one after another in the region (.text, the others it holds bytes of, .bss
-   zeroed), its symbols at their places, each RELA section's relocations written; an object of the other byte order's
+/* the object's sections laid out one after another in the region (the data it holds bytes of and .bss zeroed, then the
+   code), its symbols at their places, each RELA section's relocations written; an object of the other byte order's
    tables read turned over */
 int hostuc_load(HostUc* u, const unsigned char* object, size_t size, char* error, size_t error_size) {
     unsigned char* copy;
@@ -356,25 +421,27 @@ static int load(HostUc* u, const unsigned char* object, size_t size, char* error
     sh = (const Elf64_Shdr*)(const void*)(object + eh->e_shoff);
     at = (uint64_t*)calloc(eh->e_shnum, sizeof *at);
     if (!at) return -1;
-    for (k = 0; k < eh->e_shnum; ++k) {
+    for (k = 0; k < eh->e_shnum; ++k)
         if (sh[k].sh_type == SHT_SYMTAB) {
             syms = (const Elf64_Sym*)(const void*)(object + sh[k].sh_offset);
             nsyms = sh[k].sh_size / sizeof *syms;
             strtab = (const char*)(object + sh[sh[k].sh_link].sh_offset);
         }
-        if ((sh[k].sh_flags & SHF_ALLOC) && (sh[k].sh_type == SHT_PROGBITS || sh[k].sh_type == SHT_NOBITS) &&
-            sh[k].sh_size) {
-            /* .bss and its kin: zeroes of their size */
-            void* zero = sh[k].sh_type == SHT_NOBITS ? calloc(1, sh[k].sh_size) : NULL;
-            at[k] = hostuc_code(u, zero ? zero : object + sh[k].sh_offset, sh[k].sh_size);
-            free(zero);
-            if (!at[k]) {
-                snprintf(error, error_size, "no room for section %zu", k);
-                free(at);
-                return -1;
+    /* the data first, as a module's read-only data is before its code: the code's distances to it are negative */
+    for (int code = 0; code < 2; ++code)
+        for (k = 0; k < eh->e_shnum; ++k)
+            if ((sh[k].sh_flags & SHF_ALLOC) && (sh[k].sh_type == SHT_PROGBITS || sh[k].sh_type == SHT_NOBITS) &&
+                sh[k].sh_size && !(sh[k].sh_flags & SHF_EXECINSTR) == !code) {
+                /* .bss and its kin: zeroes of their size */
+                void* zero = sh[k].sh_type == SHT_NOBITS ? calloc(1, sh[k].sh_size) : NULL;
+                at[k] = hostuc_code(u, zero ? zero : object + sh[k].sh_offset, sh[k].sh_size);
+                free(zero);
+                if (!at[k]) {
+                    snprintf(error, error_size, "no room for section %zu", k);
+                    free(at);
+                    return -1;
+                }
             }
-        }
-    }
     for (k = 0; k < nsyms; ++k)
         if (syms[k].st_shndx != SHN_UNDEF && syms[k].st_shndx < eh->e_shnum && syms[k].st_name &&
             ELF64_ST_TYPE(syms[k].st_info) != STT_SECTION) {
@@ -457,6 +524,8 @@ int hostuc_call(HostUc* u, uint64_t fn, uint64_t a0, uint64_t a1, uint64_t* resu
     uc_reg_write(u->uc, u->a->lr, &lr);
     if (u->a->arch == UC_ARCH_PPC) uc_reg_write(u->uc, UC_PPC_REG_12, &fn); /* an ELFv2 global entry's */
     if (u->a->arch == UC_ARCH_MIPS) uc_reg_write(u->uc, UC_MIPS_REG_25, &fn); /* t9: an n64 PIC callee's */
+    u->sp = sp;
+    if (u->a->arch == UC_ARCH_ARM64) mark_kept(u);
     swap(u);
     e = uc_emu_start(u->uc, fn, lr, 0, 1u << 22);
     swap(u);
@@ -468,5 +537,5 @@ int hostuc_call(HostUc* u, uint64_t fn, uint64_t a0, uint64_t a1, uint64_t* resu
         return -1;
     }
     if (result) uc_reg_read(u->uc, u->a->result[0], result);
-    return 0;
+    return u->a->arch == UC_ARCH_ARM64 && kept_changed(u) ? -1 : 0;
 }

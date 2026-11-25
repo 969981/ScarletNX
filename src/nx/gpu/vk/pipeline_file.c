@@ -1100,6 +1100,17 @@ static int pf_nth(const PfField* f, int i) {
     for (int k = 0; k < i; k++) nth += !strcmp(f[k].name, f[i].name);
     return nth;
 }
+int pf_build_unnamed(const char* commit) {
+    size_t len = strlen(commit);
+    return !strcmp(commit, "unknown") || (len >= 6 && !strcmp(commit + len - 6, "-dirty"));
+}
+void pf_build_words(char* out, size_t n, const char* commit, const char* flags, const PFileMap* self) {
+    int at = 0;
+    if (n) out[0] = 0;
+    if (pf_build_unnamed(commit) && self && self->data)
+        at = snprintf(out, n, " exe=%016llx", (unsigned long long)vk_hash(self->data, (size_t)self->size));
+    if (flags[0] && at >= 0 && (size_t)at < n) snprintf(out + at, n - (size_t)at, " flags=%s", flags);
+}
 int pf_key_diff(char* out, size_t n, const char* key, size_t len, const char* want) {
     PfField was[32], now[32];
     int nw = pf_fields(key, len, was, 32), nn = pf_fields(want, strlen(want), now, 32), count = 0;

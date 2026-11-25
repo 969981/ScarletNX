@@ -346,6 +346,26 @@ static inline int rk_patch(SgXBuf* b, size_t at, size_t to) {
     mips_word_put(b, at, (w & 0xFFFF0000u) | ((SnxU32)d & 0xffff));
     return 0;
 }
+/* a jump past rk_j's reach, within 2 GiB: t9 the distance (LUI, in BAL's delay slot, and DADDIU, patched) from BAL's
+   link, the word after that slot (ra is the frame's, saved) */
+static inline size_t rk_j_far(SgXBuf* b) {
+    size_t at = b->n;
+    mips_w(b, sge_mips64_bal(1));
+    mips_w(b, sge_mips64_lui(RK_SA, 0));
+    mips_w(b, sge_mips64_daddiu(RK_SA, RK_SA, 0));
+    mips_w(b, sge_mips64_daddu(RK_SA, RK_SA, MIPS_RA));
+    mips_w(b, sge_mips64_jr(RK_SA));
+    mips_w(b, MIPS_NOP);
+    return at;
+}
+static inline int rk_patch_far(SgXBuf* b, size_t at, size_t to) {
+    long long d = (long long)to - (long long)at - 8, hi = (d + 0x8000) >> 16;
+    if (at + 12 > b->cap) return 0;
+    if (hi < -32768 || hi >= 32768) return -1;
+    mips_word_put(b, at + 4, sge_mips64_lui(RK_SA, (SnxU32)hi & 0xffff));
+    mips_word_put(b, at + 8, sge_mips64_daddiu(RK_SA, RK_SA, mips_i(d - (hi << 16))));
+    return 0;
+}
 /* calls and jumps through t9 (an n64 PIC callee's address) */
 static inline void rk_call_reg(SgXBuf* b, int r) {
     rk_mv(b, RK_SA, r);
@@ -361,8 +381,9 @@ static inline void rk_ret(SgXBuf* b) {
     mips_w(b, sge_mips64_jr(MIPS_RA));
     mips_w(b, MIPS_NOP);
 }
-/* d = the address of an 8-byte absolute address in the code: BAL past it (the link its address: ra is the frame's,
-   saved), the literal 8-aligned; the place of its relocation */
+/* d = the address of a literal in the code: BAL past it (the link its address: ra is the frame's, saved), 8-aligned;
+   the place of its relocation. It is the distance of a symbol from it (R_MIPS_PC32, in its first word; a module's code
+   holds no address, which would be a text relocation), or the symbol's address in a JIT unit (R_MIPS_64, b->absolute) */
 static inline size_t rk_literal(SgXBuf* b, int d) {
     size_t at;
     if ((b->n + 8) % 8) mips_w(b, MIPS_NOP);
@@ -382,11 +403,20 @@ static inline size_t rk_leaf_literal(SgXBuf* b, int d) {
     rk_mv(b, MIPS_RA, RK_S1);
     return at;
 }
-/* a call by the object's relocation: the callee's absolute address in the code (R_MIPS_64: the place this gives)
-   loaded into t9; a tail call keeps ra, the caller's, in RK_S1 around the BAL */
+/* d = the address the literal at lit (rk_literal's d) stands for, t a scratch (d, where lit isn't) */
+static inline void rk_literal_value(SgXBuf* b, int d, int lit, int t) {
+    if (b->absolute) {
+        rk_ldst(b, 1, 8, 0, d, lit, -1, 0);
+        return;
+    }
+    rk_ldst(b, 1, 4, 1, t, lit, -1, 0);
+    rk_add(b, d, lit, t, 1);
+}
+/* a call by the object's relocation: the callee's literal (the place this gives), made its address in t9; a tail call
+   keeps ra, the caller's, in RK_S1 around the BAL */
 static inline size_t rk_call_reloc(SgXBuf* b) {
     size_t at = rk_literal(b, RK_SA);
-    rk_ldst(b, 1, 8, 0, RK_SA, RK_SA, -1, 0);
+    rk_literal_value(b, RK_SA, RK_SA, RK_S2);
     rk_call_reg(b, RK_SA);
     return at;
 }
@@ -395,7 +425,7 @@ static inline size_t rk_tail_reloc(SgXBuf* b) {
     rk_mv(b, RK_S1, MIPS_RA);
     at = rk_literal(b, RK_SA);
     rk_mv(b, MIPS_RA, RK_S1);
-    rk_ldst(b, 1, 8, 0, RK_SA, RK_SA, -1, 0);
+    rk_literal_value(b, RK_SA, RK_SA, RK_S2);
     rk_jump_reg(b, RK_SA);
     return at;
 }

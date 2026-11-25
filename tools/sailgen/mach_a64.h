@@ -43,6 +43,7 @@ struct SgCtx {
     int base_seen[4]; /* a few recent values of sgx_base's, each checked against what made it */
     unsigned base_next;
     int exclusive[2], exclusive_count, exclusive_next, status; /* a load-exclusive's values, a store's status */
+    SgB qc; /* when the instruction so far sets FPSR.QC (sg_FPSR_field_write), 0 for not: stored with its V register */
     SnxU64 (*resolve)(const char* sym); /* a helper's address, where the code calls it absolutely (a test's) */
     int start;       /* the instructions before this word's */
 };
@@ -228,7 +229,7 @@ enum {
 };
 
 /* a call of the helper sym (x64_helpers.c's) or of the runtime's function at rt_offset in RtAPI, the state first
-   where state: args its other arguments (in the machine's sgx_arg_regs); its result (SGX_RET) */
+   where state: args its other arguments (in the machine's SGX_ARG_REG); its result (SGX_RET) */
 static inline SgD sgx_call(SgCtx* g, const char* sym, int rt_offset, int state, SgD* args, int nargs, int result_w) {
     SgX* x = sgx(g);
     int regs[5], k;
@@ -250,7 +251,7 @@ static inline SgD sgx_call(SgCtx* g, const char* sym, int rt_offset, int state, 
     i->calls = 1;
     for (k = 0; k < nargs; ++k) {
         i->in[k] = regs[k];
-        i->fixed[k] = sgx_arg_regs[k + (state ? 1 : 0)];
+        i->fixed[k] = SGX_ARG_REG(x, k + (state ? 1 : 0));
     }
     if (result_w) i->def = sgx_vreg(x, x->n - 1, 64);
     /* a call changes the flags; the guest's registers the helpers and the runtime's hints leave as they are */
@@ -347,10 +348,40 @@ static inline SgD sg__V_read_bits(SgCtx* g, long long n, long long hi, long long
     if (!g->vx[n]) g->vx[n] = sgx_vins(x, SGX_VF_LD16, 0, 0, NULL, 0, 1, SGX_VM_STATE, 0, 0, sgx_vd_offset(n, 0), 0, 0);
     return sg_d_slice(g, sgx_xval(128, g->vx[n]), hi, lo);
 }
+/* FPSR[QC] = 1 under path (0: always), a saturating instruction's, once for each element: the condition of them all is
+   kept, and FPSR's bit set where it holds as the instruction writes its register (sgx_qc) */
+enum { SG_FPSR_QC = 27 };
+static inline void sg_FPSR_field_write(SgCtx* g, SgB path, int field, SgD v) {
+    if (field != SG_FPSR_QC || !sgx_is_const(&v) || v.k != 1)
+        sg_fail("FPSR's field written other than QC set", field, v.w);
+    path = path ? path : sg_bool(g, 1);
+    g->qc = g->qc ? sg_b_or(g, g->qc, path) : path;
+}
+static inline void sgx_qc(SgCtx* g) {
+    SgX* x = sgx(g);
+    SgXIns* i;
+    SgD bit;
+    int r;
+    if (!g->qc) return;
+    bit = sg_d_lsl(g, sg_d_zext(g, sgx_bool_bits(x, g->qc), 32), SG_FPSR_QC);
+    g->qc = 0;
+    i = sgx_append(x, SGX_K_LOAD);
+    i->w = 32;
+    i->disp = (int)offsetof(CPU, fpsr);
+    i->def = sgx_vreg(x, x->n - 1, 32);
+    bit = sg_d_or(g, sgx_val(32, i->def), bit);
+    r = sgx_reg(x, &bit);
+    i = sgx_append(x, SGX_K_STORE);
+    i->w = 32;
+    i->in[0] = r;
+    i->disp = (int)offsetof(CPU, fpsr);
+}
+
 /* _V[n] = v, all 128 bits: a vector value by a 16-byte store, general-purpose doublewords by two */
 static inline void sg__V_write(SgCtx* g, long long n, SgD v) {
     SgX* x = sgx(g);
     SgD lo, hi;
+    sgx_qc(g);
     if (n < 0 || n > 31) sg_fail("a SIMD&FP register this back end does not keep", n, 31);
     if (v.w != 128 || v.wide || v.inv || v.nzcv) sg_fail("a SIMD&FP register written from other than 128 bits", v.w, 128);
     if (sgx_vpinned(g, n)) {
@@ -423,6 +454,90 @@ static inline void sg_FPToFixedJS(SgCtx* g, SgB path, SgD op, SgD fpcr, int is64
 static inline SgD sg_FPConvertBF__1(SgCtx* g, SgB path, SgD op, SgD fpcr) {
     return sgx_fp(g, "snx_x64_fp_bfcvt", path, fpcr, &op, 1, 0, 0, 16);
 }
+/* the reciprocals' estimates and steps, FMULX's product, FRECPX's exponent, and a conversion in a rounding of its own
+   (FCVTXN's, to odd): cpu.h's */
+static inline SgD sgx_fp_unary_of(SgCtx* g, SgB path, SgD a, SgD fpcr, unsigned op) {
+    return sgx_fp(g, "snx_x64_fp_unary", path, fpcr, &a, 1, 1, a.w | op << 8, a.w);
+}
+static inline SgD sgx_fp_binary_of(SgCtx* g, SgB path, SgD a, SgD b, SgD fpcr, unsigned op) {
+    SgD o[2] = {a, b};
+    return sgx_fp(g, "snx_x64_fp_binary", path, fpcr, o, 2, 1, a.w | op << 8, a.w);
+}
+static inline SgD sg_FPRecipEstimate(SgCtx* g, SgB path, SgD a, SgD fpcr) {
+    return sgx_fp_unary_of(g, path, a, fpcr, SNX_FP_RECPE);
+}
+static inline SgD sg_FPRSqrtEstimate(SgCtx* g, SgB path, SgD a, SgD fpcr) {
+    return sgx_fp_unary_of(g, path, a, fpcr, SNX_FP_RSQRTE);
+}
+static inline SgD sg_FPRecpX(SgCtx* g, SgB path, SgD a, SgD fpcr) {
+    return sgx_fp_unary_of(g, path, a, fpcr, SNX_FP_RECPX);
+}
+static inline SgD sg_FPMulX(SgCtx* g, SgB path, SgD a, SgD b, SgD fpcr) {
+    return sgx_fp_binary_of(g, path, a, b, fpcr, SNX_FP_MULX);
+}
+static inline SgD sg_FPRecipStepFused(SgCtx* g, SgB path, SgD a, SgD b) {
+    return sgx_fp_binary_of(g, path, a, b, sg_FPCR_read(g), SNX_FP_RECPS);
+}
+static inline SgD sg_FPRSqrtStepFused(SgCtx* g, SgB path, SgD a, SgD b) {
+    return sgx_fp_binary_of(g, path, a, b, sg_FPCR_read(g), SNX_FP_RSQRTS);
+}
+static inline SgD sg_FPConvert(SgCtx* g, SgB path, SgD op, SgD fpcr, int rounding, long long to_bits) {
+    if (to_bits != 16 && to_bits != 32 && to_bits != 64) sg_fail("a conversion to a float of this width", to_bits, 0);
+    if (rounding < 0 || rounding > 5) sg_fail("a floating-point rounding the helpers do not take", rounding, 5);
+    return sgx_fp(g, "snx_x64_fp_convert", path, fpcr, &op, 1, 1,
+                  op.w | (SnxU32)to_bits << 8 | (SnxU32)(rounding + 1) << 16, (unsigned)to_bits);
+}
+/* URECPE, URSQRTE: of 32 bits, with no flags and no mode */
+static inline SgD sgx_estimate32(SgCtx* g, SgD a, int sqrt) {
+    SgD args[2];
+    args[0] = sg_d_zext(g, a, 64);
+    args[1] = sgx_const(32, (SnxU64)sqrt);
+    return sg_d_slice(g, sgx_call(g, "snx_x64_estimate", 0, 0, args, 2, 64), 31, 0);
+}
+static inline SgD sg_UnsignedRecipEstimate(SgCtx* g, SgD a) { return sgx_estimate32(g, a, 0); }
+static inline SgD sg_UnsignedRSqrtEstimate(SgCtx* g, SgD a) { return sgx_estimate32(g, a, 1); }
+/* FMLAL's product added (path 0: always): the halves as singles, exactly, then the single's fused multiply-add */
+static inline SgD sg_FPMulAdd(SgCtx* g, SgB path, SgD addend, SgD a, SgD b, SgD fpcr);
+static inline SgD sgx_half_single(SgCtx* g, SgD a, SgD fpcr) {
+    SgD args[2];
+    args[0] = sg_d_zext(g, a, 64);
+    args[1] = sg_d_zext(g, sg_d_slice(g, fpcr, 31, 0), 64);
+    return sg_d_slice(g, sgx_call(g, "snx_x64_half", 0, 0, args, 2, 64), 31, 0);
+}
+static inline SgD sg_FPMulAddH(SgCtx* g, SgB path, SgD addend, SgD a, SgD b, SgD fpcr) {
+    SgD x = sgx_half_single(g, a, fpcr), y = sgx_half_single(g, b, fpcr);
+    return sg_FPMulAdd(g, path, addend, x, y, fpcr);
+}
+/* BFDOT's step, which neither reads FPCR (FEAT_EBF16's FPCR.EBF is not kept) nor raises a flag */
+static inline SgD sg_BFDotAdd(SgCtx* g, SgB path, SgD sum, SgD a0, SgD a1, SgD b0, SgD b1, SgD fpcr) {
+    SgD args[3];
+    (void)path, (void)fpcr;
+    args[0] = sg_d_zext(g, sum, 64);
+    args[1] = sg_d_zext(g, sg_d_concat(g, a1, a0), 64);
+    args[2] = sg_d_zext(g, sg_d_concat(g, b1, b0), 64);
+    return sg_d_slice(g, sgx_call(g, "snx_x64_bfdot", 0, 0, args, 3, 64), 31, 0);
+}
+/* SM4's substitution of a byte */
+static inline SgD sg_Sbox(SgCtx* g, SgD a) {
+    SgD x = sg_d_zext(g, a, 64);
+    return sg_d_slice(g, sgx_call(g, "snx_x64_sm4_box", 0, 0, &x, 1, 64), 7, 0);
+}
+/* AES's SubBytes, MixColumns and their inverses (op 0 to 3), a doubleword at a time: each takes its bytes, or its two
+   columns, alone */
+static inline SgD sgx_aes(SgCtx* g, SgD a, unsigned op) {
+    SgD args[2], half[2];
+    int k;
+    for (k = 0; k < 2; ++k) {
+        args[0] = sg_d_slice(g, a, 64 * k + 63, 64 * k);
+        args[1] = sgx_const(32, op);
+        half[k] = sgx_call(g, "snx_x64_aes", 0, 0, args, 2, 64);
+    }
+    return sg_d_concat(g, half[1], half[0]);
+}
+static inline SgD sg_AESSubBytes(SgCtx* g, SgD a) { return sgx_aes(g, a, 0); }
+static inline SgD sg_AESInvSubBytes(SgCtx* g, SgD a) { return sgx_aes(g, a, 1); }
+static inline SgD sg_AESMixColumns(SgCtx* g, SgD a) { return sgx_aes(g, a, 2); }
+static inline SgD sg_AESInvMixColumns(SgCtx* g, SgD a) { return sgx_aes(g, a, 3); }
 
 /* ---- the floating point of a machine that has no inline code of its own for it (SGX_FP_HELPERS: arm64.h's,
    risc.h's): the exact helpers' for every operation, x64_helpers.c's snx_x64_fp_* (cpu.h's soft float, which raises
@@ -727,9 +842,10 @@ static inline void sgx_epilogue(SgXAsm* a);
 
 /* words in a row as one function, u64 block(CPU*) returning the next pc, their instructions one SSA: a register read
    once, flags one instruction left read by the next as a condition code (CMP then B.cond is CMP and CMOVcc), the stores
-   a later one overwrites dropped. Every word but the last runs on to the next: a branch or an UNDEF ends the block
-   (the words after it are left out: count is how many it took). Its size in code, 0 when a word isn't taken, needs a
-   primitive this host has no form of, or the code needs more than cap bytes */
+   a later one overwrites dropped. Every word but the last runs on to the next: a branch, an UNDEF or an instruction
+   that leaves the next too little of the block's room ends it (the words after it are left out: count is how many it
+   took). Its size in code, 0 when a word isn't taken, needs a primitive this host has no form of, or the code needs
+   more than cap bytes */
 static size_t sg_x64_block(SgCtx* g, const SnxU32* words, size_t* count, SnxU64 pc, SnxU64 features,
                            unsigned host_features, unsigned char* code, size_t cap) {
     SgXBuf b;
@@ -750,6 +866,7 @@ static size_t sg_x64_block(SgCtx* g, const SnxU32* words, size_t* count, SnxU64 
     g->x.pool = pool;
     g->x.xpool = xpool;
     for (i = 0; i < *count; ++i) {
+        if (i && (g->x.n > SGX_MAXI / 4 || g->x.nv > SGX_MAXV / 4 || g->x.nb > SGX_MAXB / 4)) break;
         g->word = words[i];
         g->pc = pc + 4 * i;
         g->start = g->x.n;
@@ -778,6 +895,7 @@ static size_t sg_x64_block(SgCtx* g, const SnxU32* words, size_t* count, SnxU64 
     b.disp = 0;
     b.index = -1;
     memset(&a, 0, sizeof a);
+    a.x = &g->x;
     a.b = &b;
     a.resolve = g->resolve;
     sgx_prologue(&a);

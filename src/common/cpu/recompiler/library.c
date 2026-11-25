@@ -93,6 +93,8 @@ struct snx_recompiler {
        SNX_RECOMPILER_BACKEND=llvm or snx_recompiler_set_backend taking it back */
     int x64;
     size_t x64_made; /* the last module's functions the x86-64 back end made */
+    const SnxU32* without; /* snx_native_without's */
+    size_t without_count;
     char error[1024];
     /* PowerPC64: the code arena every module of the recompiler is loaded into, with the runtime library once, so all
        of them share one TOC (code_loader.h): a guest's jump from one module's code into another's keeps r2. Made by
@@ -204,35 +206,9 @@ static void fail(struct snx_recompiler* r, const char* fmt, ...) {
 
 /* ---- the recompiler ---- */
 
-/* snx_ir_init once per process, whichever thread's recompiler comes first: it writes LLVM's and ir.c's process-wide
-   state, which the game driver only ever calls from one thread */
-static int llvm_ready;
-static char llvm_error[256];
-static void llvm_init_once(void) { llvm_ready = snx_ir_init(llvm_error, sizeof(llvm_error)) ? -1 : 1; }
-#ifdef _WIN32
-static BOOL CALLBACK llvm_init_callback(PINIT_ONCE once, PVOID parameter, PVOID* context) {
-    (void)once;
-    (void)parameter;
-    (void)context;
-    llvm_init_once();
-    return TRUE;
-}
-#endif
-static int llvm_init(char* error, size_t error_size) {
-#ifdef _WIN32
-    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
-    InitOnceExecuteOnce(&once, llvm_init_callback, NULL, NULL);
-#else
-    static pthread_once_t once = PTHREAD_ONCE_INIT;
-    pthread_once(&once, llvm_init_once);
-#endif
-    if (llvm_ready < 0 && error_size) snprintf(error, error_size, "%s", llvm_error);
-    return llvm_ready < 0 ? -1 : 0;
-}
-
 int snx_recompiler_has(int flags) {
     char error[256];
-    if (flags == SNX_RECOMPILER_FLAG_LLVM) return !llvm_init(error, sizeof(error));
+    if (flags == SNX_RECOMPILER_FLAG_LLVM) return !snx_ir_init(error, sizeof(error));
     return 0;
 }
 
@@ -274,6 +250,11 @@ int snx_recompiler_set_optimization(struct snx_recompiler* r, char opt) {
     }
     r->opt = opt;
     return 0;
+}
+
+void snx_native_without(struct snx_recompiler* r, const SnxU32* words, size_t count) {
+    r->without = words;
+    r->without_count = count;
 }
 
 int snx_recompiler_set_a64_target(struct snx_recompiler* r, int target) {
@@ -668,6 +649,7 @@ typedef struct {
     /* the x86-64 back end's object of the unit's functions it made (x64_codegen.h), LLVM's object above the rest */
     unsigned char* x64;
     size_t x64_size, x64_made;
+    size_t x64_refused; /* of the others, those with an instruction it has no code for */
 } Unit;
 
 typedef struct {
@@ -691,6 +673,9 @@ static int llvm_unit(Queue* q, size_t index, char* error, size_t error_size) {
         /* the x86-64 back end first: LLVM makes only what it can't (and all of it where the IR is to be kept) */
         SnxNativeOptions options = {0};
         options.llvm_at = snx_ir_dump_pc();
+        options.refused = &u->x64_refused;
+        options.without = q->r->without;
+        options.without_count = q->r->without_count;
         made = (unsigned char*)calloc(u->last - u->first, 1);
         if (!made) {
             snprintf(error, error_size, "out of memory");
@@ -1057,7 +1042,7 @@ static int recompile_llvm(struct snx_recompiler* r, struct snx_recompiled* m, Sn
     char* cached = NULL;
     memset(&q, 0, sizeof(q));
     error[0] = 0;
-    if (llvm_init(error, sizeof(error))) {
+    if (snx_ir_init(error, sizeof(error))) {
         fail(r, "%s", error);
         return -1;
     }
@@ -1140,12 +1125,15 @@ static int recompile_llvm(struct snx_recompiler* r, struct snx_recompiled* m, Sn
         }
     }
     {
-        size_t x64_made = 0;
-        for (i = 0; i < count; ++i) x64_made += q.units[i].x64_made;
+        size_t x64_made = 0, refused = 0;
+        for (i = 0; i < count; ++i) x64_made += q.units[i].x64_made, refused += q.units[i].x64_refused;
         r->x64_made = x64_made;
         if (r->x64)
             report(r, "%s back end: %lu of %lu functions, LLVM the rest\n", snx_native_name(), (unsigned long)x64_made,
                    (unsigned long)codegen->function_count);
+        if (refused)
+            snx_error("native back end: %lu of %lu functions have an instruction it has no code for: LLVM made them",
+                      (unsigned long)refused, (unsigned long)codegen->function_count);
     }
     const char* exports[1];
     exports[0] = DESCRIPTOR_SYMBOL;

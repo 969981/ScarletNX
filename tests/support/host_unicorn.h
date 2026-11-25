@@ -15,7 +15,10 @@
    MSR's HV): hostuc_new gives NULL where the MSR it set doesn't hold. MIPS64 runs as MIPS64R2 with Unicorn's virtual
    TLB, every address its own (the kernel's segments would want them under 2 GiB). Unicorn has no LoongArch: its
    code runs in la64_interp.c's interpreter, on the same memory and the same traps. s390x runs as a z196 in 64-bit
-   addressing mode (the PSW's EA and BA); a native function's sixth argument is the ABI's stack slot (160(r15)) */
+   addressing mode (the PSW's EA and BA); a native function's sixth argument is the ABI's stack slot (160(r15)).
+
+   hostuc_call marks what a callee of AAPCS64 keeps on arm64 (X19 to X29, the low halves of V8 to V15, SP), and X18, the
+   platform's on some, and fails where one came back changed */
 #ifndef SNX_TEST_HOST_UNICORN_H
 #define SNX_TEST_HOST_UNICORN_H
 #include <stddef.h>
@@ -29,7 +32,8 @@ typedef enum {
     HOSTUC_LA64,
     HOSTUC_PPC64, /* big-endian, ELFv2 */
     HOSTUC_MIPS64, /* big-endian */
-    HOSTUC_S390X
+    HOSTUC_S390X,
+    HOSTUC_WIN64 /* x86-64's code for Windows, run by this x86-64 host itself (host_win64.c, with no Unicorn) */
 } HostUcArch;
 typedef struct HostUc HostUc;
 /* Unicorn with a region of code_cap bytes for code (and its traps after it): NULL where Unicorn has none of arch */
@@ -38,6 +42,9 @@ void hostuc_free(HostUc* u);
 const char* hostuc_name(HostUcArch arch);
 /* the test's own memory of size bytes at p (page-aligned) mapped at its address: 0, -1 */
 int hostuc_map(HostUc* u, void* p, size_t size);
+/* page-aligned memory of size bytes (zeroed), NULL on failure: below 4 GiB where there is room, as Unicorn's MIPS64 raises
+   an exception for an LL or LLD of an address above it */
+void* hostuc_pages(size_t size);
 /* size bytes of page-aligned memory mapped at its own address (zeroed), NULL on failure */
 void* hostuc_alloc(HostUc* u, size_t size);
 /* native function fn under name (what an object's undefined symbol names): its trap's address. wide: fn returns
@@ -67,5 +74,9 @@ void hostuc_swapper(HostUc* u, void (*swap)(void* user), void* user);
 /* the code at fn run with the first two arguments a0 and a1 until it returns: 0 and its result, -1 where Unicorn
    stopped (why on stderr) */
 int hostuc_call(HostUc* u, uint64_t fn, uint64_t a0, uint64_t a1, uint64_t* result);
+/* HOSTUC_WIN64's: the code's frames unwound by its function table after every instruction (1), not where it calls a
+   native function alone; and how many states were unwound, *failures of them wrongly (hostuc_call fails with them) */
+void hostuc_step(HostUc* u, int on);
+size_t hostuc_unwound(const HostUc* u, size_t* failures);
 
 #endif

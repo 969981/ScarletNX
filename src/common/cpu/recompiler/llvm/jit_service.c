@@ -512,7 +512,7 @@ static int emit_unit(SnxJitService* s, SnxCodegen* codegen, const char* table_na
             if (*object) return 0;
         }
     }
-    SnxIr* ir = snx_ir_new_jit("jit", s->config.opt, error, error_size);
+    SnxIr* ir = snx_ir_init(error, error_size) ? NULL : snx_ir_new_jit("jit", s->config.opt, error, error_size);
     if (!ir) return -1;
     LLVMValueRef* functions = (LLVMValueRef*)malloc(codegen->function_count * sizeof(*functions));
     if (!functions) {
@@ -1866,7 +1866,7 @@ static unsigned usable_cpus(void) {
    SNX_JIT_THREADS_AUTO. They run below the game's threads (thread_priority), so a compile only gets a CPU the guest
    threads, the GPU thread and audio leave idle; the miss thread is not one of them and takes no CPU from the game: it
    compiles while the thread it compiles for waits. Keeping six CPUs for the game left one compile thread on
-   hosts with up to 7 CPUs and two on 8, which fell minutes behind Ender Magnolia's misses */
+   hosts with up to 7 CPUs and two on 8, which fell minutes behind one game's misses */
 static unsigned default_threads(void) {
     unsigned cpus = usable_cpus();
     return cpus >= SNX_JIT_THREADS_AUTO + 2 ? SNX_JIT_THREADS_AUTO : cpus > 3 ? cpus - 2 : 1;
@@ -1878,7 +1878,8 @@ SnxJitService* snx_jit_service_new(const SnxJitConfig* config, char* error, size
             snprintf(error, error_size, "the AOT entries are not in ascending order");
             return NULL;
         }
-    if (snx_ir_init(error, error_size)) return NULL;
+    /* LLVM starts at the first unit it has to make, where the host has a native back end (emit_unit) */
+    if (!snx_native_available() && snx_ir_init(error, error_size)) return NULL;
     SnxJitService* s = (SnxJitService*)calloc(1, sizeof(*s));
     if (!s) {
         snprintf(error, error_size, "out of memory");

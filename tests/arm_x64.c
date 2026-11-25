@@ -2,12 +2,15 @@
    Copyright 2026 the ScarletNX contributors */
 /* The x86-64 back end's A32 blocks (src/common/cpu/recompiler/x64/x64_arm.c), or built with SNX_TEST_ARM64 or
    SNX_TEST_RV64 the arm64 or riscv64 back end's (run under Unicorn: snx-test-arm-arm64, -rv64, without the hot paths'
-   witnesses, the chain and Thumb), against the AArch32 block compiler's LLVM ones (snx_arm_llvm_block, which
+   witnesses and the chain), or with SNX_TEST_WIN64 the x86-64 one's for Windows (its calling convention, run by an
+   x86-64 host itself: support/host_win64.c), against the AArch32 block compiler's LLVM ones (snx_arm_llvm_block, which
    module_arm.c makes a 32-bit program's blocks with), at -O0: their IR as it is, which LLVM 22's -O2 makes otherwise in
    one case (VRSHL's witness, below): the same words consumed, and the same results from the same random states.
-     snx-test-arm-x64 [--blocks N] [--thumb N] [--states N] [--pool N] [--features MASK] [--seed N] [--word HEX]...
-         [--halves HEX[,HEX]...] [--dump]
-   Each block is words drawn from the A32 instructions the back end makes (data processing, branches, the loads and
+     snx-test-arm-x64 [--profile a57|a9|arm11|arm946e|arm7tdmi] [--memory flat|hosted|checked] [--trace] [--blocks N]
+         [--thumb N] [--states N] [--pool N] [--features MASK] [--seed N] [--word HEX]... [--halves HEX[,HEX]...]
+         [--dump] [--step]
+   --step (SNX_TEST_WIN64): the stack unwound by the objects' function table at every instruction of the blocks. Each
+   block is words drawn from the A32 instructions the back end makes (data processing, branches, the loads and
    stores of every kind, the multiplies and divides, the bit operations, MRS and MSR, the exclusives and acquire and
    release, the barriers and hints, SVC, BKPT, the coprocessor's and UNDEFINED, ARMv6's and ARMv7's DSP and media
    instructions, VFP and Advanced SIMD: its data processing, its element and structure loads and stores, the lane moves
@@ -22,7 +25,17 @@
    syndrome, the monitor, the TLS registers, the VFP registers and FPSCR, and guest memory must match. --pool N keeps
    the x86 values in N host registers, so they spill; --features takes the host's BMI1 (1), BMI2 (2) and LZCNT (4) out
    where not in MASK; --word runs the words given (HEX, or HEX,HEX... in a row), one block each, and says what each
-   state did; --dump prints a failing state's start */
+   state did; --dump prints a failing state's start.
+   --profile and --memory are the options' (cpu/arm/codegen.h), as LLVM's blocks take them; the words are drawn from
+   what the profile decodes, UNDEFINED ones now and then. Hosted memory and the ARM7TDMI's and the ARM946E's bus run on
+   a window of all 4 GiB and a guard, 256 KiB of memory mirrored through it; their hook (SnxArmCPU.io) and checked
+   memory's callback are the test's, whose every call, with the state as it was then, must be the same on both sides:
+   the hook's writes end the block one time in four, the callback faults, changes a fetched word and loses a reservation
+   now and then. --trace keeps the ARM7TDMI's trace and skipped bits, which must match too.
+   --callee OBJECT (under Unicorn alone) is the runtime library's functions a block calls, compiled for the machine
+   (arm_call_abi_callee.c), in the place of the host's: with it the runs have a runtime (SnxArmRt) whose callbacks are
+   that object's on one side and the test's on the other, so an argument a block passes as the machine's ABI does not
+   have it shows, and the hook (SnxArmCPU.io) is that object's too */
 #include "common/cpu/arm/llvm.h"
 #include "common/cpu/arm/simd.h"
 #include "common/cpu/recompiler/llvm/code_loader.h"
@@ -91,26 +104,52 @@ typedef SnxRv64Arm Back;
 #define back_(name) snx_rv64_arm_##name
 #define BACK_NAME   "riscv64"
 #define BACK_UC     HOSTUC_RV64
+#elif defined(SNX_TEST_WIN64)
+#define SNX_TEST_NATIVE 1
+#include "common/cpu/recompiler/x64/x64_arm.h"
+#include "common/cpu/recompiler/x64/x64_codegen.h"
+#include "support/host_unicorn.h"
+typedef SnxX64Arm Back;
+#define back_(name) snx_x64_arm_##name
+#define BACK_NAME   "x86-64 (Windows)"
+#define BACK_UC     HOSTUC_WIN64
 #else
 #include "common/cpu/recompiler/x64/x64_arm.h"
+#include "common/cpu/recompiler/x64/x64_elf.h"
 typedef SnxX64Arm Back;
 #define back_(name) snx_x64_arm_##name
 #define BACK_NAME   "x86-64"
 #endif
 #include "common/utilities/bits.h"
 #include "common/utilities/common.h"
+#include "common/utilities/endian.h"
+#include "support/arm_rt_callbacks.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 typedef uint64_t u64;
+
+/* each object goes into a loader of its own, so its names are only its own either way: COFF objects' are published */
+#if defined(_WIN32)
+#define load_object snx_code_load
+#else
+#define load_object snx_code_load_private
+#endif
 
 #define PC        0x1000u /* the blocks' address */
 #define MEM_SIZE  0x10000u
 #define CHUNK     256
-#define MAX_WORDS 6
+#define MAX_WORDS 48
 #define MAX_HALF  16 /* halfwords of a Thumb block */
+/* the window of the modes that reach past MEM_SIZE: VIEW bytes of memory mirrored through 4 GiB and a guard */
+#define VIEW      0x40000u
+#define WINDOW    ((1ull << 32) + VIEW)
 
 static struct {
     unsigned states, blocks, thumb, features;
@@ -128,9 +167,32 @@ static struct {
     const char* object; /* --object FILE: the first chunk's x86-64 object written there (objdump -d reads it) */
     const char* ll;     /* --ll FILE: the first chunk's LLVM module, before its passes, written there */
     int dump;           /* --dump: a failing state's start printed */
+#if defined(SNX_TEST_WIN64)
+    int step; /* --step: hostuc_step */
+#endif
     /* the x86-64 blocks' calls of snx_arm_fp_x64, by op: the VFP's hot paths leave to it what they can't do */
     size_t fp_calls[256], fp_hot_calls;
+    SnxArmCodegenOptions options; /* --profile, --memory and --trace */
+    int windowed;                 /* the runs' memory is the windows' */
+    unsigned char *window[2], *view[2],
+        *pristine;                      /* each side's window and the memory it mirrors; what both start from */
+    size_t hooked, transfers;           /* the hook's calls and checked memory's, LLVM's side's */
+    uint32_t chain_returns, chain_sets; /* what chain_io gives a write, and sets R2 to (0: leaves it) */
+    unsigned char* callee; /* --callee's object, callee_size bytes */
+    size_t callee_size;
+    SnxArmRt rt[2]; /* with it, each side's runtime */
+    uint32_t (*io[2])(SnxArmCPU* cpu, uint32_t address, uint32_t size_write, uint32_t value); /* and hook */
 } g_test;
+static int legacy(void) {
+    return g_test.options.profile == SNX_ARM_PROFILE_ARM7TDMI || g_test.options.profile == SNX_ARM_PROFILE_ARM946E;
+}
+static int checked(void) { return g_test.options.memory == SNX_ARM_MEMORY_CHECKED; }
+static int hosted(void) { return g_test.options.memory == SNX_ARM_MEMORY_HOSTED; }
+/* a profile with Thumb-2 (its T32 instructions and IT) */
+static int thumb2(void) {
+    return g_test.options.profile == SNX_ARM_PROFILE_A57 || g_test.options.profile == SNX_ARM_PROFILE_A9;
+}
+static SnxA32Kind decode(uint32_t w) { return snx_a32_decode_profile(g_test.options.profile, w); }
 
 static u64 rnd(void) {
     u64 x = g_test.seed += 0x9E3779B97F4A7C15ull;
@@ -140,6 +202,22 @@ static u64 rnd(void) {
 }
 
 /* ---- the words ---- */
+
+/* Unicorn's MIPS64 raises an exception for an LL or LLD of an address past 4 GiB, as the hosted and the buses' blocks'
+   window is: an exclusive of theirs is not drawn for it */
+static int no_exclusives(void) {
+#if defined(SNX_TEST_MIPS64) || defined(SNX_TEST_MIPS64BE)
+    return hosted() || legacy();
+#else
+    return 0;
+#endif
+}
+/* whether the T32 pair is an exclusive (LDREX, STREX and their byte, halfword, doubleword and acquire forms) */
+static int t32_exclusive(uint16_t a, uint16_t b) {
+    unsigned kind = b >> 4 & 15;
+    return (a & 0xFFE0u) == 0xE840u ||
+           ((a & 0xFFE0u) == 0xE8C0u && (kind == 4 || kind == 5 || kind == 7 || kind >= 12));
+}
 
 /* a class of A32 instructions: its fixed bits (value under mask) and the kind the decoder gives its words */
 typedef struct {
@@ -213,7 +291,8 @@ static const Class classes[] = {
 #define CLASSES (sizeof classes / sizeof *classes)
 
 /* a word of class c: its free bits random, two times in three under AL and else any condition but 1111 (a class of
-   the unconditional space keeps its 1111), a register field 15 one time in eight */
+   the unconditional space keeps its 1111), a register field 15 one time in eight; 0 where the profile has none of them
+   but UNDEFINED ones, one in 16 of which is taken */
 static uint32_t word_of(const Class* c) {
     for (int tries = 0; tries < 100000; ++tries) {
         u64 x = rnd();
@@ -226,8 +305,13 @@ static uint32_t word_of(const Class* c) {
             static const unsigned at[4] = {0, 8, 12, 16};
             if (((x >> (40 + 3 * f)) & 7) == 0) w |= 15u << at[f] & ~c->mask;
         }
-        if (snx_a32_decode(w) != c->kind) continue;
-        return w;
+        if (g_test.options.profile == SNX_ARM_PROFILE_A57) {
+            if (snx_a32_decode(w) != c->kind) continue;
+            return w;
+        }
+        /* another profile's: what it runs, as another kind of its own some (the ARM11's UADD8, MULH) */
+        if (decode(w) != SNX_A32_UNDEFINED || c->kind == SNX_A32_UNDEFINED) return w;
+        if (tries > 2000) return rnd() % 16 ? 0 : w;
     }
     fprintf(stderr, "FAIL: no word of class %s found\n", c->name);
     exit(1);
@@ -246,15 +330,137 @@ static const Class* pick_class(void) {
 /* ---- running ---- */
 
 #ifdef SNX_TEST_NATIVE
+#include "common/cpu/recompiler/llvm/elf_object.h"
 #define SNX_TEST_SWAP_ARM 1
 #include "support/swap_state.h"
-static void swap_arm(void* cpu) { snx_test_swap_arm((SnxArmCPU*)cpu); }
+/* a state with nothing beside it to turn over */
+static void swap_cpu(void* cpu) { snx_test_swap_arm((SnxArmCPU*)cpu); }
+static void swap_arm(void* state);
 #endif
 
+#define TRACE 64 /* the words a trace has room for */
 typedef struct {
-    SnxArmCPU cpu;
+    union {
+        SnxArmCPU cpu;
+        SnxArmCheckedCPU checked;
+    };
+    uint32_t trace[TRACE], skipped[2];
+    /* the hook's or the callback's calls: how many, and a mix of all they were given and the state they saw */
+    size_t calls;
+    u64 log, salt;
+    const unsigned char* code; /* checked memory's fetches */
+    size_t code_size;
+    uint32_t code_pc;
+    uint32_t reserved, reserved_at, reserved_size; /* the bus's own reservation */
+    SnxArmRt rt; /* --callee's runtime */
     unsigned char mem[MEM_SIZE];
 } RunState;
+#ifdef SNX_TEST_NATIVE
+static void swap_arm(void* state) {
+    RunState* s = (RunState*)state;
+    snx_test_swap_checked(&s->checked);
+    for (size_t k = 0; k < TRACE; ++k) snx_test_sw32(&s->trace[k]);
+    for (size_t k = 0; k < 2; ++k) snx_test_sw32(&s->skipped[k]);
+    snx_test_swap_u64s(&s->rt, sizeof s->rt / 8);
+}
+#endif
+static u64 mix(u64 h, u64 v) {
+    h = (h ^ v) * 0xBF58476D1CE4E5B9ull;
+    return h ^ (h >> 29);
+}
+/* a call seen: what it was given, and the state as the block has it then, its trace so far with it (the AGB board's
+   hook reads the running instruction's own slot) */
+static u64 seen(RunState* s, uint32_t a, uint32_t b, uint32_t c) {
+    const SnxArmCPU* cpu = &s->cpu;
+    u64 h = mix(mix(mix(s->log, a), b), c);
+    for (unsigned r = 0; r < 16; ++r) h = mix(h, cpu->r[r]);
+    h = mix(mix(mix(h, cpu->cpsr), cpu->exit), cpu->syndrome);
+    h = mix(mix(h, cpu->exclusive_valid), cpu->exclusive_value);
+    for (unsigned k = 0; k < 2 * MAX_HALF; ++k) h = mix(h, s->trace[k]);
+    h = mix(mix(h, s->skipped[0]), s->skipped[1]);
+    ++s->calls;
+    return s->log = h;
+}
+/* SnxArmCPU.io: a read gives a value of its width (an ARMv4T LDRSH's sign extended), from the call itself; a write
+   ends the block one time in four */
+static uint32_t test_io(SnxArmCPU* cpu, uint32_t address, uint32_t size_write, uint32_t value) {
+    u64 h = seen((RunState*)cpu, address, size_write, value);
+    uint32_t v = (uint32_t)(h >> 32);
+    if (size_write & 0x100) return h & 3 ? 0 : v | 1;
+    switch (size_write) {
+        case 1: return v & 0xff;
+        case 2: return v & 0xffff;
+        case 0x202: return v & 0x10000 ? (uint32_t)(int32_t)(int16_t)v : (uint32_t)(int32_t)(int8_t)v;
+        default: return v;
+    }
+}
+/* checked memory's callback (checked.h): one fetch in 64 faults, one in 64 finds another word; a transfer faults by its
+   address's sixteen bytes, one in eight; a store-exclusive is lost one time in four */
+static uint32_t test_access(void* context, uint32_t operation, uint32_t address, uint32_t size, void* bytes) {
+    RunState* s = (RunState*)context;
+    unsigned char* p = (unsigned char*)bytes;
+    uint32_t op = operation & 3, sum = 0;
+    if (op == SNX_ARM_ACCESS_WRITE)
+        for (uint32_t i = 0; i < size; ++i) sum = sum * 257 + p[i];
+    u64 h = seen(s, operation, address, mix(sum, size) & 0xffffffffu);
+    if (op == SNX_ARM_ACCESS_FETCH) {
+        uint32_t at = address - s->code_pc;
+        if (at > s->code_size || size > s->code_size - at || !(h & 63)) return 1;
+        memcpy(p, s->code + at, size);
+        if ((h & 63) == 1) p[(h >> 8) % size] ^= (unsigned char)(1u << (h >> 16) % 8);
+        return 0;
+    }
+    if (!(mix(s->salt, address >> 4) >> 20 & 7)) return 1;
+    if (operation & SNX_ARM_ACCESS_EXCLUSIVE) {
+        if (op == SNX_ARM_ACCESS_READ) {
+            s->reserved = 1, s->reserved_at = address, s->reserved_size = size;
+        } else {
+            uint32_t held = s->reserved && s->reserved_at == address && s->reserved_size == size;
+            s->reserved = 0;
+            if (!held && (h & 3)) return SNX_ARM_EXCLUSIVE_FAILED;
+            if (!(h >> 4 & 3)) return (h >> 8 & 1) ? SNX_ARM_EXCLUSIVE_FAILED : 3;
+        }
+    }
+    for (uint32_t i = 0; i < size; ++i) {
+        unsigned char* m = &s->mem[(address + i) % MEM_SIZE];
+        if (op == SNX_ARM_ACCESS_READ)
+            p[i] = *m;
+        else
+            *m = p[i];
+    }
+    return 0;
+}
+/* the windows, made once: 0, -1 with why on stderr */
+static int windows_new(void) {
+#if defined(_WIN32)
+    fprintf(stderr, "FAIL: no window of guest memory on this host\n");
+    return -1;
+#else
+    g_test.pristine = (unsigned char*)malloc(VIEW);
+    for (int side = 0; g_test.pristine && side < 2; ++side) {
+        FILE* f = tmpfile();
+        unsigned char* w = (unsigned char*)mmap(NULL, WINDOW, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (!f || ftruncate(fileno(f), VIEW) || w == MAP_FAILED) break;
+        for (u64 at = 0; at < WINDOW; at += VIEW)
+            if (mmap(w + at, VIEW, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fileno(f), 0) == MAP_FAILED) {
+                fprintf(stderr, "FAIL: no view of the guest window at %llx\n", (unsigned long long)at);
+                return -1;
+            }
+        g_test.window[side] = w;
+        g_test.view[side] = w;
+        fclose(f);
+    }
+    if (!g_test.window[1]) {
+        fprintf(stderr, "FAIL: no window of guest memory of %llu bytes\n", (unsigned long long)WINDOW);
+        return -1;
+    }
+    for (size_t i = 0; i < VIEW; i += 8) {
+        u64 x = rnd();
+        memcpy(g_test.pristine + i, &x, 8);
+    }
+    return 0;
+#endif
+}
 
 /* a random state of the kth kind */
 /* A block is generated code, with no type signature before its entry, which the function sanitizer's check of an
@@ -263,10 +469,10 @@ typedef struct {
 [[clang::no_sanitize("function")]] static void run_block(SnxU64 addr, SnxArmCPU* cpu) {
     ((SnxArmBlock)(uintptr_t)addr)(cpu);
 }
-static void start(RunState* s, unsigned k) {
+static void start(RunState* s, unsigned k, uint32_t pc) {
     SnxArmCPU* cpu = &s->cpu;
-    *cpu = (SnxArmCPU){0};
-    for (size_t i = 0; i < MEM_SIZE; i += 8) {
+    s->checked = (SnxArmCheckedCPU){0};
+    for (size_t i = 0; i < MEM_SIZE && !g_test.windowed; i += 8) {
         u64 x = rnd();
         memcpy(s->mem + i, &x, 8);
     }
@@ -277,20 +483,49 @@ static void start(RunState* s, unsigned k) {
         if (!anywhere && (x >> 60) == 0) cpu->r[r] = (uint32_t)(x >> 32) & 31; /* small: shift amounts, divisors */
     }
     cpu->r[13] = 0x8000u + (uint32_t)(rnd() % 0x4000) * (k % 2 ? 4 : 1);
-    cpu->r[15] = PC;
+    if (legacy()) /* most of them in a region of the bus's, some next to its end, aligned or not */
+        for (unsigned r = 0; r < 15; ++r) {
+            static const unsigned char agb[16] = {0, 1, 2, 2, 3, 3, 4, 5, 6, 7, 8, 0xA, 0xD, 0xE, 0xF, 0x10};
+            static const unsigned char nds[16] = {0, 1, 2, 2, 2, 2, 3, 3, 4, 4, 4, 4, 5, 6, 7, 0xFF};
+            u64 x = rnd();
+            uint32_t top = g_test.options.profile == SNX_ARM_PROFILE_ARM7TDMI ? agb[x & 15] : nds[x & 15];
+            uint32_t low = (x >> 4 & 7) == 0 ? 0xFFFFFFu - (uint32_t)(x >> 8) % 72 : (uint32_t)(x >> 8) & 0x3FFFF;
+            if ((x >> 40) % 5) cpu->r[r] = (top << 24 | low) & ((x >> 44) & 1 ? ~3u : ~0u);
+        }
+    cpu->r[15] = pc;
     cpu->cpsr = 0x10u | ((uint32_t)rnd() & 0xF80F0000u);
     cpu->exit = (uint32_t)rnd();
     cpu->syndrome = (uint32_t)rnd();
     cpu->mem = s->mem;
     cpu->mem_size = MEM_SIZE;
+    if (g_test.windowed) /* the AGB board's, past 4 GiB by a guard, or one that ends in a region */
+        cpu->mem_size = k % 4 == 3 ? 0x0E000010u : (1ull << 32) + 0x1000;
+    if (hosted()) cpu->exit = SNX_ARM_OK; /* the dispatch loop's */
+    if (legacy() && k % 8 != 7) cpu->io = test_io;
+    if (checked()) {
+        s->checked.abi = SNX_ARM_CHECKED_ABI + (k % 16 == 13);
+        s->checked.access = k % 16 == 14 ? NULL : test_access;
+        s->checked.context = s;
+    }
+    s->calls = 0;
+    s->log = rnd();
+    s->salt = rnd();
+    s->reserved = 0;
+    for (unsigned i = 0; i < TRACE; ++i) s->trace[i] = 0xdead0000u + i;
+    s->skipped[0] = s->skipped[1] = (uint32_t)s->salt;
     {
         static const uint32_t sizes[4] = {1, 2, 4, 8};
         u64 x = rnd();
         cpu->exclusive_valid = k % 3 != 0;
         cpu->exclusive_address = x & 1 ? cpu->r[(x >> 1) % 15] : (uint32_t)(x >> 8) % MEM_SIZE;
         cpu->exclusive_size = sizes[(x >> 40) % 4];
-        if ((x >> 44) & 1 && cpu->exclusive_address <= MEM_SIZE - 8)
-            memcpy(&cpu->exclusive_value, s->mem + cpu->exclusive_address, 8); /* the value there: a STREX takes */
+        s->reserved = (x >> 45) & 1, s->reserved_at = cpu->exclusive_address, s->reserved_size = cpu->exclusive_size;
+        if ((x >> 44) & 1 &&
+            (g_test.windowed || cpu->exclusive_address <= MEM_SIZE - 8)) /* the value there: a STREX takes */
+            memcpy(&cpu->exclusive_value,
+                   g_test.windowed ? g_test.pristine + cpu->exclusive_address % (VIEW - 8)
+                                   : s->mem + cpu->exclusive_address,
+                   8);
         else
             cpu->exclusive_value = rnd();
         if (cpu->exclusive_size < 8) cpu->exclusive_value &= (1ull << (8 * cpu->exclusive_size)) - 1;
@@ -307,6 +542,8 @@ static void start(RunState* s, unsigned k) {
         if ((x >> 34) % 5 < 3) f |= 0x10u; /* IXC */
         if ((x >> 38) % 5 == 0) f |= (uint32_t)((x >> 42) & 3) << 22;
         if ((x >> 45) % 10 == 0) f |= 1u << (8 + (x >> 50) % 5);
+        if (g_test.options.profile == SNX_ARM_PROFILE_ARM11 && (x >> 55) % 4 == 0) /* LEN and STRIDE: a short vector */
+            f |= ((uint32_t)(x >> 57) & 7) << 16 | ((uint32_t)(x >> 60) & 3) << 20;
         cpu->fpscr = f;
     }
     for (unsigned i = 0; i < 32; ++i) {
@@ -370,7 +607,26 @@ static const char* differs(const RunState* a, const RunState* b) {
                             (unsigned long long)x->d[i],
                             (unsigned long long)y->d[i]),
                    why;
-    for (size_t i = 0; i < MEM_SIZE; ++i)
+    if (a->calls != b->calls || a->log != b->log)
+        return snprintf(why, sizeof g_test.why, "%zu calls of the hook or the bus, " BACK_NAME " %zu%s", a->calls,
+                        b->calls, a->calls == b->calls ? ", not the same ones" : ""),
+               why;
+    if (a->reserved != b->reserved || a->reserved_at != b->reserved_at) return "the bus's reservation";
+    for (unsigned i = 0; i < TRACE; ++i)
+        if (a->trace[i] != b->trace[i])
+            return snprintf(why, sizeof g_test.why, "trace %u %08x, " BACK_NAME " %08x", i, a->trace[i], b->trace[i]),
+                   why;
+    if (a->skipped[0] != b->skipped[0] || a->skipped[1] != b->skipped[1])
+        return snprintf(why, sizeof g_test.why, "skipped %08x, " BACK_NAME " %08x", a->skipped[0], b->skipped[0]), why;
+    if (g_test.windowed) {
+        if (!memcmp(g_test.view[0], g_test.view[1], VIEW)) return "";
+        for (size_t i = 0; i < VIEW; ++i)
+            if (g_test.view[0][i] != g_test.view[1][i])
+                return snprintf(why, sizeof g_test.why, "guest memory at %05zx of its view: %02x, " BACK_NAME " %02x",
+                                i, g_test.view[0][i], g_test.view[1][i]),
+                       why;
+    }
+    for (size_t i = 0; i < MEM_SIZE && !g_test.windowed; ++i)
         if (a->mem[i] != b->mem[i])
             return snprintf(why, sizeof g_test.why, "guest memory at %04zx: %02x, " BACK_NAME " %02x", i, a->mem[i],
                             b->mem[i]),
@@ -391,7 +647,12 @@ static SnxCodeLoader* new_loader(char* error, size_t size) {
                    snx_code_define(loader, "snx_arm_crypto", (SnxU64)(uintptr_t)snx_arm_crypto) ||
                    snx_code_define(loader, "snx_arm_undefined", (SnxU64)(uintptr_t)snx_arm_undefined) ||
                    snx_code_define(loader, "snx_arm_coproc", (SnxU64)(uintptr_t)snx_arm_coproc) ||
-                   snx_code_define(loader, "snx_arm_multiply_carry", (SnxU64)(uintptr_t)snx_arm_multiply_carry))) {
+                   snx_code_define(loader, "snx_arm_multiply_carry", (SnxU64)(uintptr_t)snx_arm_multiply_carry) ||
+                   snx_code_define(loader, "snx_arm_io_read", (SnxU64)(uintptr_t)snx_arm_io_read) ||
+                   snx_code_define(loader, "snx_arm_io_write", (SnxU64)(uintptr_t)snx_arm_io_write) ||
+                   snx_code_define(loader, "snx_arm_checked_fetch", (SnxU64)(uintptr_t)snx_arm_checked_fetch) ||
+                   snx_code_define(loader, "snx_arm_checked_access", (SnxU64)(uintptr_t)snx_arm_checked_access) ||
+                   snx_code_define(loader, "snx_arm_checked_strex", (SnxU64)(uintptr_t)snx_arm_checked_strex))) {
         snprintf(error, size, "cannot name the runtime library's functions");
         snx_code_loader_free(loader);
         return NULL;
@@ -402,6 +663,7 @@ typedef struct {
     uint32_t words[MAX_WORDS];
     uint16_t half[MAX_HALF];
     int thumb; /* a Thumb block: half, n halfwords; else words, n of them */
+    uint32_t pc;
     size_t n, consumed;
     int made; /* the x86-64 back end made it */
 } Block;
@@ -480,7 +742,8 @@ static void t32_pair(uint16_t* a, uint16_t* b) {
         uint16_t y = (uint16_t)(((uint16_t)rnd() & ~c->mask2) | c->value2);
         SnxThumb t;
         if ((x >> 11) < 0x1D) continue;
-        if (!anything && !snx_thumb_decode(x, y, &t)) continue;
+        if (!anything && !snx_thumb_decode_profile(g_test.options.profile, x, y, &t)) continue;
+        if (no_exclusives() && t32_exclusive(x, y)) continue;
         *a = x;
         *b = y;
         return;
@@ -493,7 +756,7 @@ static void count_shapes(const Block* b) {
     for (size_t k = 0; k < b->n; ++k) {
         SnxThumb t;
         unsigned hw1 = b->half[k], hw2 = k + 1 < b->n ? b->half[k + 1] : 0;
-        if ((hw1 >> 11) < 0x1D) {
+        if ((hw1 >> 11) < 0x1D || !thumb2()) {
             ++g_test.t16;
             continue;
         }
@@ -507,12 +770,14 @@ static void random_thumb(Block* b) {
     unsigned n = rnd() % 3 == 0 ? 1 : 2 + (unsigned)(rnd() % 4), k = 0;
     b->thumb = 1;
     b->n = 0;
-    if (rnd() % 4 == 0) {
+    if (thumb2() && rnd() % 4 == 0) {
         b->half[b->n++] = (uint16_t)(0xBF00u | (unsigned)(rnd() % 15) << 4 | (1u + (unsigned)(rnd() % 15)));
         n = 1 + (unsigned)(rnd() % 4);
     }
     for (; k < n; ++k) {
-        if (rnd() % 3 == 0) {
+        if (!thumb2() && rnd() % 6 == 0) { /* BL's and BLX's halves, and what is none */
+            b->half[b->n++] = (uint16_t)(0xE800u + rnd() % 0x1800);
+        } else if (thumb2() && rnd() % 3 == 0) {
             t32_pair(&b->half[b->n], &b->half[b->n + 1]);
             b->n += 2;
         } else {
@@ -541,7 +806,7 @@ static int load(SnxCodeLoader* loader, unsigned char* object, size_t size, const
         index[n++] = i;
     }
     SnxLinkInput input = {.data = object, .size = size, .name = what};
-    int rc = snx_code_load_private(loader, &input, 1, names, n, got, error, sizeof error);
+    int rc = load_object(loader, &input, 1, names, n, got, error, sizeof error);
     if (rc) fprintf(stderr, "FAIL: the %s object: %s\n", what, error);
     for (size_t k = 0; !rc && k < n; ++k) addr[index[k]] = got[k];
     free(names);
@@ -555,9 +820,32 @@ static int load(SnxCodeLoader* loader, unsigned char* object, size_t size, const
 /* the native object loaded into Unicorn, the helpers its blocks call its traps: each block's function in addr */
 static int load_uc(HostUc* uc, unsigned char* object, size_t size, const Block* blocks, size_t count, SnxU64* addr) {
     char error[512] = "";
+    if (g_test.callee) { /* the functions a block calls, the machine's own code: its symbols are the block's calls */
+        if (hostuc_load(uc, g_test.callee, g_test.callee_size, error, sizeof error)) {
+            fprintf(stderr, "FAIL: --callee's object: %s\n", error);
+            return 1;
+        }
+        g_test.rt[1].undefined =
+            (void (*)(SnxArmCPU*, uint32_t, uint32_t))(uintptr_t)hostuc_symbol(uc, "snx_test_undefined");
+        g_test.rt[1].coproc = (void (*)(SnxArmCPU*, uint32_t))(uintptr_t)hostuc_symbol(uc, "snx_test_coproc");
+        g_test.io[1] =
+            (uint32_t (*)(SnxArmCPU*, uint32_t, uint32_t, uint32_t))(uintptr_t)hostuc_symbol(uc, "snx_test_io");
+        if (!g_test.rt[1].undefined || !g_test.rt[1].coproc || !g_test.io[1]) {
+            fprintf(stderr, "FAIL: --callee's object has no callbacks\n");
+            return 1;
+        }
+    } else if (!hostuc_native(uc, "snx_arm_undefined", (void*)snx_arm_undefined) ||
+               !hostuc_native(uc, "snx_arm_coproc", (void*)snx_arm_coproc) ||
+               !hostuc_native(uc, "snx_arm_multiply_carry", (void*)snx_arm_multiply_carry) ||
+               !hostuc_native(uc, "snx_arm_io_read", (void*)snx_arm_io_read) ||
+               !hostuc_native(uc, "snx_arm_io_write", (void*)snx_arm_io_write) ||
+               !hostuc_native(uc, "snx_arm_checked_fetch", (void*)snx_arm_checked_fetch) ||
+               !hostuc_native(uc, "snx_arm_checked_access", (void*)snx_arm_checked_access) ||
+               !hostuc_native(uc, "snx_arm_checked_strex", (void*)snx_arm_checked_strex)) {
+        fprintf(stderr, "FAIL: the " BACK_NAME " code's helpers: out of memory\n");
+        return 1;
+    }
     if (!hostuc_native(uc, "snx_arm_fp_x64", (void*)counted_fp) ||
-        !hostuc_native(uc, "snx_arm_undefined", (void*)snx_arm_undefined) ||
-        !hostuc_native(uc, "snx_arm_coproc", (void*)snx_arm_coproc) ||
         !hostuc_native(uc, "snx_arm_crypto", (void*)snx_arm_crypto) ||
         hostuc_load(uc, object, size, error, sizeof error)) {
         fprintf(stderr, "FAIL: the " BACK_NAME " object: %s\n", error);
@@ -595,7 +883,11 @@ static int run_chunk(SnxIr* ir, Back* x64, Block* blocks, size_t count) {
     /* the native code's world: the states in memory Unicorn maps at their own addresses */
     HostUc* uc = hostuc_new(BACK_UC, 16u << 20);
     RunState* s = uc ? (RunState*)hostuc_alloc(uc, 2 * sizeof *s) : NULL;
-    if (s) hostuc_swapper(uc, swap_arm, &s[1].cpu); /* a big-endian machine's state turned over around its runs */
+#if defined(SNX_TEST_WIN64)
+    if (uc && g_test.step) hostuc_step(uc, 1);
+#endif
+    if (s) hostuc_swapper(uc, swap_arm, &s[1]); /* a big-endian machine's state turned over around its runs */
+    if (s && g_test.windowed && hostuc_map(uc, g_test.window[1], WINDOW)) s = NULL;
 #else
     RunState* s = (RunState*)malloc(2 * sizeof *s);
 #endif
@@ -619,8 +911,9 @@ static int run_chunk(SnxIr* ir, Back* x64, Block* blocks, size_t count) {
         char name[16];
         size_t lc = 0, xc = 0;
         snprintf(name, sizeof name, "B_%zu", i);
-        if (!(b->thumb ? snx_thumb_llvm_block(module, name, b->half, b->n, PC, &lc)
-                       : snx_arm_llvm_block(module, name, b->words, b->n, PC, &lc))) {
+        if (!b->pc) b->pc = PC;
+        if (!(b->thumb ? snx_thumb_llvm_block_ex(module, name, b->half, b->n, b->pc, &lc, &g_test.options)
+                       : snx_arm_llvm_block_ex(module, name, b->words, b->n, b->pc, &lc, &g_test.options))) {
             block_text(b, text, sizeof text);
             fprintf(stderr, "FAIL: [%s]: LLVM refused it\n", text);
             ++g_test.failures;
@@ -628,14 +921,10 @@ static int run_chunk(SnxIr* ir, Back* x64, Block* blocks, size_t count) {
             break;
         }
         b->consumed = lc;
-#if defined(SNX_TEST_NATIVE)
-        b->made = back_(block)(x64, name, code_of(b), b->n, PC, &xc, NULL, NULL);
-#else
-        b->made = b->thumb ? snx_x64_thumb_block(x64, name, code_of(b), b->n, PC, &xc, NULL, NULL)
-                           : back_(block)(x64, name, code_of(b), b->n, PC, &xc, NULL, NULL);
-#endif
+        b->made = b->thumb ? back_(thumb_block)(x64, name, code_of(b), b->n, b->pc, &xc, NULL, NULL)
+                           : back_(block)(x64, name, code_of(b), b->n, b->pc, &xc, NULL, NULL);
         if (!b->made) {
-            SnxA32Kind k = b->thumb ? SNX_A32_UNDEFINED : snx_a32_decode(b->words[0]);
+            SnxA32Kind k = b->thumb ? SNX_A32_UNDEFINED : decode(b->words[0]);
             block_text(b, text, sizeof text);
             ++g_test.refused;
             ++g_test.refusals[k & 63];
@@ -700,8 +989,15 @@ static int run_chunk(SnxIr* ir, Back* x64, Block* blocks, size_t count) {
             const char* why;
             for (int side = 0; side < 2; ++side) {
                 g_test.seed = seed;
-                start(&s[side], k);
+                start(&s[side], k, b->pc);
                 if (b->thumb) s[side].cpu.cpsr |= SNX_ARM_T;
+                if (g_test.callee) s[side].rt = g_test.rt[side], s[side].cpu.rt = &s[side].rt;
+                if (g_test.callee && s[side].cpu.io) s[side].cpu.io = g_test.io[side];
+                s[side].code = code_of(b), s[side].code_size = b->n * (b->thumb ? 2 : 4), s[side].code_pc = b->pc;
+                if (g_test.windowed) {
+                    memcpy(g_test.view[side], g_test.pristine, VIEW);
+                    s[side].cpu.mem = g_test.window[side];
+                }
 #if defined(SNX_TEST_NATIVE)
                 if (side) {
                     if (hostuc_call(uc, xaddr[i], (u64)(uintptr_t)&s[1].cpu, 0, NULL)) s[1].cpu.exit = 0xdead;
@@ -711,6 +1007,7 @@ static int run_chunk(SnxIr* ir, Back* x64, Block* blocks, size_t count) {
                 run_block(side ? xaddr[i] : laddr[i], &s[side].cpu);
             }
             ++g_test.ran;
+            *(legacy() ? &g_test.hooked : &g_test.transfers) += s[0].calls;
             ++g_test.exits[s[0].cpu.exit & 15];
             why = differs(&s[0], &s[1]);
             if (g_test.nonly) {
@@ -724,7 +1021,7 @@ static int run_chunk(SnxIr* ir, Back* x64, Block* blocks, size_t count) {
                 fprintf(stderr, "FAIL: [%s] state %u: %s\n", text, k, why);
                 if (g_test.dump) { /* --dump: the state the runs started from, to rebuild the case by hand */
                     g_test.seed = seed;
-                    start(&s[0], k);
+                    start(&s[0], k, b->pc);
                     if (b->thumb) s[0].cpu.cpsr |= SNX_ARM_T;
                     fprintf(stderr, "  start: fpscr %08x cpsr %08x\n", s[0].cpu.fpscr, s[0].cpu.cpsr);
                     for (unsigned r = 0; r < 16; ++r)
@@ -875,7 +1172,7 @@ static int run_witnesses(SnxIr* ir, Back* x64) {
         u64 seed = g_test.seed;
         for (int side = 0; side < 2; ++side) {
             g_test.seed = seed;
-            start(&s[side], 1);
+            start(&s[side], 1, PC);
             s[side].cpu.cpsr = 0x10u;
             s[side].cpu.fpscr = w->fpscr;
             s[side].cpu.d[0] = w->d0;
@@ -905,7 +1202,7 @@ static int run_witnesses(SnxIr* ir, Back* x64) {
         const char* why;
         for (int side = 0; side < 2; ++side) {
             g_test.seed = seed;
-            start(&s[side], 1);
+            start(&s[side], 1, PC);
             if (e == 0) s[side].cpu.r[15] = PC + 4;
             if (e & 1 && e) s[side].cpu.cpsr |= SNX_ARM_T;
             if (e >= 2) s[side].cpu.cpsr |= SNX_ARM_E;
@@ -954,14 +1251,14 @@ static int run_endian_chain(Back* x64) {
     const char* names[1] = {name};
     SnxU64 addr = 0;
     RunState* s = (RunState*)malloc(sizeof *s);
-    if (!s || snx_code_load_private(loader, &input, 1, names, 1, &addr, error, sizeof error)) {
+    if (!s || load_object(loader, &input, 1, names, 1, &addr, error, sizeof error)) {
         fprintf(stderr, "FAIL: the MSR's chain's object: %s\n", error);
         free(s), free(object);
         snx_code_loader_free(loader);
         return 1;
     }
     for (int e = 0; e < 2; ++e) {
-        start(s, 1);
+        start(s, 1, PC);
         s->cpu.cpsr = 0x10u;
         s->cpu.r[0] = e ? SNX_ARM_E : 0;
         s->cpu.r[1] = 0;
@@ -982,6 +1279,154 @@ static int run_endian_chain(Back* x64) {
     g_test.failures += failures;
     free(s), free(object);
     snx_code_loader_free(loader);
+    return 0;
+}
+
+/* ---- the other modes' block to block: a write whose hook ends the block goes nowhere else, however its block goes on;
+   a hosted block checks nothing as it is entered and clears nothing, and one that ends inside an IT block goes back to
+   its dispatch loop, which looks at ITSTATE ---- */
+
+static uint32_t chain_io(SnxArmCPU* cpu, uint32_t address, uint32_t size_write, uint32_t value) {
+    (void)address, (void)size_write, (void)value;
+    if (g_test.chain_sets) cpu->r[2] = g_test.chain_sets;
+    return g_test.chain_returns;
+}
+static size_t chain_next(void* user, uint32_t key, size_t units, size_t count, uint32_t keys[2]) {
+    (void)user, (void)count;
+    if ((key & ~1u) != PC) return 0;
+    keys[0] = (key & ~1u) + (uint32_t)units * (key & 1 ? 2 : 4) + (key & 1);
+    return 1;
+}
+typedef struct {
+    const char* what;
+    const unsigned char code[16]; /* the first block's units, then the second's one */
+    int thumb;
+    size_t units;                             /* the first block's */
+    uint32_t returns;                         /* the hook's */
+    uint32_t r15, cpsr, exit;                 /* the state it starts from */
+    uint32_t end15, end_cpsr, end_exit, end2; /* R15, CPSR, the exit and R2 (0 to start with) as it ends */
+    uint32_t sets;                            /* what the hook sets R2 to, 0 for nothing */
+} ChainCase;
+static const ChainCase bus_chains[] = {
+    /* STR R0, [R1]; MOV R2, #1: the hook's write returns 0, the block goes on; nonzero, it ends there */
+    {"STR whose hook goes on",
+     {0x00, 0x00, 0x81, 0xe5, 0x01, 0x20, 0xa0, 0xe3},
+     0,
+     1,
+     0,
+     PC,
+     0x10,
+     0,
+     PC + 8,
+     0x10,
+     0,
+     1,
+     0},
+    {"STR whose hook yields",
+     {0x00, 0x00, 0x81, 0xe5, 0x01, 0x20, 0xa0, 0xe3},
+     0,
+     1,
+     1,
+     PC,
+     0x10,
+     0,
+     PC + 4,
+     0x10,
+     0,
+     0,
+     0},
+    /* the same in Thumb: STR R0, [R1]; MOVS R2, #1 */
+    {"T16 STR whose hook goes on", {0x08, 0x60, 0x01, 0x22}, 1, 1, 0, PC, 0x30, 0, PC + 4, 0x30, 0, 1, 0},
+    {"T16 STR whose hook yields", {0x08, 0x60, 0x01, 0x22}, 1, 1, 0x80000000u, PC, 0x30, 0, PC + 2, 0x30, 0, 0, 0},
+    /* ADD R2, R2, #1; STR R0, [R1], whose hook sets R2 to 0x40; ADD R2, R2, #1; NOP: the instruction after it reads
+       what the hook left, not the value the block had */
+    {"STR whose hook sets a register",
+     {0x01, 0x20, 0x82, 0xe2, 0x00, 0x00, 0x81, 0xe5, 0x01, 0x20, 0x82, 0xe2, 0x00, 0xf0, 0x20, 0xe3},
+     0,
+     3,
+     0,
+     PC,
+     0x10,
+     0,
+     PC + 16,
+     0x10,
+     0,
+     0x41,
+     0x40},
+    /* STREQ, its condition failing (Z clear): nothing stored, the block goes on whatever the hook gave before */
+    {"STREQ not run", {0x00, 0x00, 0x81, 0x05, 0x01, 0x20, 0xa0, 0xe3}, 0, 1, 1, PC, 0x10, 0, PC + 8, 0x10, 0, 1, 0},
+};
+static const ChainCase hosted_chains[] = {
+    /* NOP; MOV R2, #1, from a state no block of another mode takes: R15 elsewhere, CPSR.T and E set, an exit left */
+    {"a hosted entry",
+     {0x00, 0xf0, 0x20, 0xe3, 0x01, 0x20, 0xa0, 0xe3},
+     0,
+     1,
+     0,
+     0x777,
+     0x230,
+     5,
+     PC + 8,
+     0x230,
+     5,
+     1,
+     0},
+    /* IT EQ; MOVS R2, #1: the first block ends inside the IT block (Z clear) */
+    {"a hosted IT block's end", {0x08, 0xbf, 0x01, 0x22}, 1, 1, 0, PC, 0x30, 0, PC + 2, 0x30 | 0x00000800, 0, 0, 0},
+};
+static int run_chains(Back* x64) {
+    const ChainCase* cases = legacy() ? bus_chains : hosted() ? hosted_chains : NULL;
+    size_t n = legacy() ? sizeof bus_chains / sizeof *bus_chains : sizeof hosted_chains / sizeof *hosted_chains;
+    size_t failures = 0, ran = 0;
+    for (size_t i = 0; cases && i < n; ++i) {
+        const ChainCase* k = &cases[i];
+        unsigned char* object = NULL;
+        size_t consumed = 0, size = 0, unit = k->thumb ? 2 : 4;
+        char error[512] = "", name[16];
+        SnxCodeLoader* loader = NULL;
+        SnxU64 addr = 0;
+        if (k->thumb && !thumb2() && k->code[1] == 0xbf) continue;
+        snprintf(name, sizeof name, "%c_%08x", k->thumb ? 'T' : 'A', PC);
+        int made = k->thumb ? back_(thumb_block)(x64, NULL, k->code, k->units, PC, &consumed, chain_next, NULL) &&
+                                  back_(thumb_block)(x64, NULL, k->code + k->units * unit, 1,
+                                                      PC + (uint32_t)(k->units * unit), &consumed, chain_next, NULL)
+                            : back_(block)(x64, NULL, k->code, k->units, PC, &consumed, chain_next, NULL) &&
+                                  back_(block)(x64, NULL, k->code + k->units * unit, 1,
+                                               PC + (uint32_t)(k->units * unit), &consumed, chain_next, NULL);
+        SnxLinkInput input = {0};
+        const char* names[1] = {name};
+        RunState* s = (RunState*)calloc(1, sizeof *s);
+        if (made && s && !back_(object)(x64, &object, &size, NULL) && (loader = new_loader(error, sizeof error)) &&
+            (input = (SnxLinkInput){.data = object, .size = size, .name = "chain"}, 1) &&
+            !snx_code_load_private(loader, &input, 1, names, 1, &addr, error, sizeof error)) {
+            g_test.chain_returns = k->returns;
+            g_test.chain_sets = k->sets;
+            s->cpu.mem = g_test.window[1];
+            s->cpu.mem_size = 1ull << 32;
+            s->cpu.io = chain_io;
+            s->cpu.r[1] = 0x04000100;
+            s->cpu.r[15] = k->r15;
+            s->cpu.cpsr = k->cpsr;
+            s->cpu.exit = k->exit;
+            run_block(addr, &s->cpu);
+            ++ran;
+            if (s->cpu.r[15] != k->end15 || s->cpu.cpsr != k->end_cpsr || s->cpu.exit != k->end_exit ||
+                s->cpu.r[2] != k->end2) {
+                fprintf(stderr,
+                        "FAIL: %s: R15 %08x, CPSR %08x, exit %u, R2 %u; wanted R15 %08x, CPSR %08x, exit %u, R2 %u\n",
+                        k->what, s->cpu.r[15], s->cpu.cpsr, s->cpu.exit, s->cpu.r[2], k->end15, k->end_cpsr,
+                        k->end_exit, k->end2);
+                ++failures;
+            }
+        } else {
+            fprintf(stderr, "FAIL: %s: %s%s\n", k->what, back_(why)(x64), error);
+            ++failures;
+        }
+        free(s), free(object);
+        if (loader) snx_code_loader_free(loader);
+    }
+    if (cases) printf("%zu cases of a block to the next, %zu failures\n", ran, failures);
+    g_test.failures += failures;
     return 0;
 }
 
@@ -1014,13 +1459,13 @@ static int run_vrshl_witness(Back* x64) {
     const char* names[1] = {name};
     SnxU64 addr = 0;
     RunState* s = (RunState*)malloc(sizeof *s);
-    if (!s || snx_code_load_private(loader, &input, 1, names, 1, &addr, error, sizeof error)) {
+    if (!s || load_object(loader, &input, 1, names, 1, &addr, error, sizeof error)) {
         fprintf(stderr, "FAIL: VRSHL's witness's object: %s\n", error);
         free(s), free(object);
         snx_code_loader_free(loader);
         return 1;
     }
-    start(s, 1);
+    start(s, 1, PC);
     s->cpu.cpsr = 0x10u;
     for (unsigned i = 0; i < 16; ++i) {
         unsigned byte = i % 8 * 8;
@@ -1041,6 +1486,8 @@ static int run_vrshl_witness(Back* x64) {
     snx_code_loader_free(loader);
     return 0;
 }
+
+#endif
 
 /* ---- Thumb's witnesses: the entry's checks (thumb_block's), and the accesses the block compilers don't agree on
    without care ---- */
@@ -1111,11 +1558,22 @@ static int run_thumb_witnesses(SnxIr* ir, Back* x64) {
     unsigned char *lobj = NULL, *xobj = NULL;
     size_t lsize = 0, xsize = 0;
     SnxU64 *laddr = calloc(count, sizeof *laddr), *xaddr = calloc(count, sizeof *xaddr);
+#if defined(SNX_TEST_NATIVE)
+    HostUc* uc = hostuc_new(BACK_UC, 16u << 20);
+    RunState* s = uc ? (RunState*)hostuc_alloc(uc, 2 * sizeof *s) : NULL;
+    if (s) hostuc_swapper(uc, swap_arm, &s[1].cpu);
+#else
     RunState* s = (RunState*)malloc(2 * sizeof *s);
+#endif
     char error[512];
     if (!blocks || !laddr || !xaddr || !s) {
         fprintf(stderr, "FAIL: out of memory for the %zu Thumb witnesses\n", count);
-        free(blocks), free(laddr), free(xaddr), free(s);
+        free(blocks), free(laddr), free(xaddr);
+#if defined(SNX_TEST_NATIVE)
+        if (uc) hostuc_free(uc);
+#else
+        free(s);
+#endif
         LLVMDisposeModule(module);
         return 1;
     }
@@ -1130,13 +1588,14 @@ static int run_thumb_witnesses(SnxIr* ir, Back* x64) {
         memcpy(b->half, thumb_cases[i].half, sizeof thumb_cases[i].half);
         snprintf(name, sizeof name, "B_%zu", i);
         if (!snx_thumb_llvm_block(module, name, b->half, b->n, PC, &consumed) ||
-            !(b->made = snx_x64_thumb_block(x64, name, code_of(b), b->n, PC, &xconsumed, NULL, NULL))) {
+            !(b->made = back_(thumb_block)(x64, name, code_of(b), b->n, PC, &xconsumed, NULL, NULL))) {
             fprintf(stderr, "FAIL: the Thumb witness %s: a back end refused it: %s\n", thumb_cases[i].what,
                     back_(why)(x64));
             return 1;
         }
         if (consumed != xconsumed) {
-            fprintf(stderr, "FAIL: the Thumb witness %s: LLVM's block takes %zu halfwords, the x86-64 back end's %zu\n",
+            fprintf(stderr,
+                    "FAIL: the Thumb witness %s: LLVM's block takes %zu halfwords, the " BACK_NAME " back end's %zu\n",
                     thumb_cases[i].what, consumed, xconsumed);
             ++failures;
         }
@@ -1144,7 +1603,11 @@ static int run_thumb_witnesses(SnxIr* ir, Back* x64) {
     if (snx_ir_module_object(ir, module, '0', &lobj, &lsize, error, sizeof error) ||
         back_(object)(x64, &xobj, &xsize, NULL) || !(lloader = new_loader(error, sizeof error)) ||
         !(xloader = new_loader(error, sizeof error)) || load(lloader, lobj, lsize, "LLVM", blocks, count, 0, laddr) ||
+#if defined(SNX_TEST_NATIVE)
+        load_uc(uc, xobj, xsize, blocks, count, xaddr)) {
+#else
         load(xloader, xobj, xsize, BACK_NAME, blocks, count, 1, xaddr)) {
+#endif
         fprintf(stderr, "FAIL: the Thumb witnesses' objects: %s\n", error);
         return 1;
     }
@@ -1154,10 +1617,16 @@ static int run_thumb_witnesses(SnxIr* ir, Back* x64) {
             u64 seed = g_test.seed;
             for (int side = 0; side < 2; ++side) {
                 g_test.seed = seed;
-                start(&s[side], w->exit == ANY ? k : 1);
+                start(&s[side], w->exit == ANY ? k : 1, PC);
                 s[side].cpu.cpsr = w->set & CPSR_SET ? w->cpsr : s[side].cpu.cpsr | SNX_ARM_T;
                 if (w->set & R15_SET) s[side].cpu.r[15] = w->r15;
                 if (w->set & REGS_SET) s[side].cpu.r[0] = w->r0, s[side].cpu.r[1] = w->r1;
+#if defined(SNX_TEST_NATIVE)
+                if (side) {
+                    if (hostuc_call(uc, xaddr[i], (u64)(uintptr_t)&s[1].cpu, 0, NULL)) s[1].cpu.exit = 0xdead;
+                    continue;
+                }
+#endif
                 run_block(side ? xaddr[i] : laddr[i], &s[side].cpu);
             }
             const char* why = differs(&s[0], &s[1]);
@@ -1173,24 +1642,202 @@ static int run_thumb_witnesses(SnxIr* ir, Back* x64) {
            "failures\n",
            count, failures);
     g_test.failures += failures;
-    free(s), free(lobj), free(xobj), free(laddr), free(xaddr), free(blocks);
+#if defined(SNX_TEST_NATIVE)
+    hostuc_free(uc);
+#else
+    free(s);
+#endif
+    free(lobj), free(xobj), free(laddr), free(xaddr), free(blocks);
     snx_code_loader_free(lloader);
     snx_code_loader_free(xloader);
     LLVMDisposeModule(module);
     return 0;
 }
-#endif
 
+/* ---- a block that goes on to its own start: past the thread's poll, the word at snx_arm_poll_offset from the state,
+   which the module's variable holds. Set, the block returns there, R15 its start; clear, it loops */
+typedef struct {
+    SnxArmCPU cpu;
+    uint32_t other;
+    uint32_t poll; /* the thread's */
+} PollState;
+static size_t poll_next(void* user, uint32_t key, size_t units, size_t count, uint32_t keys[2]) {
+    (void)user, (void)units, (void)count;
+    if ((key & ~1u) != PC) return 0;
+    keys[0] = key; /* itself, T set or not */
+    return 1;
+}
+/* thumb: a Thumb block's, entered with T set */
+static int run_poll_chain(Back* x64, int thumb) {
+    static const uint32_t words[2] = {0xE2500001u, 0x1AFFFFFDu}; /* SUBS R0, R0, #1; BNE the block */
+    static const uint16_t halves[2] = {0x3801u, 0xD1FDu};        /* the same in T16 */
+    unsigned char* object = NULL;
+    size_t consumed = 0, size = 0, failures = 0;
+    char error[512] = "", name[16];
+    SnxU64 addr = 0;
+    int rc = 1;
+    snprintf(name, sizeof name, "%c_%08x", thumb ? 'T' : 'A', PC);
+    if (!(thumb ? back_(thumb_block)(x64, NULL, (const unsigned char*)halves, 2, PC, &consumed, poll_next, NULL)
+                : back_(block)(x64, NULL, (const unsigned char*)words, 2, PC, &consumed, poll_next, NULL)) ||
+        back_(object)(x64, &object, &size, NULL)) {
+        fprintf(stderr, "FAIL: the poll's block: %s\n", back_(why)(x64));
+        return 1;
+    }
+#if defined(SNX_TEST_NATIVE)
+    HostUc* uc = hostuc_new(BACK_UC, 1u << 20);
+    PollState* t = uc ? (PollState*)hostuc_alloc(uc, sizeof *t) : NULL;
+    int64_t* offset = uc ? (int64_t*)hostuc_alloc(uc, sizeof *offset) : NULL;
+    if (!t || !offset) goto done;
+    *offset = (int64_t)offsetof(PollState, poll);
+    if (hostuc_big(BACK_UC)) *offset = (int64_t)snx_bswap64((uint64_t)*offset);
+    hostuc_swapper(uc, swap_cpu, &t->cpu);
+    if (hostuc_define(uc, "snx_arm_poll_offset", (uint64_t)(uintptr_t)offset) ||
+        hostuc_load(uc, object, size, error, sizeof error) || !(addr = hostuc_symbol(uc, name)))
+        goto done;
+#else
+    /* the module's variable in an object of its own: the code reads it within 2 GiB */
+    SnxCodeLoader* loader = NULL;
+    PollState* t = (PollState*)malloc(sizeof *t);
+    int64_t offset = (int64_t)offsetof(PollState, poll);
+    SnxXElf* data = snx_xelf_new();
+    unsigned char* data_object = NULL;
+    size_t data_size = 0;
+    const char* names[1] = {name};
+    int made = data != NULL;
+    if (made) {
+        size_t at = snx_xelf_put(data, SNX_ELF_DATA, &offset, sizeof offset, 8);
+        snx_xelf_symbol(data, "snx_arm_poll_offset", SNX_ELF_DATA, at, sizeof offset, SNX_ELF_GLOBAL);
+        made = !snx_xelf_write(data, &data_object, &data_size);
+        snx_xelf_free(data);
+    }
+    SnxLinkInput inputs[2] = {{.data = object, .size = size, .name = "poll"},
+                              {.data = data_object, .size = data_size, .name = "data"}};
+    if (!made || !t || !(loader = new_loader(error, sizeof error)) ||
+        load_object(loader, inputs, 2, names, 1, &addr, error, sizeof error))
+        goto done;
+#endif
+    for (int set = 0; set < 2; ++set) {
+        *t = (PollState){0};
+        t->cpu.r[0] = 5;
+        t->cpu.r[15] = PC;
+        t->cpu.cpsr = 0x10u | (thumb ? SNX_ARM_T : 0);
+        t->poll = (uint32_t)set;
+#if defined(SNX_TEST_NATIVE)
+        if (hostuc_call(uc, addr, (uint64_t)(uintptr_t)&t->cpu, 0, NULL)) {
+            fprintf(stderr, "FAIL: the poll's block stopped, the poll %s\n", set ? "set" : "clear");
+            ++failures;
+            continue;
+        }
+#else
+        run_block(addr, &t->cpu);
+#endif
+        uint32_t r0 = set ? 4 : 0, r15 = set ? PC : thumb ? PC + 4 : PC + 8;
+        if (t->cpu.exit != SNX_ARM_OK || t->cpu.r[0] != r0 || t->cpu.r[15] != r15) {
+            fprintf(stderr, "FAIL: the poll's block, the poll %s: exit %u, R0 %u, R15 %08x; wanted R0 %u, R15 %08x\n",
+                    set ? "set" : "clear", t->cpu.exit, t->cpu.r[0], t->cpu.r[15], r0, r15);
+            ++failures;
+        }
+    }
+    printf("a%s block back to its start past the thread's poll, set and clear: %zu failures\n",
+           thumb ? " Thumb" : "n A32", failures);
+    g_test.failures += failures;
+    rc = 0;
+done:
+    if (rc) fprintf(stderr, "FAIL: the poll's object: %s\n", error);
+    free(object);
+#if defined(SNX_TEST_NATIVE)
+    if (uc) hostuc_free(uc);
+#else
+    free(t), free(data_object);
+    snx_code_loader_free(loader);
+#endif
+    return rc;
+}
+
+#if defined(SNX_TEST_WIN64)
+/* the entry's checks of an A32 and a Thumb block (llvm.c's block_begin and thumb_block, in their order), each failed one
+   with its exit and syndrome, R15 left as it is; run an instruction at a time, its exit's code having no frame */
+static int run_entries(Back* x64) {
+    enum { WORD = 0xE3A00001u /* MOV R0, #1 */, HALF = 0x2001u /* MOVS R0, #1 */ };
+    static const struct {
+        const char* what;
+        int thumb;
+        uint32_t r15, cpsr, exit, syndrome;
+    } cases[] = {
+        {"R15 elsewhere", 0, PC + 4, 0x10u, SNX_ARM_BAD_ENTRY, PC},
+        {"T set", 0, PC, 0x30u, SNX_ARM_BAD_ENTRY, WORD},
+        {"E set", 0, PC, 0x210u, SNX_ARM_ENDIAN_UNSUPPORTED, WORD},
+        {"T and E set", 0, PC, 0x230u, SNX_ARM_BAD_ENTRY, WORD},
+        {"R15 elsewhere", 1, PC + 2, 0x30u, SNX_ARM_BAD_ENTRY, PC},
+        {"T clear", 1, PC, 0x10u, SNX_ARM_BAD_ENTRY, HALF},
+        {"ITSTATE's high bits", 1, PC, 0x430u, SNX_ARM_IT_ENTRY, 0x04},
+        {"ITSTATE's low bits", 1, PC, 0x06000030u, SNX_ARM_IT_ENTRY, 0x03},
+        {"E set", 1, PC, 0x230u, SNX_ARM_ENDIAN_UNSUPPORTED, HALF},
+        {"none", 0, PC, 0x10u, SNX_ARM_OK, 0},
+        {"none", 1, PC, 0x30u, SNX_ARM_OK, 0},
+    };
+    static const uint32_t word = WORD;
+    static const uint16_t half = HALF;
+    unsigned char* object = NULL;
+    size_t consumed = 0, size = 0, failures = 0;
+    char error[512] = "";
+    SnxU64 addr[2] = {0};
+    if (!back_(block)(x64, "E_arm", (const unsigned char*)&word, 1, PC, &consumed, NULL, NULL) ||
+        !back_(thumb_block)(x64, "E_thumb", (const unsigned char*)&half, 1, PC, &consumed, NULL, NULL) ||
+        back_(object)(x64, &object, &size, NULL)) {
+        fprintf(stderr, "FAIL: the entries' blocks: %s\n", back_(why)(x64));
+        return 1;
+    }
+    HostUc* uc = hostuc_new(BACK_UC, 1u << 20);
+    RunState* s = uc ? (RunState*)hostuc_alloc(uc, sizeof *s) : NULL;
+    if (!s || hostuc_load(uc, object, size, error, sizeof error) || !(addr[0] = hostuc_symbol(uc, "E_arm")) ||
+        !(addr[1] = hostuc_symbol(uc, "E_thumb"))) {
+        fprintf(stderr, "FAIL: the entries' object: %s\n", error);
+        free(object);
+        if (uc) hostuc_free(uc);
+        return 1;
+    }
+    hostuc_step(uc, 1);
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; ++k) {
+        const int ok = cases[k].exit == SNX_ARM_OK;
+        memset(s, 0, sizeof *s);
+        s->cpu.r[15] = cases[k].r15;
+        s->cpu.cpsr = cases[k].cpsr;
+        s->cpu.exit = 0x55, s->cpu.syndrome = 0x55;
+        uint32_t r15 = ok ? PC + (cases[k].thumb ? 2 : 4) : cases[k].r15;
+        if (hostuc_call(uc, addr[cases[k].thumb], (uint64_t)(uintptr_t)&s->cpu, 0, NULL) ||
+            s->cpu.exit != cases[k].exit || s->cpu.syndrome != cases[k].syndrome || s->cpu.r[15] != r15 ||
+            s->cpu.r[0] != (unsigned)ok) {
+            fprintf(stderr, "FAIL: a%s block's entry, %s: exit %u, syndrome %x, R15 %x, R0 %u; wanted %u, %x, %x, %d\n",
+                    cases[k].thumb ? " Thumb" : "n A32", cases[k].what, s->cpu.exit, s->cpu.syndrome, s->cpu.r[15],
+                    s->cpu.r[0], cases[k].exit, cases[k].syndrome, r15, ok);
+            ++failures;
+        }
+    }
+    printf("the entries' checks, %zu states: %zu failures\n", sizeof cases / sizeof *cases, failures);
+    free(object);
+    hostuc_step(uc, 0);
+    hostuc_free(uc);
+    g_test.failures += failures;
+    return 0;
+}
+#endif
+/* a block's address: the bus's open bus reads the code by its region, and in IWRAM by its halfword */
+static uint32_t block_pc(int thumb) {
+    static const uint32_t at[] = {0x1000, 0x2001000, 0x3001000, 0x3001002, 0x7000010, 0x8001000, 0x8001006};
+    if (g_test.options.profile != SNX_ARM_PROFILE_ARM7TDMI) return PC;
+    uint32_t pc = at[rnd() % (sizeof at / sizeof *at)];
+    return thumb ? pc : pc & ~3u;
+}
 int main(int argc, char** argv) {
     char error[512];
     SnxIr* ir = NULL;
     g_test.states = 16;
     g_test.blocks = 6000;
-#if !defined(SNX_TEST_NATIVE)
     g_test.thumb = 4000;
-#endif
     g_test.features = ~0u;
     g_test.seed = 0xa32;
+    g_test.options.abi = SNX_ARM_CODEGEN_OPTIONS_ABI;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--states") && i + 1 < argc)
             g_test.states = (unsigned)strtoul(argv[++i], NULL, 10);
@@ -1208,9 +1855,44 @@ int main(int argc, char** argv) {
             g_test.object = argv[++i];
         else if (!strcmp(argv[i], "--ll") && i + 1 < argc)
             g_test.ll = argv[++i];
-        else if (!strcmp(argv[i], "--dump"))
+        else if (!strcmp(argv[i], "--callee") && i + 1 < argc) {
+            g_test.callee = snx_read_file(argv[++i], &g_test.callee_size);
+            if (!g_test.callee) return fprintf(stderr, "FAIL: cannot read %s\n", argv[i]), 1;
+            g_test.rt[0] = (SnxArmRt){snx_test_undefined, snx_test_coproc};
+            g_test.io[0] = snx_test_io;
+#if !defined(SNX_TEST_NATIVE)
+            return fprintf(stderr, "--callee %s: the x86-64 blocks run here, with the host's functions\n", argv[i]), 2;
+#endif
+        } else if (!strcmp(argv[i], "--dump"))
             g_test.dump = 1;
-        else if (!strcmp(argv[i], "--word") && i + 1 < argc && g_test.nonly < 64) {
+#if defined(SNX_TEST_WIN64)
+        else if (!strcmp(argv[i], "--step"))
+            g_test.step = 1;
+#endif
+        else if (!strcmp(argv[i], "--trace"))
+            g_test.options.trace = offsetof(RunState, trace), g_test.options.skipped = offsetof(RunState, skipped);
+        else if (!strcmp(argv[i], "--profile") && i + 1 < argc) {
+            static const char* const names[] = {[SNX_ARM_PROFILE_A57] = "a57",
+                                                [SNX_ARM_PROFILE_ARM11] = "arm11",
+                                                [SNX_ARM_PROFILE_A9] = "a9",
+                                                [SNX_ARM_PROFILE_ARM7TDMI] = "arm7tdmi",
+                                                [SNX_ARM_PROFILE_ARM946E] = "arm946e"};
+            unsigned k = 0;
+            while (k < 5 && strcmp(argv[i + 1], names[k])) ++k;
+            if (k == 5)
+                return fprintf(stderr, "--profile %s is not a57, arm11, a9, arm7tdmi or arm946e\n", argv[i + 1]), 2;
+            g_test.options.profile = (SnxArmProfile)k;
+            ++i;
+        } else if (!strcmp(argv[i], "--memory") && i + 1 < argc) {
+            static const char* const names[] = {[SNX_ARM_MEMORY_FLAT] = "flat",
+                                                [SNX_ARM_MEMORY_CHECKED] = "checked",
+                                                [SNX_ARM_MEMORY_HOSTED] = "hosted"};
+            unsigned k = 0;
+            while (k < 3 && strcmp(argv[i + 1], names[k])) ++k;
+            if (k == 3) return fprintf(stderr, "--memory %s is not flat, checked or hosted\n", argv[i + 1]), 2;
+            g_test.options.memory = (SnxArmMemoryMode)k;
+            ++i;
+        } else if (!strcmp(argv[i], "--word") && i + 1 < argc && g_test.nonly < 64) {
             const char* w = argv[++i];
             size_t n = 0;
             for (char* end; n < MAX_WORDS && *w; w = *end == ',' ? end + 1 : end) {
@@ -1226,11 +1908,13 @@ int main(int argc, char** argv) {
                 ++at;
             }
         } else
-            return fprintf(stderr,
-                           "usage: snx-test-arm-x64 [--blocks N] [--thumb N] [--states N] [--pool N] [--features MASK] "
-                           "[--seed N] [--object FILE] [--word HEX]... [--halves HEX[,HEX]...]\n%s is not one of "
-                           "these\n",
-                           argv[i]),
+            return fprintf(
+                       stderr,
+                       "usage: snx-test-arm-x64 [--profile NAME] [--memory NAME] [--trace] [--blocks N] [--thumb N] [--states N] [--pool N] [--features MASK] "
+                       "[--seed N] [--object FILE] [--callee OBJECT] [--word HEX]... "
+                       "[--halves HEX[,HEX]...]\n%s is not one of "
+                       "these\n",
+                       argv[i]),
                    2;
     }
 #if defined(SNX_TEST_NATIVE)
@@ -1242,17 +1926,29 @@ int main(int argc, char** argv) {
         }
         hostuc_free(probe);
     }
-    if (g_test.thumb || g_test.nhalves)
-        return fprintf(stderr,
-                       "FAIL: --thumb %u, --halves of %zu: the " BACK_NAME " back end makes no Thumb blocks yet\n",
-                       g_test.thumb, g_test.nhalves),
-               2;
+#if defined(SNX_TEST_WIN64)
+    snx_x64_set_win64(1);
+#endif
 #else
     if (!back_(available)()) {
         printf("SKIP: no " BACK_NAME " back end on this host\n");
         return 77;
     }
 #endif
+    if (!snx_arm_codegen_options_valid(&g_test.options))
+        return fprintf(stderr, "FAIL: no block compiler takes this profile, memory and trace\n"), 2;
+    if (g_test.callee && checked())
+        return fprintf(stderr,
+                       "--callee and --memory checked: the callback is the test's, which compiled code cannot call\n"),
+               2;
+    g_test.windowed = hosted() || legacy();
+#if defined(_WIN32)
+    if (g_test.windowed) {
+        printf("SKIP: no window of guest memory of %llu bytes on Windows\n", (unsigned long long)WINDOW);
+        return 77;
+    }
+#endif
+    if (g_test.windowed && windows_new()) return 1;
     if (snx_ir_init(error, sizeof error) || !(ir = snx_ir_new_jit("arm-x64", '2', error, sizeof error))) {
         fprintf(stderr, "FAIL: no LLVM for this host: %s\n", error);
         return 1;
@@ -1263,17 +1959,31 @@ int main(int argc, char** argv) {
         fprintf(stderr, "FAIL: out of memory for the " BACK_NAME " back end's compiler or the blocks\n");
         return 1;
     }
+    if (back_(options)(x64, &g_test.options)) {
+        fprintf(stderr, "FAIL: the " BACK_NAME " back end takes no such options\n");
+        return 1;
+    }
+    int plain = g_test.options.profile == SNX_ARM_PROFILE_A57 && g_test.options.memory == SNX_ARM_MEMORY_FLAT;
 #if defined(SNX_TEST_NATIVE)
-    back_(limit)(x64, g_test.pool, ~0u);
+    back_(limit)(x64, g_test.pool, g_test.features | ~7u);
     size_t done = 0;
+    for (int thumb = 0; thumb < 2; ++thumb)
+        if (plain && !g_test.nonly && !g_test.nhalves && run_poll_chain(x64, thumb)) ++g_test.failures;
+#if defined(SNX_TEST_WIN64)
+    if (plain && !g_test.nonly && !g_test.nhalves && run_entries(x64)) ++g_test.failures;
+#endif
 #else
     back_(limit)(x64, g_test.pool, g_test.features | ~7u);
     size_t done = 0;
-    if (!g_test.nonly && !g_test.nhalves && run_witnesses(ir, x64)) ++g_test.failures;
-    if (!g_test.nonly && !g_test.nhalves && run_endian_chain(x64)) ++g_test.failures;
-    if (!g_test.nonly && !g_test.nhalves && run_vrshl_witness(x64)) ++g_test.failures;
-    if (!g_test.nonly && !g_test.nhalves && run_thumb_witnesses(ir, x64)) ++g_test.failures;
+    /* the witnesses are the Cortex-A57's on flat memory */
+    if (plain && !g_test.nonly && !g_test.nhalves && run_witnesses(ir, x64)) ++g_test.failures;
+    if (plain && !g_test.nonly && !g_test.nhalves && run_endian_chain(x64)) ++g_test.failures;
+    for (int thumb = 0; thumb < 2; ++thumb)
+        if (plain && !g_test.nonly && !g_test.nhalves && run_poll_chain(x64, thumb)) ++g_test.failures;
+    if (plain && !g_test.nonly && !g_test.nhalves && run_vrshl_witness(x64)) ++g_test.failures;
+    if (!plain && !g_test.nonly && !g_test.nhalves && run_chains(x64)) ++g_test.failures;
 #endif
+    if (plain && !g_test.nonly && !g_test.nhalves && run_thumb_witnesses(ir, x64)) ++g_test.failures;
     if (g_test.nhalves) {
         blocks[0].thumb = 1;
         blocks[0].n = g_test.nhalves;
@@ -1295,11 +2005,14 @@ int main(int argc, char** argv) {
             Block* b = &blocks[i];
             *b = (Block){0};
             /* one word alone a third of the time, else two to six */
-            b->n = rnd() % 3 == 0 ? 1 : 2 + (size_t)(rnd() % (MAX_WORDS - 1));
+            b->n = rnd() % 3 == 0 ? 1 : 2 + (size_t)(rnd() % 5); /* MAX_WORDS is --word's */
+            b->pc = block_pc(0);
             for (size_t k = 0; k < b->n; ++k) {
-                const Class* c = pick_class();
-                b->words[k] = word_of(c);
-                ++g_test.kinds[c->kind & 63];
+                const Class* c;
+                do c = pick_class();
+                while (!(b->words[k] = word_of(c)) ||
+                       (no_exclusives() && (c->kind == SNX_A32_EXCLUSIVE || c->kind == SNX_A32_ACQUIRE_RELEASE)));
+                ++g_test.kinds[decode(b->words[k]) & 63];
             }
         }
         if (run_chunk(ir, x64, blocks, count)) break;
@@ -1311,6 +2024,7 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < count; ++i) {
             blocks[i] = (Block){0};
             random_thumb(&blocks[i]);
+            blocks[i].pc = block_pc(1);
             count_shapes(&blocks[i]);
         }
         if (run_chunk(ir, x64, blocks, count)) break;
@@ -1338,6 +2052,8 @@ int main(int argc, char** argv) {
         printf("snx_arm_fp_x64: %zu calls of the hot paths' operations (their cold paths), %zu of the others\n", cold,
                other - cold);
     }
+    if (g_test.hooked || g_test.transfers)
+        printf("%zu calls of the bus hook, %zu of checked memory's callback\n", g_test.hooked, g_test.transfers);
     printf("their exits:");
     for (unsigned e = 0; e < 16; ++e)
         if (g_test.exits[e])

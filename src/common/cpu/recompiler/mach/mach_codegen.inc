@@ -11,7 +11,9 @@
    absolute doubleword's relocation), SGX_FN_TARGET (the register a call's target and a function's entry are in),
    the pins' host registers (mg_pin_hosts, MG_NPINS, MG_NPINS_FIXED where an exclusive, an atomic or CRC32 takes the
    last ones, MG_PIN_RESERVED(h) whether a pin's register is one values may be in), the vector pins' (MG_VPIN(k),
-   the k-th, MG_NVPINS) and the vector registers no value may take (MG_XRESERVED: the callee's).
+   the k-th, MG_NVPINS) and the vector registers no value may take (MG_XRESERVED: the callee's). MG_FAR_JUMPS where its
+   jumps have a longer form (Unit.far), MG_POOL_REACH how far the code goes past the first LDR of a literal before the
+   literals are put in it (mg_pool_island).
 
    Each basic block's instructions are sailgen's emitters', appended to one SSA region (registers read once, flags
    reused, constants folded) and assembled when the block ends. The guest's registers are in the CPU structure at
@@ -80,6 +82,12 @@ typedef struct {
     signed char vpin[32]; /* each V register's vector register, -1 for none */
     signed char mempin;   /* the guest memory's base's host register, -1 for none */
     size_t index; /* the function's in the codegen: its snx_stale byte */
+    size_t at;    /* the index of the function's instruction being made, its count past them */
+    int far;      /* the function's jumps are the machine's longest (MG_FAR_JUMPS): its short ones did not reach */
+    /* the addresses of the function's instructions there is no code for (options.alone), undefined where they run */
+    SnxU64* none;
+    size_t nnone, cap_none;
+    int again;    /* the machine's glue refused the function to make it again its way (mg_finish), once */
     int dispatch, d_label, mismatch_label;
     int nstubs, cap_stubs;
     struct Stub {
@@ -148,6 +156,14 @@ static void mg_dispatch(Unit* u, int lab0);
 static int mg_finish(Unit* u, size_t fix0);
 /* a relocation of the unit's to one of its own functions (at target_at), resolved in place: 1, 0 where it stays one */
 static int mg_resolve_local(Unit* u, const Reloc* r, size_t target_at);
+#ifdef MG_POOL_REACH
+/* the literals so far, here, a jump over them */
+static void mg_pool_island(Unit* u);
+#endif
+#ifdef MG_WRITE_OBJECT
+/* the unit's object in another format than ELF (x86-64's COFF): 1 written, 0 for ELF's (write_object) */
+static int MG_WRITE_OBJECT(Unit* u, unsigned char** object, size_t* size);
+#endif
 #ifdef MG_BOUND
 /* what a bound PLT stub's slot is compared with (call_stub, the BR of a stub): a jump to label where the function at
    index is stale, where the guest's Xr is not value (its pin's, else the state's), where CPU.pc is not; and CPU.pc as
@@ -233,6 +249,9 @@ static void flush(Unit* u) {
     SgCtx* g = u->g;
     int k;
     if (g->x.n) sgx_assemble_region(&u->a, &g->x);
+#ifdef MG_POOL_REACH
+    if (u->a.nrips && u->b.n - u->a.rips[0].at > MG_POOL_REACH) mg_pool_island(u);
+#endif
     g->x.end_dead = 0;
     g->x.end_vdead = 0;
     for (k = 0; k < 32; ++k) g->gpr[k] = g->vd[k][0] = g->vd[k][1] = g->vx[k] = g->gk_known[k] = 0;
@@ -657,6 +676,10 @@ static int sys(Unit* u, SnxU32 word) {
         case 4: { /* DC ZVA: the 64 bytes of the block at a zeroed, four 16-byte stores */
             SgX* x = sgx(g);
             SgD block = sg_d_and(g, a, sgx_const(64, ~(SnxU64)63));
+            if (!SGX_HAS_VREGS) { /* eight of 8 bytes */
+                for (int d = 0; d < 64; d += 8) sg_GuestMemWrite(g, sg_d_add_int(g, block, d), 8, 0, sgx_const(64, 0));
+                return 1;
+            }
             int z = sgx_xconst(x, 0, 0), base = sgx_mem(g), index = sgx_reg(x, &block), k, in[4] = {0, z, 0, 0};
             for (k = 0; k < 4; ++k)
                 sgx_vins(x, SGX_VF_ST16, 0, 0, in, 0, 0, SGX_VM_GUEST, base, index, 16 * k, 0, 0);
@@ -908,6 +931,344 @@ static int call_or_stub(Unit* u, SnxU64 target, int tail) {
 }
 #endif
 
+/* bits hi..lo of a SIMD&FP register */
+static SgD vbits(SgCtx* g, unsigned n, unsigned hi, unsigned lo) {
+    return sg_d_slice(g, sg__V_read_bits(g, n, 127, 0), hi, lo);
+}
+/* v9.5's and v9.6's, which the Sail (v9.4) has no clause of: FEAT_FPRCVT's conversions between a SIMD&FP register's
+   integer and its float, FEAT_FAMINMAX's extremes of the magnitudes, FEAT_LUT's tables of 2- and 4-bit numbers. 1 made,
+   0 not one of them */
+static int newer(Unit* u, const SnxA64Insn* insn, SnxU32 word) {
+    static const signed char fp_size[4] = {32, 64, 0, 16};
+    SgCtx* g = u->g;
+    const SnxA64Args* a = &insn->args;
+    unsigned rd = word & 31, rn = word >> 5 & 31, rm = word >> 16 & 31, e, n, bits;
+    unsigned isize = word >> 31 ? 64 : 32, fsize = (unsigned)fp_size[word >> 22 & 3];
+    SgD r, table;
+    int round, uns = 0;
+    switch (insn->op) {
+    case SNX_A64_OP_UCVTF_simd: uns = 1; /* fallthrough */
+    case SNX_A64_OP_SCVTF_simd:
+        r = vbits(g, rn, isize - 1, 0);
+        r = sg_FixedToFP(g, 0, r, 0, uns, sg_FPCR_read(g), SG_FP_ROUNDING_FPCR, fsize);
+        sg__V_write(g, rd, sg_d_zext(g, r, 128));
+        return 1;
+    case SNX_A64_OP_FCVTNU_g_simd: uns = 1; /* fallthrough */
+    case SNX_A64_OP_FCVTNS_g_simd: round = 0; break;
+    case SNX_A64_OP_FCVTPU_g_simd: uns = 1; /* fallthrough */
+    case SNX_A64_OP_FCVTPS_g_simd: round = 1; break;
+    case SNX_A64_OP_FCVTMU_g_simd: uns = 1; /* fallthrough */
+    case SNX_A64_OP_FCVTMS_g_simd: round = 2; break;
+    case SNX_A64_OP_FCVTZU_g_simd: uns = 1; /* fallthrough */
+    case SNX_A64_OP_FCVTZS_g_simd: round = 3; break;
+    case SNX_A64_OP_FCVTAU_g_simd: uns = 1; /* fallthrough */
+    case SNX_A64_OP_FCVTAS_g_simd: round = 4; break;
+    case SNX_A64_OP_FAMAX:
+    case SNX_A64_OP_FAMIN:
+        bits = 8u << a->esz;
+        r = sg_d_empty(128);
+        for (e = 0; e < (a->q ? 128 : 64) / bits; ++e) {
+            SgD o[2] = {vbits(g, rn, (e + 1) * bits - 1, e * bits), vbits(g, rm, (e + 1) * bits - 1, e * bits)};
+            for (n = 0; n < 2; ++n) { /* the magnitudes, but a NaN's sign is its own */
+                SgD m = sg_d_and(g, o[n], sgx_const(bits, sg_ones(bits - 1)));
+                SnxU64 inf = sg_ones(bits - 1) & ~sg_ones(bits == 64 ? 52 : bits == 32 ? 23 : 10);
+                SgB nan = sgx_d_ult(g, sgx_const(64, inf), sg_d_zext(g, m, 64));
+                o[n] = sg_d_select(g, nan, sg_d_zext(g, o[n], 64), sg_d_zext(g, m, 64));
+                o[n] = sg_d_slice(g, o[n], bits - 1, 0);
+            }
+            /* no operand is flushed, whatever FPCR.FZ and FZ16 hold */
+            table = sg_d_and(g, sg_FPCR_read(g), sgx_const(64, ~(SnxU64)(1u << 24 | 1u << 19)));
+            table = sgx_fp(g, "snx_x64_fp_minmax", 0, table, o, 2, 1,
+                           bits | (SnxU32)(insn->op == SNX_A64_OP_FAMIN) << 8, bits);
+            sg_d_set_slice(g, &r, (e + 1) * bits - 1, e * bits, table);
+        }
+        sg__V_write(g, rd, r);
+        return 1;
+    case SNX_A64_OP_LUTI2_1b:
+    case SNX_A64_OP_LUTI2_1h:
+    case SNX_A64_OP_LUTI4_1b:
+    case SNX_A64_OP_LUTI4_2h: {
+        unsigned by = insn->op == SNX_A64_OP_LUTI2_1b || insn->op == SNX_A64_OP_LUTI2_1h ? 2 : 4; /* a number's bits */
+        unsigned at;
+        bits = insn->op == SNX_A64_OP_LUTI2_1b || insn->op == SNX_A64_OP_LUTI4_1b ? 8 : 16;
+        n = 128 / bits;
+        at = (unsigned)a->idx * n * by; /* the segment of Vm */
+        table = vbits(g, rn, 127, 0);
+        if (insn->op == SNX_A64_OP_LUTI4_2h) table = sg_d_concat(g, vbits(g, (rn + 1) & 31, 127, 0), table);
+        r = sg_d_empty(128);
+        for (e = 0; e < n; ++e) {
+            SgI i = sg_i_uint(g, vbits(g, rm, at + (e + 1) * by - 1, at + e * by));
+            sg_d_set_slice(g, &r, (e + 1) * bits - 1, e * bits, sg_d_elem_dyn(g, table, i, bits));
+        }
+        sg__V_write(g, rd, r);
+        return 1;
+    }
+    default: return 0;
+    }
+    r = sg_FPToFixed(g, 0, vbits(g, rn, fsize - 1, 0), 0, uns, sg_FPCR_read(g), round, isize);
+    sg__V_write(g, rd, sg_d_zext(g, r, 128));
+    return 1;
+}
+
+/* FEAT_FP8's, as FPMR zero has them (E5M2, no scale, no saturation): the state holds no FPMR, and an MSR or MRS of it
+   is undefined, so zero is what it stays */
+static int fp8(Unit* u, const SnxA64Insn* insn, SnxU32 word) {
+    SgCtx* g = u->g;
+    unsigned rd = word & 31, rn = word >> 5 & 31, rm = word >> 16 & 31, q = word >> 30 & 1, e, n, bits, count;
+    unsigned byte = (word >> 11 & 1) << 3 | (word >> 19 & 7), lane = 0; /* by element: Vm's byte; Vn's in the group */
+    int by_element = 0;
+    SgD r = sg_d_empty(128), args[4];
+    switch (insn->op) {
+    case SNX_A64_OP_FSCALE:
+        bits = 8u << insn->args.esz;
+        for (e = 0; e < (q ? 128 : 64) / bits; ++e) {
+            args[0] = vbits(g, rn, (e + 1) * bits - 1, e * bits);
+            args[1] = vbits(g, rm, (e + 1) * bits - 1, e * bits);
+            args[0] = sgx_fp(g, "snx_x64_fp_scale", 0, sg_FPCR_read(g), args, 2, 1, bits, bits);
+            sg_d_set_slice(g, &r, (e + 1) * bits - 1, e * bits, args[0]);
+        }
+        sg__V_write(g, rd, r);
+        return 1;
+    case SNX_A64_OP_F1CVTL:
+    case SNX_A64_OP_F2CVTL:
+    case SNX_A64_OP_BF1CVTL:
+    case SNX_A64_OP_BF2CVTL:
+        for (e = 0; e < 8; ++e) {
+            args[0] = sg_d_zext(g, vbits(g, rn, 64 * q + 8 * e + 7, 64 * q + 8 * e), 64);
+            args[1] = sgx_const(32, insn->op == SNX_A64_OP_BF1CVTL || insn->op == SNX_A64_OP_BF2CVTL);
+            args[0] = sg_d_slice(g, sgx_call(g, "snx_x64_fp8_widen", 0, 1, args, 2, 64), 15, 0);
+            sg_d_set_slice(g, &r, 16 * e + 15, 16 * e, args[0]);
+        }
+        sg__V_write(g, rd, r);
+        return 1;
+    case SNX_A64_OP_FCVTN_bh:
+    case SNX_A64_OP_FCVTN_bs:
+        bits = insn->op == SNX_A64_OP_FCVTN_bh ? 16 : 32;
+        n = bits == 16 && !q ? 4 : 128 / bits; /* of Vn, and then of Vm */
+        count = bits == 32 && q ? 64 : 0;      /* FCVTN2's: the register's top half, the other kept */
+        if (count) sg_d_set_slice(g, &r, 63, 0, vbits(g, rd, 63, 0));
+        for (e = 0; e < 2 * n; ++e) {
+            unsigned at = e % n * bits, to = count + 8 * e;
+            args[0] = sg_d_zext(g, vbits(g, e < n ? rn : rm, at + bits - 1, at), 64);
+            args[1] = sgx_const(32, bits);
+            args[0] = sg_d_slice(g, sgx_call(g, "snx_x64_fp8_narrow", 0, 1, args, 2, 64), 7, 0);
+            sg_d_set_slice(g, &r, to + 7, to, args[0]);
+        }
+        sg__V_write(g, rd, r);
+        return 1;
+    /* sums of n products of bytes, each into an element of bits */
+    case SNX_A64_OP_FDOT_sb_vi:
+        byte = 4 * ((word >> 11 & 1) << 1 | (word >> 21 & 1));
+        by_element = 1; /* fallthrough */
+    case SNX_A64_OP_FDOT_sb_v: bits = 32, n = 4, count = q ? 4 : 2; break;
+    case SNX_A64_OP_FDOT_hb_vi:
+        byte = 2 * ((word >> 11 & 1) << 2 | (word >> 20 & 3));
+        rm &= 15;
+        by_element = 1; /* fallthrough */
+    case SNX_A64_OP_FDOT_hb_v: bits = 16, n = 2, count = q ? 8 : 4; break;
+    case SNX_A64_OP_FMLAL_hb_vi:
+        rm &= 7;
+        by_element = 1; /* fallthrough */
+    case SNX_A64_OP_FMLAL_hb_v: bits = 16, n = 1, count = 8, lane = q; break;
+    case SNX_A64_OP_FMLALL_sb_vi:
+        rm &= 7;
+        by_element = 1; /* fallthrough */
+    case SNX_A64_OP_FMLALL_sb_v: bits = 32, n = 1, count = 4, lane = q << 1 | (word >> 22 & 1); break;
+    case SNX_A64_OP_FMMLA_sb: bits = 32, n = 8, count = 4; break;
+    case SNX_A64_OP_FMMLA_hb: bits = 16, n = 4, count = 8; break;
+    default: return 0;
+    }
+    for (e = 0; e < count; ++e) {
+        unsigned an, am;
+        if (n * 8 > bits) /* a matrix of 2 rows and 2 columns in each bits * 4 */
+            an = e / 4 * 64 + (e >> 1 & 1) * 8 * n, am = e / 4 * 64 + (e & 1) * 8 * n;
+        else
+            an = am = e * bits + 8 * lane;
+        if (by_element) am = 8 * byte;
+        args[0] = sg_d_zext(g, vbits(g, rd, (e + 1) * bits - 1, e * bits), 64);
+        args[1] = sg_d_zext(g, vbits(g, rn, an + 8 * n - 1, an), 64);
+        args[2] = sg_d_zext(g, vbits(g, rm, am + 8 * n - 1, am), 64);
+        args[3] = sgx_const(32, bits | n << 8);
+        args[0] = sg_d_slice(g, sgx_call(g, "snx_x64_fp8_dot", 0, 0, args, 4, 64), (long long)bits - 1, 0);
+        sg_d_set_slice(g, &r, (e + 1) * bits - 1, e * bits, args[0]);
+    }
+    sg__V_write(g, rd, r);
+    return 1;
+}
+
+/* FEAT_CMPBR's: CB<cc> of two registers (CBB<cc>'s and CBH<cc>'s low byte or halfword), or of one and a 6-bit
+   integer */
+static void compare_branch(Unit* u, const SnxA64Insn* insn, SnxU32 word) {
+    /* the comparisons sgx_d_cmp64 has: == != < <= > >=; the ones cc names, of registers and of an integer */
+    static const signed char reg[8] = {4, 5, 4, 5, 0, 0, 0, 1}, imm[8] = {4, 2, 4, 2, 0, 0, 0, 1};
+    SgCtx* g = u->g;
+    unsigned cc = word >> 21 & 7, bits;
+    int is_signed = cc < 2, by_reg = insn->op == SNX_A64_OP_CB_cond;
+    SgD a = xzr_or(g, word & 31), b;
+    bits = by_reg ? 8u << insn->args.esz : word >> 31 ? 64 : 32;
+    a = sg_d_slice(g, a, bits - 1, 0);
+    b = by_reg ? sg_d_slice(g, xzr_or(g, word >> 16 & 31), bits - 1, 0) : sgx_const(bits, word >> 15 & 63);
+    a = is_signed ? sg_d_sext(g, a, 64) : sg_d_zext(g, a, 64);
+    b = is_signed ? sg_d_sext(g, b, 64) : sg_d_zext(g, b, 64);
+    g->taken = sgx_d_cmp64(g, by_reg ? reg[cc] : imm[cc], a, b, !is_signed);
+    g->branched = 1;
+}
+
+/* FEAT_LSE128's LDCLRP, LDSETP and SWPP: CASP's loop, the pair read until no other write came between */
+static void pair_atomic(Unit* u, const SnxA64Insn* insn, SnxU32 word, SnxU64 address) {
+    SgCtx* g = u->g;
+    unsigned rt = word & 31, rn = word >> 5 & 31, rt2 = word >> 16 & 31;
+    int again = new_label(u);
+    SgD base, old, value, next, got;
+    flush_to(u, address);
+    bind(u, again);
+    base = sg_GPR_read(g, rn);
+    old = sg_d_concat(g, sg_GuestMemRead(g, sg_d_add_int(g, base, 8), 8, 0), sg_GuestMemRead(g, base, 8, 0));
+    value = sg_d_concat(g, sg_GPR_read(g, rt2), sg_GPR_read(g, rt));
+    next = insn->op == SNX_A64_OP_LDCLRP   ? sg_d_and(g, old, sg_d_not(g, value))
+           : insn->op == SNX_A64_OP_LDSETP ? sg_d_or(g, old, value)
+                                           : value;
+    got = sg_GuestCompareSwap(g, base, old, next);
+    jump_if(u, sg_b_not(g, sg_d_eq(g, got, old)), again, address);
+    sg_GPR_write(g, rt, sg_d_slice(g, got, 63, 0));
+    sg_GPR_write(g, rt2, sg_d_slice(g, got, 127, 64));
+}
+
+/* FEAT_MOPS's SET and CPY: option A (PSTATE.C 0), the whole of it in the first of the three instructions, as it may be;
+   the other two do what Xn still holds, nothing after it. A copy that must go backward leaves Xd and Xs as they were */
+static int memory_op(Unit* u, const SnxA64Insn* insn, SnxU32 word) {
+    SgCtx* g = u->g;
+    unsigned rd = word & 31, rn = word >> 5 & 31, rs = word >> 16 & 31;
+    SgD d, s, n, args[3], zero = sgx_const(64, 0);
+    SgB back;
+    int set = 0, first = 0;
+    switch (insn->op) {
+    case SNX_A64_OP_SETP:
+    case SNX_A64_OP_SETGP: first = 1; /* fallthrough */
+    case SNX_A64_OP_SETM:
+    case SNX_A64_OP_SETE:
+    case SNX_A64_OP_SETGM:
+    case SNX_A64_OP_SETGE: set = 1; break;
+    case SNX_A64_OP_CPYP:
+    case SNX_A64_OP_CPYFP: first = 1; break;
+    case SNX_A64_OP_CPYM:
+    case SNX_A64_OP_CPYE:
+    case SNX_A64_OP_CPYFM:
+    case SNX_A64_OP_CPYFE: break;
+    default: return 0;
+    }
+    d = sg_GPR_read(g, rd);
+    n = sg_GPR_read(g, rn);
+    s = xzr_or(g, rs);
+    if (first) {
+        SgD most = sgx_const(64, set ? 0x7FFFFFFFFFFFFFFFull : 0x007FFFFFFFFFFFFFull);
+        n = sg_d_select(g, sgx_d_ult(g, most, n), most, n);
+        /* backward: Xd past Xs and before its end */
+        back = sg_bool(g, 0);
+        if (insn->op == SNX_A64_OP_CPYP) back = sg_b_and(g, sgx_d_ult(g, s, d), sgx_d_ult(g, sg_d_sub(g, d, s), n));
+        args[0] = d, args[1] = set ? n : s, args[2] = set ? s : n;
+        sgx_call(g, set ? "snx_x64_set" : "snx_x64_copy", 0, 1, args, 3, 0);
+        sg_GPR_write(g, rd, sg_d_select(g, back, d, sg_d_add(g, d, n)));
+        if (!set) sg_GPR_write(g, rs, sg_d_select(g, back, s, sg_d_add(g, s, n)));
+        sg_PSTATE_write(g, SG_PSTATE_N, 4, sgx_const(4, 0));
+    } else {
+        /* Xn below 0: so many bytes before Xd (and Xs); above, a copy backward's, from Xd (and Xs) on */
+        SgB forward = sgx_d_cmp64(g, 2, n, zero, 0);
+        SgD left = sg_d_select(g, forward, sg_d_sub(g, zero, n), n);
+        SgD to = sg_d_select(g, forward, sg_d_add(g, d, n), d);
+        args[0] = to;
+        args[1] = set ? left : sg_d_select(g, forward, sg_d_add(g, s, n), s);
+        args[2] = set ? s : left;
+        sgx_call(g, set ? "snx_x64_set" : "snx_x64_copy", 0, 1, args, 3, 0);
+    }
+    sg_GPR_write(g, rn, zero);
+    return 1;
+}
+
+/* instructions past the guests' CPUs that are others', or nothing, where EL0 runs: 1 made, -1 UNDEF, 0 the Sail's (of
+   g->word). No allocation tag is kept (FEAT_MTE): STG and ST2G only move their base, the zeroing forms clear their
+   16-byte granules too, LDG gives a tag of 0 and STGP stores its pair, as ir_ldst.c's; the forms of many tags are
+   EL1's */
+static int past_guests(Unit* u, const SnxA64Insn* insn, SnxU32 word, SnxU64 address_of) {
+    SgCtx* g = u->g;
+    const SnxA64Args* a = &insn->args;
+    SnxU64 offset = (SnxU64)(int64_t)a->imm;
+    SgD base, address;
+    int k, bytes = 0;
+    switch (insn->op) {
+    /* PSTATE.DIT, SSBS and TCO change nothing this CPU keeps */
+    case SNX_A64_OP_MSR_i_DIT:
+    case SNX_A64_OP_MSR_i_SBSS:
+    case SNX_A64_OP_MSR_i_TCO: return 1;
+    /* a speculation barrier is a whole one, and DSB's nXS form is DSB */
+    case SNX_A64_OP_SB:
+    case SNX_A64_OP_DSB_nXS: g->word = 0xD5033F9Fu; return 0;
+    /* waits that may end at any time: YIELD */
+    case SNX_A64_OP_WFET:
+    case SNX_A64_OP_WFIT: g->word = 0xD503203Fu; return 0;
+    /* no guarded control stack and no streaming mode, and the array forms of the tags are EL1's */
+    case SNX_A64_OP_MSR_i_SVCR:
+    case SNX_A64_OP_GCSSTR:
+    case SNX_A64_OP_LDGM:
+    case SNX_A64_OP_STGM:
+    case SNX_A64_OP_STZGM: return -1;
+    case SNX_A64_OP_LDG:
+        if (a->rt != 31)
+            sg_GPR_write(g, a->rt, sg_d_and(g, sg_GPR_read(g, a->rt), sgx_const(64, ~((SnxU64)15 << 56))));
+        return 1;
+    case SNX_A64_OP_STGP: offset <<= 4; bytes = -1; break;
+    case SNX_A64_OP_STZG: bytes = 16; break;
+    case SNX_A64_OP_STZ2G: bytes = 32; break;
+    case SNX_A64_OP_STG:
+    case SNX_A64_OP_ST2G: break;
+    case SNX_A64_OP_LDCLRP:
+    case SNX_A64_OP_LDSETP:
+    case SNX_A64_OP_SWPP: pair_atomic(u, insn, word, address_of); return 1;
+    default: return memory_op(u, insn, word) || newer(u, insn, word) || fp8(u, insn, word);
+    }
+    base = sg_GPR_read(g, a->rn);
+    address = a->p ? base : sg_d_add_int(g, base, (long long)offset);
+    if (bytes < 0) {
+        sg_GuestMemWrite(g, address, 8, 0, xzr_or(g, (unsigned)a->rt));
+        sg_GuestMemWrite(g, sg_d_add_int(g, address, 8), 8, 0, xzr_or(g, (unsigned)a->rt2));
+    }
+    for (k = 0; k < bytes; k += 8) sg_GuestMemWrite(g, sg_d_add_int(g, address, k), 8, 0, sgx_const(64, 0));
+    if (a->w) sg_GPR_write(g, a->rn, a->p ? sg_d_add_int(g, base, (long long)offset) : address);
+    return 1;
+}
+
+/* u->f can't be made, for its instruction u->at (its count: for no instruction's), or for what failed there (why, else
+   NULL): said, once a function, with what it becomes */
+static void no_code(Unit* u, const char* why) {
+    const SnxFunction* f = u->f;
+    const char* becomes =
+        u->options->alone ? "it raises an undefined instruction where it runs" : "LLVM makes the function";
+    SnxU64 address;
+    SnxU32 word = 0;
+    SnxA64Insn insn;
+    if (u->options->refused) ++*u->options->refused;
+    if (u->at >= f->count) {
+        snx_error("native back end: the function at 0x%llx: %s%s", (unsigned long long)f->start,
+                  why ? why : "longer than its branches reach", u->options->alone ? "" : ": LLVM makes the function");
+        return;
+    }
+    address = snx_function_address(f, u->at);
+    (void)snx_codegen_word((SnxCodegen*)u->codegen, address, &word);
+    snx_a64_decode_word(word, u->codegen->features, &insn);
+    if (why) {
+        snx_error("native back end: the function at 0x%llx: %s, at or before %s (%08x) at 0x%llx: %s",
+                  (unsigned long long)f->start, why, snx_a64_op_text(insn.op), (unsigned)word,
+                  (unsigned long long)address, becomes);
+        return;
+    }
+    SnxU64 past = insn.feature & ~(SnxU64)SNX_A64_TARGET_OUNCE;
+    snx_error("native back end: the function at 0x%llx: %s (%08x) at 0x%llx %s%s, which it has no code for (the "
+              "guest's target is %s): %s",
+              (unsigned long long)f->start, snx_a64_op_text(insn.op), (unsigned)word, (unsigned long long)address,
+              past ? "needs " : "is one", past ? snx_a64_feature_text(past) : "",
+              snx_a64_target_text(u->codegen->features), becomes);
+}
+
 static int instruction(Unit* u, size_t index, SnxU64 address, SnxU32 word) {
     SgCtx* g = u->g;
     SgX* x = &g->x;
@@ -926,6 +1287,11 @@ static int instruction(Unit* u, size_t index, SnxU64 address, SnxU32 word) {
     g->taken = 0;
     g->exclusive_count = g->exclusive_next = 0;
     g->status = 0;
+    g->qc = 0;
+    for (size_t k = 0; k < u->nnone; ++k)
+        if (u->none[k] == address) goto undef;
+    for (size_t k = 0; k < u->options->without_count; ++k)
+        if (u->options->without[k] == word) return 0;
     switch (insn.flow) {
     case SNX_A64_FLOW_UNDEF:
     undef:
@@ -934,7 +1300,6 @@ static int instruction(Unit* u, size_t index, SnxU64 address, SnxU32 word) {
         leave(u);
         return 1;
     case SNX_A64_FLOW_PLAIN:
-        if (insn.feature & ~(SnxU64)SNX_A64_TARGET_OUNCE) goto undef;
         if (insn.op == SNX_A64_OP_SYS) {
             int k = sys(u, word);
             if (k < 0) goto undef;
@@ -951,6 +1316,22 @@ static int instruction(Unit* u, size_t index, SnxU64 address, SnxU32 word) {
             int v = vec(u, &insn, word);
             if (v < 0) goto undef;
             if (v) break;
+        }
+        if (insn.feature & ~(SnxU64)SNX_A64_TARGET_OUNCE) {
+            int v = past_guests(u, &insn, word, address);
+            if (v < 0) goto undef;
+            if (v) break;
+        }
+        if (insn.op == SNX_A64_OP_LDXR || insn.op == SNX_A64_OP_LDXP || insn.op == SNX_A64_OP_STXR) {
+            /* the fields the encoding wants all ones, which the Sail's decode reads so and the processor ignores: Rt2
+               of a single's, Rs of a load's */
+            if (insn.op != SNX_A64_OP_LDXP) g->word |= 31u << 10;
+            if (insn.op != SNX_A64_OP_STXR) g->word |= 31u << 16;
+        }
+        if ((word >> 25 & 7) == 7 && (x->n > SGX_MAXI / 4 || x->nv > SGX_MAXV / 4 || x->nb > SGX_MAXB / 4)) {
+            /* an Advanced SIMD instruction by its elements may take most of a region: it begins one */
+            flush_to(u, address);
+            g->start = x->n;
         }
         if (!sg_decode(g) || x->unmade) return 0;
         if (g->undefined) {
@@ -971,7 +1352,9 @@ static int instruction(Unit* u, size_t index, SnxU64 address, SnxU32 word) {
         terminal = 1;
         break;
     case SNX_A64_FLOW_BC:
-        if (!sg_decode(g) || x->unmade || !g->branched) return 0;
+        if (insn.op == SNX_A64_OP_CB_cond || insn.op == SNX_A64_OP_CB_cond_imm) compare_branch(u, &insn, word);
+        else if (!sg_decode(g) || x->unmade || !g->branched)
+            return 0;
         target = snx_a64_branch_target(&insn, address);
         if (g->taken) {
             /* the region goes on past the JCC: what the block knows (its registers' values, the flags, constants)
@@ -1593,6 +1976,7 @@ static int function(Unit* u, const SnxFunction* f, size_t index) {
     char sym[40];
     u->f = f;
     u->index = index;
+    u->at = f->count;
     u->nframe = 0;
     u->a.cold.n = 0;
     u->a.ncjumps = u->a.nccalls = 0;
@@ -1600,6 +1984,7 @@ static int function(Unit* u, const SnxFunction* f, size_t index) {
     u->a.slots_max = 0;
     u->nstubs = 0;
     g_fail = &jb;
+    g_why = NULL;
     if (setjmp(jb)) {
         ok = 0;
         goto out;
@@ -1641,6 +2026,7 @@ static int function(Unit* u, const SnxFunction* f, size_t index) {
                 bind(u, lab0 + (int)vi);
             }
             (void)snx_codegen_word((SnxCodegen*)u->codegen, address, &word);
+            u->at = vi;
             if (!instruction(u, vi, address, word)) {
                 ok = 0;
                 goto out;
@@ -1648,6 +2034,7 @@ static int function(Unit* u, const SnxFunction* f, size_t index) {
         }
     }
     flush(u);
+    u->at = f->count;
     leave(u); /* off the end */
     /* mismatch: { c->pc = e; goto D; } or { CALLDYN(e); return; }; D: the poll, then switch (c->pc) over the
        leaders, else CALLDYN(c->pc) */
@@ -1686,6 +2073,7 @@ out:
         u->g->x.n = 0;
         u->g->x.nv = 1;
         u->g->x.nb = 1;
+        u->g->x.unmade = 0;
     }
     u->nfixups = ok ? u->nfixups : fix0;
     u->nlabels = lab0; /* a function's labels are its own */
@@ -1694,6 +2082,7 @@ out:
 
 /* ---- the ELF object ---- */
 
+#if !defined(_WIN32) /* whose objects are COFF: MG_WRITE_OBJECT's */
 typedef struct {
     unsigned char* p;
     size_t n, cap;
@@ -1910,6 +2299,7 @@ static int write_object(Unit* u, unsigned char** object, size_t* size) {
     *size = o.n;
     return 0;
 }
+#endif
 
 static int mach_object(SnxCodegen* codegen, size_t first, size_t last, const SnxNativeOptions* options,
                        unsigned char* made, unsigned char** object, size_t* size, char* error, size_t error_size,
@@ -1930,6 +2320,9 @@ static int mach_object(SnxCodegen* codegen, size_t first, size_t last, const Snx
     u.b.p = (unsigned char*)malloc(u.b.cap);
     u.b.index = -1;
     u.b.disp = 0;
+#ifdef MG_R_FAR
+    u.b.absolute = options->jit;
+#endif
     u.codegen = codegen;
     u.options = options;
     u.a.b = &u.b;
@@ -1943,7 +2336,7 @@ static int mach_object(SnxCodegen* codegen, size_t first, size_t last, const Snx
     u.g->x.nv = 1;
     u.g->x.nb = 1;
     for (i = first; i < last; ++i) {
-        size_t before = u.b.n;
+        size_t before = u.b.n, relocs = u.nrelocs, syms = u.nsyms;
         if (options->llvm_at && codegen->functions[i].start == options->llvm_at) {
             if (options->jit) break; /* made[] stays 0: LLVM's, for the IR it prints */
             continue;
@@ -1952,25 +2345,64 @@ static int mach_object(SnxCodegen* codegen, size_t first, size_t last, const Snx
             u.b.cap = u.b.cap * 2 + codegen->functions[i].count * 400 + 4096;
             u.b.p = (unsigned char*)realloc(u.b.p, u.b.cap);
         }
+        u.again = 0;
         made[i - first] = (unsigned char)function(&u, &codegen->functions[i], i);
+        if (!made[i - first] && u.again) made[i - first] = (unsigned char)function(&u, &codegen->functions[i], i);
         if (u.b.n > u.b.cap) {
-            /* past the buffer: grown, and made again */
+            /* past the buffer: grown, and made again, its symbol and relocations too */
+            for (; u.nrelocs > relocs; --u.nrelocs) free(u.relocs[u.nrelocs - 1].sym);
+            for (; u.nsyms > syms; --u.nsyms) free(u.syms[u.nsyms - 1].name);
             u.b.n = before;
             u.b.cap *= 4;
             u.b.p = (unsigned char*)realloc(u.b.p, u.b.cap);
             --i;
             continue;
         }
+#ifdef MG_FAR_JUMPS
+        if (!made[i - first] && !u.far && u.at >= codegen->functions[i].count) {
+            /* a jump's reach: made again with the long ones */
+            u.far = 1;
+            --i;
+            continue;
+        }
+        u.far = 0;
+#endif
+        if (!made[i - first]) {
+            if (!u.nnone) no_code(&u, g_why);
+            if (options->alone && u.at < codegen->functions[i].count) {
+                SnxU64 address = snx_function_address(&codegen->functions[i], u.at);
+                if (!u.nnone || u.none[u.nnone - 1] != address) {
+                    /* made again, that instruction undefined */
+                    u.none = (SnxU64*)grow(u.none, &u.cap_none, u.nnone + 1, sizeof *u.none);
+                    u.none[u.nnone++] = address;
+                    --i;
+                    continue;
+                }
+                /* it was already: what fails there is no instruction's */
+                snx_error("native back end: the function at 0x%llx is not made",
+                          (unsigned long long)codegen->functions[i].start);
+            }
+        }
+        u.nnone = 0;
         count += made[i - first];
         if (options->jit && !made[i - first]) break;
     }
     if (options->jit && count != last - first) count = 0;
     if (count) {
-        write_object(&u, object, size);
+        int written = 0;
+#ifdef MG_WRITE_OBJECT
+        written = MG_WRITE_OBJECT(&u, object, size);
+#endif
+#if !defined(_WIN32)
+        if (!written) write_object(&u, object, size);
+#else
+        (void)written;
+#endif
     }
     for (i = 0; i < u.nrelocs; ++i) free(u.relocs[i].sym);
     for (i = 0; i < u.nsyms; ++i) free(u.syms[i].name);
     free(u.relocs), free(u.syms), free(u.fixups), free(u.label_at), free(u.frame_at), free(u.stubs), free(u.b.p);
+    free(u.none);
     free(u.live_buf), free(u.exits_buf), free(u.vlive_buf);
     free(u.a.cold.p), free(u.a.pool), free(u.a.rips), free(u.a.cjumps), free(u.a.ccalls);
     free(u.g);

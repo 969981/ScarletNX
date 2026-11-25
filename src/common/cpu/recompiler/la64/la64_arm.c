@@ -16,7 +16,7 @@
 
 #if !defined(_WIN32)
 /* the ELF LoongArch relocations the blocks have (the LoongArch ELF psABI's numbers) */
-enum { LA_EM = 258, LA_R_64 = 2, LA_R_CALL36 = 110 };
+enum { LA_EM = 258, LA_R_64_PCREL = 109, LA_R_CALL36 = 110 };
 #define MG_ARM_INC         "a32_la64.inc"
 #define MG_ARM             SnxLa64Arm
 #define MG_ARM_NEXT        SnxLa64ArmNext
@@ -28,8 +28,9 @@ enum { LA_EM = 258, LA_R_64 = 2, LA_R_CALL36 = 110 };
 #define MG_ARM_ELF_FLAGS   0x43 /* the LP64D ABI, object file v1 */
 #define MG_ARM_CALL_RELOC  LA_R_CALL36
 #define MG_ARM_R_TAIL      LA_R_CALL36
-#define MG_ARM_R_ABS64     LA_R_64
+#define MG_ARM_R_LITERAL   LA_R_64_PCREL
 #define MG_ARM_ENTRY_EXIT  "snx_la64_a32_entry_exit"
+#define MG_ARM_THUMB_ENTRY "snx_la64_thumb_entry"
 #define MG_ARM_LOAD_FENCE  1 /* a load is no acquire: a DBAR after it */
 #define MG_ARM_FP_HOT      0
 
@@ -50,11 +51,19 @@ enum { LA_EM = 258, LA_R_64 = 2, LA_R_CALL36 = 110 };
 int snx_la64_arm_available(void) { return 0; }
 SnxLa64Arm* snx_la64_arm_new(void) { return NULL; }
 void snx_la64_arm_free(SnxLa64Arm* c) { (void)c; }
+int snx_la64_arm_options(SnxLa64Arm* c, const SnxArmCodegenOptions* options) {
+    (void)c, (void)options;
+    return -1;
+}
 int snx_la64_arm_block(SnxLa64Arm* c, const char* name, const unsigned char* code, size_t count, uint32_t pc,
                        size_t* consumed, SnxLa64ArmNext next, void* user) {
     (void)c, (void)name, (void)code, (void)count, (void)pc, (void)next, (void)user;
     *consumed = 0;
     return 0;
+}
+int snx_la64_arm_thumb_block(SnxLa64Arm* c, const char* name, const unsigned char* code, size_t count, uint32_t pc,
+                             size_t* consumed, SnxLa64ArmNext next, void* user) {
+    return snx_la64_arm_block(c, name, code, count, pc, consumed, next, user);
 }
 const char* snx_la64_arm_why(const SnxLa64Arm* c) {
     (void)c;

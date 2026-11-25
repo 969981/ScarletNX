@@ -5,8 +5,8 @@
 
    The function's ABI is GuestFn's under n64: the state in a0, kept in s0, the entry in a1 (SGX_FN_TARGET); ra, gp, fp
    and s0-s7 saved (mips64.h's frame), s1-s7 and gp the pinned guest registers. The object is ELF MIPS64 (n64, its
-   relocations' r_info laid out as n64's): a call's and snx_stale's absolute address an R_MIPS_64 in the code, the
-   callee entered through t9 */
+   relocations' r_info laid out as n64's): a call's and snx_stale's literal in the code is a distance (R_MIPS_PC32), or
+   in a JIT unit the address (R_MIPS_64), the callee entered through t9 */
 #include "common/cpu/recompiler/mips64/mips64_codegen.h"
 #include "common/cpu/recompiler/llvm/link.h"
 #include "common/cpu/recompiler/llvm/elf_object.h"
@@ -32,7 +32,9 @@
 
 /* a word the emitters can't make (bits.h's sg_fail) leaves the function to another back end */
 static _Thread_local jmp_buf* g_fail;
+static _Thread_local const char* g_why; /* what it was */
 #define SG_FAIL_JUMP g_fail
+#define SG_FAIL_NOTE(what, a, b) (g_why = (what), (void)(a), (void)(b))
 #define SGX_FN 1
 
 typedef struct SgXAsm SgXAsm;
@@ -52,10 +54,13 @@ static inline void sgx_machine_op(SgXAsm* a, int at, const unsigned char* r);
 #define MG_ELF_FLAGS 0x80000007u /* MIPS64 release 2, PIC, CPIC, NOREORDER: LLVM's mips64el objects' */
 #define MG_R_INFO(sym, type) snx_elf_info(EM_MIPS, (sym), (type))
 #define MG_R_ABS64 SNX_MIPS_64
-#define MG_R_CALL SNX_MIPS_64
-#define MG_R_TAIL SNX_MIPS_64
+#define MG_R_LITERAL SNX_MIPS_PC32
+#define MG_R_FAR SNX_MIPS_64 /* a JIT unit's literals: its code may be out of a PC32's reach of what it names */
+#define MG_R_CALL MG_R_LITERAL
+#define MG_R_TAIL MG_R_LITERAL
 #define SGX_FN_TARGET 5 /* a1 */
 static const signed char mg_pin_hosts[8] = {17, 18, 19, 20, 21, 22, 23, 28}; /* s1-s7, gp */
+#define MG_FAR_JUMPS 1 /* past B's 128 KiB: rk_j_far */
 #define MG_NPINS 8
 #define MG_NPINS_FIXED 8
 #define MG_PIN_RESERVED(h) 0

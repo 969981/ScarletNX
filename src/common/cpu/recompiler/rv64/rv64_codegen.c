@@ -33,7 +33,9 @@
 
 /* a word the emitters can't make (bits.h's sg_fail) leaves the function to another back end */
 static _Thread_local jmp_buf* g_fail;
+static _Thread_local const char* g_why; /* what it was */
 #define SG_FAIL_JUMP g_fail
+#define SG_FAIL_NOTE(what, a, b) (g_why = (what), (void)(a), (void)(b))
 #define SGX_FN 1
 
 typedef struct SgXAsm SgXAsm;
@@ -45,10 +47,12 @@ static inline void sgx_machine_op(SgXAsm* a, int at, const unsigned char* r);
 #define MG_EM EM_RISCV
 #define MG_ELF_FLAGS 0x5 /* RVC, the LP64D float ABI: LLVM's riscv64 objects' */
 #define MG_R_ABS64 SNX_RV_64
+#define MG_R_LITERAL SNX_RV_32_PCREL
 #define MG_R_CALL SNX_RV_CALL_PLT
 #define MG_R_TAIL SNX_RV_CALL_PLT
 #define SGX_FN_TARGET 11 /* a1 */
 static const signed char mg_pin_hosts[10] = {18, 19, 20, 21, 22, 23, 24, 25, 26, 27}; /* s2-s11 */
+#define MG_FAR_JUMPS 1 /* past JAL's 1 MiB: AUIPC and JALR */
 #define MG_NPINS 10
 #define MG_NPINS_FIXED 10
 #define MG_PIN_RESERVED(h) 0

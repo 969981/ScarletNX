@@ -4,6 +4,7 @@
    x64/x64_codegen.h, arm64/arm64_codegen.h) */
 #ifndef SNX_RECOMPILER_NATIVE_H
 #define SNX_RECOMPILER_NATIVE_H
+#include "common/cpu/arm/codegen.h"
 #include "common/cpu/recompiler/codegen.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -23,13 +24,25 @@ typedef struct {
     void* bound_user;
     /* a function left to LLVM, 0 for none: the one whose IR the setting ir_dump_pc prints */
     SnxU64 llvm_at;
+    /* no other back end makes what this one can't: an instruction it has no code for raises an undefined instruction
+       where it runs, and its function is made. 0: the function is left to LLVM */
+    int alone;
+    /* where not NULL, how many functions it could not make whole, added to it; each is said once (snx_error) */
+    size_t* refused;
+    /* words taken as ones there is no code for, how many: what a test of that asks for */
+    const SnxU32* without;
+    size_t without_count;
     /* the AOT module's stale checks (ir_codegen.c's snx_ir_stale_checks): snx_stale[the function's index] read at the
        entry and after each call's return */
     int stale;
 } SnxNativeOptions;
 
-/* this host's native back end (mach/native.c): x86-64's on an x86-64 host that loads ELF objects, arm64's on an arm64
-   one; 1 where there is one */
+/* what r's modules are made without (SnxNativeOptions.without), as a test of it asks: words is kept as it is */
+struct snx_recompiler;
+void snx_native_without(struct snx_recompiler* r, const SnxU32* words, size_t count);
+
+/* this host's native back end (mach/native.c): x86-64's on an x86-64 host, arm64's on an arm64 one that loads ELF
+   objects...; 1 where there is one */
 int snx_native_available(void);
 /* its name, for the recompiler's lines ("x86-64", "arm64"; "none") */
 const char* snx_native_name(void);
@@ -50,9 +63,12 @@ typedef size_t (*SnxNativeArmNext)(void* user, uint32_t key, size_t units, size_
 int snx_native_arm_available(void);
 SnxNativeArm* snx_native_arm_new(void);
 void snx_native_arm_free(SnxNativeArm* c);
+/* what the next blocks are made for (cpu/arm/codegen.h; NULL the Cortex-A57 on flat memory, as a new compiler's): 0, or
+   -1 for options no block compiler takes */
+int snx_native_arm_options(SnxNativeArm* c, const SnxArmCodegenOptions* options);
 int snx_native_arm_block(SnxNativeArm* c, const char* name, const unsigned char* code, size_t count, uint32_t pc,
                          size_t* consumed, SnxNativeArmNext next, void* user);
-/* the Thumb block at pc, where the host's back end makes them (x86-64's); refused elsewhere */
+/* the Thumb block at pc, its code little-endian halfwords, *consumed the halfwords it covers */
 int snx_native_thumb_block(SnxNativeArm* c, const char* name, const unsigned char* code, size_t count, uint32_t pc,
                            size_t* consumed, SnxNativeArmNext next, void* user);
 const char* snx_native_arm_why(const SnxNativeArm* c);
@@ -62,8 +78,9 @@ int snx_native_arm_entry(SnxNativeArm* c, uint32_t key);
 
 /* An AOT module descriptor's few functions in a RISC machine's code (mach/risc_desc.inc, each one's code generator),
    for nx/loader/module_x64.c, which writes the data and puts each function in: its code and its relocations (of sym +
-   addend at the code's byte at; type 0 an address of 8 bytes, the machine's abs64), the object's machine, e_flags and
-   byte order the machine's. Each 0, -1 out of room */
+   addend at the code's byte at; type 0 a literal's, the machine's literal), the object's machine, e_flags and byte order
+   the machine's. The code holds no address of the module's (abs64, the data's): a text relocation, which the linker
+   refuses. Each 0, -1 out of room */
 typedef struct {
     unsigned char code[1024];
     size_t size;
@@ -77,7 +94,7 @@ typedef struct {
 } SnxNativeFn;
 typedef struct SnxNativeDesc {
     const char* name;
-    unsigned em, elf_flags, abs64;
+    unsigned em, elf_flags, abs64, literal;
     int big;
     /* a function returning &sym */
     int (*returns)(SnxNativeFn* f, const char* sym);

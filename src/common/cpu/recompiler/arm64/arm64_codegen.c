@@ -38,7 +38,9 @@
 
 /* a word the emitters can't make (bits.h's sg_fail) leaves the function to another back end */
 static _Thread_local jmp_buf* g_fail;
+static _Thread_local const char* g_why; /* what it was */
 #define SG_FAIL_JUMP g_fail
+#define SG_FAIL_NOTE(what, a, b) (g_why = (what), (void)(a), (void)(b))
 #define SGX_FN 1
 
 typedef struct SgXAsm SgXAsm;
@@ -55,6 +57,8 @@ static const signed char mg_pin_hosts[9] = {20, 21, 22, 23, 24, 25, 26, 27, 28};
 #define MG_NPINS_FIXED 9
 #define MG_PIN_RESERVED(h) 0
 #define MG_BOUND 1
+#define MG_FAR_JUMPS 1             /* past B.cond's 1 MiB: the opposite over a B */
+#define MG_POOL_REACH (512u << 10) /* LDR (literal)'s is 1 MiB */
 #define MG_VPIN(k) (31 - (k))
 #define MG_NVPINS 8
 #define MG_XRESERVED 0xFF80u /* V8-V15 (the callee's low halves), V7 (arm64_vec.c's scratch) */
@@ -92,6 +96,11 @@ static void jmp(Unit* u, int label) {
     w32(u, sge_a64_b_uncond(0));
 }
 static void jcc(Unit* u, int cc, int label) {
+    if (u->far) {
+        w32(u, sge_a64_b_cond((SnxU32)cc ^ 1, 2));
+        jmp(u, label);
+        return;
+    }
     fixup(u, label, FIX_BCOND);
     w32(u, sge_a64_b_cond((SnxU32)cc, 0));
 }
@@ -352,6 +361,12 @@ static int put_offset(Unit* u, size_t at, long long d, int kind) {
     u->b.p[at] = (unsigned char)w, u->b.p[at + 1] = (unsigned char)(w >> 8), u->b.p[at + 2] = (unsigned char)(w >> 16);
     u->b.p[at + 3] = (unsigned char)(w >> 24);
     return 1;
+}
+static void mg_pool_island(Unit* u) {
+    size_t at = u->b.n;
+    w32(u, sge_a64_b_uncond(0));
+    sgx_pool_emit(&u->a);
+    put_offset(u, at, (long long)(u->b.n - at) / 4, FIX_B);
 }
 static int mg_finish(Unit* u, size_t fix0) {
     size_t i;

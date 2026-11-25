@@ -32,6 +32,27 @@
 #ifndef SGX_FP_HELPERS
 #define SGX_FP_HELPERS 0 /* mach_a64.h's exact helpers for all the floating point, not the machine's own code */
 #endif
+/* a machine of two calling conventions (x64.h's): the registers values may be in, a call's argument n's register (past
+   the machine's registers, SGX_NREG + a slot of the frame, where the convention has it on the stack), the frame's first
+   slot for values (those below are the convention's) and the vector registers no value may be in as the callee's */
+#ifndef SGX_POOL
+#define SGX_POOL(a) sgx_pool
+#define SGX_POOL_N(a) sizeof sgx_pool
+#endif
+#ifndef SGX_ARG_REG
+#define SGX_ARG_REG(x, n) sgx_arg_regs[n]
+#endif
+#ifndef SGX_A32_ARG /* AArch32's calls' after the state, its exclusive store's registers and a bus access's memory's base */
+#define SGX_A32_ARG(x, n) sgx_a32_args[n]
+#define SGX_A32_STREX_REGS(x) sgx_a32_strex
+#define SGX_A32_BUS_MEM(x) sgx_a32_args[3]
+#endif
+#ifndef SGX_SLOT0
+#define SGX_SLOT0(a) 0
+#endif
+#ifndef SGX_XCALLEE
+#define SGX_XCALLEE(a) 0u
+#endif
 
 /* ---- the SSA of the block's instructions ---- */
 
@@ -162,6 +183,26 @@ static inline int sgx_dead_words(SnxU64 dead, SnxU32 vdead, unsigned short* word
 #define SGX_MAXDW 8
 #define SGX_WIDE 256
 
+/* an integer known only when the guest runs, exactly (SgI's node): the operation it is of other integers, or bits, and
+   the doublewords of its value in two's complement that something has read so far (sgx_int_dw makes them). bits: how
+   many hold it, its sign's included; pos: it is never negative, so bits - 1 hold it and zeros are past them */
+#define SGX_IDW    4 /* 256 bits at most */
+#define SGX_MAXINT 1024
+enum {
+    SGX_IN_BITS, SGX_IN_ADD, SGX_IN_SUB, SGX_IN_MUL, SGX_IN_SHL, SGX_IN_SHR, SGX_IN_SHLV, SGX_IN_SHRV, SGX_IN_SELECT
+};
+typedef struct {
+    unsigned id; /* its number, which its place in the ring (SgX.ints) is another's where they differ */
+    unsigned char op, pos;
+    unsigned char made, carried; /* the doublewords made (bit k the k-th's), and whether the carry is */
+    short bits;
+    unsigned a, b; /* what it is of */
+    int c;         /* SGX_IN_SELECT: the condition, of a where it holds */
+    long long k;   /* SGX_IN_SHL, SGX_IN_SHR: the amount */
+    SgD n;         /* SGX_IN_SHLV, SGX_IN_SHRV: the amount, of 64 bits, from 0 to 255 */
+    SgD dw[SGX_IDW], carry; /* ADD's and SUB's carry (borrow) out of the first, 0 or 1 of 64 bits */
+} SgXInt;
+
 typedef struct {
     SgXIns ins[SGX_MAXI];
     int n;
@@ -185,6 +226,8 @@ typedef struct {
        lowest first, an SgD's wide - 1 indexing them; a ring, as they live for an instruction's emission */
     SgD wide[SGX_WIDE][SGX_MAXDW];
     unsigned nwide;
+    SgXInt ints[SGX_MAXINT]; /* the exact integers, a ring as wide's is: an instruction's */
+    unsigned nints;
     /* a few recent values, for one made again (each is checked against the instruction that made it, which a new region
        has replaced): vector forms of registers alone, the pool's loads, sums of two registers */
     int vec_seen[16], pool_seen[8], sum_seen[8];
@@ -201,7 +244,8 @@ typedef int SgB;
 
 /* an integer known only when the guest runs: its value modulo 2^64 (v, an SgD of 64 bits: what gen.c's (x).v reads),
    or not made yet: the product of a and b (UMULH's, SMULH's high half), or x MOD 2^m (a shift's amount, which the
-   shift's x86 form takes as it is: the selection proved its count mask is Arm's MOD datasize) */
+   shift's x86 form takes as it is: the selection proved its count mask is Arm's MOD datasize). What needs more of it
+   than that (a saturation, a shift right) reads its exact value (node) */
 enum { SGX_I_VAL, SGX_I_MUL, SGX_I_MOD };
 typedef struct {
     SgD v;
@@ -210,6 +254,7 @@ typedef struct {
     unsigned w;
     SgD a, b;
     long long m;
+    unsigned node; /* the exact integer (SgXInt) it is, 0 for one its 64 bits are, as signed */
 } SgI;
 
 /* ---- the machine's values (x64_asm.h's for x86-64) ----
@@ -675,6 +720,9 @@ static inline void sgx_dws(SgCtx* g, SgD a, SgD* out) {
         out[0] = sg_d_zext(g, a, 64);
         return;
     }
+    if (a.w > 128 && (a.v || a.vh || a.k || a.kh)) sg_fail("bits past 128 that are not Zeros", a.w, 0);
+    for (k = 2; k < n; ++k) out[k] = sgx_const(64, 0); /* sg_d_fill's Zeros */
+    if (a.w > 128) a.w = 128;
     out[0] = sgx_half(a, 0);
     out[1] = sg_d_zext(g, sgx_half(a, 1), 64);
 }
@@ -1041,6 +1089,11 @@ static inline SgD sgx_shift_i(SgCtx* g, int kind, SgD a, long long n) {
     unsigned w = a.w, pw = sgx_width(w);
     SgD r;
     if (!n) return a;
+    if (kind == 3 && w != 32 && w != 64 && w) {
+        /* a rotation of other bits (SHA's y @ x): the low n of them over the rest */
+        n %= w;
+        return n ? sg_d_concat(g, sg_d_slice(g, a, n - 1, 0), sg_d_slice(g, a, w - 1, n)) : a;
+    }
     if (kind != 3 && n >= (long long)w && w <= 64) {
         /* by the width or more (SRI's mask of LSR(Ones(esize), esize)): zeros, or the sign's copies */
         if (kind != 2) return sgx_const(w, 0);
@@ -1505,15 +1558,182 @@ static inline SgI sgx_int(SgD v, int is_signed) {
     i.w = v.w;
     return i;
 }
-static inline SgI sg_i_uint(SgCtx* g, SgD x) {
-    SgI i = sgx_int(sg_d_zext(g, x, 64), 0);
-    i.uint = 1;
+
+/* ---- an integer's exact value ---- */
+
+/* the exact integer numbered id */
+static inline SgXInt* sgx_int_at(SgX* x, unsigned id) {
+    SgXInt* n = &x->ints[id % SGX_MAXINT];
+    if (!id || n->id != id) sg_fail("an integer of more than SGX_MAXINT operations", (long long)id, SGX_MAXINT);
+    return n;
+}
+/* a new one: op of a and b, of so many bits */
+static inline SgXInt* sgx_int_new(SgX* x, int op, unsigned a, unsigned b, int bits, int pos) {
+    SgXInt* n;
+    if (bits > 64 * SGX_IDW) sg_fail("an integer over 256 bits", bits, op);
+    n = &x->ints[++x->nints % SGX_MAXINT];
+    memset(n, 0, sizeof *n);
+    n->id = x->nints;
+    n->op = (unsigned char)op;
+    n->a = a;
+    n->b = b;
+    n->bits = (short)bits;
+    n->pos = (unsigned char)(pos != 0);
+    return n;
+}
+/* how many doublewords hold it: past them its sign's copies (zeros, where it is never negative) */
+static inline unsigned sgx_int_ndw(const SgXInt* n) {
+    int bits = n->pos ? n->bits - 1 : n->bits;
+    return bits <= 64 ? 1u : ((unsigned)bits + 63) / 64;
+}
+static inline SgD sgx_i_val(SgCtx* g, SgI* i);
+/* i's node: the one it has, or of its 64 bits as a signed integer */
+static inline unsigned sgx_i_node(SgCtx* g, SgI* i) {
+    SgX* x = sgx(g);
+    SgXInt* n;
+    SgD v;
+    if (i->node) return i->node;
+    v = sgx_i_val(g, i);
+    n = sgx_int_new(x, SGX_IN_BITS, 0, 0, 64, 0);
+    n->dw[0] = v;
+    n->made = 1;
+    return i->node = n->id;
+}
+static inline int sgx_i_bits(SgCtx* g, const SgI* i) { return i->node ? sgx_int_at(sgx(g), i->node)->bits : 64; }
+static inline int sgx_i_pos(SgCtx* g, const SgI* i) { return i->node ? sgx_int_at(sgx(g), i->node)->pos : 0; }
+
+static inline SnxU64 sgx_mulh(SnxU64 a, SnxU64 b, int is_signed);
+static inline SgD sgx_int_dw(SgCtx* g, unsigned id, unsigned k);
+/* a bool as a doubleword 0 or 1 */
+static inline SgD sgx_b_dw(SgCtx* g, SgB b) { return sg_d_zext(g, sgx_bool_bits(sgx(g), b), 64); }
+/* the carry (a difference's borrow) out of the first doubleword of a sum */
+static inline SgD sgx_int_carry(SgCtx* g, unsigned id) {
+    SgXInt* n = sgx_int_at(sgx(g), id);
+    SgD a, b, c;
+    if (n->carried) return n->carry;
+    a = sgx_int_dw(g, n->a, 0);
+    b = sgx_int_dw(g, n->b, 0);
+    c = sgx_b_dw(g, n->op == SGX_IN_SUB ? sgx_d_ult(g, a, b) : sgx_d_ult(g, sgx_int_dw(g, id, 0), a));
+    n->carry = c;
+    n->carried = 1;
+    return c;
+}
+/* the amount's bit that moves a whole doubleword (64) or two (128) */
+static inline SgB sgx_int_moves(SgCtx* g, SgD amount, unsigned by) {
+    return sg_b_not(g, sg_d_is_zero(g, sg_d_and(g, amount, sgx_const(64, by))));
+}
+/* SGX_IN_SHLV's doubleword k by the amount's low 6 bits alone */
+static inline SgD sgx_int_shifted(SgCtx* g, const SgXInt* n, unsigned k) {
+    SgD lo = sg_d_shift_dyn(g, sgx_int_dw(g, n->a, k), n->n, 0), other;
+    if (!k) return lo;
+    other = sg_d_lsr(g, sgx_int_dw(g, n->a, k - 1), 1);
+    return sg_d_or(g, lo, sg_d_shift_dyn(g, other, sg_d_not(g, n->n), 1)); /* by 63 - (n MOD 64) more */
+}
+/* doubleword k of an integer's value in two's complement */
+static inline SgD sgx_int_dw(SgCtx* g, unsigned id, unsigned k) {
+    SgXInt* n = sgx_int_at(sgx(g), id);
+    unsigned ndw = sgx_int_ndw(n);
+    SgD r;
+    if (k >= ndw) {
+        if (n->pos) return sgx_const(64, 0);
+        return sg_d_asr(g, sgx_int_dw(g, id, ndw - 1), 63);
+    }
+    if (n->made >> k & 1) return n->dw[k];
+    switch (n->op) {
+    case SGX_IN_ADD:
+    case SGX_IN_SUB: {
+        SgD a = sgx_int_dw(g, n->a, k), b = sgx_int_dw(g, n->b, k);
+        r = n->op == SGX_IN_SUB ? sg_d_sub(g, a, b) : sg_d_add(g, a, b);
+        if (k > 1) sg_fail("a sum of integers past 128 bits", n->bits, k);
+        if (k) {
+            SgD in = sgx_int_carry(g, id);
+            r = n->op == SGX_IN_SUB ? sg_d_sub(g, r, in) : sg_d_add(g, r, in);
+        }
+        break;
+    }
+    case SGX_IN_MUL: {
+        /* of two integers that fit 64 bits with their sign: the low half is made already, the high one is SMULH */
+        const SgXInt *a = sgx_int_at(sgx(g), n->a), *b = sgx_int_at(sgx(g), n->b);
+        SgD av, bv;
+        SgX* x = sgx(g);
+        if (k != 1 || a->bits > 64 || b->bits > 64) sg_fail("a product of integers over 64 bits", n->bits, k);
+        av = sgx_int_dw(g, n->a, 0);
+        bv = sgx_int_dw(g, n->b, 0);
+        if (sgx_is_const(&av) && sgx_is_const(&bv)) r = sgx_const(64, sgx_mulh(av.k, bv.k, 1));
+        else
+            r = SGX_OP(x, smulh, 64, av, bv);
+        break;
+    }
+    case SGX_IN_SHL: {
+        long long q = n->k / 64, s = n->k % 64;
+        SgD lo = (long long)k >= q ? sgx_int_dw(g, n->a, (unsigned)((long long)k - q)) : sgx_const(64, 0);
+        r = sg_d_lsl(g, lo, s);
+        if (s && (long long)k > q)
+            r = sg_d_or(g, r, sg_d_lsr(g, sgx_int_dw(g, n->a, (unsigned)((long long)k - q - 1)), 64 - s));
+        break;
+    }
+    case SGX_IN_SHR: {
+        unsigned q = (unsigned)(n->k / 64);
+        long long s = n->k % 64;
+        const SgXInt* a = sgx_int_at(sgx(g), n->a);
+        SgD lo = sgx_int_dw(g, n->a, k + q);
+        if (!s) r = lo;
+        else if (k + q + 1 >= sgx_int_ndw(a))
+            r = a->pos ? sg_d_lsr(g, lo, s) : sg_d_asr(g, lo, s);
+        else
+            r = sg_d_or(g, sg_d_lsr(g, lo, s), sg_d_lsl(g, sgx_int_dw(g, n->a, k + q + 1), 64 - s));
+        break;
+    }
+    case SGX_IN_SHLV: {
+        /* by 64 where the amount is 64 or more (sgx_i_shift): the doublewords moved up one */
+        SgB far = sgx_int_moves(g, n->n, 192);
+        SgD t = sgx_int_shifted(g, n, k);
+        r = sg_d_select(g, far, k ? sgx_int_dw(g, n->a, k - 1) : sgx_const(64, 0), t);
+        break;
+    }
+    case SGX_IN_SHRV: { /* of one doubleword: the sign from an amount of 64 on */
+        const SgXInt* a = sgx_int_at(sgx(g), n->a);
+        SgD t;
+        if (sgx_int_ndw(a) > 1) sg_fail("a shift right by the guest's amount of an integer over 64 bits", a->bits, k);
+        t = sg_d_shift_dyn(g, sgx_int_dw(g, n->a, 0), n->n, a->pos ? 1 : 2);
+        r = sg_d_select(g, sgx_int_moves(g, n->n, 192), sgx_int_dw(g, n->a, 1), t);
+        break;
+    }
+    case SGX_IN_SELECT: r = sg_d_select(g, n->c, sgx_int_dw(g, n->a, k), sgx_int_dw(g, n->b, k)); break;
+    default: sg_fail("an integer's doubleword nothing made", n->op, k);
+    }
+    n->dw[k] = r;
+    n->made |= (unsigned char)(1u << k);
+    return r;
+}
+
+/* UInt(x), SInt(x) and a constant */
+static inline SgI sgx_i_bits_of(SgCtx* g, SgD bits, int is_signed) {
+    SgXInt* n;
+    SgI i;
+    unsigned w = bits.w;
+    if (w > 64) sg_fail("an integer of bits past 64", w, is_signed);
+    i = sgx_int(is_signed ? sg_d_sext(g, bits, 64) : sg_d_zext(g, bits, 64), is_signed);
+    n = sgx_int_new(sgx(g), SGX_IN_BITS, 0, 0, (int)w + !is_signed, !is_signed);
+    n->dw[0] = i.v;
+    n->made = 1;
+    i.uint = !is_signed;
+    i.node = n->id;
     return i;
 }
-static inline SgI sg_i_sint(SgCtx* g, SgD x) { return sgx_int(sg_d_sext(g, x, 64), 1); }
+static inline SgI sg_i_uint(SgCtx* g, SgD x) { return sgx_i_bits_of(g, x, 0); }
+static inline SgI sg_i_sint(SgCtx* g, SgD x) { return sgx_i_bits_of(g, x, 1); }
 static inline SgI sg_i_const(SgCtx* g, long long v) {
-    (void)g;
-    return sgx_int(sgx_const(64, (SnxU64)v), 1);
+    SgI i = sgx_int(sgx_const(64, (SnxU64)v), 1);
+    SnxU64 m = v < 0 ? ~(SnxU64)v : (SnxU64)v;
+    int bits = 1;
+    SgXInt* n;
+    for (; m; m >>= 1) ++bits;
+    n = sgx_int_new(sgx(g), SGX_IN_BITS, 0, 0, bits, v >= 0);
+    n->dw[0] = i.v;
+    n->made = 1;
+    i.node = n->id;
+    return i;
 }
 /* made modulo 2^64: what an integer's slice of its low bits reads */
 static inline SgD sgx_i_val(SgCtx* g, SgI* i) {
@@ -1526,20 +1746,71 @@ static inline SgD sgx_i_val(SgCtx* g, SgI* i) {
         i->kind = SGX_I_VAL;
     } else if (i->kind == SGX_I_MOD)
         i->v = sg_d_zext(g, sg_d_slice(g, i->v, i->m - 1, 0), 64), i->kind = SGX_I_VAL;
+    if (i->node) {
+        SgXInt* n = sgx_int_at(x, i->node);
+        if (!(n->made & 1)) n->dw[0] = i->v, n->made |= 1;
+    }
     return i->v;
 }
-static inline SgI sg_i_add(SgCtx* g, SgI a, SgI b) { return sgx_int(sg_d_add(g, sgx_i_val(g, &a), sgx_i_val(g, &b)), a.is_signed); }
-static inline SgI sg_i_sub(SgCtx* g, SgI a, SgI b) { return sgx_int(sg_d_sub(g, sgx_i_val(g, &a), sgx_i_val(g, &b)), a.is_signed); }
+/* the sum (op SGX_IN_ADD) or the difference of two */
+static inline SgI sgx_i_sum(SgCtx* g, int op, SgI a, SgI b) {
+    SgX* x = sgx(g);
+    SgD av = sgx_i_val(g, &a), bv = sgx_i_val(g, &b);
+    SgI r = sgx_int(op == SGX_IN_SUB ? sg_d_sub(g, av, bv) : sg_d_add(g, av, bv), a.is_signed);
+    unsigned na = sgx_i_node(g, &a), nb = sgx_i_node(g, &b);
+    int ba = sgx_i_bits(g, &a), bb = sgx_i_bits(g, &b);
+    SgXInt* n = sgx_int_new(x, op, na, nb, (ba > bb ? ba : bb) + 1,
+                            op == SGX_IN_ADD && sgx_i_pos(g, &a) && sgx_i_pos(g, &b));
+    n->dw[0] = r.v;
+    n->made = 1;
+    r.node = n->id;
+    return r;
+}
+static inline SgI sg_i_add(SgCtx* g, SgI a, SgI b) { return sgx_i_sum(g, SGX_IN_ADD, a, b); }
+static inline SgI sg_i_sub(SgCtx* g, SgI a, SgI b) { return sgx_i_sum(g, SGX_IN_SUB, a, b); }
+static inline SgI sg_i_neg(SgCtx* g, SgI a) { return sg_i_sub(g, sg_i_const(g, 0), a); }
 static inline SgI sg_i_mul(SgCtx* g, SgI a, SgI b) {
     SgI r;
+    unsigned na = sgx_i_node(g, &a), nb = sgx_i_node(g, &b);
+    int pos = sgx_i_pos(g, &a) && sgx_i_pos(g, &b);
     memset(&r, 0, sizeof r);
     r.kind = SGX_I_MUL;
     r.a = sgx_i_val(g, &a);
     r.b = sgx_i_val(g, &b);
     r.is_signed = a.is_signed || b.is_signed;
     r.w = 64;
+    r.node = sgx_int_new(sgx(g), SGX_IN_MUL, na, nb, sgx_i_bits(g, &a) + sgx_i_bits(g, &b) - pos, pos)->id;
     return r;
 }
+/* a << k and a >> k (a floor), k known when it recompiles (sg_i_shl, sg_i_shr) or an integer from 0 to 255 known when
+   the guest runs (sg_i_shl_dyn, sg_i_shr_dyn). A shift left by one of 64 or more is by 64: the value's low 64 bits are
+   0 either way, and unless it is 0 it is past what 64 bits hold, which is all a slice of 64 bits or a saturation to
+   them asks of it (an amount below 0, which the Sail doesn't shift by, gives any value) */
+static inline SgI sgx_i_shift(SgCtx* g, int op, SgI a, long long k, SgI* amount) {
+    unsigned na = sgx_i_node(g, &a), id;
+    int ba = sgx_i_bits(g, &a), pos = sgx_i_pos(g, &a), left = op == SGX_IN_SHL || op == SGX_IN_SHLV;
+    SgXInt* n;
+    SgI r;
+    (void)sgx_i_val(g, &a); /* its low doubleword, made (a product's) */
+    if (!amount && (k < 0 || k > 255)) sg_fail("an integer shifted by an amount out of its range", k, left);
+    if (left) ba += amount ? 64 : (int)k;
+    else if (!amount)
+        ba = ba - (int)k > pos + 1 ? ba - (int)k : pos + 1;
+    n = sgx_int_new(sgx(g), op, na, 0, ba, pos);
+    id = n->id;
+    n->k = k;
+    if (amount) {
+        n->n = sgx_i_val(g, amount);
+        sgx_flat(sgx(g), &n->n);
+    }
+    r = sgx_int(sgx_int_dw(g, id, 0), a.is_signed);
+    r.node = id;
+    return r;
+}
+static inline SgI sg_i_shl(SgCtx* g, SgI a, long long k) { return sgx_i_shift(g, SGX_IN_SHL, a, k, NULL); }
+static inline SgI sg_i_shr(SgCtx* g, SgI a, long long k) { return sgx_i_shift(g, SGX_IN_SHR, a, k, NULL); }
+static inline SgI sg_i_shl_dyn(SgCtx* g, SgI a, SgI k) { return sgx_i_shift(g, SGX_IN_SHLV, a, 0, &k); }
+static inline SgI sg_i_shr_dyn(SgCtx* g, SgI a, SgI k) { return sgx_i_shift(g, SGX_IN_SHRV, a, 0, &k); }
 
 /* the product of two constants, 128 bits: its high half (signed or not) */
 static inline SnxU64 sgx_mulh(SnxU64 a, SnxU64 b, int is_signed) {
@@ -1563,6 +1834,7 @@ static inline SgI sg_i_mod(SgCtx* g, SgI a, long long m) {
     if (a.kind == SGX_I_VAL && sgx_is_const(&a.v)) return sgx_int(sgx_const(64, a.v.k & (SnxU64)(m - 1)), a.is_signed);
     a.kind = SGX_I_MOD;
     a.m = k;
+    a.node = 0;
     return a;
 }
 static inline SgD sg_i_slice(SgCtx* g, SgI i, long long hi, long long lo) {
@@ -1987,6 +2259,7 @@ typedef struct SgXAsm {
        registers pins hold, which no value is given (reserved, xreserved) */
     void (*pin_cs)(void* machine, int store);
     unsigned reserved, xreserved;
+    unsigned xsaved; /* the callee's vector registers the function saved itself (x64.h's SGX_XCALLEE) */
     /* the constant pool (16 bytes each) the function's RIP-relative operands read, after its code
        (sgx_pool_emit), and where each such operand's displacement is */
     SnxU64 (*pool)[2];
@@ -2068,11 +2341,12 @@ static inline void sgx_spill(SgXAsm* a, int r) { sgx_spill_at(a, r, -1); }
 /* a host register free at instruction at, none of avoid's (a mask: the registers the instruction reads or writes):
    one whose value nothing reads after, or else the one whose value is read latest, spilled */
 static inline int sgx_free_reg(SgXAsm* a, int at, unsigned avoid) {
-    unsigned k, n = a->x->pool && (unsigned)a->x->pool < sizeof sgx_pool ? (unsigned)a->x->pool : sizeof sgx_pool;
+    const signed char* pool = SGX_POOL(a);
+    unsigned k, n = a->x->pool && (unsigned)a->x->pool < SGX_POOL_N(a) ? (unsigned)a->x->pool : SGX_POOL_N(a);
     int best = -1;
     avoid |= a->reserved;
     for (k = 0; k < n; ++k) {
-        int r = sgx_pool[k];
+        int r = pool[k];
         if (avoid & (1u << r)) continue;
         if (!a->owner[r] || (a->owner[r] > 0 && a->x->v[a->owner[r]].last < at)) {
             if (a->owner[r] > 0) a->x->v[a->owner[r]].reg = -1;
@@ -2081,7 +2355,7 @@ static inline int sgx_free_reg(SgXAsm* a, int at, unsigned avoid) {
         }
     }
     for (k = 0; k < n; ++k) {
-        int r = sgx_pool[k];
+        int r = pool[k];
         if ((avoid & (1u << r)) || a->owner[r] <= 0) continue;
         if (best < 0 || a->x->v[a->owner[r]].last > a->x->v[a->owner[best]].last) best = r;
     }
@@ -2111,11 +2385,12 @@ static inline void sgx_evict(SgXAsm* a, int r, int at, unsigned avoid) {
     int v = a->owner[r];
     if (v > 0 && a->x->v[v].last > at) {
         /* a free register of the pool, else its slot (spilled from r, where the instruction may still read it) */
-        unsigned k, n = a->x->pool && (unsigned)a->x->pool < sizeof sgx_pool ? (unsigned)a->x->pool : sizeof sgx_pool;
+        const signed char* pool = SGX_POOL(a);
+        unsigned k, n = a->x->pool && (unsigned)a->x->pool < SGX_POOL_N(a) ? (unsigned)a->x->pool : SGX_POOL_N(a);
         int to = -1;
         avoid |= a->reserved; /* R10 and R11 when they hold pins, which the value would overwrite */
         for (k = 0; k < n && to < 0; ++k) {
-            int c = sgx_pool[k];
+            int c = pool[k];
             if (((avoid | (1u << r)) >> c) & 1) continue;
             if (!a->owner[c] || (a->owner[c] > 0 && a->x->v[a->owner[c]].last < at)) {
                 if (a->owner[c] > 0) a->x->v[a->owner[c]].reg = -1;
@@ -2137,10 +2412,11 @@ static inline void sgx_evict(SgXAsm* a, int r, int at, unsigned avoid) {
 
 /* a caller-saved register none of held's, for a call's argument of no fixed register */
 static inline int sgx_arg_free(SgXAsm* a, unsigned held) {
+    const signed char* pool = SGX_POOL(a);
     unsigned k;
     held |= a->reserved;
-    for (k = 0; k < sizeof sgx_pool; ++k)
-        if (!(held & (1u << sgx_pool[k]))) return sgx_pool[k];
+    for (k = 0; k < SGX_POOL_N(a); ++k)
+        if (!(held & (1u << pool[k]))) return pool[k];
     sg_fail("no register for a call's argument", (long long)held, 0);
 }
 
@@ -2533,9 +2809,10 @@ static inline void sgx_assemble_region(SgXAsm* a, SgX* x) {
     SgXBuf* b = a->b;
     a->x = x;
     if (x->xpool) a->xreserved |= ~0u << x->xpool;
+    a->xreserved |= SGX_XCALLEE(a);
     memset(a->owner, 0, sizeof a->owner);
     memset(a->xowner, 0, sizeof a->xowner);
-    a->slots = 0;
+    a->slots = SGX_SLOT0(a);
     for (i = 0; i < x->nv; ++i) {
         x->v[i].reg = -1;
         x->v[i].slot = -1;
@@ -2643,10 +2920,15 @@ static inline void sgx_assemble_region(SgXAsm* a, SgX* x) {
                 for (k = 0; k < SGX_MACHINE_IN; ++k)
                     if (s->in[k]) {
                         SgXV* vv = &x->v[s->in[k]];
-                        int fr = s->fixed[k] >= 0 ? s->fixed[k] : sgx_arg_free(a, held);
+                        int stack = s->fixed[k] >= SGX_NREG; /* on the stack: through a register, put there */
+                        int fr = s->fixed[k] >= 0 && !stack ? s->fixed[k] : sgx_arg_free(a, held);
                         if (vv->xmm >= 0) sgx_spill_x(a, 0, vv->xmm, fr);
                         else
                             sgx_mov_mem(a, 1, 64, fr, SGX_FRAME, 8 * vv->slot);
+                        if (stack) {
+                            sgx_mov_mem(a, 0, 64, fr, SGX_FRAME, 8 * (s->fixed[k] - SGX_NREG));
+                            continue;
+                        }
                         held |= 1u << fr;
                         r[k] = (unsigned char)fr;
                     }
@@ -2829,11 +3111,27 @@ static inline SgI sg_i_div(SgCtx* g, SgI a, SgI b) {
     return sgx_int(q, s);
 }
 
-/* c ? a : b of integers, modulo 2^64 (UDIV's and SDIV's divisor-0 case) */
+/* c ? a : b of integers */
 static inline SgI sg_i_select(SgCtx* g, SgB c, SgI a, SgI b) {
     int s = a.is_signed || b.is_signed;
+    SgX* x = sgx(g);
     SgD av = sgx_i_val(g, &a), bv = sgx_i_val(g, &b);
-    return sgx_int(sg_d_select(g, c, av, bv), s);
+    unsigned na, nb;
+    SgXInt* n;
+    SgI r;
+    if (x->b[c].kind == SGX_B_CONST) return x->b[c].v ? a : b;
+    r = sgx_int(sg_d_select(g, c, av, bv), s);
+    na = sgx_i_node(g, &a), nb = sgx_i_node(g, &b);
+    n = sgx_int_new(x, SGX_IN_SELECT, na, nb, 0, sgx_i_pos(g, &a) && sgx_i_pos(g, &b));
+    {
+        int ba = sgx_i_bits(g, &a), bb = sgx_i_bits(g, &b);
+        n->bits = (short)(ba > bb ? ba : bb);
+    }
+    n->c = c;
+    n->dw[0] = r.v;
+    n->made = 1;
+    r.node = n->id;
+    return r;
 }
 
 /* the sum of x's elements of size bits, modulo 2^size (gen.c's halves, ADDV's Reduce, on a machine whose back end has
@@ -2856,30 +3154,21 @@ static inline SgD sg_d_reduce_add(SgCtx* g, SgD x, unsigned size) {
 /* IsZeroBit: '1' where x is zero */
 static inline SgD sg_d_is_zero_bit(SgCtx* g, SgD x) { return sgx_bool_bits(sgx(g), sg_d_is_zero(g, x)); }
 
-/* a == b, !=, <, <=, > and >= (op 0 to 5) of integers known only at run time: their values modulo 2^64 compared as
-   signed, which is exact for what AArch32's decode compares (UInt and SInt of 32 bits at most, and their sums), or as
-   unsigned where both are UInt's (or one a constant from 0 to 2^63 - 1: CMHS's elements of 64 bits); a product,
-   which may not be exact, is left to another back end */
-static inline SgB sg_i_cmp(SgCtx* g, int op, SgI a, SgI b) {
+/* a op b of 64-bit values, signed or not */
+static inline SgB sgx_d_cmp64(SgCtx* g, int op, SgD av, SgD bv, int uns) {
     static const int scond[6] = {SGX_ARM_EQ, SGX_ARM_NE, SGX_ARM_LT, SGX_ARM_LE, SGX_ARM_GT, SGX_ARM_GE};
     static const int ucond[6] = {SGX_ARM_EQ, SGX_ARM_NE, SGX_ARM_CC, SGX_ARM_LS, SGX_ARM_HI, SGX_ARM_CS};
-    const int* cond = scond;
+    const int* cond = uns ? ucond : scond;
     static const int mirror[6] = {0, 1, 4, 5, 2, 3}; /* a op b is b mirror[op] a */
     SgX* x = sgx(g);
-    if (op < 0 || op > 5) sg_fail("a comparison of integers it does not know", op, 5);
-    if (a.kind == SGX_I_MUL || b.kind == SGX_I_MUL) sg_fail("a comparison of a product", op, 0);
-    SgD av = sgx_i_val(g, &a), bv = sgx_i_val(g, &b);
     sgx_flat(x, &av);
     sgx_flat(x, &bv);
-    if ((a.uint || (sgx_is_const(&av) && (long long)av.k >= 0)) && (b.uint || (sgx_is_const(&bv) && (long long)bv.k >= 0)) &&
-        (a.uint || b.uint))
-        cond = ucond;
     if (sgx_is_const(&av) && sgx_is_const(&bv)) {
         long long p = (long long)av.k, q = (long long)bv.k;
         SnxU64 up = av.k, uq = bv.k;
-        int r = cond == ucond
-                    ? (op == 0 ? up == uq : op == 1 ? up != uq : op == 2 ? up < uq : op == 3 ? up <= uq : op == 4 ? up > uq : up >= uq)
-                    : (op == 0 ? p == q : op == 1 ? p != q : op == 2 ? p < q : op == 3 ? p <= q : op == 4 ? p > q : p >= q);
+        int less = uns ? up < uq : p < q;
+        int more = !less && p != q;
+        int r = op <= 1 ? (p == q) != op : op == 2 ? less : op == 3 ? !more : op == 4 ? more : !less;
         return sgx_bool(x, SGX_B_CONST, r, 0);
     }
     if (sgx_is_const(&av)) {
@@ -2902,6 +3191,97 @@ static inline SgB sg_i_cmp(SgCtx* g, int op, SgI a, SgI b) {
     if (!s) sg_fail("no CMP form", op, 0);
     sgx_emit(x, s, in, 2, 64, 0, -1);
     return sgx_bool(x, SGX_B_CC, x->flags_ins, s->cc_of[cond[op]]);
+}
+/* a == b, !=, <, <=, > and >= (op 0 to 5) of integers known only at run time: their values modulo 2^64 compared as
+   signed, where their bits fit (UInt and SInt of 32 bits at most, and their sums), or as unsigned where both are
+   UInt's (or one a constant from 0 to 2^63 - 1: CMHS's elements of 64 bits) */
+static inline SgB sg_i_cmp(SgCtx* g, int op, SgI a, SgI b) {
+    int uns;
+    if (op < 0 || op > 5) sg_fail("a comparison of integers it does not know", op, 5);
+    SgD av = sgx_i_val(g, &a), bv = sgx_i_val(g, &b);
+    uns = (a.uint || (sgx_is_const(&av) && (long long)av.k >= 0)) &&
+          (b.uint || (sgx_is_const(&bv) && (long long)bv.k >= 0)) && (a.uint || b.uint) &&
+          sgx_i_bits(g, &a) <= 65 && sgx_i_bits(g, &b) <= 65;
+    if (!uns && (sgx_i_bits(g, &a) > 64 || sgx_i_bits(g, &b) > 64))
+        sg_fail("a comparison of integers past 64 bits", sgx_i_bits(g, &a), sgx_i_bits(g, &b));
+    return sgx_d_cmp64(g, op, av, bv, uns);
+}
+/* Min(a, b), Max(a, b) and Abs(a) */
+static inline SgI sg_i_minmax(SgCtx* g, SgI a, SgI b, int minimum) {
+    SgB c = sg_i_cmp(g, minimum ? 3 : 5, a, b);
+    return sg_i_select(g, c, a, b);
+}
+static inline SgI sg_i_abs(SgCtx* g, SgI a) {
+    SgI n, r;
+    if (sgx_i_pos(g, &a)) return a;
+    n = sg_i_neg(g, a);
+    r = sg_i_select(g, sg_i_cmp(g, 2, a, sg_i_const(g, 0)), n, a);
+    if (r.node) sgx_int_at(sgx(g), r.node)->pos = 1;
+    return r;
+}
+/* SatQ(i, N, is_unsigned): i's low N bits where i is the integer they are, else the limit nearer to it, and whether it
+   isn't: its doublewords against those bits' extension, and the limit by its sign */
+static inline void sg_SatQ(SgCtx* g, SgI i, long long n, int is_unsigned, SgD* result, SgB* saturated) {
+    unsigned id = sgx_i_node(g, &i), k;
+    int bits = sgx_i_bits(g, &i), pos = sgx_i_pos(g, &i) != 0;
+    SgD low = sg_i_slice(g, i, n - 1, 0), ext, diff, sign, limit;
+    is_unsigned = is_unsigned != 0;
+    const SgXInt* node = sgx_int_at(sgx(g), id);
+    unsigned ndw = sgx_int_ndw(node);
+    if (n < 1 || n > 64) sg_fail("a saturation to these bits", n, is_unsigned);
+    if (is_unsigned ? pos && bits - 1 <= n : bits <= n) { /* it always is */
+        *result = low;
+        *saturated = sg_bool(g, 0);
+        return;
+    }
+    ext = is_unsigned ? sg_d_zext(g, low, 64) : sg_d_sext(g, low, 64);
+    diff = sg_d_xor(g, sgx_int_dw(g, id, 0), ext);
+    sign = is_unsigned ? sgx_const(64, 0) : sg_d_asr(g, ext, 63);
+    /* its sign too, past its doublewords, where the limits' kind is another's: an unsigned one's of an integer that may
+       be negative, a signed one's of one that never is */
+    for (k = 1; k < ndw + (is_unsigned != pos); ++k) diff = sg_d_or(g, diff, sg_d_xor(g, sgx_int_dw(g, id, k), sign));
+    /* the limit: 0 or all ones for an unsigned one, the smallest or the largest, by the sign of i's top doubleword */
+    if (pos) limit = sgx_const(64, sg_ones((unsigned)(is_unsigned ? n : n - 1)));
+    else
+        limit = sg_d_xor(g, sg_d_asr(g, sgx_int_dw(g, id, ndw - 1), 63),
+                         sgx_const(64, is_unsigned ? ~0ull : sg_ones((unsigned)n - 1)));
+    *saturated = sg_b_not(g, sg_d_is_zero(g, diff));
+    *result = sg_d_slice(g, sg_d_select(g, *saturated, limit, sg_d_zext(g, low, 64)), n - 1, 0);
+}
+static inline void sg_SignedSatQ(SgCtx* g, SgI i, long long n, SgD* result, SgB* saturated) {
+    sg_SatQ(g, i, n, 0, result, saturated);
+}
+static inline void sg_UnsignedSatQ(SgCtx* g, SgI i, long long n, SgD* result, SgB* saturated) {
+    sg_SatQ(g, i, n, 1, result, saturated);
+}
+/* BitCount(x): the bits of each two, of each four, of each byte, then all the bytes' */
+static inline SgI sg_i_bitcount(SgCtx* g, SgD x) {
+    unsigned w = x.w;
+    SgD v;
+    if (w > 64) sg_fail("BitCount of over 64 bits", w, 0);
+    v = sg_d_zext(g, x, 64);
+    v = sg_d_sub(g, v, sg_d_and(g, sg_d_lsr(g, v, 1), sgx_const(64, 0x5555555555555555ull)));
+    v = sg_d_add(g, sg_d_and(g, v, sgx_const(64, 0x3333333333333333ull)),
+                 sg_d_and(g, sg_d_lsr(g, v, 2), sgx_const(64, 0x3333333333333333ull)));
+    v = sg_d_and(g, sg_d_add(g, v, sg_d_lsr(g, v, 4)), sgx_const(64, 0x0F0F0F0F0F0F0F0Full));
+    if (w > 8) v = sg_d_lsr(g, SGX_OP(sgx(g), mul, 64, v, sgx_const(64, 0x0101010101010101ull)), 56);
+    return sg_i_uint(g, sg_d_slice(g, v, 6, 0));
+}
+/* Elem_read(x, e, size), e known only when the guest runs: the doubleword it is in, picked by each bit of its number,
+   shifted down (an e past x's elements, which the Sail doesn't read, gives any bits) */
+static inline SgD sg_d_elem_dyn(SgCtx* g, SgD a, SgI e, long long size) {
+    SgD dw[SGX_MAXDW], at = sgx_i_val(g, &e);
+    unsigned n = sgx_ndw(a.w), k, j, bit = 0, log = 0;
+    if (size != 8 && size != 16 && size != 32 && size != 64) sg_fail("an element of this size", size, 0);
+    if (a.w > 64 * SGX_MAXDW || a.w % 64) sg_fail("an element of a value of these bits", a.w, size);
+    while ((8 << log) < size) ++log;
+    at = sg_d_lsl(g, at, 3 + log); /* the element's first bit */
+    sgx_dws(g, a, dw);
+    for (bit = 0; n > 1; ++bit, n = (n + 1) / 2) {
+        SgB odd = sg_b_not(g, sg_d_is_zero(g, sg_d_and(g, at, sgx_const(64, 64ull << bit))));
+        for (k = j = 0; k < n; k += 2, ++j) dw[j] = k + 1 < n ? sg_d_select(g, odd, dw[k + 1], dw[k]) : dw[k];
+    }
+    return sg_d_slice(g, sg_d_shift_dyn(g, dw[0], at, 1), size - 1, 0);
 }
 
 /* LSL_C, LSR_C, ASR_C and ROR_C (kind 0 to 3) by an amount known when it recompiles: the shifted value and the last bit

@@ -22,7 +22,7 @@
 #define RK_BIG_ENDIAN MIPS_BE
 #define MG_ARM_ELF_BIG MIPS_BE
 /* the ELF MIPS64 relocation the blocks have (n64's number) */
-enum { MIPS_EM = 8, MIPS_R_64 = 18 };
+enum { MIPS_EM = 8, MIPS_R_PC32 = 248 };
 #define MG_ARM_INC         "a32_mips64.inc"
 #define MG_ARM             SnxMips64Arm
 #define MG_ARM_NEXT        SnxMips64ArmNext
@@ -32,10 +32,11 @@ enum { MIPS_EM = 8, MIPS_R_64 = 18 };
 #define MG_ARM_FEATURES()  0u
 #define MG_ARM_EM          MIPS_EM
 #define MG_ARM_ELF_FLAGS   0x80000007u /* MIPS64r2, PIC, CPIC, NOREORDER */
-#define MG_ARM_CALL_RELOC  MIPS_R_64
-#define MG_ARM_R_TAIL      MIPS_R_64
-#define MG_ARM_R_ABS64     MIPS_R_64
+#define MG_ARM_CALL_RELOC  MIPS_R_PC32
+#define MG_ARM_R_TAIL      MIPS_R_PC32
+#define MG_ARM_R_LITERAL   MIPS_R_PC32
 #define MG_ARM_ENTRY_EXIT  "snx_mips_a32_entry_exit"
+#define MG_ARM_THUMB_ENTRY "snx_mips_thumb_entry"
 #define MG_ARM_LOAD_FENCE  1 /* a load is no acquire: a SYNC after it */
 #define MG_ARM_FP_HOT      0
 
@@ -56,11 +57,19 @@ enum { MIPS_EM = 8, MIPS_R_64 = 18 };
 int snx_mips64_arm_available(void) { return 0; }
 SnxMips64Arm* snx_mips64_arm_new(void) { return NULL; }
 void snx_mips64_arm_free(SnxMips64Arm* c) { (void)c; }
+int snx_mips64_arm_options(SnxMips64Arm* c, const SnxArmCodegenOptions* options) {
+    (void)c, (void)options;
+    return -1;
+}
 int snx_mips64_arm_block(SnxMips64Arm* c, const char* name, const unsigned char* code, size_t count, uint32_t pc,
                        size_t* consumed, SnxMips64ArmNext next, void* user) {
     (void)c, (void)name, (void)code, (void)count, (void)pc, (void)next, (void)user;
     *consumed = 0;
     return 0;
+}
+int snx_mips64_arm_thumb_block(SnxMips64Arm* c, const char* name, const unsigned char* code, size_t count, uint32_t pc,
+                               size_t* consumed, SnxMips64ArmNext next, void* user) {
+    return snx_mips64_arm_block(c, name, code, count, pc, consumed, next, user);
 }
 const char* snx_mips64_arm_why(const SnxMips64Arm* c) {
     (void)c;

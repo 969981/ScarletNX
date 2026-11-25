@@ -105,7 +105,7 @@ static u32 later_drain(void) {
 
 /* The fatal path of a lost device runs on the recording thread: record.c's submit_run calls fatal(), whose window
    release asks the ring to drain (vk_rec_sync). A wait there waits for the thread that runs it, so the process spun at
-   full speed instead of showing the error (Super Mario Bros. Wonder on MoltenVK). A call that the recording thread
+   full speed instead of showing the error (a game on MoltenVK). A call that the recording thread
    makes into the ring must return at once, and the packet after it must still run */
 static void recorder_self_sync(void* arg) {
     vk_rec_sync();
@@ -7911,6 +7911,7 @@ static int check_finish_lets_go(void) {
 #include "vulkan_tex_partial.inc"
 #include "vulkan_texture_quiet.inc"
 #include "vulkan_cube_take.inc"
+#include "vulkan_rt_stride.inc"
 #include "vulkan_texture_quiet_other.inc"
 #include "vulkan_memo_over_target.inc"
 #include "vulkan_astc_later.inc"
@@ -8801,6 +8802,10 @@ static int run_headless(int argc, char** argv) {
             result = check_texture_quiet_alias();
         else if (!strcmp(name, "cube_take"))
             result = check_cube_take();
+        else if (!strcmp(name, "rt_stride"))
+            result = check_rt_stride() || check_rt_stride_apart() || check_rt_stride_written();
+        else if (!strcmp(name, "rt_stride_written"))
+            result = check_rt_stride_written();
         else if (!strcmp(name, "cube_take_frames"))
             result = check_cube_take_frames();
         else if (!strcmp(name, "texture_quiet"))
@@ -9035,6 +9040,7 @@ static int run_headless(int argc, char** argv) {
         if (!strcmp(name, "way") && ++ran) CHECK(!check_uma_way());
         if (!strcmp(name, "region_writes") && ++ran) CHECK(!check_uma_region_writes());
         if (!strcmp(name, "region_merge") && ++ran) CHECK(!check_uma_region_merge());
+        if (!strcmp(name, "region_trap") && ++ran) CHECK(!check_uma_region_trap());
         if (!strcmp(name, "writes") && ++ran) CHECK(!check_uma_writes());
         if (!strcmp(name, "atlas_pending") && ++ran) CHECK(!check_uma_atlas_pending());
         if (!strcmp(name, "feedback") && ++ran) CHECK(!check_uma_feedback());
@@ -9067,7 +9073,8 @@ static int run_headless(int argc, char** argv) {
         if (!ran) {
             fprintf(stderr,
                     "SNX_TEST_UMA_ONLY=%s names no check: 1, runtime_write, constants, constants_copied, migrate, way, "
-                    "region_writes, region_merge, writes, atlas_pending, feedback, publish, dispatch, dispatch_open, "
+                    "region_writes, region_merge, region_trap, writes, atlas_pending, feedback, publish, dispatch, "
+                    "dispatch_open, "
                     "nvdec, texture_pending, dispatch_constants, "
                     "dispatch_table, header_words, placed, placed_view, logged_back, trapped_window, copies, "
                     "pages_producers, pages_counts, pages_partial, texture_region, dma_region, storage_region, "
@@ -9109,6 +9116,7 @@ static int run_headless(int argc, char** argv) {
         CHECK(!check_uma_migrate());
         CHECK(!check_uma_region_writes());
         CHECK(!check_uma_region_merge());
+        CHECK(!check_uma_region_trap());
         CHECK(!check_uma_pages_counts());
         CHECK(!check_uma_pages_producers());
         CHECK(!check_uma_pages_partial());
@@ -9325,6 +9333,9 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_dma_bands());
     CHECK(!check_rt_superseded());
     CHECK(!check_rt_aside());
+    CHECK(!check_rt_stride());
+    CHECK(!check_rt_stride_apart());
+    CHECK(!check_rt_stride_written());
     CHECK(!check_so_note());
     CHECK(!check_dma_bands_frames());
     CHECK(!check_flush_parts());
@@ -9392,6 +9403,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_uma_migrate());
     CHECK(!check_uma_region_writes());
     CHECK(!check_uma_region_merge());
+    CHECK(!check_uma_region_trap());
     CHECK(!check_uma_pages_counts());
     CHECK(!check_uma_pages_producers());
     CHECK(!check_uma_pages_partial());

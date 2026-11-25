@@ -132,6 +132,7 @@ root decode_ldr_imm_gen_aarch64_instrs_memory_single_general_immediate_signed_pr
 root decode_ldr_imm_gen_aarch64_instrs_memory_single_general_immediate_unsigned
 root decode_ldr_lit_gen_aarch64_instrs_memory_literal_general
 root decode_ldr_reg_gen_aarch64_instrs_memory_single_general_register
+root decode_ldra_aarch64_instrs_memory_single_general_immediate_signed_pac
 root decode_ldrb_imm_aarch64_instrs_memory_single_general_immediate_signed_post_idx
 root decode_ldrb_imm_aarch64_instrs_memory_single_general_immediate_signed_pre_idx
 root decode_ldrb_imm_aarch64_instrs_memory_single_general_immediate_unsigned
@@ -493,20 +494,54 @@ lower FPConvert__1
 lower FPToFixedJS
 lower FPConvertBF__1
 lower FPRoundingMode
+lower FPConvert
+lower FPMulX
+lower FPRecipEstimate
+lower FPRSqrtEstimate
+lower FPRecipStepFused
+lower FPRSqrtStepFused
+lower FPRecpX
+lower UnsignedRecipEstimate
+lower UnsignedRSqrtEstimate
+# and FMLAL's, BFDOT's steps and SM4's table
+lower FPMulAddH
+lower BFDotAdd
+lower Sbox
+# the saturations, each once in the back end rather than in every clause that saturates
+lower SatQ
+lower SignedSatQ
+lower UnsignedSatQ
+# and AES's tables, which a guest's byte picks from
+lower AESSubBytes
+lower AESInvSubBytes
+lower AESMixColumns
+lower AESInvMixColumns
 
 # NX's fixups for floating point (nx.sail) in their place: the SIMD&FP registers are _V's elements and FPCR is the
-# register as the CPU keeps it; FP is enabled at EL0; nothing merges without FEAT_AFP; and FPAbs and FPNeg unpack an
-# operand only under FEAT_AFP, which no guest has
+# register as the CPU keeps it, as FPSR is; FP is enabled at EL0; nothing merges without FEAT_AFP; FPAbs and FPNeg
+# unpack an operand only under FEAT_AFP, which no guest has; the comparisons that answer a bool read FPCompare's flags;
+# and a rounded shift keeps its sum short
 stop V_read
 stop V_set
 stop FPCR_read
 stop FPCR
 stop CheckFPEnabled64
 stop CheckFPAdvSIMDEnabled64
+stop AArch64_CheckFPAdvSIMDEnabled
 stop IsMerging
 stop UsingAArch32
 stop HaveFP16Ext
 stop FPUnpack__1
+stop FPSR
+stop FPCompareEQ
+stop FPCompareGE
+stop FPCompareGT
+stop RShr
+stop BFMulAddH
+stop execute_aarch64_instrs_integer_tags_mcaddtag
+stop execute_aarch64_instrs_integer_tags_mcsubtag
+stop execute_aarch64_instrs_integer_tags_mcinsertrandomtag
+stop execute_aarch64_instrs_integer_tags_mcinserttagmask
 
 # A64 Advanced SIMD and the SIMD&FP loads and stores not above: copied, not generated here (keep: LLVM makes them with
 # llvm/ir_vec.c); the RISC back ends' a64_risc.roots take those sailgen makes, in general-purpose doublewords
@@ -1067,3 +1102,22 @@ keep decode_xar_advsimd_aarch64_instrs_vector_crypto_sha3_xar
 keep decode_xtn_advsimd_aarch64_instrs_vector_arithmetic_unary_extract_nosat
 keep decode_zip1_advsimd_aarch64_instrs_vector_transfer_vector_permute_zip
 keep decode_zip2_advsimd_aarch64_instrs_vector_transfer_vector_permute_zip
+keep decode_axflag_aarch64_instrs_integer_flags_axflag
+keep decode_cnt_aarch64_instrs_integer_arithmetic_unary_cnt
+keep decode_ctz_aarch64_instrs_integer_arithmetic_unary_ctz
+keep decode_smax_imm_aarch64_instrs_integer_arithmetic_max_min_smax_imm
+keep decode_smax_reg_aarch64_instrs_integer_arithmetic_max_min_smax_reg
+keep decode_smin_imm_aarch64_instrs_integer_arithmetic_max_min_smin_imm
+keep decode_smin_reg_aarch64_instrs_integer_arithmetic_max_min_smin_reg
+keep decode_subp_aarch64_instrs_integer_arithmetic_pointer_mcsubtracttaggedaddress
+keep decode_subps_aarch64_instrs_integer_arithmetic_pointer_mcsubtracttaggedaddresssetflags
+keep decode_umax_imm_aarch64_instrs_integer_arithmetic_max_min_umax_imm
+keep decode_umax_reg_aarch64_instrs_integer_arithmetic_max_min_umax_reg
+keep decode_umin_imm_aarch64_instrs_integer_arithmetic_max_min_umin_imm
+keep decode_umin_reg_aarch64_instrs_integer_arithmetic_max_min_umin_reg
+keep decode_xaflag_aarch64_instrs_integer_flags_xaflag
+keep decode_addg_aarch64_instrs_integer_tags_mcaddtag
+keep decode_gmi_aarch64_instrs_integer_tags_mcinserttagmask
+keep decode_irg_aarch64_instrs_integer_tags_mcinsertrandomtag
+keep decode_subg_aarch64_instrs_integer_tags_mcsubtag
+keep decode_abs_aarch64_instrs_integer_arithmetic_unary_abs

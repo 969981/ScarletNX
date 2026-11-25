@@ -12,13 +12,19 @@
    (the code, the CPU structure, guest memory) is mapped into it at the same addresses, so the code and this
    process's C share every pointer, and a call out (a helper by its name, the runtime's RtAPI functions) goes to a page
    of traps whose hook calls the native function with the registers' arguments.
-     snx-test-sail-MACH [--states N] [--samples N] [--sequences N] [--pool N] [--verbose] [--dump WORD...]
+     snx-test-sail-MACH [--states N] [--samples N] [--sequences N] [--pool N] [--xmm N] [--target NAME] [--verbose]
+                        [--ops OP...] [--qemu QEMU RUNNER DIR] [--without MASK] [--dump WORD...]
+   --target: the guest's features, ounce (the default) or max
+   --qemu: the words' results held to qemu-aarch64 -cpu max's (tests/qemu_ref: its path, the runner's, a folder for
+   its files) rather than to LLVM's steps, which lack what no guest's CPU has; not loads nor stores
+   --ops: the words of these ops of the decoder alone, and no sequences
    --dump prints the words' block as hex bytes for a disassembler (llvm-mc --disassemble -triple=MACH) */
 #include "sail_mach_emit.h"
 #include "support/host_unicorn.h"
 #define SNX_TEST_SWAP_CPU 1
 #include "support/swap_state.h"
 #include "llvm_steps.h"
+#include "qemu_ref/qemu_ref.h"
 #include "llvm_qemu_words.h"
 #include "common/cpu/aarch64/a64_decoder.h"
 #include <setjmp.h>
@@ -28,17 +34,28 @@
 #include <string.h>
 #include <sys/mman.h>
 
-#define TARGET SNX_A64_TARGET_OUNCE
-#define CODE_MAX 4096
+#define CODE_MAX (64u << 10) /* --dump's */
 #define MEMORY_SIZE    (4u << 20)
 #define MEMORY_ZERO    (2u << 20)
 #define MEMORY_TOUCHED 0x14000u
 #define PAGE 4096u
+#if defined(SAIL_MACH_WIN64)
+/* the x86-64 back end's code for Windows, run by this host itself (support/host_win64.c): its processor's features, less
+   those --without names */
+#include "common/cpu/recompiler/x64/x64_codegen.h"
+#define SAIL_MACH_HOST snx_x64_features()
+/* reserved encodings (ADD shifted by ROR, UBFM of bit 32 up in 32 bits, ADD extended by 5), whose code calls undef */
+static const u32 g_reserved[] = {0x0BC00000u, 0x53008000u, 0x0B20F400u};
+#endif
+enum { RESERVED = 3 }; /* g_reserved's */
+
 #define HOST SAIL_MACH_HOST /* the machine's features the code may use (its SGX_F_*) */
 
 static struct {
     u64 seed;
+    u64 target; /* the guest's features: --target's, the Ounce's unless it names another */
     unsigned undef;
+    u64 undef_args; /* what rt->undef was passed: the pc and the word */
     int verbose;
     sigjmp_buf jump;
     int jumping;
@@ -84,7 +101,7 @@ static int fp_differs(const CPU* a, const CPU* b) {
 
 static const char* op_name(u32 word) {
     SnxA64Insn insn;
-    return snx_a64_decode_word(word, TARGET, &insn) != SNX_A64_OP_UNDEF ? snx_a64_op_text(insn.op) : NULL;
+    return snx_a64_decode_word(word, g_test.target, &insn) != SNX_A64_OP_UNDEF ? snx_a64_op_text(insn.op) : NULL;
 }
 
 static void on_abort(int signal_number) {
@@ -97,8 +114,9 @@ static void on_wfe(CPU* c) {
     ++g_test.wfe;
 }
 static void on_undef(CPU* c, u64 pc, u32 word) {
-    (void)c, (void)pc, (void)word;
+    (void)c;
     ++g_test.undef;
+    g_test.undef_args = 3 * g_test.undef_args + (pc ^ (u64)word << 32);
 }
 
 /* ---- the traps: a helper's name to its entry, the hook that calls it ---- */
@@ -117,7 +135,13 @@ u64 snx_x64_fp_jcvt(CPU* c, u64 a, u64 fpcr);
 u64 snx_x64_fp_bfcvt(CPU* c, u64 a, u64 fpcr);
 
 u64 snx_x64_crc32(u64 acc, u64 value, u32 desc);
+u64 snx_x64_aes(u64 x, u32 op);
+u64 snx_x64_estimate(u64 a, u32 sqrt);
+u64 snx_x64_half(u64 a, u64 fpcr);
+u64 snx_x64_bfdot(u64 sum, u64 a, u64 b);
+u64 snx_x64_sm4_box(u64 a);
 u64 snx_x64_stxp(CPU* c, u64 a, u64 v1, u64 v2);
+extern const u32 snx_x64_crc32_table[256];
 HostUcPair snx_x64_casp(CPU* c, u64 a, u64 e0, u64 e1, u64 d0, u64 d1);
 
 #define TRAP_FN(name) {#name, (void*)name}
@@ -129,19 +153,18 @@ static u64 resolve(const char* sym) {
                  TRAP_FN(snx_x64_fp_minmax), TRAP_FN(snx_x64_fp_compare), TRAP_FN(snx_x64_fp_convert),
                  TRAP_FN(snx_x64_fp_round), TRAP_FN(snx_x64_fp_round_int), TRAP_FN(snx_x64_fp_to_int),
                  TRAP_FN(snx_x64_fp_from_int), TRAP_FN(snx_x64_fp_jcvt), TRAP_FN(snx_x64_fp_bfcvt),
-                 TRAP_FN(snx_x64_crc32), TRAP_FN(snx_x64_stxp)};
+                 TRAP_FN(snx_x64_crc32), TRAP_FN(snx_x64_stxp), TRAP_FN(snx_x64_aes), TRAP_FN(snx_x64_estimate),
+                 TRAP_FN(snx_x64_half), TRAP_FN(snx_x64_bfdot), TRAP_FN(snx_x64_sm4_box)};
     size_t i;
     if (!g_test.uc) return 0x1000; /* --dump's: no Unicorn, an address of the right size */
     if (!strcmp(sym, "snx_x64_casp")) return hostuc_native_wide(g_test.uc, sym, (void*)snx_x64_casp);
+#if defined(SAIL_MACH_WIN64)
+    if (!strcmp(sym, "snx_x64_crc32_table")) return (u64)(uintptr_t)snx_x64_crc32_table;
+#endif
     for (i = 0; i < sizeof table / sizeof *table; ++i)
         if (!strcmp(sym, table[i].name)) return hostuc_native(g_test.uc, table[i].name, table[i].f);
     return 0;
 }
-static void* page_alloc(size_t size) {
-    void* p = mmap(NULL, (size + PAGE - 1) & ~(size_t)(PAGE - 1), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    return p == MAP_FAILED ? NULL : p;
-}
-
 /* a big-endian machine's state and runtime table turned over around its runs (host_unicorn.h's swapper) */
 static void swap_state(void* user) {
     (void)user;
@@ -186,7 +209,7 @@ static int is_ldst(u32 word) {
 static void ldst_start(CPU* c, u32 word, unsigned s) {
     SnxA64Insn insn;
     u64 address;
-    snx_a64_decode_word(word, TARGET, &insn);
+    snx_a64_decode_word(word, g_test.target, &insn);
     c->x[31] = 0x1000 + (rnd() & 0xff0);
     c->x[insn.args.rn] = 0x1000 + (rnd() & 0xff0);
     c->x[insn.args.rm] = 0x1000 + (rnd() & 0xff0);
@@ -240,8 +263,92 @@ static void start_state(CPU* start, unsigned s, RtAPI* rt) {
     start->pc = 0x1000;
 }
 
+/* the words under QEMU (how: its path, the runner's, a folder) and by the machine's code, from the same states: how
+   many differ. The runs made are added to *compared */
+static size_t against_qemu(const u32* words, const size_t* offset, unsigned char* code, size_t n, unsigned states,
+                           char* const* how, RtAPI* rt, size_t* compared) {
+    enum { BATCH = 2048 };
+    SnxQrefBatch batch = {0};
+    CPU* starts = (CPU*)malloc(sizeof *starts * BATCH);
+    size_t total = n * states, done, k, failures = 0;
+    char error[512];
+    if (!starts) return 1;
+    for (done = 0; done < total; done += BATCH) {
+        size_t count = total - done < BATCH ? total - done : BATCH;
+        snx_qref_clear(&batch);
+        for (k = 0; k < count; ++k) {
+            SnxQrefCase c;
+            CPU* s = &starts[k];
+            unsigned r;
+            start_state(s, (unsigned)((done + k) % states), rt);
+            snx_qref_case_init(&c);
+            for (r = 0; r < 31; ++r) c.state.x[r] = s->x[r];
+            c.state.sp = s->x[31];
+            c.state.nzcv = (u32)s->n << 31 | (u32)s->z << 30 | (u32)s->cf << 29 | (u32)s->vf << 28;
+            c.state.fpcr = s->fpcr;
+            c.state.fpsr = s->fpsr;
+            for (r = 0; r < 32; ++r) c.state.v[r][0] = s->v[r].d[0], c.state.v[r][1] = s->v[r].d[1];
+            if (snx_qref_add(&batch, &c, &words[(done + k) / states], 1, NULL, 0) < 0) {
+                fprintf(stderr, "FAIL: a case QEMU's runner has no room for\n");
+                ++failures;
+                goto out;
+            }
+        }
+        if (snx_qref_run(&batch, how[0], how[1], "max", how[2], error, sizeof error)) {
+            fprintf(stderr, "FAIL: QEMU: %s\n", error);
+            ++failures;
+            goto out;
+        }
+        for (k = 0; k < count; ++k) {
+            const SnxQrefResult* q = &batch.results[k];
+            u32 word = words[(done + k) / states];
+            CPU end = starts[k];
+            unsigned r, undef, differs;
+            u64 next;
+            end.mem = g_test.memory[1] + MEMORY_ZERO;
+            g_test.undef = 0;
+            next = run(code + offset[(done + k) / states], &end);
+            undef = g_test.undef;
+            ++*compared;
+            differs = undef != (q->outcome == SNX_QREF_UNDEF);
+            if (!undef) {
+                u32 nzcv = (u32)end.n << 31 | (u32)end.z << 30 | (u32)end.cf << 29 | (u32)end.vf << 28;
+                differs |= q->outcome != SNX_QREF_NEXT || next != 0x1004 || end.x[31] != q->state.sp ||
+                           end.fpsr != q->state.fpsr || end.fpcr != q->state.fpcr || nzcv != q->state.nzcv;
+                for (r = 0; r < 31; ++r) differs |= end.x[r] != q->state.x[r];
+                for (r = 0; r < 32; ++r)
+                    differs |= end.v[r].d[0] != q->state.v[r][0] || end.v[r].d[1] != q->state.v[r][1];
+            }
+            if (!differs) continue;
+            ++failures;
+            fprintf(stderr, "FAIL: %s %08x: the %s code's result is not QEMU's (its outcome %u)\n", op_name(word),
+                    (unsigned)word, hostuc_name(SAIL_MACH_UC), (unsigned)q->outcome);
+            if (g_test.verbose) {
+                for (r = 0; r < 31; ++r)
+                    if (end.x[r] != q->state.x[r])
+                        fprintf(stderr, "  x%u: start %llx qemu %llx native %llx\n", r,
+                                (unsigned long long)starts[k].x[r], (unsigned long long)q->state.x[r],
+                                (unsigned long long)end.x[r]);
+                for (r = 0; r < 32; ++r)
+                    if (end.v[r].d[0] != q->state.v[r][0] || end.v[r].d[1] != q->state.v[r][1])
+                        fprintf(stderr, "  v%u: qemu %016llx:%016llx native %016llx:%016llx\n", r,
+                                (unsigned long long)q->state.v[r][1], (unsigned long long)q->state.v[r][0],
+                                (unsigned long long)end.v[r].d[1], (unsigned long long)end.v[r].d[0]);
+                fprintf(stderr, "  fpsr: qemu %08x native %08x; fpcr %08x\n", (unsigned)q->state.fpsr,
+                        (unsigned)end.fpsr, (unsigned)starts[k].fpcr);
+            }
+        }
+    }
+out:
+    snx_qref_free(&batch);
+    free(starts);
+    return failures;
+}
+
 int main(int argc, char** argv) {
-    unsigned states = 64, samples = 3, sequences = 2000, i, k;
+    char** qemu = NULL;
+    unsigned states = 64, samples = 3, sequences = 2000, i, k, nops = 0;
+    char** ops = NULL;
     u32 *rows = NULL, *words;
     size_t count, n = 0, failures = 0, unmade = 0, compared = 0, bytes = 0;
     unsigned char* code;
@@ -251,31 +358,55 @@ int main(int argc, char** argv) {
     char error[1024];
     RtAPI rt = {.undef = on_undef, .sev = on_sev, .wfe = on_wfe, .cas128 = snx_runtime_cas128};
     struct sigaction sa;
+#if defined(SAIL_MACH_WIN64)
+    snx_x64_set_win64(1);
+#endif
     snx_mach_set_resolve(resolve);
+    g_test.target = SNX_A64_TARGET_OUNCE;
     for (i = 1; i < (unsigned)argc; ++i) {
         if (!strcmp(argv[i], "--states") && i + 1 < (unsigned)argc) states = (unsigned)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--samples") && i + 1 < (unsigned)argc)
             samples = (unsigned)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pool") && i + 1 < (unsigned)argc)
             snx_mach_set_pool(atoi(argv[++i]));
+        else if (!strcmp(argv[i], "--xmm") && i + 1 < (unsigned)argc)
+            snx_mach_set_xpool(atoi(argv[++i]));
         else if (!strcmp(argv[i], "--sequences") && i + 1 < (unsigned)argc)
             sequences = (unsigned)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--verbose"))
             g_test.verbose = 1;
         else if (!strcmp(argv[i], "--trace"))
             g_test.verbose = 2;
-        else if (!strcmp(argv[i], "--dump") && i + 1 < (unsigned)argc) {
-            unsigned char buf[CODE_MAX];
+#if defined(SAIL_MACH_WIN64)
+        else if (!strcmp(argv[i], "--without") && i + 1 < (unsigned)argc)
+            snx_x64_without((unsigned)strtoul(argv[++i], NULL, 0));
+#endif
+        else if (!strcmp(argv[i], "--target") && i + 1 < (unsigned)argc) {
+            const char* name = argv[++i];
+            if (strcmp(name, "ounce") && strcmp(name, "max")) {
+                fprintf(stderr, "--target %s: the targets are ounce and max\n", name);
+                return 2;
+            }
+            g_test.target = !strcmp(name, "max") ? snx_a64_features(SNX_A64_TARGET_MAX) : SNX_A64_TARGET_OUNCE;
+        } else if (!strcmp(argv[i], "--qemu") && i + 3 < (unsigned)argc) {
+            qemu = argv + i + 1;
+            i += 3;
+        } else if (!strcmp(argv[i], "--ops") && i + 1 < (unsigned)argc) {
+            ops = argv + i + 1;
+            while (i + 1 < (unsigned)argc && argv[i + 1][0] != '-') ++i, ++nops;
+            sequences = 0;
+        } else if (!strcmp(argv[i], "--dump") && i + 1 < (unsigned)argc) {
+            static unsigned char buf[CODE_MAX];
             u32 ws[16];
             size_t nw = 0, got, b;
             while (i + 1 < (unsigned)argc && nw < 16) ws[nw++] = (u32)strtoul(argv[++i], NULL, 16);
-            got = snx_mach_block(ws, &nw, 0x1000, TARGET, HOST, buf, sizeof buf);
+            got = snx_mach_block(ws, &nw, 0x1000, g_test.target, HOST, buf, sizeof buf);
             for (b = 0; b < got; ++b) printf("0x%02x%c", buf[b], b + 1 < got ? ' ' : '\n');
             if (!got) printf("(not made)\n");
             return 0;
         } else {
             fprintf(stderr, "usage: snx-test-sail-%s [--states N] [--samples N] [--sequences N] [--pool N] "
-                            "[--verbose] [--dump WORD...]\n",
+                            "[--xmm N] [--target NAME] [--verbose] [--ops OP...] [--qemu QEMU RUNNER DIR] [--dump WORD...]\n",
                     hostuc_name(SAIL_MACH_UC));
             return 2;
         }
@@ -285,26 +416,28 @@ int main(int argc, char** argv) {
     sa.sa_handler = on_abort;
     sigaction(SIGABRT, &sa, NULL);
     for (k = 0; k < 3; ++k) {
-        g_test.memory[k] = (unsigned char*)page_alloc(MEMORY_SIZE);
+        g_test.memory[k] = (unsigned char*)hostuc_pages(MEMORY_SIZE);
         if (!g_test.memory[k]) return 1;
     }
     for (i = 0; i < MEMORY_SIZE; ++i) g_test.memory[2][i] = (unsigned char)rnd();
     memcpy(g_test.memory[0], g_test.memory[2], MEMORY_SIZE);
     memcpy(g_test.memory[1], g_test.memory[2], MEMORY_SIZE);
-    code = (unsigned char*)page_alloc(code_cap);
+    code = (unsigned char*)hostuc_pages(code_cap);
     if (!code || unicorn_begin(code, code_cap)) {
         fprintf(stderr, "FAIL: no memory or Unicorn for the code\n");
         return 1;
     }
     count = lqd_row_words(samples, rnd, &rows);
-    words = (u32*)malloc(sizeof(u32) * (count * 8 + 1));
-    offset = (size_t*)malloc(sizeof *offset * (count * 8 + 1));
+    words = (u32*)malloc(sizeof(u32) * (count * 8 + RESERVED));
+    offset = (size_t*)malloc(sizeof *offset * (count * 8 + RESERVED));
     if (!words || !offset) return 1;
     for (i = 0; i < count; ++i) {
         static const u32 fields[3] = {0x1fu, 0x1fu << 5, 0x1fu << 16};
         const char* name = op_name(rows[i]);
         unsigned f;
         if (!name) continue;
+        for (k = 0; k < nops && strcmp(name, ops[k]); ++k) {}
+        if (nops && k == nops) continue;
         for (f = 0; f < 8; ++f) {
             u32 w = rows[i];
             size_t got = 0;
@@ -315,7 +448,7 @@ int main(int argc, char** argv) {
             g_test.jumping = 1;
             if (sigsetjmp(g_test.jump, 1)) failed = 1;
             else
-                got = snx_mach_step(w, 0x1000, TARGET, HOST, code + code_at, code_cap - code_at);
+                got = snx_mach_step(w, 0x1000, g_test.target, HOST, code + code_at, code_cap - code_at);
             g_test.jumping = 0;
             if (failed) {
                 ++unmade;
@@ -332,11 +465,40 @@ int main(int argc, char** argv) {
         }
     }
     free(rows);
+    for (k = 0; k < nops; ++k) {
+        for (i = 0; i < n && strcmp(op_name(words[i]), ops[k]); ++i) {}
+        if (i < n) continue;
+        ++failures;
+        fprintf(stderr, "FAIL: --ops: the %s back end makes no word of %s\n", hostuc_name(SAIL_MACH_UC), ops[k]);
+    }
+    if (qemu) {
+        for (i = 0, k = 0; i < n; ++i)
+            if (!is_ldst(words[i])) offset[k] = offset[i], words[k++] = words[i];
+        hostuc_changed(g_test.uc, code, code_cap);
+        failures += against_qemu(words, offset, code, k, states, qemu, &rt, &compared);
+        printf("sail_%s: %u words, %zu runs against QEMU, %zu failures (%zu words not made)\n",
+               hostuc_name(SAIL_MACH_UC), k, compared, failures, unmade);
+        return failures != 0;
+    }
+#if defined(SAIL_MACH_WIN64)
+    for (i = 0; i < RESERVED; ++i) {
+        size_t got = snx_mach_step(g_reserved[i], 0x1000, g_test.target, HOST, code + code_at, code_cap - code_at);
+        if (!got) {
+            ++failures;
+            fprintf(stderr, "FAIL: %08x: the %s back end doesn't make its UNDEFINED\n", (unsigned)g_reserved[i],
+                    hostuc_name(SAIL_MACH_UC));
+            continue;
+        }
+        offset[n] = code_at;
+        code_at += (got + 15) & ~(size_t)15;
+        words[n++] = g_reserved[i];
+    }
+#endif
     if (llvm_steps_begin(&set, 0, LLVM_STEPS_HOST, error, sizeof error)) {
         fprintf(stderr, "FAIL: %s\n", error);
         return 1;
     }
-    for (i = 0; i < n; ++i) llvm_steps_add(&set, words[i], 0x1000, TARGET);
+    for (i = 0; i < n; ++i) llvm_steps_add(&set, words[i], 0x1000, g_test.target);
     if (llvm_steps_load(&set, error, sizeof error)) {
         fprintf(stderr, "FAIL: %s\n", error);
         return 1;
@@ -347,19 +509,20 @@ int main(int argc, char** argv) {
             CPU start, end[2];
             u64 next[2];
             unsigned undef[2];
+            u64 args[2];
             start_state(&start, s, &rt);
             if (is_ldst(words[i])) ldst_start(&start, words[i], s);
             end[0] = start;
             end[1] = start;
             end[0].mem = g_test.memory[0] + MEMORY_ZERO;
             end[1].mem = g_test.memory[1] + MEMORY_ZERO;
-            g_test.undef = g_test.sev = g_test.wfe = 0;
+            g_test.undef = g_test.sev = g_test.wfe = 0, g_test.undef_args = 0;
             if (g_test.verbose == 2) fprintf(stderr, "run %s %08x state %u\n", op_name(words[i]), (unsigned)words[i], s);
             next[0] = set.steps[i](&end[0]);
-            undef[0] = g_test.undef + 16 * g_test.sev + 256 * g_test.wfe;
-            g_test.undef = g_test.sev = g_test.wfe = 0;
+            undef[0] = g_test.undef + 16 * g_test.sev + 256 * g_test.wfe, args[0] = g_test.undef_args;
+            g_test.undef = g_test.sev = g_test.wfe = 0, g_test.undef_args = 0;
             next[1] = run(code + offset[i], &end[1]);
-            undef[1] = g_test.undef + 16 * g_test.sev + 256 * g_test.wfe;
+            undef[1] = g_test.undef + 16 * g_test.sev + 256 * g_test.wfe, args[1] = g_test.undef_args;
             ++compared;
             {
                 int memory = memcmp(g_test.memory[0] + MEMORY_ZERO, g_test.memory[1] + MEMORY_ZERO, MEMORY_TOUCHED);
@@ -368,9 +531,9 @@ int main(int argc, char** argv) {
                 memcpy(g_test.memory[0] + MEMORY_ZERO, g_test.memory[2] + MEMORY_ZERO, MEMORY_TOUCHED);
                 memcpy(g_test.memory[1] + MEMORY_ZERO, g_test.memory[2] + MEMORY_ZERO, MEMORY_TOUCHED);
             }
-            if (next[0] != next[1] || undef[0] != undef[1] || memcmp(end[0].x, end[1].x, sizeof end[0].x) ||
-                end[0].n != end[1].n || end[0].z != end[1].z || end[0].cf != end[1].cf || end[0].vf != end[1].vf ||
-                fp_differs(&end[0], &end[1])) {
+            if (next[0] != next[1] || undef[0] != undef[1] || args[0] != args[1] ||
+                memcmp(end[0].x, end[1].x, sizeof end[0].x) || end[0].n != end[1].n || end[0].z != end[1].z ||
+                end[0].cf != end[1].cf || end[0].vf != end[1].vf || fp_differs(&end[0], &end[1])) {
                 ++failures;
                 fprintf(stderr, "FAIL: %s %08x state %u: the %s code's result differs\n", op_name(words[i]),
                         (unsigned)words[i], s, hostuc_name(SAIL_MACH_UC));
@@ -400,7 +563,7 @@ int main(int argc, char** argv) {
             g_test.jumping = 1;
             if (sigsetjmp(g_test.jump, 1)) failed = 1;
             else
-                got = snx_mach_block(sq->w, &sq->count, 0x1000, TARGET, HOST, code + code_at, code_cap - code_at);
+                got = snx_mach_block(sq->w, &sq->count, 0x1000, g_test.target, HOST, code + code_at, code_cap - code_at);
             g_test.jumping = 0;
             if (failed) {
                 ++failures;
@@ -422,7 +585,7 @@ int main(int argc, char** argv) {
         for (q = 0; q < nseq; ++q) {
             size_t j;
             seq[q].first = steps;
-            for (j = 0; j < seq[q].count; ++j, ++steps) llvm_steps_add(&set, seq[q].w[j], 0x1000 + 4 * j, TARGET);
+            for (j = 0; j < seq[q].count; ++j, ++steps) llvm_steps_add(&set, seq[q].w[j], 0x1000 + 4 * j, g_test.target);
         }
         if (llvm_steps_load(&set, error, sizeof error)) {
             fprintf(stderr, "FAIL: %s\n", error);
@@ -434,20 +597,21 @@ int main(int argc, char** argv) {
                 CPU start, end[2];
                 u64 next[2] = {0, 0};
                 unsigned undef[2];
+                u64 args[2];
                 size_t j;
                 start_state(&start, st & 3, &rt);
                 end[0] = start;
                 end[1] = start;
-                g_test.undef = g_test.sev = g_test.wfe = 0;
+                g_test.undef = g_test.sev = g_test.wfe = 0, g_test.undef_args = 0;
                 for (j = 0; j < seq[q].count; ++j) next[0] = set.steps[seq[q].first + j](&end[0]);
-                undef[0] = g_test.undef + 16 * g_test.sev + 256 * g_test.wfe;
-                g_test.undef = g_test.sev = g_test.wfe = 0;
+                undef[0] = g_test.undef + 16 * g_test.sev + 256 * g_test.wfe, args[0] = g_test.undef_args;
+                g_test.undef = g_test.sev = g_test.wfe = 0, g_test.undef_args = 0;
                 next[1] = run(code + seq[q].code, &end[1]);
-                undef[1] = g_test.undef + 16 * g_test.sev + 256 * g_test.wfe;
+                undef[1] = g_test.undef + 16 * g_test.sev + 256 * g_test.wfe, args[1] = g_test.undef_args;
                 ++compared;
-                if (next[0] != next[1] || undef[0] != undef[1] || memcmp(end[0].x, end[1].x, sizeof end[0].x) ||
-                    end[0].n != end[1].n || end[0].z != end[1].z || end[0].cf != end[1].cf || end[0].vf != end[1].vf ||
-                    fp_differs(&end[0], &end[1])) {
+                if (next[0] != next[1] || undef[0] != undef[1] || args[0] != args[1] ||
+                    memcmp(end[0].x, end[1].x, sizeof end[0].x) || end[0].n != end[1].n || end[0].z != end[1].z ||
+                    end[0].cf != end[1].cf || end[0].vf != end[1].vf || fp_differs(&end[0], &end[1])) {
                     ++failures;
                     fprintf(stderr, "FAIL: the block of");
                     for (j = 0; j < seq[q].count; ++j)
