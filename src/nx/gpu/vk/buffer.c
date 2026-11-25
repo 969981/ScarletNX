@@ -29,6 +29,7 @@
 #include "nx/gpu/vk/resource_stats.h"
 #include "nx/gpu/vk/descriptors.h"
 #include "nx/gpu/vk/pending_pages.h"
+#include "nx/gpu/vk/addr_gens.h"
 
 typedef struct {
     u64 start, len, hash, shash;
@@ -658,6 +659,7 @@ static void range_map_free(RangeMap* m) {
 }
 
 typedef struct WwStage WwStage;
+typedef struct WwOpen WwOpen;
 /* this thread's state */
 static _Thread_local struct {
     /* Suppress recursive lookups by the landing thread. Other readers still take vk_lock and wait for landing. */
@@ -671,6 +673,7 @@ static _Thread_local struct {
     u32 ww_stream;
     int ww_streaming;
     WwStage* wstage; /* the running scan's, for ww_note */
+    const WwOpen* wopen; /* vk_ww_open's, for open_note */
 } t_buffer;
 
 static void out_free(GfxOut* o);
@@ -1945,6 +1948,7 @@ void vk_ww_dirty_clear(u64 cpu, u64 len) {
 static void ww_mark(u8* p, u64 n) {
     u64 o = (u64)(p - g_mem);
     if (o >= AS_SIZE || !n) return;
+    u64 bumped = 0; /* the granules of the generations by address done (addr_gens.h), past the stamps */
     for (u64 pg = o >> 12, e = (o + n - 1) >> 12; pg <= e && pg < (AS_SIZE >> 12); pg++) {
         u64 l = pg >> (WW_LEAF_SHIFT - 12);
         if (!g_wleaf[l]) {
@@ -1961,6 +1965,14 @@ static void ww_mark(u8* p, u64 n) {
         } else /* no table: the stamp below stands for the whole leaf */
             ww_dirty_set(l << (WW_LEAF_SHIFT - 12), (l + 1) << (WW_LEAF_SHIFT - 12));
         g_wleaf_max[l] = g_wclock;
+        /* after the stamp. Without a table the stamp stands for the whole leaf, and so does the bump */
+        const u64 at = g_wleaf[l] ? pg << 12 : l << WW_LEAF_SHIFT, len = g_wleaf[l] ? 0x1000 : 1ull << WW_LEAF_SHIFT;
+        if (at + len > bumped) {
+            const u64 from = at > bumped ? at : bumped, to = (at + len + (1ull << ADDR_GENS_SHIFT) - 1) &
+                                                             ~((1ull << ADDR_GENS_SHIFT) - 1);
+            addr_gens_bump(ADDR_GENS_CPU, from, to - from);
+            bumped = to;
+        }
     }
 }
 /* a range of guest memory [a, e) */
@@ -1976,6 +1988,7 @@ static void ww_mark_pages(u64 o, u64 e) {
         if (!g_wleaf[l] && pg == l * lp && end == lend) {
             g_wleaf_max[l] = g_wclock;
             ww_dirty_set(pg, end);
+            addr_gens_bump(ADDR_GENS_CPU, pg << 12, (end - pg) << 12); /* after the stamp, as ww_mark bumps */
         } else
             ww_mark(GP(pg << 12), (end - pg) << 12);
         pg = end;
@@ -2081,6 +2094,19 @@ static _Atomic int g_wscan_failed;     /* atomic */
 static _Atomic int g_wscan_on;         /* atomic: the scanner runs */
 static PMutex g_wscan_wlk = PMUTEX_INIT;
 static PCond g_wscan_cv;
+/* The checks scanning now (atomic). On Windows the scanner starts no scan while one does: the write watch calls of
+   two threads at once slow each other down. In one game a check's call that found no page took 64 us against the
+   scanner's 14 us, about 47 us a leaf against 4, and with the scanner waiting the checks took 12 us a leaf. A check
+   runs on the thread that records the draws, which sets the frame rate, and the scanner's next leaves can wait. The
+   other hosts' scans were not measured so: their scanner keeps going. A test sets WW_SCANS_SERIAL on any host */
+static _Atomic int g_wcheck_scans;
+#if !defined(WW_SCANS_SERIAL)
+#if defined(_WIN32)
+#define WW_SCANS_SERIAL 1
+#else
+#define WW_SCANS_SERIAL 0
+#endif
+#endif
 /* plat_ww_scan's callback: a run of written pages. When the stage is full its last range grows over the new one
    (scans go up through memory), marking more than was written: a cache over the rest only checks its contents once */
 static void ww_note(u8* p, u64 n) {
@@ -2111,19 +2137,30 @@ static int ww_scan_free(u64 a, u64 e) {
     }
     return r;
 }
+/* the leaves [lo, hi], in address order as every claimer takes them */
+static void ww_claim_all(u64 lo, u64 hi) {
+    for (u64 l = lo; l <= hi; l++)
+        while (!ww_claim(l)) plat_yield();
+}
+static void ww_claims_end(u64 lo, u64 hi) {
+    for (u64 l = lo; l <= hi; l++) atomic_store_explicit(&g_wleaf_busy[l], 0, memory_order_release);
+}
+/* written range r in g_wres (under g_wres_lk) */
+static void wres_add_nl(WwRange r) {
+    const int n = atomic_load_explicit(&g_wres_n, memory_order_relaxed);
+    if (n < WW_RES_N) {
+        g_wres[n] = r;
+        atomic_store_explicit(&g_wres_n, n + 1, memory_order_release);
+    } else { /* full: the last range covers this one too */
+        WwRange* w = &g_wres[WW_RES_N - 1];
+        if (r.a < w->a) w->a = r.a;
+        if (r.e > w->e) w->e = r.e;
+    }
+}
 /* what a scan put in st, in g_wres for the next check to mark, before its leaves' claims end */
 static void ww_publish(WwStage* st) {
     pm_lock(&g_wres_lk);
-    int n = atomic_load_explicit(&g_wres_n, memory_order_relaxed);
-    for (int i = 0; i < st->n; i++)
-        if (n < WW_RES_N)
-            g_wres[n++] = st->r[i];
-        else { /* full: the last range covers this one too */
-            WwRange* w = &g_wres[WW_RES_N - 1];
-            if (st->r[i].a < w->a) w->a = st->r[i].a;
-            if (st->r[i].e > w->e) w->e = st->r[i].e;
-        }
-    atomic_store_explicit(&g_wres_n, n, memory_order_release);
+    for (int i = 0; i < st->n; i++) wres_add_nl(st->r[i]);
     pm_unlock(&g_wres_lk);
     st->n = 0;
 }
@@ -2348,6 +2385,8 @@ static void ww_scanner(void* arg) {
                 l = ww_next_ever(l + 1, n);
                 continue;
             }
+            /* before its claims, which a check would wait for */
+            while (WW_SCANS_SERIAL && atomic_load_explicit(&g_wcheck_scans, memory_order_acquire)) plat_yield();
             u64 lo = l;
             while (l < n && l - lo < WW_RUN_MAX && ww_wanted(l, seen, from) && ww_claim(l)) l++;
             if (l == lo) { /* a check is scanning it */
@@ -2412,6 +2451,8 @@ static int ww_take_leaves(u64 lo, u64 hi, u32 seen) {
         }
     }
     if (first <= hi) {
+        if (WW_SCANS_SERIAL)
+            atomic_fetch_add_explicit(&g_wcheck_scans, 1, memory_order_acq_rel); /* the scanner waits */
         /* the scanner may be scanning some of them: wait for those, which it may have scanned in this epoch */
         for (a = first; a <= last; a++)
             while (!ww_claim(a)) plat_yield();
@@ -2428,9 +2469,11 @@ static int ww_take_leaves(u64 lo, u64 hi, u32 seen) {
             while (a <= last && (i32)(atomic_load_explicit(&g_wleaf_done[a], memory_order_relaxed) - seen) < 0) a++;
             if (ww_scan_leaves(run, a - 1, seen, &g_wstage_check) < 0) {
                 for (; a <= last; a++) atomic_store_explicit(&g_wleaf_busy[a], 0, memory_order_release);
+                if (WW_SCANS_SERIAL) atomic_fetch_sub_explicit(&g_wcheck_scans, 1, memory_order_acq_rel);
                 return -1;
             }
         }
+        if (WW_SCANS_SERIAL) atomic_fetch_sub_explicit(&g_wcheck_scans, 1, memory_order_acq_rel);
     }
     ww_take_scanned();
     for (a = l; a <= hi; a++)
@@ -2569,6 +2612,10 @@ int vk_ww_take(const u8* host, u64 len) {
     return ww_take(host, len);
 }
 u32 vk_ww_now(void) { return g_wclock; }
+int vk_ww_gen(const u8* host, u64 len, u32* gen) {
+    if (!host || host < g_mem) return 0;
+    return addr_gens_read(ADDR_GENS_CPU, (u64)(host - g_mem), len, gen);
+}
 void vk_ww_stats(u32 presents) {
     static u32 epoch0;
     u32 e = atomic_load_explicit(&g_ww_epoch, memory_order_relaxed);
@@ -2590,12 +2637,11 @@ void vk_ww_stats(u32 presents) {
 static int ww_cool_range(u64 a, u64 e) {
     u64 lo = a >> WW_LEAF_SHIFT, hi = (e - 1) >> WW_LEAF_SHIFT;
     if (!plat_ww_hot_in(GP(a), e - a)) return 0;
-    for (u64 l = lo; l <= hi; l++)
-        while (!ww_claim(l)) plat_yield();
+    ww_claim_all(lo, hi);
     t_buffer.wstage = &g_wstage_check;
     plat_ww_cool(GP(a), e - a, ww_note);
     ww_publish(&g_wstage_check);
-    for (u64 l = lo; l <= hi; l++) atomic_store_explicit(&g_wleaf_busy[l], 0, memory_order_release);
+    ww_claims_end(lo, hi);
     return 1;
 }
 void vk_ww_cool(const u8* host, u64 len) {
@@ -2613,6 +2659,64 @@ void vk_ww_cool(const u8* host, u64 len) {
     if (!cooled) return;
     ww_take_scanned(); /* newer than every baseline before, and no newer than the one the caller takes next */
     ww_take_peers();
+}
+/* A watch over a region's pages (vk_own_watch) traps them, and a scan skips a trapped page: what the CPU wrote on it
+   after its last scan would be in none, as nothing of it is left when the page opens. So it is scanned before the
+   trap */
+void vk_ww_watching(u64 lo, u64 hi) {
+    const u64 first = lo >> WW_LEAF_SHIFT, last = (hi - 1) >> WW_LEAF_SHIFT;
+    if (g_ww <= 0 || atomic_load_explicit(&g_wscan_failed, memory_order_acquire)) return; /* no baseline to miss it */
+    ww_claim_all(first, last);
+    t_buffer.wstage = &g_wstage_check;
+    if (ww_scan_free(lo, hi) < 0) atomic_store_explicit(&g_wscan_failed, 1, memory_order_release);
+    ww_publish(&g_wstage_check);
+    ww_claims_end(first, last);
+}
+/* The pages that vk_ww_open opens, from guest address lo on: the hash of each from before, and a bit for each that its
+   scan found written */
+struct WwOpen {
+    u64 lo, n;
+    u64 *hash, *written;
+};
+static void open_note(u8* p, u64 size) {
+    const WwOpen* o = t_buffer.wopen;
+    for (u64 k = (u64)(p - GP(o->lo)) >> 12, e = k + (size >> 12); k < e && k < o->n; k++)
+        o->written[k >> 6] |= 1ull << (k & 63);
+}
+/* They read as written once open (plat_trap_continue), and a report of that, taken for the CPU's write, is newer than
+   every baseline: a target drawn there after gave its pixels up for memory's older bytes at its next publish, as after
+   a landing (vk_ww_landed). What a landing notes there is compared at a later scan, through the pool's mirror. These
+   pages have no place there, and the view of the region's buffer goes with it, so they are scanned as they open, with
+   their leaves claimed over both: no other scan reports them. A thread that the opening woke, or any other, may have
+   written them by then: a page whose bytes are not those from before counts, as any written page. Read while the watch
+   is on them, where no thread can have written them */
+void vk_ww_open(u64 lo, u64 hi, const u8* bytes, void (*go)(void* ctx), void* ctx) {
+    const u64 n = (hi - lo) >> 12, first = lo >> WW_LEAF_SHIFT, last = (hi - 1) >> WW_LEAF_SHIFT;
+    WwOpen o = {.lo = lo, .n = n, .hash = calloc(n + ((n + 63) >> 6), sizeof *o.hash)};
+    if (!o.hash) {
+        WARN_LIMIT(4,
+                   "vulkan: no memory to tell the CPU's writes to %llu KiB of guest memory at %llx from their watch's "
+                   "end: all of it reads as written\n",
+                   (unsigned long long)((hi - lo) >> 10), (unsigned long long)lo);
+        go(ctx);
+        return;
+    }
+    o.written = o.hash + n;
+    for (u64 k = 0; k < n; k++) o.hash[k] = vk_hash(bytes + (k << 12), 4096);
+    ww_claim_all(first, last);
+    go(ctx);
+    t_buffer.wopen = &o;
+    /* -1 too where the host tracks no writes: no consumer asks then */
+    if (plat_ww_scan(GP(lo), hi - lo, open_note) < 0) atomic_store_explicit(&g_wscan_failed, 1, memory_order_release);
+    t_buffer.wopen = NULL;
+    for (u64 k = 0; k < n; k++)
+        if ((o.written[k >> 6] >> (k & 63) & 1) && vk_hash(bytes + (k << 12), 4096) != o.hash[k]) {
+            pm_lock(&g_wres_lk);
+            wres_add_nl((WwRange){lo + (k << 12), lo + ((k + 1) << 12)});
+            pm_unlock(&g_wres_lk);
+        }
+    ww_claims_end(first, last);
+    free(o.hash);
 }
 /* fn(user, at, n) for each run of [host, host + len) on pages written after since, at the range's byte offset at: for
    a range vk_written_since(host, len, since) has just found written, so its pages are marked */

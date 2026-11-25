@@ -58,11 +58,12 @@ typedef struct {
     char name[24];
     size_t at, size, rel0, nrel;
     size_t own; /* its entry past the checks (X and its name), from its start; (size_t)-1 for none (entry's) */
+    size_t end; /* where its frame's code ends: the failed check's exit (MG_ARM_EXIT_LAST) and the literals are past it */
 } Made;
 
 struct MG_ARM {
     SgCtx g;
-    SnxArmCodegenOptions options; /* the next blocks' */
+    SnxArmChainedOptions options; /* the next blocks', no chaining in those that ask for none */
     SgXAsm a;
     SgXBuf b;
     Rel* rel; /* the block being made's */
@@ -77,8 +78,9 @@ struct MG_ARM {
     unsigned features;
     int pool;
     const char* why;
-    int big;    /* the block being made has 32-bit frame sizes (frame) */
+    int big;    /* the block being made has 32-bit frame sizes, or a page's probe (frame) */
     size_t own; /* its entry past the checks, from its start (prologue) */
+    size_t end; /* where its frame's code ends (Made.end) */
 };
 
 int MG_ARM_API(available)(void) { return MG_ARM_AVAILABLE(); }
@@ -94,12 +96,22 @@ MG_ARM* MG_ARM_API(new)(void) {
         return NULL;
     }
     c->features = MG_ARM_FEATURES();
-    c->options.abi = SNX_ARM_CODEGEN_OPTIONS_ABI;
+    c->options.options.abi = SNX_ARM_CODEGEN_OPTIONS_ABI;
     return c;
 }
 int MG_ARM_API(options)(MG_ARM* c, const SnxArmCodegenOptions* options) {
+    if (options && options->abi == SNX_ARM_CHAINED_OPTIONS_ABI) {
+        const SnxArmChainedOptions* chained = (const SnxArmChainedOptions*)options; /* its first member */
+        if (!snx_arm_chained_options_valid(chained)) return -1;
+        c->options = *chained;
+        return 0;
+    }
     if (!snx_arm_codegen_options_valid(options)) return -1;
-    c->options = options ? *options : (SnxArmCodegenOptions){.abi = SNX_ARM_CODEGEN_OPTIONS_ABI};
+    c->options = (SnxArmChainedOptions){0};
+    if (options)
+        c->options.options = *options;
+    else
+        c->options.options.abi = SNX_ARM_CODEGEN_OPTIONS_ABI;
     return 0;
 }
 void MG_ARM_API(free)(MG_ARM* c) {
@@ -132,9 +144,11 @@ static void unit_reloc(void* machine, size_t at, const char* sym, long long adde
     add_rel(c, at, sym, MG_ARM_CALL_RELOC, addend);
 }
 
+static void mg_tail(MG_ARM* c, int reg);
 /* the machine's instructions besides its AArch32 part's own (x64_a32.h, arm64_a32.h, risc_a32.h): SGX_A32_OUT, a jump
-   to a way out of the block, and SGX_A32_BUS, an access of the ARM7TDMI or the ARM946E the bus hook may take. Their
-   cold ways are written after the block's code (cold_ways) */
+   to a way out of the block, and SGX_A32_BUS, an access of the ARM7TDMI or the ARM946E the bus hook may take (their
+   cold ways are written after the block's code: cold_ways); a chained block's SGX_A32_FIELD, a load of the runtime's,
+   and SGX_A32_TAIL, its tail call */
 static inline void sgx_machine_op(SgXAsm* a, int at, const unsigned char* r) {
     SgXIns* i = &a->x->ins[at];
     SgCtx* g = (SgCtx*)a->machine;
@@ -149,6 +163,14 @@ static inline void sgx_machine_op(SgXAsm* a, int at, const unsigned char* r) {
         g->outs = (SgA32Out*)sgx_a32_grow(g->outs, &g->cap_outs, g->nouts + 1, sizeof *g->outs);
         g->outs[g->nouts++] = o;
         sgx_a32_jcc(g, b, i->cc, o.label);
+        return;
+    }
+    if (i->op == SGX_A32_FIELD) {
+        sgx_mov_mem(a, 1, i->w, SGX_RET, r[0], i->disp);
+        return;
+    }
+    if (i->op == SGX_A32_TAIL) {
+        mg_tail((MG_ARM*)((char*)g - offsetof(MG_ARM, g)), r[0]);
         return;
     }
     if (i->op != SGX_A32_BUS) sg_fail("a machine instruction of no kind", i->op, at);
@@ -228,7 +250,7 @@ static void cold_ways(MG_ARM* c) {
 static void mg_prologue(MG_ARM* c, SnxU32 pc, int* bad);
 static void mg_entry_exit(MG_ARM* c, SnxU32 pc, SnxU32 first, int bad);
 static void mg_return(MG_ARM* c);
-static void mg_go_on(MG_ARM* c, SnxU32 key, SnxU32 block, const SnxU32* next, size_t nnext, int public);
+static void mg_go_on(MG_ARM* c, SnxU32 key, int polled, const SnxU32* next, size_t nnext, int public);
 static int mg_patch_frame(MG_ARM* c);
 static void mg_entry_exit_fn(SnxXElf* o);
 
@@ -1901,6 +1923,7 @@ static size_t arm_code(MG_ARM* c, const unsigned char* code, size_t count, SnxU3
         g->pc = pc + 4 * (SnxU32)i;
         g->next = (SnxU32)g->pc + 4;
         g->branched = g->undefined = 0;
+        g->taken = 0;
         g->iset = 0;
         g->skip = -1;
         g->when = 0;
@@ -1936,6 +1959,104 @@ static void checked_entry(SgCtx* g) {
         sgx_a32_exit(g, bad, SNX_ARM_BAD_ENTRY, sgx_const(32, SNX_ARM_CHECKED_ABI), 1);
     }
 }
+/* ---- a chained hosted block's end (codegen.h's SnxArmChainedOptions) ---- */
+
+/* the slice's steps back, less back: the block's return where none is left, R15 = pc first where it is known (not
+   where it is stored already) */
+static void count_back(MG_ARM* c, SgD back, int known, SnxU32 pc) {
+    SgCtx* g = &c->g;
+    SgX* x = sgx(g);
+    SgXIns* l = sgx_append(x, SGX_K_LOAD);
+    l->w = 32;
+    l->disp = (int)c->options.poll;
+    l->def = sgx_vreg(x, x->n - 1, 32);
+    SgD left = sg_d_sub(g, sgx_val(32, l->def), back);
+    sgx_a32_put(g, c->options.poll, 32, left);
+    SgB none = less(g, left, sgx_const(32, 1));
+    if (!known) {
+        sgx_a32_on(g, SGX_A32_JCC, none)->disp = g->ret;
+        return;
+    }
+    SgXIns* i = sgx_a32_on(g, SGX_A32_OUT, none);
+    i->imm = 0;
+    i->kv[1] = (SnxU64)pc << 32;
+}
+/* the host's w bits at [p + disp], none of the guest's memory */
+static SgD host_field(SgCtx* g, int p, int disp, unsigned w) {
+    SgX* x = sgx(g);
+    SgXIns* i = sgx_a32_machine(g, SGX_A32_FIELD, 0);
+    i->in[0] = p;
+    i->disp = disp;
+    i->w = (unsigned char)w;
+    i->def = sgx_vreg(x, x->n - 1, w);
+    return sgx_val(w, i->def);
+}
+/* the block's end at target, 32 bits (stored in R15 already), in the state whose CPSR.T is t: a tail call of the block the
+   runtime's table has there, after the poll where it is at or before the block's start; the return where there is no
+   table or it lacks the target */
+static void look_up(MG_ARM* c, SgD target, SgD t, SnxU32 block) {
+    SgCtx* g = &c->g;
+    SgX* x = sgx(g);
+    SgXIns* l = sgx_append(x, SGX_K_LOAD);
+    l->w = 64;
+    l->disp = (int)c->options.lookup;
+    l->def = sgx_vreg(x, x->n - 1, 64);
+    SgD table = sgx_val(64, l->def), key = sg_d_or(g, target, sg_d_zext(g, t, 32));
+    sgx_reg(x, &key);
+    sg_flags_flush(g); /* before the conditions made here */
+    sgx_a32_on(g, SGX_A32_JCC, sg_d_is_zero(g, table))->disp = g->ret;
+    SgD slot = sg_d_and(g, sg_d_lsr(g, target, 1), sgx_const(32, SNX_ARM_LOOKUP_SLOTS - 1));
+    static_assert(sizeof(SnxArmLookup) == 16, "a slot's place is its number shifted by 4");
+    SgD entry = sg_d_add(g, table, sg_d_lsl(g, sg_d_zext(g, slot, 64), 4));
+    int at = sgx_reg(x, &entry);
+    SgD seen = host_field(g, at, (int)offsetof(SnxArmLookup, key), 32);
+    sgx_a32_on(g, SGX_A32_JCC, sg_b_not(g, sg_d_eq(g, seen, key)))->disp = g->ret;
+    SgD to = host_field(g, at, (int)offsetof(SnxArmLookup, block), 64);
+    sgx_reg(x, &to);
+    sgx_a32_on(g, SGX_A32_JCC, sg_d_is_zero(g, to))->disp = g->ret;
+    SgB back = sg_b_not(g, sgx_d_ult(g, sgx_const(32, block), target)); /* the target at or before it */
+    count_back(c, sg_d_zext(g, sgx_bool_bits(x, back), 32), 0, 0);
+    sgx_a32_machine(g, SGX_A32_TAIL, 0)->in[0] = to.v;
+}
+/* the end with R15 key's address in key's state (mg_go_on's): a chained block counts its step back down, and takes a
+   target that is none of its successors through the table */
+static void go_on(MG_ARM* c, SnxU32 key, SnxU32 block, const SnxU32* next, size_t nnext, int public, int chained) {
+    SgCtx* g = &c->g;
+    const int back = (key & ~1u) <= block;
+    size_t k = 0;
+    while (k < nnext && next[k] != key) ++k;
+    if (!chained || (k == nnext && !c->options.lookup)) {
+        mg_go_on(c, key, back, next, nnext, public);
+        return;
+    }
+    if (k < nnext) {
+        if (back) count_back(c, sgx_const(32, 1), 1, key & ~1u);
+        flush(c);
+        mg_go_on(c, key, 0, next, nnext, public);
+        return;
+    }
+    sgx_a32_pc(g, sgx_const(32, key & ~1u));
+    look_up(c, sgx_const(32, key & ~1u), sgx_const(1, key & 1), block);
+    flush(c);
+}
+/* an import's stub: the runtime's function called in the SVC's place, then the block past it (after its key) where the
+   function says so and that is the block's successor; else the return */
+static void import_call(MG_ARM* c, SnxU32 after, const SnxU32* next, size_t nnext) {
+    SgCtx* g = &c->g;
+    SgX* x = sgx(g);
+    SgD args[2] = {sgx_const(64, c->options.import), sgx_const(64, c->options.direct)};
+    size_t k = 0;
+    sgx_a32_pc(g, sgx_const(32, after & ~1u));
+    sgx_a32_call(g, "snx_arm_direct", args, 2, 1);
+    SgD done = sg_d_slice(g, sgx_val(64, x->ins[x->n - 1].def), 31, 0);
+    sgx_a32_on(g, SGX_A32_JCC, sg_d_is_zero(g, done))->disp = g->ret;
+    flush(c);
+    while (k < nnext && next[k] != after) ++k;
+    if (k < nnext)
+        mg_go_on(c, after, 0, next, nnext, 0);
+    else
+        sgx_a32_jmp(g, &c->b, g->ret);
+}
 /* one block into c->b, A32 or (thumb) Thumb: its size, 0 where refused (t_mach_arm.why says why) */
 static size_t block(MG_ARM* c, const unsigned char* code, size_t count, SnxU32 pc, int thumb, size_t* consumed,
                     MG_ARM_NEXT succ, void* user) {
@@ -1967,10 +2088,10 @@ static size_t block(MG_ARM* c, const unsigned char* code, size_t count, SnxU32 p
     c->a.machine = g;
     c->a.reloc = unit_reloc;
     g->nlabels = g->nfix = g->nexits = g->nmonitors = g->nouts = g->nbuses = 0;
-    g->profile = c->options.profile;
-    g->memory = c->options.memory;
-    g->trace = c->options.trace;
-    g->skipped = c->options.skipped;
+    g->profile = c->options.options.profile;
+    g->memory = c->options.options.memory;
+    g->trace = c->options.options.trace;
+    g->skipped = c->options.options.skipped;
     g->block_pc = pc;
     g->yields = 0;
     x->n = 0;
@@ -1997,7 +2118,8 @@ static size_t block(MG_ARM* c, const unsigned char* code, size_t count, SnxU32 p
     g->e_written = 0;
     mg_prologue(c, pc, &bad);
     if (sgx_a32_checked(g)) checked_entry(g);
-    units = thumb ? thumb_code(c, code, count, pc, &itstate) : arm_code(c, code, count, pc);
+    const int stub = c->options.direct != 0; /* the SVC, whatever its immediate */
+    units = stub ? 1 : thumb ? thumb_code(c, code, count, pc, &itstate) : arm_code(c, code, count, pc);
     *consumed = units;
     SnxU32 nexts[2];
     size_t nnext = succ ? succ(user, pc | (SnxU32)thumb, units, count, nexts) : 0;
@@ -2005,11 +2127,15 @@ static size_t block(MG_ARM* c, const unsigned char* code, size_t count, SnxU32 p
        the jump there goes through its checks) */
     SnxU32 it = itstate ? sg_it_bits(itstate) : 0;
     if (it && sgx_a32_hosted(g)) nnext = 0; /* its dispatch loop's, which looks at ITSTATE */
+    const int chained = c->options.poll && !it;
     /* the end: the last instruction's way (a branch's target, the backend's exit, or on), then, past its condition's
        skip, the next instruction's */
-    if (g->branched) {
+    if (stub)
+        import_call(c, (pc + (thumb ? 2u : 4u)) | (SnxU32)thumb, nexts, nnext);
+    else if (g->branched) {
         SgD t = g->target;
-        int tconst = sgx_is_const(&t), to_thumb = thumb;
+        SgB taken = g->taken;
+        int tconst = sgx_is_const(&t), to_thumb = thumb, other = -1;
         if (g->pending >> SG_PSTATE_T & 1) {
             SgD f = g->field[SG_PSTATE_T];
             if (sgx_is_const(&f))
@@ -2017,13 +2143,27 @@ static size_t block(MG_ARM* c, const unsigned char* code, size_t count, SnxU32 p
             else
                 tconst = 0;
         }
-        if (!tconst) sgx_a32_pc(g, t); /* a known target's R15 go_on's */
+        const int looked = !tconst && chained && c->options.lookup;
+        if (!tconst) { /* a known target's R15 go_on's */
+            if (taken) t = sg_d_select(g, taken, t, sgx_const(32, g->next)), taken = 0;
+            sgx_reg(x, &t);
+            sgx_a32_pc(g, t);
+        }
         if (it) cpsr_bits(g, 0, sgx_const(32, it));
+        if (taken) { /* two known ways, each its own */
+            other = sgx_a32_label(g);
+            sgx_a32_on(g, SGX_A32_JCC, sg_b_not(g, taken))->disp = other;
+        }
+        if (looked) look_up(c, t, sg_PSTATE_read(g, SG_PSTATE_T), pc);
         flush(c);
         if (tconst)
-            mg_go_on(c, (SnxU32)t.k | (SnxU32)to_thumb, pc, nexts, nnext, it != 0);
-        else
+            go_on(c, (SnxU32)t.k | (SnxU32)to_thumb, pc, nexts, nnext, it != 0, chained);
+        else if (!looked)
             sgx_a32_jmp(g, b, g->ret);
+        if (other >= 0) {
+            sgx_a32_bind(g, b, other);
+            go_on(c, g->next | (SnxU32)thumb, pc, nexts, nnext, it != 0, chained);
+        }
     } else if (!g->undefined) {
         /* on, both ways past the skip */
         if (g->skip >= 0)
@@ -2034,16 +2174,16 @@ static size_t block(MG_ARM* c, const unsigned char* code, size_t count, SnxU32 p
             cpsr_bits(g, 0, sgx_const(32, it));
             flush(c);
         }
-        mg_go_on(c, g->next | (SnxU32)thumb, pc, nexts, nnext, g->e_written || it);
+        go_on(c, g->next | (SnxU32)thumb, pc, nexts, nnext, g->e_written || it, chained);
     } else
         flush(c); /* its own code left */
-    if (g->skip >= 0) {
+    if (!stub && g->skip >= 0) {
         bind_skip(c, 0);
         if (it) {
             cpsr_bits(g, 0, sgx_const(32, it));
             flush(c);
         }
-        mg_go_on(c, g->next | (SnxU32)thumb, pc, nexts, nnext, it != 0);
+        go_on(c, g->next | (SnxU32)thumb, pc, nexts, nnext, it != 0, chained);
     }
     sgx_a32_stubs(g, b);
     cold_ways(c);
@@ -2053,11 +2193,12 @@ static size_t block(MG_ARM* c, const unsigned char* code, size_t count, SnxU32 p
     sgx_a32_bind(g, b, g->ret);
     mg_return(c);
     sgx_cold_emit(&c->a);
+    c->end = b->n;
     if (entered && MG_ARM_EXIT_LAST(c)) mg_entry_exit(c, pc, first, bad);
     sgx_pool_emit(&c->a);
     if (mg_patch_frame(c)) {
         t_mach_arm.fail = saved;
-        ++c->big; /* made again with 32-bit frame sizes (x86-64's) */
+        ++c->big; /* made again with 32-bit frame sizes (x86-64's), or with a page's probe (arm64's on Windows) */
         return (size_t)-1;
     }
     if (sgx_a32_patch(g, b)) sg_fail("a jump to a label never bound", 0, 0);
@@ -2067,7 +2208,7 @@ static size_t block(MG_ARM* c, const unsigned char* code, size_t count, SnxU32 p
 
 /* a block's code (size bytes), relocations and record kept for the object: 1, or 0 out of memory */
 static int keep(MG_ARM* c, const unsigned char* code, size_t size, const Rel* rel, size_t nrel, SnxU32 pc,
-                const char* name, size_t own) {
+                const char* name, size_t own, size_t end) {
     if (c->ntext + size > c->cap_text) {
         size_t cap = c->cap_text ? c->cap_text * 2 : (size_t)1 << 20;
         while (cap < c->ntext + size) cap *= 2;
@@ -2096,6 +2237,7 @@ static int keep(MG_ARM* c, const unsigned char* code, size_t size, const Rel* re
     m->rel0 = c->nrels;
     m->nrel = nrel;
     m->own = own;
+    m->end = end;
     memcpy(c->text + c->ntext, code, size);
     c->ntext += size;
     if (nrel) memcpy(c->rels + c->nrels, rel, nrel * sizeof *rel);
@@ -2139,7 +2281,7 @@ static int make(MG_ARM* c, const char* name, const unsigned char* code, size_t c
         return 0;
     }
     /* kept: its code, its relocations, its record */
-    if (!keep(c, c->b.p, size, c->rel, (size_t)c->nrel, pc, name, c->own)) {
+    if (!keep(c, c->b.p, size, c->rel, (size_t)c->nrel, pc, name, c->own, c->end)) {
         c->why = "out of memory";
         return 0;
     }
@@ -2181,8 +2323,9 @@ int MG_ARM_API(object)(MG_ARM* c, unsigned char** object, size_t* size, size_t* 
         snx_xelf_symbol(o, m->name, SNX_ELF_TEXT, at, m->size,
                         m->own == (size_t)-1 && m->name[0] == 'X' ? SNX_ELF_LOCAL | SNX_ELF_FUNC
                                                                   : SNX_ELF_GLOBAL | SNX_ELF_HIDDEN | SNX_ELF_FUNC);
-#ifdef MG_ARM_UNWIND
-        MG_ARM_UNWIND(o, at, c->text + m->at, m->size, m->own, c->rels + m->rel0, m->nrel);
+#ifdef MG_ARM_COFF
+        if (m->own != (size_t)-1)
+            snx_xelf_unwind(o, at + m->own, at + m->end, c->text + m->at + m->own, m->end - m->own);
 #endif
         if (m->own != (size_t)-1) {
             char own[sizeof m->name + 1];
@@ -2200,12 +2343,17 @@ int MG_ARM_API(object)(MG_ARM* c, unsigned char** object, size_t* size, size_t* 
     c->ntext = c->cap_text = c->nrels = c->cap_rels = c->nmade = c->cap_made = 0;
     int rc = snx_xelf_write(o, object, size);
     snx_xelf_free(o);
+    if (rc == -2) {
+        fprintf(stderr, "native back end: AArch32 blocks of a relocation or a prologue COFF has no form of\n");
+        abort();
+    }
     return rc ? -1 : 0;
 }
 int MG_ARM_API(absorb)(MG_ARM* c, MG_ARM* from) {
     for (size_t i = 0; i < from->nmade; ++i) {
         const Made* m = &from->made[i];
-        if (!keep(c, from->text + m->at, m->size, from->rels + m->rel0, m->nrel, m->pc, m->name, m->own)) return -1;
+        if (!keep(c, from->text + m->at, m->size, from->rels + m->rel0, m->nrel, m->pc, m->name, m->own, m->end))
+            return -1;
     }
     free(from->text), free(from->rels), free(from->made);
     from->text = NULL, from->rels = NULL, from->made = NULL;

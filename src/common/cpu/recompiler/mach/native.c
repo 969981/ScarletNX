@@ -21,6 +21,8 @@
 #include "common/cpu/recompiler/x64/x64_arm.h"
 #include "common/cpu/recompiler/x64/x64_cache.h"
 #include "common/cpu/recompiler/x64/x64_codegen.h"
+#include "common/cpu/recompiler/x64/x64_elf.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -77,6 +79,33 @@ int snx_native_cached_object(SnxCodegen* codegen, size_t first, size_t last, con
         return snx_x64_cached_object(codegen, first, last, options, made, object, size, reused, error, error_size);
     *reused = 0;
     return snx_native_object(codegen, first, last, options, made, object, size, error, error_size);
+}
+
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+int snx_native_target(const char* triple) {
+#if !defined(_WIN32) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    size_t n = strlen(triple);
+    return !strncmp(triple, "arm64-apple-ios", 15) && n >= 4 && !strcmp(triple + n - 4, "-elf");
+#else
+    (void)triple;
+    return 0;
+#endif
+}
+
+int snx_native_target_object(const char* triple, SnxCodegen* codegen, size_t first, size_t last,
+                             const SnxNativeOptions* options, unsigned char* made, unsigned char** object, size_t* size,
+                             char* error, size_t error_size) {
+    unsigned features = 0; /* the architecture's baseline: the device's CPU is not known here */
+    if (!snx_native_target(triple)) {
+        snprintf(error, error_size, "no native back end of this build makes the target %s", triple);
+        return -1;
+    }
+#if defined(__APPLE__) && TARGET_OS_IOS && defined(__aarch64__)
+    features = snx_arm64_features(); /* the pack is made where it runs */
+#endif
+    return snx_arm64_object(codegen, first, last, options, features, made, object, size, error, error_size);
 }
 
 /* the AArch32 blocks' compiler: the host's (x86-64's, arm64's or riscv64's) */
@@ -239,3 +268,25 @@ const SnxNativeDesc* snx_native_desc_named(const char* name) {
     return NULL;
 }
 #endif
+
+/* <elf.h>'s, where the system has it */
+enum { NATIVE_EM_AARCH64 = 183, NATIVE_R_X86_64_64 = 1, NATIVE_R_AARCH64_ABS64 = 257 };
+SnxXElf* snx_native_data(unsigned* pointer) {
+    const SnxNativeDesc* d = snx_native_desc();
+    SnxXElf* o = snx_native_available() ? snx_xelf_new() : NULL;
+    if (!o) return NULL;
+    if (d) {
+        snx_xelf_set_machine(o, d->em);
+        snx_xelf_set_flags(o, d->elf_flags);
+        snx_xelf_set_big(o, d->big);
+        *pointer = d->abs64;
+    } else if (snx_x64_available()) {
+        if (snx_x64_win64()) snx_xelf_set_coff(o, 1);
+        *pointer = NATIVE_R_X86_64_64; /* a COFF object's too */
+    } else {
+        snx_xelf_set_machine(o, NATIVE_EM_AARCH64);
+        if (snx_arm64_windows()) snx_xelf_set_coff(o, 1);
+        *pointer = NATIVE_R_AARCH64_ABS64; /* a COFF object's too */
+    }
+    return o;
+}

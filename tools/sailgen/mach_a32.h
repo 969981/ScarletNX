@@ -79,6 +79,7 @@ struct SgCtx {
     int iset;  /* SelectInstrSet's, 0 for the block's */
     int branched, undefined;
     SgD target;    /* BranchTo's, 32 bits */
+    SgB taken;     /* where it holds, the next instruction where it does not (CBZ); 0 for always */
     int gpr[15];   /* the region's value of each register, 0 for none */
     int cpsr;      /* the region's CPSR, 0 for none */
     SgD field[32]; /* PSTATE's fields written and not stored yet (pending's bits) */
@@ -358,9 +359,11 @@ enum {
     /* the block compiler's own (mach_arm.inc's sgx_machine_op), on every machine: */
     SGX_A32_OUT, /* to a new way out (SgA32Out) on cc: kv[0] the word, imm its reason + 1, 0 for a yield; kv[1] the
                     instruction's address, and the next one's from bit 32 */
-    SGX_A32_BUS /* on cc, out of the hot code to sym(state, in[0] the address, imm its size, kv[0]'s low word or in[3]),
+    SGX_A32_BUS, /* on cc, out of the hot code to sym(state, in[0] the address, imm its size, kv[0]'s low word or in[3]),
                     R15 kv[0]'s high word, else sel's access of [in[1] + in[2]]: a load's into SGX_RET (kv[1] 1), or a
                     store of in[3], SGX_RET then 0 */
+    SGX_A32_FIELD, /* SGX_RET = the host's number of w bits at [in[0] + disp]: no guest memory */
+    SGX_A32_TAIL   /* the block's end: a tail call of the block whose address is in[0] */
 };
 
 /* a machine instruction, after the fields written are stored: whatever it does may leave the region (a jump, an exit)
@@ -434,7 +437,8 @@ static inline void sg_branch_to(SgCtx* g, SgD target, SgB when) {
     if (target.w != 32) sg_fail("a branch to a target of other than 32 bits", target.w, 32);
     sg_transfer_commit(g);
     g->branched = 1;
-    g->target = when ? sg_d_select(g, when, target, sgx_const(32, g->next)) : target;
+    g->target = target;
+    g->taken = when;
 }
 /* R15 = v */
 static inline void sgx_a32_pc(SgCtx* g, SgD v) { sgx_a32_put(g, offsetof(SnxArmCPU, r) + 60, 32, v); }

@@ -41,8 +41,8 @@ typedef struct {
 struct snx_recompiler;
 void snx_native_without(struct snx_recompiler* r, const SnxU32* words, size_t count);
 
-/* this host's native back end (mach/native.c): x86-64's on an x86-64 host, arm64's on an arm64 one that loads ELF
-   objects...; 1 where there is one */
+/* this host's native back end (mach/native.c): x86-64's on an x86-64 host, arm64's on an arm64 one whose objects are
+   ELF or COFF...; 1 where there is one */
 int snx_native_available(void);
 /* its name, for the recompiler's lines ("x86-64", "arm64"; "none") */
 const char* snx_native_name(void);
@@ -55,6 +55,17 @@ int snx_native_object(SnxCodegen* codegen, size_t first, size_t last, const SnxN
 int snx_native_cached_object(SnxCodegen* codegen, size_t first, size_t last, const SnxNativeOptions* options,
                              unsigned char* made, unsigned char** object, size_t* size, int* reused, char* error,
                              size_t error_size);
+
+/* 1 where this host's build makes the module of another machine's triple (module_llvm.h's: the pack of objects a JIT
+   loader takes) with a native back end: arm64's, for arm64-apple-ios<version>-elf, whose objects are the ELF that
+   loader reads, with Darwin's calling convention. 0 for another triple, on a Windows host, whose objects are COFF
+   alone, and on a big-endian one, whose descriptors are its own numbers. Its code takes the features of the host it is
+   made on only where that is the device (an app that recompiles for itself), else the architecture's baseline */
+int snx_native_target(const char* triple);
+/* snx_native_object for a triple snx_native_target takes; nothing is reused */
+int snx_native_target_object(const char* triple, SnxCodegen* codegen, size_t first, size_t last,
+                             const SnxNativeOptions* options, unsigned char* made, unsigned char** object, size_t* size,
+                             char* error, size_t error_size);
 
 /* the host's back end's AArch32 blocks (x64/x64_arm.h's or arm64/arm64_arm.h's, whose functions these are): a compiler
    of its own for one thread, NULL where the host has none or out of memory */
@@ -75,6 +86,12 @@ const char* snx_native_arm_why(const SnxNativeArm* c);
 int snx_native_arm_object(SnxNativeArm* c, unsigned char** object, size_t* size, size_t* blocks);
 int snx_native_arm_absorb(SnxNativeArm* c, SnxNativeArm* from);
 int snx_native_arm_entry(SnxNativeArm* c, uint32_t key);
+
+/* An object of data alone, in the host's native back end's format (x64/x64_elf.h's builder), as an AOT module's
+   descriptor may be: NULL with no native back end on this host, or out of memory. *pointer is the relocation that makes
+   8 bytes of the data a symbol's address */
+typedef struct SnxXElf SnxXElf;
+SnxXElf* snx_native_data(unsigned* pointer);
 
 /* An AOT module descriptor's few functions in a RISC machine's code (mach/risc_desc.inc, each one's code generator),
    for nx/loader/module_x64.c, which writes the data and puts each function in: its code and its relocations (of sym +

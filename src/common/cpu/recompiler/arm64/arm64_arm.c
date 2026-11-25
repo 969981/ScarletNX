@@ -4,7 +4,8 @@
    (a32_arm64.inc), and its glue here: the frame (X29, X30 and X19 saved, the spill slots below), the entry checks on
    X0, the chaining's tail jumps (JUMP26) and its poll (ADRP and LDR of snx_arm_poll_offset), and the entry stub of a
    block another back end makes. The VFP's arithmetic is snx_arm_fp's, its helper (no hot path yet). It builds on any
-   host: its blocks are arm64's code, which the tests run under Unicorn */
+   host: its blocks are arm64's code, which the tests run under Unicorn. On Windows the object is COFF, a frame's code one
+   entry of its function table */
 #include "common/cpu/recompiler/arm64/arm64_arm.h"
 #include "common/cpu/recompiler/arm64/arm64_codegen.h"
 #include "common/cpu/recompiler/x64/x64_elf.h"
@@ -15,7 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) || defined(__aarch64__) /* as arm64_codegen.c */
 /* the AArch64 ELF relocations the blocks have (the ELF for the Arm 64-bit Architecture's numbers) */
 enum {
     A64_EM = 183, /* EM_AARCH64 */
@@ -24,7 +25,10 @@ enum {
     A64_CALL26 = 283,
     A64_LDST64_ABS_LO12_NC = 286
 };
-static unsigned arm64_arm_features(void) { return snx_arm64_available() ? snx_arm64_features() : SNX_ARM64_F_ALL; }
+static unsigned arm64_arm_features(void) {
+    return (snx_arm64_available() ? snx_arm64_features() : SNX_ARM64_F_ALL) |
+           (snx_arm64_windows() ? SNX_ARM64_F_WIN : 0);
+}
 #define MG_ARM_INC         "a32_arm64.inc"
 #define MG_ARM             SnxArm64Arm
 #define MG_ARM_NEXT        SnxArm64ArmNext
@@ -36,6 +40,10 @@ static unsigned arm64_arm_features(void) { return snx_arm64_available() ? snx_ar
 #define MG_ARM_CALL_RELOC  A64_CALL26
 #define MG_ARM_LOAD_FENCE  1 /* an LDR is no acquire: a DMB after it, as LLVM's LDA lowering's order */
 #define MG_ARM_FP_HOT      0
+#define MG_ARM_ABI          SNX_ARM64_F_WIN
+/* the code of a frame one range, the one exit that has none past it */
+#define MG_ARM_EXIT_LAST(c) windows(c)
+#define MG_ARM_COFF         snx_arm64_windows()
 
 #if defined(__clang__)
 #pragma clang diagnostic ignored "-Wunused-variable"
@@ -47,23 +55,34 @@ static unsigned arm64_arm_features(void) { return snx_arm64_available() ? snx_ar
 #pragma GCC diagnostic ignored "-Wunused-function"
 #endif
 
+static int windows(const SnxArm64Arm* c);
 #include "common/cpu/recompiler/mach/mach_arm.inc"
 
 /* ---- the arm64 glue ---- */
+
+/* the block is made for Windows */
+static int windows(const SnxArm64Arm* c) { return (c->features & SNX_ARM64_F_WIN) != 0; }
 
 /* every operation snx_arm_fp's (its helper's) */
 static SgD fp_call(SgCtx* g, SnxArmVectorOp op, unsigned width, SnxU32 param, SgD xv, SgD yv, SgD zv) {
     return fp_helper(g, op, width, param, xv, yv, zv);
 }
 
-/* the frame's room: SUB or ADD SP of the slots' size, patched once the block is done (sgx_patch_frame) */
+/* the frame's room: SUB or ADD SP of the slots' size, patched once the block is done (sgx_patch_frame), on Windows the
+   SUB past a probe of one of a page or more */
+static void frame_here(MG_ARM* c, size_t at) {
+    if (c->a.nframe >= 256) sg_fail("a block of too many epilogues", c->a.nframe, 256);
+    c->a.frame_at[c->a.nframe++] = at;
+}
 static void frame(MG_ARM* c, int add) {
     SgXBuf* b = &c->b;
-    if (c->a.nframe >= 256) sg_fail("a block of too many epilogues", c->a.nframe, 256);
-    c->a.frame_at[c->a.nframe++] = b->n;
+    if (!add && c->big) frame_here(c, sga_stack_probe(b));
+    frame_here(c, b->n);
     sga_w(b, add ? sge_a64_add_addsub_imm(31, 31, 0, 0, 1) : sge_a64_sub_addsub_imm(31, 31, 0, 0, 1));
 }
+/* 1 where the frame is a page or more and has no probe: made again with it */
 static int mg_patch_frame(MG_ARM* c) {
+    if (windows(c) && !c->big && SGA_FRAME_PROBED(sga_frame_size(&c->a))) return 1;
     sgx_patch_frame(&c->a);
     return 0;
 }
@@ -122,9 +141,9 @@ static void mg_return(MG_ARM* c) {
     sga_w(&c->b, sge_a64_ret(30));
 }
 /* where the block ends with R15 key's address in key's state: a jump to the block's own entry past its checks (X and
-   its name) where key is one of the successors, after the poll for one at or before the block's start; else R15
-   stored and the return. public: the block's checked entry instead, R15 stored */
-static void mg_go_on(MG_ARM* c, SnxU32 key, SnxU32 block, const SnxU32* next, size_t nnext, int public) {
+   its name) where key is one of the successors, after the poll where polled (key at or before the block's start); else
+   R15 stored and the return. public: the block's checked entry instead, R15 stored */
+static void mg_go_on(MG_ARM* c, SnxU32 key, int polled, const SnxU32* next, size_t nnext, int public) {
     SgXBuf* b = &c->b;
     SgCtx* g = &c->g;
     size_t k = 0;
@@ -134,7 +153,7 @@ static void mg_go_on(MG_ARM* c, SnxU32 key, SnxU32 block, const SnxU32* next, si
         sgx_a32_jmp(g, b, g->ret);
         return;
     }
-    if ((key & ~1u) <= block) {
+    if (polled) {
         /* ADRP X16, snx_arm_poll_offset; LDR X16, [X16, :lo12:]; LDR W16, [X19, X16]; CBZ W16, go: a thread of higher
            priority waits, the return with R15 stored */
         int go = sgx_a32_label(g);
@@ -155,6 +174,15 @@ static void mg_go_on(MG_ARM* c, SnxU32 key, SnxU32 block, const SnxU32* next, si
     if (!public) sym[0] = 'X';
     add_rel(c, b->n, sym, A64_JUMP26, 0);
     sga_w(b, sge_a64_b_uncond(0));
+}
+
+/* the block's end in a tail call of the block at the address in reg: the state its argument, as it is this one's */
+static void mg_tail(MG_ARM* c, int reg) {
+    SgXBuf* b = &c->b;
+    sga_w(b, sge_a64_orr_log_shift(SGA_X16, SGA_ZR, 0, (SnxU32)reg, 0, 1)); /* MOV X16, reg */
+    sga_w(b, sge_a64_orr_log_shift(0, SGA_ZR, 0, SGX_BASE, 0, 1));          /* MOV X0, X19 */
+    epilogue(c);
+    sga_w(b, sge_a64_br(SGA_X16));
 }
 
 /* snx_a64_a32_entry_exit(state X0, the block's address W1, its first word W2), each object's own, where a block's
@@ -238,7 +266,7 @@ int snx_arm64_arm_entry(MG_ARM* c, uint32_t key) {
     name_of(rel.sym, sizeof rel.sym, key);
     char name[24];
     snprintf(name, sizeof name, "X%s", rel.sym);
-    return keep(c, code, b.n, &rel, 1, key & ~1u, name, (size_t)-1) ? 0 : -1;
+    return keep(c, code, b.n, &rel, 1, key & ~1u, name, (size_t)-1, 0) ? 0 : -1;
 }
 #else
 int snx_arm64_arm_available(void) { return 0; }

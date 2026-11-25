@@ -158,6 +158,7 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/armlib_object.c"
 add_library(snx_llvm STATIC ir.c ir_state.c ir_promote.c ir_emit.c ir_profile.c ir_helpers.c
     ir_int.c ir_sail.c ir_ldst.c ir_fpu.c ir_vec.c ir_vec_fp.c ir_vec_crypto.c ir_codegen.c link.c link_elf.c link_coff.c link_macho.c elf_object.c objects_pack.c
     code_loader.c code_loader_coff.c gdb_jit.c jit_service.c jit_cache.c "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/exec.c"
+    "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/aot.c"
     "${CMAKE_CURRENT_BINARY_DIR}/rtlib_object.c" "${CMAKE_CURRENT_BINARY_DIR}/rtlib_bitcode.c"
     "${CMAKE_CURRENT_BINARY_DIR}/armlib_object.c")
 set_target_properties(snx_llvm PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON C_EXTENSIONS ON)
@@ -188,7 +189,7 @@ if(SNX_X64)
 endif()
 # the arm64 back end (src/common/cpu/recompiler/arm64): the same functions in A64, from the emitters sailgen
 # generates with the A64 Sail's encoders; built on every host (its code is arm64's, which the tests run under
-# Unicorn), the default code generator on arm64's ELF hosts
+# Unicorn; not on Windows on another machine), the default code generator on arm64's ELF hosts and Windows
 target_sources(snx_llvm PRIVATE "${PROJECT_SOURCE_DIR}/src/common/cpu/recompiler/arm64/arm64_codegen.c"
                                "${PROJECT_SOURCE_DIR}/src/common/cpu/recompiler/arm64/arm64_arm.c"
                                "${PROJECT_SOURCE_DIR}/src/common/cpu/recompiler/mach/native.c")

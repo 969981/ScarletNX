@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 /* An AOT module's descriptor for a RISC host (nx/loader/module_x64.c over mach/risc_desc.inc), for each little-endian
-   one under Unicorn (support/host_unicorn.c; loongarch64 in its interpreter): the descriptor of a made-up program of
+   one under Unicorn (support/host_unicorn.c; loongarch64 in its interpreter), and arm64's (module_x64.c's own, which a
+   pack of iOS's has whatever host makes it): the descriptor of a made-up program of
    three functions and two imports loaded with them (each function a trap), then
      snx_module()    its MOD, ENT_ADDR the entries' addresses and ENT_PTR their functions
      snx_routes()    its table's version
@@ -11,14 +12,16 @@
      snx_aot_<e>    (with a profile run's units) a tail call of the entry's function
    A big-endian host's descriptor is the same code; its data is the host's numbers, which a test here can't read. With
    SNX_TEST_WIN64 (snx-test-module-desc-win64) it is x86-64's for Windows, a COFF object of its calling convention, run by
-   an x86-64 host itself (support/host_win64.c).
-     snx-test-module-desc [MACHINE...]   (riscv64 ppc64le mips64el loongarch64 by default) */
+   an x86-64 host itself (support/host_win64.c); with SNX_TEST_ARM64WIN (snx-test-module-desc-arm64win) arm64's for
+   Windows, and arm64's of a pack beside it, which stays ELF.
+     snx-test-module-desc [MACHINE...]   (riscv64 ppc64le mips64el loongarch64 arm64 by default) */
 #include "nx/loader/module_x64.h"
 #include "nx/loader/module_abi.h"
 #include "nx/loader/loader.h"
 #include "common/cpu/aarch64/cpu.h"
 #include "common/runtime/interface.h"
 #include "common/cpu/recompiler/variants.h"
+#include "common/cpu/recompiler/arm64/arm64_codegen.h"
 #include "common/cpu/recompiler/x64/x64_codegen.h"
 #include "support/host_unicorn.h"
 #include <stdio.h>
@@ -46,8 +49,11 @@ static int machine(const char* name, HostUcArch arch) {
 #if defined(SNX_TEST_WIN64)
     const SnxNativeDesc* desc = NULL; /* module_x64.c's own */
     const int found = snx_x64_win64();
+#elif defined(SNX_TEST_ARM64WIN)
+    const SnxNativeDesc* desc = NULL;
+    const int found = snx_arm64_windows();
 #else
-    const SnxNativeDesc* desc = snx_native_desc_named(name);
+    const SnxNativeDesc* desc = !strcmp(name, "arm64") ? &snx_a64_desc : snx_native_desc_named(name);
     const int found = desc != NULL;
 #endif
     static const SnxU64 starts[3] = {SNX_CODE_BASE + 0x100, SNX_CODE_BASE + 0x200, SNX_CODE_BASE + 0x300};
@@ -236,6 +242,84 @@ static int machine(const char* name, HostUcArch arch) {
     return failures != 0;
 }
 
+#if defined(SNX_TEST_ARM64WIN)
+/* a module of so many imports that IMPORT_FN's slots go past what COFF's ADRP holds: the stubs on both sides of that
+   place each read their own */
+static int many_imports(void) {
+    enum { COUNT = 140000, SIDE = (1 << 20) / 8 };
+    static const size_t asked[] = {0, SIDE - 1, SIDE, SIDE + 1, COUNT - 1};
+    SnxProgram* loaded = (SnxProgram*)calloc(1, sizeof *loaded);
+    SnxU64* imports = (SnxU64*)calloc(COUNT, sizeof *imports);
+    SnxCodegen codegen = {0};
+    SnxCodegenOptions options = {0};
+    const char* name = "arm64 imports";
+    unsigned char* object = NULL;
+    size_t size = 0, entries = 0, variants = 0;
+    char error[256] = "", sym[48];
+    int failures = 0;
+    HostUc* u = hostuc_new(HOSTUC_ARM64_WIN, 1u << 20);
+    uint64_t* table = NULL;
+    if (!u) {
+        free(loaded), free(imports);
+        return 77;
+    }
+    for (size_t k = 0; imports && k < COUNT; ++k) imports[k] = 0x7100000000ull + 16 * k;
+    if (!loaded || !imports ||
+        snx_x64_descriptor_for(NULL, &codegen, &options, loaded, imports, COUNT, NULL, 0, &object, &size, &entries,
+                               &variants, error, sizeof error) ||
+        hostuc_load(u, object, size, error, sizeof error) ||
+        !(table = (uint64_t*)(uintptr_t)hostuc_symbol(u, "IMPORT_FN")))
+        CHECK(0, "the descriptor of %d imports: %s", COUNT, error);
+    else {
+        const uint64_t to = hostuc_native(u, "imported", (void*)imported);
+        const uint64_t other = hostuc_native(u, "missed", (void*)missed);
+        for (size_t k = 0; k < COUNT; ++k) table[k] = other;
+        for (size_t k = 0; k < sizeof asked / sizeof *asked; ++k) {
+            uint64_t got = 0;
+            table[asked[k]] = to;
+            snprintf(sym, sizeof sym, "snx_aot_%llx", (unsigned long long)imports[asked[k]]);
+            CHECK(!hostuc_call(u, hostuc_symbol(u, sym), 1, 2, &got) && got == 0x1A, "%s gave %llx", sym,
+                  (unsigned long long)got);
+            table[asked[k]] = other;
+        }
+    }
+    printf("module_desc %s: %s\n", name, failures ? "FAILED" : "ok");
+    free(object), free(loaded), free(imports);
+    hostuc_free(u);
+    return failures != 0;
+}
+#endif
+
+#if defined(SNX_TEST_ARM64WIN)
+/* a Windows host's own descriptor is a COFF object, and a pack's (snx_a64_desc: a phone's) an ELF one all the same */
+static int packed(void) {
+    const char* name = "a pack's arm64";
+    const SnxU64 imports[1] = {0x7100000000ull};
+    SnxProgram* loaded = (SnxProgram*)calloc(1, sizeof *loaded);
+    SnxCodegen codegen = {0};
+    SnxCodegenOptions options = {0};
+    int failures = 0;
+    for (int own = 0; loaded && own < 2; ++own) {
+        unsigned char* object = NULL;
+        size_t size = 0, entries = 0, variants = 0;
+        char error[256] = "";
+        const int rc = snx_x64_descriptor_for(own ? NULL : &snx_a64_desc, &codegen, &options, loaded, imports, 1, NULL,
+                                              0, &object, &size, &entries, &variants, error, sizeof error);
+        CHECK(!rc, "%s descriptor: %s", own ? "the host's own" : "a pack's", error);
+        if (!rc && own)
+            CHECK(size > 2 && object[0] == 0x64 && object[1] == 0xAA, "the host's own descriptor is not COFF's arm64");
+        if (!rc && !own)
+            CHECK(size > 20 && !memcmp(object, "\177ELF", 4) && object[18] == 183 && object[19] == 0,
+                  "a pack's descriptor is not ELF's arm64");
+        free(object);
+    }
+    if (!loaded) ++failures;
+    printf("module_desc %s: %s\n", name, failures ? "FAILED" : "ok");
+    free(loaded);
+    return failures != 0;
+}
+#endif
+
 int main(int argc, char** argv) {
     static const struct {
         const char* name;
@@ -243,16 +327,21 @@ int main(int argc, char** argv) {
     } all[] = {
 #if defined(SNX_TEST_WIN64)
         {"x86-64", HOSTUC_WIN64}
+#elif defined(SNX_TEST_ARM64WIN)
+        {"arm64", HOSTUC_ARM64_WIN}
 #else
         {"riscv64", HOSTUC_RV64},
         {"ppc64le", HOSTUC_PPC64LE},
         {"mips64el", HOSTUC_MIPS64EL},
-        {"loongarch64", HOSTUC_LA64}
+        {"loongarch64", HOSTUC_LA64},
+        {"arm64", HOSTUC_ARM64}
 #endif
     };
     int failed = 0, skipped = 0, ran = 0;
 #if defined(SNX_TEST_WIN64)
     snx_x64_set_win64(1);
+#elif defined(SNX_TEST_ARM64WIN)
+    snx_arm64_set_windows(1);
 #endif
     for (size_t k = 0; k < sizeof all / sizeof *all; ++k) {
         int asked = argc < 2;
@@ -261,5 +350,9 @@ int main(int argc, char** argv) {
         int rc = machine(all[k].name, all[k].arch);
         failed |= rc == 1, skipped += rc == 77, ran += rc != 77;
     }
+#if defined(SNX_TEST_ARM64WIN)
+    failed |= many_imports() == 1;
+    failed |= packed();
+#endif
     return failed ? 1 : skipped && !ran ? 77 : 0;
 }
