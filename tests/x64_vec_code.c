@@ -34,6 +34,17 @@
 /* MOVMSKPS and MOVMSKPD r32, xmm (0F 50, 66 0F 50): a lane mask the hot code tests */
 #define MOVMSKPS      "0F 50"
 #define MOVMSKPD      "66 0F 50"
+/* SETNE r/m8 (0F 95): a condition made a value */
+#define SETNE         "0F 95"
+/* JP rel32 (0F 8A); PUSH qword [rsp + disp32] (FF B4 24) and its POPFQ (9D) */
+#define JP_REL32       "0F 8A"
+#define PUSH_RSP_POPFQ "FF B4 24 ?? ?? ?? ?? 9D"
+/* PADDD (66 0F FE) and PADDQ (66 0F D4), or their VEX forms */
+#define PADDD         "66 0F FE|C5 ?? FE|C4 ?? ?? FE"
+#define PADDQ         "66 0F D4|C5 ?? D4|C4 ?? ?? D4"
+/* INSERTPS (66 0F 3A 21) and MOVQ xmm, xmm/m64 (F3 0F 7E), or their VEX forms: a scalar's upper bits made 0 in XMM */
+#define INSERTPS      "66 0F 3A 21|C4 ?? ?? 21"
+#define MOVQ_XMM      "F3 0F 7E|C5 FA 7E|C5 7A 7E"
 /* MOVDQU xmm, m128: a V register's load from the state, or a constant's from the pool */
 #define MOVDQU_LOAD   "F3 0F 6F"
 /* GF2P8AFFINEQB xmm, xmm/m128, imm8 (66 0F 3A CE) and its VEX.128 form (C4, two bytes, CE); SHA1RNDS4 (0F 3A CC),
@@ -119,6 +130,15 @@ static const Row k_rows[] = {
     {"fadd v0.4s, v1.4s, v2.4s (the hot code's one lane mask)", 0, 0, 816, -1, "=1 " MOVMSKPS, "4E22D420"},
     {"fmul v0.2d, v1.2d, v2.2d (the hot code's one lane mask)", 0, 0, 864, -1, "=1 " MOVMSKPD, "6E62DC20"},
     {"fmla v0.4s, v1.4s, v2.4s (the hot code's one lane mask)", NEEDS_FMA, 0, 928, -1, "=1 " MOVMSKPS, "4E22CC20"},
+    {"fmul v0.4s, v1.4s, v2.4s (the hot test with no SETNE)", 0, 0, 832, -1, "!" SETNE, "6E22DC20"},
+    {"fcmp s1, s2 (NZCV off UCOMISS's flags: JP out where unordered)", 0, 0, 416, -1, JP_REL32, "1E222020"},
+    {"fcmpe d1, d2 (its cold path's flags back by PUSH and POPFQ)", 0, 0, 368, -1, PUSH_RSP_POPFQ, "1E622030"},
+    {"frecps v0.4s, v1.4s, v2.4s (the warm path: its hot test with no SETNE)", 0, 0, 768, -1, "!" SETNE, "4E22FC20"},
+    {"frsqrts d0, d1, d2 (the warm path: its hot test with no SETNE)", 0, 0, 800, -1, "!" SETNE, "5EE2FC20"},
+    {"ucvtf s0, x1 (from 2^63 up inline: the exponent's PADDD)", 0, 0, 352, -1, PADDD, "9E230020"},
+    {"ucvtf d0, x1, #3 (from 2^63 up inline: the exponent's PADDQ)", 0, 0, 384, -1, PADDQ, "9E43F420"},
+    {"fneg s0, s1 (by the vector's lanes)", 0, 0, 240, -1, INSERTPS, "1E214020"},
+    {"fabs d0, d1 (by the vector's lanes)", 0, 0, 240, -1, MOVQ_XMM, "1E60C020"},
     {"fmax v0.4s, v1.4s, v2.4s (the hot code's one lane mask)", 0, 0, 656, -1, "=1 " MOVMSKPS, "4E22F420"},
     {"fcmeq v0.4s, v1.4s, v2.4s (the hot code's one lane mask)", 0, 0, 640, -1, "=1 " MOVMSKPS, "4E22E420"},
     {"fsqrt v0.4s, v1.4s (the hot code's one lane mask)", 0, 0, 784, -1, "=1 " MOVMSKPS, "6EA1F820"},

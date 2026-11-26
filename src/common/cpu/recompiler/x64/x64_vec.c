@@ -458,7 +458,14 @@ static int fcold(SgCtx* g, SgB bad, int fast, int a, int b, int d, SnxU32 desc) 
    that every lane of r is a normal number (nr: fnot_roomy's); the cold path tests the rest before its call
    (x64_asm.h's sgx_cold_vwarm: zacc's bits), back to r where it holds: exact zeros, FZ with no denormal argument */
 static int fwarm(SgCtx* g, int r, int nr, unsigned sz, int n, int a, int b, int d, SnxU32 desc, unsigned zacc) {
-    SgB hot = sg_b_or(g, fstate(g, SGX_FPCR_RMODE | SGX_FPCR_FZ, 1), vany(g, nr, sz, n));
+    /* one test of nr's lane bits ORed with the state's bits, once a region: no condition made of each */
+    SgD lanes = sgx_val(32, sgx_v1(X, k_fmask[sz], nr, 0));
+    if (!g->fp_any_bits) {
+        SgD bits = sgx_fp_bad_bits(g, sg_FPCR_read(g), SGX_FPCR_RMODE | SGX_FPCR_FZ, 1);
+        g->fp_any_bits = sgx_reg(X, &bits);
+    }
+    if (n < (sz ? 2 : 4)) lanes = sg_d_and(g, lanes, sgx_const(32, (1u << n) - 1));
+    SgB hot = sg_b_not(g, sg_d_is_zero(g, sg_d_or(g, lanes, sgx_val(32, g->fp_any_bits))));
     return sgx_vcold_warm(X, hot, r, "snx_x64_fp_vec", a, b, d, desc, 0x80 | 0x20 | zacc, (int)offsetof(CPU, fpcr),
                           (int)offsetof(CPU, fpsr), 0);
 }
@@ -598,8 +605,7 @@ static int ffrom_int(SgCtx* g, unsigned sz, int n, int a, int uns, int fbits) {
 /* FRECPS (2 - a b) and FRSQRTS ((3 - a b) / 2) rounded once: the host's FMA, an infinity by a zero and the rest the FMA
    would get wrong (a NaN, a result not normal) going cold through the exact helper, whose special cases are its own */
 static int fstep(SgCtx* g, unsigned sz, int n, int a, int b, int sqrt) {
-    int t, r, bad, op = sqrt ? SNX_FP_RSQRTS : SNX_FP_RECPS;
-    SgB cold;
+    int t, r, op = sqrt ? SNX_FP_RSQRTS : SNX_FP_RECPS;
     if (!(X->features & SGX_F_FMA))
         return fcold(g, sg_bool(g, 1), vzero(g), a, b, 0, FDESC(0, sz, n) | (SnxU32)op << 12);
     {
@@ -610,9 +616,8 @@ static int fstep(SgCtx* g, unsigned sz, int n, int a, int b, int sqrt) {
     }
     /* halving a result whose half is normal is exact */
     r = sqrt ? op2(g, k_fmul[sz], t, fsplat(g, sz, sz ? 0x3FE0000000000000ull : 0x3F000000u)) : t;
-    bad = fnot_roomy(g, sz, r);
-    cold = sg_b_or(g, fstate(g, SGX_FPCR_RMODE, 1), fflushed(g, sz, n, a, b, 0));
-    return fcold(g, sg_b_or(g, cold, vany(g, bad, sz, n)), r, a, b, 0, FDESC(0, sz, n) | (SnxU32)op << 12);
+    /* a zero only where a b is exactly 2 (3), so every one exact; a and b FZ may flush */
+    return fwarm(g, r, fnot_roomy(g, sz, r), sz, n, a, b, 0, FDESC(0, sz, n) | (SnxU32)op << 12, 1 | 2u << 3);
 }
 /* FRECPE, FRSQRTE as ir_vec_fp.c's fast_estimate makes them, where every lane is normal with a normal estimate
    (FRSQRTE's positive): the exponent, and the low 8 bits of (2^19 / a' + 1) / 2 (FRSQRTE's: of the root of 2^28 / a'),
@@ -664,6 +669,11 @@ static int vec_fp(Unit* u, const SnxA64Insn* insn, SnxU32 word) {
     case SNX_A64_OP_FCMGE_s:
     case SNX_A64_OP_FCMEQ_s:
     case SNX_A64_OP_FABD_s: scalar = 1; break;
+    case SNX_A64_OP_FNEG_s:
+    case SNX_A64_OP_FABS_s:
+        if ((word >> 22 & 3) > 1) return 0; /* a half: the Sail's */
+        scalar = 1;
+        break;
     case SNX_A64_OP_SCVTF_f:
     case SNX_A64_OP_UCVTF_f:
     case SNX_A64_OP_FCVTZS_f:
@@ -687,6 +697,8 @@ static int vec_fp(Unit* u, const SnxA64Insn* insn, SnxU32 word) {
     case SNX_A64_OP_FCMGT_s: case SNX_A64_OP_FCMGE_s: case SNX_A64_OP_FCMEQ_s: case SNX_A64_OP_FABD_s:
     case SNX_A64_OP_FCVTZS_vf: case SNX_A64_OP_FCVTZU_vf: case SNX_A64_OP_SCVTF_vf: case SNX_A64_OP_UCVTF_vf:
     case SNX_A64_OP_FCVTL_v: case SNX_A64_OP_FCVTN_v: break;
+    case SNX_A64_OP_FNEG_s:
+    case SNX_A64_OP_FABS_s: break;
     case SNX_A64_OP_SCVTF_f: case SNX_A64_OP_UCVTF_f: case SNX_A64_OP_FCVTZS_f: case SNX_A64_OP_FCVTZU_f:
         if (!scalar) return 0; /* the general-purpose register forms: the Sail's */
         break;
@@ -724,8 +736,10 @@ static int vec_fp(Unit* u, const SnxA64Insn* insn, SnxU32 word) {
             r = ffma(g, sz, n, vread(g, rd), vread(g, rn), m, insn->op == SNX_A64_OP_FMLS_vi);
         break;
     }
-    case SNX_A64_OP_FNEG_v: r = vxor(g, vread(g, rn), fsplat(g, sz, 1ull << (sz ? 63 : 31))); break;
-    case SNX_A64_OP_FABS_v: r = vandn(g, fsplat(g, sz, 1ull << (sz ? 63 : 31)), vread(g, rn)); break;
+    case SNX_A64_OP_FNEG_v:
+    case SNX_A64_OP_FNEG_s: r = vxor(g, vread(g, rn), fsplat(g, sz, 1ull << (sz ? 63 : 31))); break;
+    case SNX_A64_OP_FABS_v:
+    case SNX_A64_OP_FABS_s: r = vandn(g, fsplat(g, sz, 1ull << (sz ? 63 : 31)), vread(g, rn)); break;
     case SNX_A64_OP_FSQRT_v: r = fsqrt(g, sz, n, vread(g, rn)); break;
     case SNX_A64_OP_FCMEQ_v:
     case SNX_A64_OP_FCMEQ_s: r = fcompare(g, sz, n, vread(g, rn), vread(g, rm), 0, 0); break;

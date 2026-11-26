@@ -3,9 +3,10 @@
 /* The arm64 back end's guest functions: mach/mach_codegen.inc over sailgen's arm64 emitters (a64_arm64.inc), with
    the glue of AAPCS64 written here, every word an encoder's of the A64 Sail (a64_enc.inc).
 
-   The function's ABI is GuestFn's: the state in X0, kept in X19, the entry in X1 (SGX_FN_TARGET, as a call's target
-   is); X29 and X30 saved, then X19 and X20, and X21 to X28 where the function pins guest registers there (the
-   callee's: no call changes them), SP 16-aligned below a frame of spill slots whose size is patched in at the end.
+   The function's ABI is GuestFn's: the state in X0, kept in X19 (SGX_BASE_BIAS past it), the entry in X1
+   (SGX_FN_TARGET, as a call's target is); X29 and X30 saved, then X19 and X20, and X21 to X28 where the function
+   pins guest registers there (the callee's: no call changes them), SP 16-aligned below a frame of spill slots whose
+   size is patched in at the end.
    The guest's vector registers are pinned in V31 down to V24 (caller-saved: stored around a call); V8 to V15,
    whose low halves are the callee's, hold no value, nor does V7, a by-element form's Rm (arm64_vec.c). X16 and X17 are the glue's and the assembler's own.
 
@@ -16,7 +17,7 @@
    registers Windows' too (X18, the system's, is never touched), in a COFF object whose function table unwinds it by the
    prologue and the epilogues (x64_elf.c), a frame of a page or more read page by page first (the guard page's) */
 #include "common/cpu/recompiler/arm64/arm64_codegen.h"
-#include "common/cpu/recompiler/llvm/link.h"
+#include "common/cpu/recompiler/object/link.h"
 #include "common/cpu/recompiler/x64/x64_elf.h"
 #include "common/cpu/aarch64/a64_decoder.h"
 #include "common/cpu/aarch64/cpu.h"
@@ -31,7 +32,7 @@
 /* not on Windows on another machine, whose tests run none of its code */
 #if !defined(_WIN32) || defined(__aarch64__)
 #if defined(__APPLE__) || defined(_WIN32)
-#include "common/cpu/recompiler/llvm/elf_defs.h"
+#include "common/cpu/recompiler/object/elf_defs.h"
 #else
 #include <elf.h>
 #endif
@@ -66,6 +67,8 @@ typedef struct SgXAsm SgXAsm;
 static inline void sgx_machine_op(SgXAsm* a, int at, const unsigned char* r);
 
 #include "a64_arm64.inc"
+
+static_assert(SNX_ARM64_STATE_BIAS == SGX_BASE_BIAS, "arm64_codegen.h's bias of X19 is sailgen's");
 
 /* ---- what mach_codegen.inc asks of the machine ---- */
 #define MG_EM EM_AARCH64
@@ -131,7 +134,7 @@ static void jcc(Unit* u, int cc, int label) {
 /* the state's field at off, of bytes, to or from Xt */
 static void state_ldst(Unit* u, int load, int bytes, int rt, size_t off) { sga_ldst(&u->b, load, bytes, rt, SGX_BASE, -1, (int)off); }
 static void movi(Unit* u, int rd, SnxU64 v) { sga_movi(&u->b, rd, v, 1); }
-static void mov_x0_state(Unit* u) { w32(u, sge_a64_orr_log_shift(0, SGA_ZR, 0, SGX_BASE, 0, 1)); }
+static void mov_x0_state(Unit* u) { sga_state_out(&u->b); }
 static void set_pc(Unit* u, SnxU64 pc) {
     movi(u, SGA_X16, pc);
     state_ldst(u, 0, 8, SGA_X16, offsetof(CPU, pc));
@@ -143,16 +146,17 @@ static void call_rt(Unit* u, int off) {
     w32(u, sge_a64_blr(SGA_X16));
 }
 
-/* the pins to the state (store; none where none is newer than it) or from it: every one, or (caller) the vector ones,
-   which a call may change */
+/* the pins to the state (store: those written there since it was in step, cur_dirty) or from it (those pin_sel
+   names, the ones live there): every one, or (caller) the vector ones, which a call may change */
 static void pins_of(Unit* u, SgXBuf* b, int store, int caller) {
     int n;
-    if (!u->pinned || (store && !u->cur_dirty && !u->vcur_dirty)) return;
+    if (!u->pinned) return;
     if (u->mempin >= 0 && !store && !caller) sga_ldst(b, 1, 8, u->mempin, SGX_BASE, -1, (int)offsetof(CPU, mem));
     for (n = 0; n < 32; ++n) {
-        if (u->pin[n] >= 0 && !caller)
+        if (u->pin[n] >= 0 && !caller && (store ? (u->pin_wr & u->cur_dirty) >> n & 1 : u->pin_sel >> n & 1))
             sga_ldst(b, !store, 8, u->pin[n], SGX_BASE, -1, (int)(offsetof(CPU, x) + 8 * (size_t)n));
-        if (u->vpin[n] >= 0) sga_fp_ldst(b, !store, 16, u->vpin[n], SGX_BASE, -1, (int)(offsetof(CPU, v) + 16 * (size_t)n));
+        if (u->vpin[n] >= 0 && (store ? (u->vpin_wr & u->vcur_dirty) >> n & 1 : u->vpin_sel >> n & 1))
+            sga_fp_ldst(b, !store, 16, u->vpin[n], SGX_BASE, -1, (int)(offsetof(CPU, v) + 16 * (size_t)n));
     }
 }
 
@@ -161,9 +165,9 @@ static void frame_here(Unit* u, size_t at) {
     u->frame_at = (size_t*)grow(u->frame_at, &u->cap_frame, u->nframe + 1, sizeof *u->frame_at);
     u->frame_at[u->nframe++] = at;
 }
-/* STP X29, X30, [SP, #-96]!; MOV X29, SP; STP X19, X20, [SP, #16] (and X21-X28 where pinned); MOV X19, X0; SUB SP,
-   SP, #frame (patched), on Windows past the probe of one of a page or more; the pins loaded. x64_elf.c's a64_prologue
-   reads it back, and knows the epilogue by it */
+/* STP X29, X30, [SP, #-96]!; MOV X29, SP; STP X19, X20, [SP, #16] (and X21-X28 where pinned); ADD X19, X0, #8
+   (sga_state_in); SUB SP, SP, #frame (patched), on Windows past the probe of one of a page or more; the pins loaded.
+   x64_elf.c's a64_prologue reads it back, and knows the epilogue by it */
 static void prologue(Unit* u) {
     w32(u, sge_a64_stp_gen_pre_idx(29, 31, 30, (SnxU32)-12 & 0x7F, 2));
     w32(u, sge_a64_add_addsub_imm(29, 31, 0, 0, 1));
@@ -172,7 +176,7 @@ static void prologue(Unit* u) {
         int k;
         for (k = 0; k < 4; ++k) w32(u, sge_a64_stp_gen_general_offset((SnxU32)(21 + 2 * k), 31, (SnxU32)(22 + 2 * k), (SnxU32)(4 + 2 * k), 2));
     }
-    w32(u, sge_a64_orr_log_shift(SGX_BASE, SGA_ZR, 0, 0, 0, 1)); /* MOV X19, X0 */
+    sga_state_in(&u->b);
     if (windows(u) && u->again) frame_here(u, sga_stack_probe(&u->b));
     frame_here(u, u->b.n);
     w32(u, sge_a64_sub_addsub_imm(31, 31, 0, 0, 1));
@@ -342,7 +346,8 @@ static void mg_entry(Unit* u, size_t index, SnxU64 start) {
         stale_test(u, index);
         jcc(u, 0, live); /* B.EQ */
         state_ldst(u, 0, 8, 1, offsetof(CPU, pc));
-        leave(u);
+        epilogue(u); /* no pin changed yet (and not every one loaded): none stored */
+        w32(u, sge_a64_ret(30));
         bind(u, live);
     }
     movi(u, SGA_X16, start);

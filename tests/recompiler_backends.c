@@ -61,7 +61,7 @@
     defined(SNX_TEST_LA64) || defined(SNX_TEST_PPC64BE) || defined(SNX_TEST_MIPS64BE) || defined(SNX_TEST_S390X) ||    \
     defined(SNX_TEST_WIN64)
 #define SNX_TEST_NATIVE 1
-#include "common/cpu/recompiler/llvm/elf_object.h"
+#include "common/cpu/recompiler/object/elf_object.h"
 #include "support/host_unicorn.h"
 #define SNX_TEST_SWAP_CPU 1
 #include "support/swap_state.h"
@@ -364,7 +364,7 @@ static const char* const k_vec_ops[] = {
     "FMINV_s", "FMAXNMV_s", "FMINNMV_s", "FRECPE_v", "FRECPE_s", "FRSQRTE_v", "FRSQRTE_s", "FRECPS_v", "FRECPS_s",
     "FRSQRTS_v", "FRSQRTS_s", "FRINTN_v", "FRINTP_v", "FRINTM_v", "FRINTZ_v", "FRINTA_v", "AESE", "AESD", "AESMC",
     "FMULX_v", "FMULX_vi", "FCVTNS_vi", "FCVTNU_vi", "FCVTPS_vi", "FCVTPU_vi", "FCVTMS_vi", "FCVTMU_vi", "FCVTAS_vi",
-    "FCVTAU_vi",
+    "FCVTAU_vi", "FNEG_s", "FABS_s",
     "AESIMC", "SHA1C", "SHA1P", "SHA1M", "SHA1SU0", "SHA1H", "SHA1SU1", "SHA256H", "SHA256H2", "SHA256SU0", "SHA256SU1",
     "SUQADD_v", "USQADD_v", "SUQADD_s", "USQADD_s", "SQABS_v", "SQNEG_v", "SQABS_s", "SQNEG_s", "RBIT_v", "SRSHL_v",
     "URSHL_v", "UQSHL_v", "SQRSHL_v", "UQRSHL_v", "SSHL_s", "USHL_s", "SRSHL_s", "URSHL_s", "SQSHL_s", "UQSHL_s",
@@ -572,7 +572,10 @@ static void start_state(CPU* c, unsigned s) {
 
 /* a state of --ops: in three of four, the SIMD&FP registers' elements (of one size a register) are values where the
    integers' arithmetic turns, small ones (a shift by a register's amounts), or a float's: zeros, infinities, NaNs,
-   denormals, the normals' ends, halfway cases, ordinary numbers; QC set in some, FZ16 random with FPCR's other bits */
+   denormals, the normals' ends, halfway cases, ordinary numbers; QC set in some, FZ16 random with FPCR's other bits;
+   in some, the SIMD&FP registers' low single or double one of those floats (below); in half, the first 16
+   general-purpose registers integers at the conversions' steps: the ends, ties of a single's and
+   a double's rounding (below 2^63 and above it, where UCVTF of an X converts a half) with a 1 past them or one short */
 static void ops_state(CPU* c, unsigned s) {
     static const uint64_t k32[] = {0, 0x80000000u, 0x3f800000u, 0xbf800000u, 0x40000000u, 0x7f800000u, 0xff800000u,
                                    0x7fc00000u, 0xffc00001u, 0x7fa00000u, 0xff800001u, 0x00000001u, 0x80000001u,
@@ -592,8 +595,17 @@ static void ops_state(CPU* c, unsigned s) {
                                    0x47efffffe0000000ull, 0x380fffffc0000000ull, 0x36a0000000000000ull};
     static const uint64_t k16[] = {0, 0x8000, 0x3c00, 0xbc00, 0x4000, 0x7c00, 0xfc00, 0x7e00, 0x7d00, 0xfe01,
                                    1, 0x8001, 0x3ff, 0x400, 0x8400, 0x7bff, 0xfbff, 0x3800, 0x3e00, 0x7800, 0x0100};
+    static const uint64_t kint[] = {
+        0x0000000000000000ull, 0x0000000000000001ull, 0x7fffffffffffffffull, 0x8000000000000000ull,
+        0x8000000000000001ull, 0xffffffffffffffffull, 0x8000008000000000ull, 0x8000018000000000ull,
+        0x8000008000000001ull, 0x8000007fffffffffull, 0xffffff8000000000ull, 0x8000000000000400ull,
+        0x8000000000000c00ull, 0x8000000000000401ull, 0x80000000000003ffull, 0xfffffffffffffc00ull,
+        0x0000000001000001ull, 0x0000000001000003ull, 0x0020000000000001ull, 0x0020000000000003ull,
+        0xfffffffffeffffffull, 0xffdfffffffffffffull};
     unsigned r, i;
     start_state(c, s);
+    if (s & 8)
+        for (r = 0; r < 16; ++r) c->x[r] = kint[rnd() % (sizeof kint / sizeof *kint)];
     if (s & 2) c->fpsr |= 1u << 27;
     if (s & 1) c->fpcr |= (uint32_t)rnd() & 1u << 19;
     if ((s >> 2 & 3) == 3) return;
@@ -616,6 +628,20 @@ static void ops_state(CPU* c, unsigned s) {
             lane &= m;
             c->v[r].d[i * e / 64] = (c->v[r].d[i * e / 64] & ~(m << (i * e % 64))) | lane << (i * e % 64);
         }
+    }
+    /* in some, every register's low single (or double) one of the floats above, or in one of four a signalling NaN,
+       and FPSR's IOC and IDC clear: a scalar compare's operands, NaNs of both kinds and the denormals FZ flushes among
+       them, and the flags it raises seen */
+    if ((s >> 4 & 3) == 1 || (s >> 4 & 3) == 2) {
+        static const uint64_t snan[2][2] = {{0x7f800001u, 0xffbfffffu}, {0x7ff0000000000001ull, 0xfff7ffffffffffffull}};
+        int dbl = (s >> 4 & 3) == 2;
+        for (r = 0; r < 32; ++r) {
+            uint64_t f = !(rnd() % 4) ? snan[dbl][rnd() & 1]
+                         : dbl        ? k64[rnd() % (sizeof k64 / sizeof *k64)]
+                                      : k32[rnd() % (sizeof k32 / sizeof *k32)];
+            c->v[r].d[0] = dbl ? f : (c->v[r].d[0] & ~0xffffffffull) | f;
+        }
+        c->fpsr &= ~0x81u;
     }
 }
 

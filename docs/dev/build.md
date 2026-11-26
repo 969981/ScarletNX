@@ -313,8 +313,8 @@ runtime must not mix with another LLVM build.
    cd ScarletNX
    ```
 
-4. Configure and build. These are CI's options without its ccache and `-DSNX_DEPLOY=OFF` ones. They give
-   CMake the MSYS2 tools as Windows paths and build the pinned SDL3.
+4. Configure and build. These are CI's options without its ccache, LTO, VP9 vectors and `-DSNX_DEPLOY=OFF` ones.
+   They give CMake the MSYS2 tools as Windows paths and build the pinned SDL3.
 
    ```sh
    cmake --preset default \
@@ -337,7 +337,7 @@ runtime must not mix with another LLVM build.
 6. Run `build/default/scarletnx.exe` from the CLANG64 shell, which has the DLLs it imports on PATH
    ([Usage](../user/usage.md)). For a copy that runs without MSYS2, `cmake --install build/default --prefix stage` puts
    `scarletnx.exe` in `stage/bin`. Then copy the DLLs it imports from `/clang64/bin`, as CI's
-   "Bundle runtime DLLs and licenses" step does.
+   "Bundle runtime DLLs and licenses" step does (`scripts/ci/windows.sh bundle`).
 
 ## Rebuild, deploy, cache
 
@@ -493,6 +493,9 @@ cmake --preset default -B build -DSNX_FFMPEG_ASM=OFF && cmake --build build
 - `-DSNX_TOOLS_ONLY=ON`: build the extraction/recompilation driver without the runtime, see below (default OFF).
 - `-DSNX_RECOMPILER_SHARED=ON`, `-DSNX_RECOMPILER_INSTALL=ON`: also build the recompiler as a shared library, and
   install the library, see [Library](library.md) (defaults OFF and the value of `SNX_TOOLS_ONLY`).
+- `-DSNX_WITH_LLVM=OFF`: build the recompiler's core alone, without LLVM: its own back ends, and what links and loads
+  their objects (`snx_recompiler_core`), with the tests of it. Every driver needs LLVM, so the configure stops and names
+  the ones that are on (default ON).
 - `-DSNX_SAIL_X64=OFF`: build without the x86-64 back end, and LLVM makes every function. The default is ON on x86-64,
   Android's included; a tree keeps the value it was first configured with, which the configure's log says. Its
   instruction selection is in the tree (`tools/sailgen/sdm/x64_isel.inc`,
@@ -506,7 +509,7 @@ it:
 
 - `-DSNX_TEST_SANITIZERS=ON`: build the native tests, and the programs and libraries of the repository they run or
   link, with ASan and UBSan (`runtime_architecture` names one left out). The runtime is one, so it is not deployed.
-  CI's Linux x86-64 job (`Linux AppImage (x86_64)`) runs the tests this way, with
+  CI's job `Linux (x86_64, ASan + UBSan)` runs the tests this way, with
   `LSAN_OPTIONS=use_stacks=0:use_registers=0:suppressions=$PWD/tests/lsan.supp` so the leak check finds the same leaks
   on every machine, and none of the system's libraries' own (SDL's ALSA backend never frees ALSA's device hints).
 - `-DSNX_TEST_VULKAN=ON`: add the offscreen Vulkan integration tests, see below.
@@ -517,8 +520,8 @@ it:
   edenprobe as CI does against its baseline, with guest buffers copied and read in place (docs/dev/edenprobe.md).
 - `-DSNX_TEST_SDM=ON`: download the Intel SDM into `CPM_SOURCE_CACHE` once and have `sailgen_sdm_isel` make the x86-64
   back end's instruction selection again from it, which must be the tree's (needs `pdftotext`, poppler's). The test is
-  skipped without the PDF, which `-DSNX_SDM_PDF=` also names. CI's Linux x86-64 job runs it on the nightly and on a pull
-  request that changes `tools/sailgen`.
+  skipped without the PDF, which `-DSNX_SDM_PDF=` also names. CI's Linux x86-64 job runs it on a run by hand, a
+  version's tag and a pull request that changes `tools/sailgen`.
 - `-DSNX_TEST_VP9_VECTORS=ON`: add the `nvdec_vp9_*` tests, which run NVDEC's VP9 jobs on libvpx's test vectors;
   configure downloads the 32 files from the WebM project into `CPM_SOURCE_CACHE` once. CI's Linux, ASan, Windows and
   macOS jobs run them.
@@ -535,8 +538,8 @@ wheel of unicorn 2.1.4 has both, in its `include` and `lib/libunicorn.so.2`), th
 that the native back ends make for the other machines against LLVM's, and their A32 and Thumb blocks (`arm_<machine>_vector`
 and its like, with `SNX_TEST_ARM_DIFF`) against Unicorn's own ARM core (`ctest -L unicorn`, `ctest -L rv64` for one
 machine).
-CI's Linux x86-64 job runs them in every push, nightly and run by hand, and in a pull request that changes what they test
-(`scripts/recompiler-changes.py`), and fails where a machine ran none (`scripts/unicorn-tests.py`). PowerPC64's are
+CI's job `Linux (x86_64, other machines under Unicorn)` runs them in every pull request, run by hand and version's tag,
+as all of its tests, and fails where a machine ran none (`scripts/unicorn-tests.py`). PowerPC64's are
 skipped: Unicorn 2.1.4 as it is released does not hold the MSR of a 64-bit PowerPC.
 
 The tests labelled `census` (`ctest -L census -V`) recompile five whole programs that they make: a Switch game of a word of
@@ -591,8 +594,8 @@ ctest --test-dir build/tools --output-on-failure
 
 The recompiler generates game code with LLVM, its only backend. LLVM's
 development files are required: `llvm-config` finds them (`-DSNX_LLVM_CONFIG=/path/to/llvm-config` picks one), and
-the configure stops without them on every platform, including Windows and cross-builds. There is no recompiler
-build without LLVM. Modules are built for the machine that builds them, with its instruction set
+the configure stops without them on every platform, including Windows and cross-builds. No driver builds without LLVM:
+`-DSNX_WITH_LLVM=OFF` builds the recompiler's core alone. Modules are built for the machine that builds them, with its instruction set
 extensions (build == host == target); nothing is detected at run time. Whole functions are batched into units of 90000
 instructions (20000 on Android; `--chunk`), with a progress line per compiled unit.
 

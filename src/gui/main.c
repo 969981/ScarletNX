@@ -36,6 +36,7 @@
 #include "gui/find.h"
 #include "gui/bluetooth.h"
 #include "gui/gpu_driver_fetch.h"
+#include "gui/nightly_check.h"
 #include "gui/gui.h"
 #include "gui/i18n.h"
 #include "gui/icons.h"
@@ -295,7 +296,7 @@ typedef struct {
 /* the App screen's values, as its rows show them, and Folders' (what each row's folder is, past its path) */
 typedef struct {
     char theme[64], text[64], language[64], animations[16], side[16], background[48], places[48], moves[32];
-    char drivers[64], freedreno[32];
+    char drivers[64], freedreno[32], updates[16];
     char folder[GUI_FOLDER_ROWS][64];
 } GuiAppForm;
 /* GPU Drivers' values: each row's mark, (*) on the pick; on a greyed row, what this device lacks for it */
@@ -865,6 +866,14 @@ typedef struct App {
     bool
         fingers; /* a screen of fingers (SNX_TOUCH_UI): the tabs and the foot's keys a finger's row high, its letters */
     int side_box;        /* app.ini's side_box (GuiSide): auto, on or off; F2 shows or hides it */
+    /* app.ini's check_updates (GUI_UPDATES_*): Ask, the default, asks before the first look at GitHub; due, looked at
+       once the menu is free at the start; the look's thread and the event its answer comes as */
+    int updates;
+    bool updates_due;
+    SDL_Thread* nightly_thread;
+    Uint32 nightly_event;
+    char nightly_url[256];    /* GUI_ASK_NIGHTLY's page */
+    bool nightly_asking;      /* the look's thread has yet to answer */
     int options[GUI_OPTIONS]; /* Games' options, each its word's index in option_keys (0 its first word) */
     bool options_shown;       /* the View box over Games, a row an option, options_focus's in focus */
     int options_focus;
@@ -1674,6 +1683,10 @@ static const char* const place_labels[GUI_PLACES] = {SNX_TR_NOOP("Data"), SNX_TR
 /* side_box's words in app.ini, GuiSide's order, and as Settings > App shows them */
 static const char* const side_words[] = {"auto", "on", "off"};
 static const char* const side_names[] = {SNX_TR_NOOP("Auto"), SNX_TR_NOOP("On"), SNX_TR_NOOP("Off")};
+/* check_updates' words in app.ini, and as Settings > App shows them: Ask its default */
+enum { GUI_UPDATES_ASK, GUI_UPDATES_ON, GUI_UPDATES_OFF };
+static const char* const updates_words[] = {"ask", "on", "off"};
+static const char* const updates_names[] = {SNX_TR_NOOP("Ask"), SNX_TR_NOOP("On"), SNX_TR_NOOP("Off")};
 /* background_recompile's, auto its default: the queue's recompiles gentle on battery and at full speed on the charger,
    always at full speed, or always gentle (job_gentle) */
 enum { GUI_BACKGROUND_AUTO, GUI_BACKGROUND_FULL, GUI_BACKGROUND_GENTLE };
@@ -1734,7 +1747,7 @@ static int app_known(void* ctx, const char* section, const char* key) {
     static const char* const own[] = {
         "theme",         "ui_scale",         "text_size",  "side_box",   "background_recompile", "recompile_background",
         "animations",    "dumps_subfolders", "dumps_main", "probe_mode", "recompiled_main",      "gpu_driver",
-        "freedreno_env", "language"};
+        "freedreno_env", "language",         "check_updates"};
     (void)ctx;
     if (!strcmp(section, "app")) {
         if (option_of(key) >= 0) return 1;
@@ -1761,7 +1774,8 @@ static void games_defaults(App* app) {
 /* Settings > App's picks and Games' options written to app_file: 0, else nonzero, said by the caller */
 static int app_write(App* app) {
     char *text, *was = NULL, *top, *rest, *whole, why[1024] = "";
-    size_t size = 256 + 32 * GUI_OPTIONS + sizeof app->gpu_driver + sizeof app->freedreno + 40 + 32, was_size = 0;
+    size_t size = 256 + 32 * GUI_OPTIONS + sizeof app->gpu_driver + sizeof app->freedreno + 40 + 32 + 24,
+           was_size = 0;
     int n, failed, i;
     if (!app->app_file || app->look_only) return 0;
     for (i = 0; i < GUI_PLACES; ++i) size += 16 + (app->place[i] ? strlen(app->place[i]) : 0);
@@ -1774,6 +1788,7 @@ static int app_write(App* app) {
     n += snprintf(text + n, size - (size_t)n, "animations = %d\n", !app->animations_off);
     n += snprintf(text + n, size - (size_t)n, "side_box = %s\n", side_words[app->side_box]);
     n += snprintf(text + n, size - (size_t)n, "background_recompile = %s\n", background_words[app->background_mode]);
+    n += snprintf(text + n, size - (size_t)n, "check_updates = %s\n", updates_words[app->updates]);
     n += snprintf(text + n, size - (size_t)n, "dumps_subfolders = %s\n", app->dumps_shallow ? "off" : "on");
     n += snprintf(text + n, size - (size_t)n, "dumps_main = %s\n", app->dumps_off ? "off" : "on");
     n += snprintf(text + n, size - (size_t)n, "recompiled_main = %s\n", app->recompiled_off ? "off" : "on");
@@ -1871,7 +1886,7 @@ static int app_read(App* app, bool apply, char* bad, size_t size, char* renamed,
     int background = app->background_mode, kept, old_background = -1;
     bool shallow = app->dumps_shallow, main_off = app->dumps_off, games_off = app->recompiled_off;
     bool full = app->probe_full;
-    int side = app->side_box;
+    int side = app->side_box, updates = app->updates;
     char driver[sizeof app->gpu_driver], freedreno[sizeof app->freedreno];
     SnxIni ini;
     if (size) bad[0] = 0;
@@ -1967,6 +1982,13 @@ static int app_read(App* app, bool apply, char* bad, size_t size, char* renamed,
             for (w = 0; w < 3 && strcmp(value, side_words[w]); ++w) {}
             if (w < 3) {
                 side = w;
+                continue;
+            }
+        } else if (!strcmp(ini.section, "app") && !strcmp(key, "check_updates")) {
+            int w;
+            for (w = 0; w < 3 && strcmp(value, updates_words[w]); ++w) {}
+            if (w < 3) {
+                updates = w;
                 continue;
             }
         } else if (!strcmp(ini.section, "app") && !strcmp(key, "background_recompile")) {
@@ -2068,6 +2090,8 @@ static int app_read(App* app, bool apply, char* bad, size_t size, char* renamed,
                           places[place]       ? places[place]
                           : app->place[place] ? app->place[place]
                                               : "none");
+        else if (n < (int)size && !strcmp(ini.section, "app") && !strcmp(key, "check_updates"))
+            n += snprintf(bad + n, size - (size_t)n, snx_tr(" (it keeps %s)"), updates_words[updates]);
         if (n >= (int)size) n = (int)size - 1;
     }
     if (others_size) {
@@ -2094,6 +2118,7 @@ static int app_read(App* app, bool apply, char* bad, size_t size, char* renamed,
     if (apply) snprintf(app->gpu_driver, sizeof app->gpu_driver, "%s", driver);
     if (apply) snprintf(app->freedreno, sizeof app->freedreno, "%s", freedreno);
     if (apply) app->background_mode = background;
+    if (apply) app->updates = updates;
     if (apply && side != app->side_box) {
         app->side_box = side;
         layout(app);
@@ -3027,6 +3052,8 @@ static const char* ask_question(App* app) {
         case GUI_ASK_PACK:
         case GUI_ASK_FORGET: return app->ask_line;
         case GUI_ASK_OVERWRITE: return snx_tr("Overwrite users.ini? It is kept as users.ini.old");
+        case GUI_ASK_UPDATES: return snx_tr("Check for new nightlies?");
+        case GUI_ASK_NIGHTLY: return app->ask_line;
         case GUI_ASK_ERROR: return app->error_line;
         case GUI_ASK_CLOSE:
             if (!app->menu.running && !app->finished) return job_leaving(app);
@@ -3074,7 +3101,8 @@ static void text_from(App* app, GuiRect r, int x, int y, const char* value, int 
     value = gui_cols_skip(value, skip);
     SDL_SetTextureColorMod(app->font, color.r, color.g, color.b);
     while (*value) {
-        int c = gui_menu_glyph(gui_utf8_step(&value)), n = gui_glyph_cols(c);
+        uint32_t point = gui_utf8_step(&value);
+        int c = gui_menu_glyph(point == '\n' ? ' ' : point), n = gui_glyph_cols(c); /* a line break on one row */
         if (n > room) break;
         glyph(app, (float)x, (float)y, c);
         room -= n;
@@ -3122,14 +3150,15 @@ static GuiRect over_rect(const App* app, int cols, int h) {
     w = SDL_min((cols + 2) * cell_w(app), width - 2 * cell_w(app));
     return gui_rect((width - w) / 2, SDL_max(0, (height - h) / 2), w, h);
 }
-/* the bytes of s's first row at width columns: a path's up to a slash (gui_wrap), other text's up to a space or after a
-   wide letter, as Chinese breaks between any two */
+/* the bytes of s's first row at width columns: a path's up to a slash (gui_wrap), other text's up to a line break, a
+   space or after a wide letter, as Chinese breaks between any two */
 static size_t wrap_at(const char* s, int width, int path) {
     const char *p = s, *space = NULL;
     int n = 0;
     if (path) return gui_wrap(s, width);
     while (*p) {
         const char* next = p;
+        if (*p == '\n') return (size_t)(p - s);
         int cols = gui_glyph_cols(gui_menu_glyph(gui_utf8_step(&next)));
         if ((n += cols) > width) break;
         p = next;
@@ -3155,7 +3184,7 @@ static int wrap_in(App* app, GuiRect r, int x, int y, const char* s, int path, S
         return 1;
     }
     while (*s && y + (rows + 1) * cell_h(app) <= r.y + r.h) {
-        size_t n = wrap_at(s, width, path), next = n;
+        size_t n = wrap_at(s, width, path), next = n + (s[n] == '\n');
         while (s[next] == ' ') ++next;
         if (s[next] && y + (rows + 2) * cell_h(app) > r.y + r.h) { /* no row for the rest: cut, it would be lost */
             text_in(app, r, x, y + rows * cell_h(app), s, color);
@@ -3163,7 +3192,7 @@ static int wrap_in(App* app, GuiRect r, int x, int y, const char* s, int path, S
         }
         snprintf(row, sizeof row, "%.*s", (int)n, s);
         text_in(app, r, x, y + rows * cell_h(app), row, color);
-        for (s += n; *s == ' ';) ++s; /* a row starts at a word */
+        for (s += n + (s[n] == '\n'); *s == ' ';) ++s; /* a row starts at a word, or after a line break */
         ++rows;
     }
     return rows;
@@ -3172,8 +3201,10 @@ static int wrap_in(App* app, GuiRect r, int x, int y, const char* s, int path, S
 static int wrap_rows(const App* app, const char* s, int width, int path) {
     int rows = 0;
     if (width <= 0 || app->theme.text == GUI_TEXT_SLIDE) return 1;
-    for (; *s; ++rows)
-        for (s += wrap_at(s, width, path); *s == ' ';) ++s;
+    for (; *s; ++rows) {
+        s += wrap_at(s, width, path);
+        for (s += *s == '\n'; *s == ' ';) ++s;
+    }
     return SDL_max(rows, 1);
 }
 /* why the box of what Move Old Files did lists what it lists, over them */
@@ -3364,6 +3395,8 @@ static void choices_place(App* app, int of, GuiRect area, const char* question, 
         int margin = app->theme.cursor[0] ? gui_text_cols(app->theme.cursor) * cw : 0;
         int w = SDL_min(SDL_max(longest, 24) * cw + margin, area.w), top;
         rows = wrap_rows(app, question, (area.w - 4 * cw) / cw, 0);
+        rows = SDL_min(rows,
+                       SDL_max(1, (area.h - list_h - (tab_w ? cell_h(app) : 0) - cell_h(app) / 2) / cell_h(app) - 2));
         c->box = gui_rect(area.x, area.y + area.h - (rows + 2) * cell_h(app), area.w, (rows + 2) * cell_h(app));
         if (tab_w) c->tab = gui_rect(c->box.x + 2 * cw, c->box.y - cell_h(app), tab_w * cw, cell_h(app) + 4 * s);
         top = (tab_w ? c->tab.y : c->box.y) - cell_h(app) / 2 - list_h;
@@ -3376,6 +3409,7 @@ static void choices_place(App* app, int of, GuiRect area, const char* question, 
         int cols = SDL_max(gui_text_cols(question) + tab_w, longest), w, h;
         w = SDL_min((cols + 2) * cw, area.w - 2 * cw);
         rows = wrap_rows(app, question, (w - 2 * cw - tab_w * cw) / cw, 0);
+        rows = SDL_min(rows, SDL_max(1, (area.h - list_h - 12 * s) / cell_h(app))); /* the choices kept whole */
         list_h = SDL_min(list_h, SDL_max(0, area.h - rows * cell_h(app) - 12 * s)); /* the box kept in the area */
         h = rows * cell_h(app) + list_h + 12 * s;
         c->box = gui_rect(area.x + (area.w - w) / 2, area.y + SDL_max(0, (area.h - h) / 2), w, h);
@@ -3402,7 +3436,7 @@ static void choices_draw(App* app, const GuiChoices* c, const char* question, co
         pane(app, c->box, NULL);
         wrap_in(app,
                 gui_rect(c->box.x, c->box.y, c->box.w - (tab && tab[0] ? gui_text_cols(tab) + 2 : 0) * cell_w(app),
-                         c->box.h),
+                         c->at.y - c->box.y),
                 c->box.x + cell_w(app), c->box.y + 4 * s, question, 0, rgb(t->warning));
         if (tab && tab[0])
             text_in(app, c->box, c->box.x + c->box.w - (gui_text_cols(tab) + 1) * cell_w(app), c->box.y + 4 * s, tab,
@@ -3445,8 +3479,8 @@ static GuiRect choices_over(const App* app) {
 #endif
 /* the questions over a run, the menu or a form (GuiAsk's order): the first choice keeps things as they are, but
    GUI_ASK_ADDONS's Yes, the answer it is asked for, which neither choice keeps, and GUI_ASK_CLEAN_OWN's, both cleans,
-   which Back keeps from */
-static const char* const ask_choices[][2] = {{SNX_TR_NOOP("Continue"), SNX_TR_NOOP("Abort")},
+   which Back keeps from; GUI_ASK_UPDATES's three */
+static const char* const ask_choices[][3] = {{SNX_TR_NOOP("Continue"), SNX_TR_NOOP("Abort")},
                                              {SNX_TR_NOOP("Cancel"), SNX_TR_NOOP("Exit")},
                                              {SNX_TR_NOOP("Only This Folder"), SNX_TR_NOOP("With Subfolders")},
                                              {SNX_TR_NOOP("Cancel"), SNX_TR_NOOP("Use Anyway")},
@@ -3470,6 +3504,8 @@ static const char* const ask_choices[][2] = {{SNX_TR_NOOP("Continue"), SNX_TR_NO
                                              {SNX_TR_NOOP("Cancel"), SNX_TR_NOOP("Import")},
                                              {SNX_TR_NOOP("NSP"), SNX_TR_NOOP("XCI")},
                                              {SNX_TR_NOOP("Cancel"), SNX_TR_NOOP("Forget")},
+                                             {SNX_TR_NOOP("Yes"), SNX_TR_NOOP("No"), SNX_TR_NOOP("Don't Ask Again")},
+                                             {SNX_TR_NOOP("Close"), SNX_TR_NOOP("Open Page")},
                                              {SNX_TR_NOOP("OK"), NULL}};
 /* a question added to GuiAsk takes its choices here, in its place */
 typedef char snx_gui_ask_choices[SDL_arraysize(ask_choices) == GUI_ASK_ERROR + 1 ? 1 : -1];
@@ -3500,6 +3536,8 @@ static const unsigned ask_tones[] = {UI_ATTR_CAUTION, /* Abort: the run ends */
                                      UI_ATTR_CAUTION, /* Import: the saves there to the trash */
                                      0,               /* XCI: a pack that changes nothing kept */
                                      UI_ATTR_CAUTION, /* Forget: a Joy-Con 2, synced again with its sync button */
+                                     0,               /* No: asked again at the next start */
+                                     0,               /* Open Page */
                                      0};
 typedef char snx_gui_ask_tones[SDL_arraysize(ask_tones) == GUI_ASK_ERROR + 1 ? 1 : -1];
 /* the question shown, over the whole screen in the middle or at its foot, a choice asked twice saying so once pressed:
@@ -9055,6 +9093,11 @@ static const GuiThemeKey app_keys[] = {
                  "its threads as the recompile's settings give them. Gentle: as many as the memory holds, up to half "
                  "of those, at a low priority. Each goes gently while a game plays"),
      0, 0, 0, 0, NULL},
+    {"", SNX_TR_NOOP("Check for updates"), GUI_KEY_ACTION, offsetof(GuiAppForm, updates),
+     sizeof(((GuiAppForm*)0)->updates), NULL, 0,
+     SNX_TR_NOOP("At each start, whether a newer nightly is out, said with what changed and its page; nothing is "
+                 "downloaded. Ask: asks first. On: looks. Off: never looks"),
+     0, 0, 0, 0, NULL},
     {"", SNX_TR_NOOP("Theme Editor"), GUI_KEY_ACTION, 0, 0, NULL, 0,
      SNX_TR_NOOP("This theme's keys with a preview, saved as themes/<name>/theme.ini"), 0, 0, 0, 0, NULL},
     {"", SNX_TR_NOOP("Folders"), GUI_KEY_ACTION, offsetof(GuiAppForm, places), sizeof(((GuiAppForm*)0)->places), NULL,
@@ -9082,6 +9125,7 @@ enum {
     GUI_APP_ANIMATIONS,
     GUI_APP_SIDE,
     GUI_APP_BACKGROUND,
+    GUI_APP_UPDATES,
     GUI_APP_EDITOR,
     GUI_APP_PLACES,
     GUI_APP_DRIVERS,
@@ -9130,6 +9174,7 @@ static void app_values(App* app) {
                  on_battery(app) ? snx_tr("Gentle, on battery") : snx_tr("Full"));
     else
         snprintf(f->background, sizeof f->background, "%s", snx_tr(background_names[app->background_mode]));
+    snprintf(f->updates, sizeof f->updates, "%s", snx_tr(updates_names[app->updates]));
     moved = 0;
     for (int i = 0; i < GUI_PLACES; ++i) moved += app->place[i] != NULL;
     if (moved && app->folder_count)
@@ -11412,6 +11457,114 @@ static void fetch_answer(App* app, int code, void* data) {
     free(data);
 }
 
+/* ---- Settings > App's Check for updates: the newest nightly asked of GitHub once a start, on a thread, the menu told
+   when it is newer than this build (gui/nightly_check.h), what changed and its page; nothing downloaded ---- */
+typedef struct {
+    GuiHttpsGet get;
+    Uint32 event;
+    int failed;
+    SnxHttpsResponse r;
+    char why[700];
+} GuiNightlyJob;
+static int SDLCALL nightly_run(void* data) {
+    GuiNightlyJob* job = (GuiNightlyJob*)data;
+    SnxHttpsOptions o = {"application/vnd.github+json", 30, 1u << 20, 0, NULL, NULL};
+    job->failed = job->get(GUI_NIGHTLY_LATEST, &o, &job->r, job->why, sizeof job->why) != 0;
+    fetch_push(job->event, 0, job);
+    return 0;
+}
+/* the look at GitHub, one at a time; what keeps it from starting said in the message line */
+static void nightly_start(App* app) {
+    GuiNightlyJob* job;
+#ifdef SNX_GUI_HTTPS
+    snx_https_init(); /* libcurl's global setup, here on the main thread before any thread */
+#endif
+    if (!app->https_get) {
+        snprintf(app->message, sizeof app->message,
+                 snx_tr("Check for updates: this build of the launcher has no HTTPS client"));
+        return;
+    }
+    if (app->nightly_thread) return;
+    if (!app->nightly_event) app->nightly_event = SDL_RegisterEvents(1);
+    job = (GuiNightlyJob*)calloc(1, sizeof *job);
+    if (!job) {
+        snprintf(app->message, sizeof app->message, snx_tr("Check for updates: no memory to ask"));
+        return;
+    }
+    job->get = app->https_get;
+    job->event = app->nightly_event;
+    app->nightly_thread = app->nightly_event ? SDL_CreateThread(nightly_run, "nightly", job) : NULL;
+    if (!app->nightly_thread) {
+        snprintf(app->message, sizeof app->message, snx_tr("Check for updates: no thread: %s"), SDL_GetError());
+        free(job);
+        return;
+    }
+    app->nightly_asking = true;
+}
+/* GitHub's answer: a newer nightly's question (GUI_ASK_NIGHTLY), or what failed in the message line; one not newer is
+   said in the log alone */
+static void nightly_answer(App* app, GuiNightlyJob* job) {
+    GuiNightly n;
+    char why[400];
+    int newer, at, i;
+    thread_ended(&app->nightly_thread);
+    app->nightly_asking = false;
+    if (job->failed)
+        snprintf(app->message, sizeof app->message, snx_tr("Check for updates: %s"), job->why);
+    else if (!gui_nightly_parse(job->r.body ? job->r.body : "", job->r.size, &n, why, sizeof why))
+        snprintf(app->message, sizeof app->message, snx_tr("Check for updates: HTTP %d: %s"), job->r.status, why);
+    else if (job->r.status != 200)
+        snprintf(app->message, sizeof app->message, snx_tr("Check for updates: HTTP %d for %s"), job->r.status, n.tag);
+    else if ((newer = gui_nightly_newer(n.tag, snx_build_branch(), snx_build_commit(), snx_build_committed())) ==
+             GUI_NIGHTLY_NO_TAG)
+        snprintf(app->message, sizeof app->message,
+                 snx_tr("Check for updates: the newest nightly is tagged %s, not nightly-YYYY-MM-DD-<commit>"), n.tag);
+    else if (newer == GUI_NIGHTLY_NO_DAY)
+        snprintf(app->message, sizeof app->message,
+                 snx_tr("Check for updates: the newest nightly is %s, and this build (%s %s, committed %s) has no day "
+                        "to compare"),
+                 n.tag, snx_build_branch(), snx_build_commit(), snx_build_committed());
+    else if (!newer)
+        gui_log("Check for updates: the newest nightly, %s, is not newer than this build (%s %s)", n.tag,
+                snx_build_branch(), snx_build_commit());
+    else {
+        at = snprintf(app->ask_line, sizeof app->ask_line, snx_tr("%s is out; this build is %s %s."),
+                      n.name[0] ? n.name : n.tag, snx_build_branch(), snx_build_commit());
+        /* what changed, a change a line of its own, as a question's box breaks its rows */
+        if (n.count && at > 0 && (size_t)at < sizeof app->ask_line)
+            at += snprintf(app->ask_line + at, sizeof app->ask_line - (size_t)at, " %s", snx_tr("What changed:"));
+        for (i = 0; i < n.count && at > 0 && (size_t)at < sizeof app->ask_line; ++i)
+            at += snprintf(app->ask_line + at, sizeof app->ask_line - (size_t)at, "\n- %s", n.changes[i]);
+        if (n.count && n.more && at > 0 && (size_t)at < sizeof app->ask_line) {
+            char more[64];
+            snprintf(more, sizeof more, snx_tr("and %d more"), n.more);
+            snprintf(app->ask_line + at, sizeof app->ask_line - (size_t)at, "\n%s", more);
+        }
+        snprintf(app->nightly_url, sizeof app->nightly_url, "%s", n.url);
+        gui_confirm_open(&app->confirm, GUI_ASK_NIGHTLY, false);
+    }
+    free(job->r.body);
+    free(job);
+}
+/* Check for updates' question answered: Yes looks now and at each start (On), Don't Ask Again never (Off), No and Back
+   leave it Ask, asked again at the next start */
+static void updates_answer(App* app, int taken) {
+    if (taken == 0 || taken == 2) {
+        app->updates = taken == 0 ? GUI_UPDATES_ON : GUI_UPDATES_OFF;
+        app_save(app);
+    }
+    if (taken == 0) nightly_start(app);
+}
+/* the look a start makes, once the menu is free: no setup, question, form, run or splash over it */
+static void updates_begin(App* app) {
+    if (!app->updates_due || app->setup_on || app->confirm.shown || app->editing || app->menu.running || app->splash)
+        return;
+    app->updates_due = false;
+    if (app->updates == GUI_UPDATES_ASK)
+        gui_confirm_open(&app->confirm, GUI_ASK_UPDATES, false);
+    else if (app->updates == GUI_UPDATES_ON)
+        nightly_start(app);
+}
 /* ---- Settings > GBA > Covers: a GBA game made from a ROM, with Box art picked, gets its box from libretro-thumbnails
    (gui/covers.h) as it is made: the ROM's CRC-32 names it in libretro-database's No-Intro list, whose copy the cache
    keeps, and the box under that name goes in its folder as icon.png, which its rows show (gui_game_icon). One game at
@@ -13011,6 +13164,8 @@ static void app_action(App* app, int row, int step) {
         layout(app);
     } else if (row == GUI_APP_BACKGROUND) { /* the one running follows at once (job_priority), its threads as started */
         app->background_mode = (app->background_mode + (step < 0 ? 2 : 1)) % 3;
+    } else if (row == GUI_APP_UPDATES) { /* the next start follows it */
+        app->updates = (app->updates + (step < 0 ? 2 : 1)) % 3;
     } else if (row == GUI_APP_LANGUAGE) {
         app->language = (app->language + (step < 0 ? snx_gui_language_count : 1)) % (snx_gui_language_count + 1);
         language_apply(app);
@@ -13038,7 +13193,7 @@ static void app_action(App* app, int row, int step) {
         return;
     }
     if (row == GUI_APP_THEME || row == GUI_APP_TEXT || row == GUI_APP_LANGUAGE || row == GUI_APP_ANIMATIONS ||
-        row == GUI_APP_SIDE || row == GUI_APP_BACKGROUND)
+        row == GUI_APP_SIDE || row == GUI_APP_BACKGROUND || row == GUI_APP_UPDATES)
         app_save(app);
     app_values(app);
 }
@@ -23577,6 +23732,7 @@ static void abort_run(App* app) {
     app->aborting = true;
 }
 static void pack_answer(App* app, bool taken, bool xci);
+static void updates_answer(App* app, int taken);
 /* a key on the question shown (gui_confirm_key); answered, what it asked about: the menu closed, a run aborted or
    started, a folder added or used as the choice says */
 static void ask_key(App* app, GuiKey key) {
@@ -23620,6 +23776,11 @@ static void ask_key(App* app, GuiKey key) {
         setup_type(app);
     else if (ask == GUI_ASK_ABORT && second)
         abort_run(app);
+    else if (ask == GUI_ASK_UPDATES)
+        updates_answer(app, app->confirm.taken);
+    else if (ask == GUI_ASK_NIGHTLY && second && !SDL_OpenURL(app->nightly_url))
+        snprintf(app->message, sizeof app->message, snx_tr("Open Page: %s did not open: %s"), app->nightly_url,
+                 SDL_GetError());
 }
 /* the pointer on the question, at pixel x, y: a choice under it takes the focus, a click presses it
    (ui_choices_rows_row_action_cb); a click off the box is Back */
@@ -23635,8 +23796,9 @@ static const char* choice_text(App* app, int of, int i, char* out, size_t size) 
     if (i < 0) return NULL;
     switch (of) {
         case GUI_CHOICES_ASK:
-            if (i >= (ask_choices[ask][1] ? 2 : 1)) return NULL;
+            if (i >= (ask_choices[ask][2] ? 3 : ask_choices[ask][1] ? 2 : 1)) return NULL;
             if (!i) return snx_tr(ask_choices[ask][0]);
+            if (i == 2) return snx_tr(ask_choices[ask][2]);
             snprintf(out, size, "%s%s%s", snx_tr(ask_choices[ask][1]), app->confirm.armed ? ": " : "",
                      app->confirm.armed ? snx_tr(SAY_AGAIN) : "");
             return out;
@@ -24976,6 +25138,11 @@ static void event_take(App* app, const SDL_Event* e) {
         cover_answer(app, (GuiCoverJob*)e->user.data1);
         return;
     }
+    /* Check for updates' thread: GitHub's answer */
+    if (app->nightly_event && e->type == app->nightly_event) {
+        nightly_answer(app, (GuiNightlyJob*)e->user.data1);
+        return;
+    }
     /* Download Driver's threads: a repository's releases, a download's progress and its end */
     if (app->fetch_event && e->type == app->fetch_event) {
         fetch_answer(app, e->user.code, e->user.data1);
@@ -25676,6 +25843,7 @@ int snx_gui_main(const char* self) {
     last_run_look(app); /* a run whose end the last start did not see: the setup's first page, Last Run */
     left_behind(app);   /* what an older version left: the setup's last pages, Old Files */
     setup_start(app);
+    app->updates_due = true; /* Check for updates, once the menu is free */
     app->games_fresh = true;
     watch_start(app);
     app->dump_icons.live = true; /* the dumps' icons asked on a thread of their own */
@@ -25694,6 +25862,7 @@ int snx_gui_main(const char* self) {
         while (SDL_PollEvent(&e)) event(app, &e);
         pads_repeat(app);
         pump(app);
+        updates_begin(app);
 #ifdef SDL_PLATFORM_ANDROID
         if (app->play_due && !app->hidden) play_take(app); /* after pump, which reads how the game before ended */
         play_held_take(app);
