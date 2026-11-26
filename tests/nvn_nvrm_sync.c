@@ -80,6 +80,12 @@ u32 nvn_replay_shown_syncpt(void) { return 9; }
 
 /* ---- what the file needs of the runtime besides: stubs, none reached by the cases below */
 void nvn_replay_finish_all(void) {}
+/* a descriptor's write in the replay's order: lands at once, as with nothing left to replay */
+int nvn_replay_write(u64 gva, const void* data, u32 len) {
+    memcpy(GP(gva), data, len);
+    return 1;
+}
+u32 nvn_replay_writes_pending(void) { return 0; }
 void gpu_mem_written_cpu(u64 cpu, u64 size) {
     (void)cpu;
     (void)size;
@@ -102,11 +108,8 @@ const SnxNros* g_nros; /* main.c's: a game module without NROs of its own */
 void pm_init(PMutex* m) { (void)m; }
 void pm_lock(PMutex* m) { (void)m; }
 void pm_unlock(PMutex* m) { (void)m; }
-KThread* kthread_cur(void) { return NULL; }
-void kthread_block(KThread* t) { (void)t; }
-void kthread_unblock(KThread* t) { (void)t; }
-void core_enter(KThread* t) { (void)t; }
-void core_leave(KThread* t) { (void)t; }
+void kthread_host_wait_begin(void) {}
+void kthread_host_wait_end(void) {}
 u64 guest_ticks(void) { return 0; }
 u64 guest_gpu_ticks(void) { return 0; }
 int gpu_release_stamp_sync(u64 cpu, int may_wait) {

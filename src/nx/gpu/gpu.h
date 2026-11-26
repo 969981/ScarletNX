@@ -205,7 +205,7 @@ typedef struct {
     u32 flags;
     const char** ran; /* where the renderer writes the name of the upscaler that ran, NULL for nowhere */
     /* with GPU_UPSCALE_REPROJECTED_MOTION: this frame's render pixel (x, y as -1 to 1, y down, depth as stored) to
-       the frame before's, row-major (hle/hook/snx_hook_module.h's SnxHookRecordedUpscale) */
+       the frame before's, row-major (nn/snx_hook_module.h's SnxHookRecordedUpscale) */
     f32 reprojection[16];
 } GpuUpscale;
 enum {
@@ -552,6 +552,8 @@ void gpu_call_renderer(void (*fn)(void*), void* arg, const u32* chans, u32 nchan
 /* Cooperative calls return 0 while waiting and 1 when complete. A lane's calls stay ordered; other lanes and
    ordinary calls can run while it waits. The callback owns its resume cursor. Lane is in [0,63]. */
 void gpu_call_poll(int (*fn)(void*), void* arg, u32 lane);
+/* whether lane has a cooperative call queued or running */
+int gpu_lane_busy(u32 lane);
 /* a verify channel with its id (from GPU_VERIFY_ID), reset as a new channel is, and freed; and a word of its stream,
    decoded at once: its 3D engine's methods only, the puller's binds, and the 3D engine's held constants and draw
    flushed before any other engine's method, as method_call does. On the GPU thread */
