@@ -872,5 +872,64 @@ class ArchitectureTests(unittest.TestCase):
         )
 
 
+class ConfigFilesTests(unittest.TestCase):
+    """check_config_files: every reader of a settings file in src/ is in tests/config_files.json"""
+
+    REGISTRY = {
+        'files': [
+            {'id': 'a.ini', 'adapter': 'tests/config_files_x.c', 'names': ['a.ini'], 'functions': ['src/x.c:read_a']},
+            {'id': 'b.ini', 'adapter': 'tests/config_files_x.c', 'names': [], 'functions': []},
+        ],
+        'records': {'doc': ''},
+        'not_config': {'doc': '', 'threads.txt': 'a dump'},
+    }
+
+    def errors(self, sources, registry=None, adapter='{.id = "a.ini"}, {.id = "b.ini"}'):
+        with tempfile.TemporaryDirectory(prefix='snx-arch-test-') as temporary:
+            root = Path(temporary)
+            files = {
+                'tests/config_files.json': json.dumps(registry or self.REGISTRY),
+                'tests/config_files_x.c': adapter,
+                **sources,
+            }
+            for name, text in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text, encoding='ascii')
+            return architecture.check_config_files(root)
+
+    READ_A = 'static int read_a(void) {\n    snx_ini_start(&ini, text);\n    return snx_ini_next(&ini, &k, &v);\n}\n'
+
+    def test_the_listed_reader_passes(self):
+        self.assertEqual(self.errors({'src/x.c': self.READ_A}), [])
+
+    def test_a_new_reader_is_named(self):
+        errors = self.errors({'src/x.c': self.READ_A + 'int read_b(void) {\n    return snx_ini_value(p, "k") != 0;\n}\n'})
+        self.assertEqual(len(errors), 1)
+        self.assertIn('src/x.c:6: snx_ini_value in read_b', errors[0])
+        self.assertIn('tests/config_files.json does not list', errors[0])
+
+    def test_a_reader_gone_is_named(self):
+        errors = self.errors({'src/x.c': 'int other(void) { return 0; }\n'})
+        self.assertEqual(errors, ['tests/config_files.json: src/x.c:read_a (a.ini) is no function in src/ any more: take it out'])
+
+    def test_a_new_file_name_is_named(self):
+        errors = self.errors({'src/x.c': self.READ_A, 'src/y.h': '#define F "newer.ini"\n#define T "threads.txt"\n'})
+        self.assertEqual(len(errors), 1)
+        self.assertTrue(errors[0].startswith('src/y.h:1: "newer.ini" names a file'))
+
+    def test_adapters_agree(self):
+        # no adapter; an adapter's id the registry lacks
+        registry = json.loads(json.dumps(self.REGISTRY))
+        registry['files'][1]['adapter'] = None
+        errors = self.errors({'src/x.c': self.READ_A}, registry=registry, adapter='{.id = "a.ini"}, {.id = "z.ini"}')
+        self.assertIn(
+            "tests/config_files.json: b.ini has no adapter: every settings file runs through tests/config_files.h's "
+            'situations',
+            errors,
+        )
+        self.assertIn('tests/config_files_x.c: z.ini is no id of tests/config_files.json', errors)
+        self.assertEqual(len(errors), 2)
+
+
 if __name__ == '__main__':
     unittest.main()

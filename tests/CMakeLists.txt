@@ -6,7 +6,7 @@ the runtime links those libraries too, and isn't deployed)" OFF)
 option(SNX_TEST_VULKAN "Run offscreen Vulkan integration tests (requires a Vulkan 1.3 ICD, e.g. lavapipe)" OFF)
 option(SNX_TEST_ONLINE_LIVE
        "Ask each WFC service's DNS server over the internet (online_presets_live, ctest -L network)" OFF)
-option(SNX_TEST_ARM_AOT "Build asset-free static ARM11/checked-memory witnesses (requires native LLVM SDK)" OFF)
+option(SNX_TEST_ARM_AOT "Build asset-free static ARM11/checked-memory witnesses (requires a native build of the 3DS)" OFF)
 option(SNX_TEST_VP9_VECTORS
        "Run NVDEC's VP9 jobs on libvpx's test vectors (configure downloads 32 files from the WebM project)" OFF)
 if(SNX_TEST_VP9_VECTORS AND SNX_TOOLS_ONLY)
@@ -55,7 +55,8 @@ if(SNX_TEST_SANITIZERS)
         snx_ble_system
         snx-logscan
         # the recompiler, its backends and what they take of the common code
-        snx_recompiler_base snx_llvm snx_arm_llvm snx_arm_decode scarletnx-recompiler scarletnx-recompiler-shared
+        snx_recompiler_base snx_llvm snx_arm_llvm snx_arm_decode snx_arm_rt scarletnx-recompiler
+        scarletnx-recompiler-shared
         # the driver, its extraction, the first start's setup, the settings and the build's line
         snx_driver snx_nx_module snx_driver_llvm hactool_lib snx_setup snx_settings snx_settings_runtime snx_build_info
         snx-test-build-info
@@ -859,8 +860,8 @@ target_link_libraries(snx-test-gpu-driver-stage PRIVATE scarletnx-common)
 add_test(NAME gpu_driver_stage COMMAND snx-test-gpu-driver-stage)
 # the common utilities alone, for the tests every build runs (gui_probe) and the NX ones
 add_library(snx_test_common STATIC "${PROJECT_SOURCE_DIR}/src/common/utilities/common.c"
-    "${PROJECT_SOURCE_DIR}/src/common/utilities/ini_lines.c" "${PROJECT_SOURCE_DIR}/src/common/utilities/game_ini.c"
-    "${PROJECT_SOURCE_DIR}/src/common/utilities/script.c")
+    "${PROJECT_SOURCE_DIR}/src/common/utilities/ini_lines.c" "${PROJECT_SOURCE_DIR}/src/common/utilities/config_file.c"
+    "${PROJECT_SOURCE_DIR}/src/common/utilities/game_ini.c" "${PROJECT_SOURCE_DIR}/src/common/utilities/script.c")
 snx_test_target(snx_test_common c23)
 target_link_libraries(snx_test_common PUBLIC snx_libdeflate) # a control.nacp's titles in deflate
 target_link_libraries(snx_test_common PUBLIC scarletnx-platform) # the clocks (snx_seconds)
@@ -1048,7 +1049,7 @@ if(SNX_BUILD_3DS)
     add_test(NAME 3ds_uds_relay COMMAND snx-test-3ds-uds)
     add_test(NAME 3ds_uds_delayed_relay COMMAND snx-test-3ds-uds --delay)
     # a wait of the two lasts 30 s at most and says what is missing (3ds_uds.c), which ctest's own limit must not precede
-    # alone: a request within 100 ms and a DSP frame 4.9 ms away are the host's clock, which tests beside them take
+    # alone: a request within 100 ms is the host's clock, which tests beside them take
     set_tests_properties(3ds_uds_delayed_relay 3ds_uds_relay PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
     # nim:aoc's Initialize answers the no-network error a console gives (tests/3ds_nim_aoc.c)
     add_executable(snx-test-3ds-nim-aoc 3ds_nim_aoc.c support/3ds_guest.c)
@@ -2799,6 +2800,9 @@ add_executable(snx-test-options-tv-mode options_tv_mode.c "${PROJECT_SOURCE_DIR}
 snx_test_target(snx-test-options-tv-mode gnu23)
 target_link_libraries(snx-test-options-tv-mode PRIVATE scarletnx-common)
 add_test(NAME options_tv_mode COMMAND snx-test-options-tv-mode)
+# the game's .ini and picks through tests/config_files.h's situations (config_files_options.c), a process each
+add_test(NAME config_files_options COMMAND snx-test-options-tv-mode --config-files game.ini)
+add_test(NAME config_files_picks COMMAND snx-test-options-tv-mode --config-files game.picks)
 # the player's pause (runtime/pause.c), hotkey_pause's: each press's line, a pause that didn't happen, and another pause
 # in force; the guest threads, the GPU, host1x and the clocks stubbed
 add_executable(snx-test-pause-toggle pause_toggle.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/pause.c")
@@ -2875,6 +2879,28 @@ add_test(NAME linux_signal COMMAND snx-test-linux-signal)
 add_executable(snx-test-ini-lines ini_lines.c "${PROJECT_SOURCE_DIR}/src/common/utilities/ini_lines.c")
 snx_test_target(snx-test-ini-lines c23)
 add_test(NAME ini_lines COMMAND snx-test-ini-lines)
+# the rule of every settings file the project writes and reads (common/utilities/config_file.c)
+add_executable(snx-test-config-file config_file.c)
+snx_test_target(snx-test-config-file c23)
+target_link_libraries(snx-test-config-file PRIVATE snx_test_common)
+add_test(NAME config_file COMMAND snx-test-config-file)
+# tests/config_files.h's situations: common/utilities' settings files (config_files_common.c), setup.ini where the
+# setup is built
+add_executable(snx-test-config-files-common config_files_common.c
+    "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/joycon2_known.c" # the runtime's joycon2.txt
+    "${PROJECT_SOURCE_DIR}/src/3ds/runtime/game_record.c") # a 3DS game's record and picks
+snx_test_target(snx-test-config-files-common c23)
+target_link_libraries(snx-test-config-files-common PRIVATE scarletnx-common)
+if(TARGET snx_setup)
+    target_link_libraries(snx-test-config-files-common PRIVATE snx_setup)
+    target_compile_definitions(snx-test-config-files-common PRIVATE SNX_CONFIG_SETUP)
+endif()
+add_test(NAME config_files_common COMMAND snx-test-config-files-common)
+# the runner of those situations: a reader that follows the rule passes, and each way of breaking it fails
+add_executable(snx-test-config-files-checker config_files_checker.c)
+snx_test_target(snx-test-config-files-checker c23)
+target_link_libraries(snx-test-config-files-checker PRIVATE scarletnx-common)
+add_test(NAME config_files_checker COMMAND snx-test-config-files-checker)
 # the R_ result helpers (src/nx/hle/result.h), strict ISO C23 as the code that may use them
 add_executable(snx-test-result-macros result_macros.c)
 snx_test_target(snx-test-result-macros c23)
@@ -4175,58 +4201,7 @@ target_link_libraries(snx-llvm-pieces PRIVATE scarletnx-recompiler)
 # holds already
 target_include_directories(snx-llvm-pieces PRIVATE "$<TARGET_PROPERTY:snx_llvm,INTERFACE_INCLUDE_DIRECTORIES>")
 target_include_directories(snx-llvm-pieces SYSTEM PRIVATE "${SNX_LLVM_INCLUDE_DIR}")
-# A32 emits self-contained host objects, without the A64 interpreter or RtAPI.
-add_executable(snx-test-arm-emit arm_emit.c)
-snx_test_target(snx-test-arm-emit gnu23)
-target_link_libraries(snx-test-arm-emit PRIVATE snx_arm_llvm)
-# Thumb16/32 emits self-contained host objects the same way.
-add_executable(snx-test-thumb-emit thumb_emit.c)
-snx_test_target(snx-test-thumb-emit gnu23)
-target_link_libraries(snx-test-thumb-emit PRIVATE snx_arm_llvm)
-option(SNX_TEST_ARM_DIFF "Compare A32 LLVM execution with Python unicorn 2.1.4" OFF)
-if(UNIX AND NOT CMAKE_CROSSCOMPILING)
-    if(Python3_Interpreter_FOUND)
-        # the ARM tests run emitted code and Unicorn in Python: -X faulthandler names where a crash in either was
-        add_test(NAME arm_llvm_witnesses COMMAND "${Python3_EXECUTABLE}" -X faulthandler
-            "${CMAKE_CURRENT_SOURCE_DIR}/arm_test.py"
-            --emitter $<TARGET_FILE:snx-test-arm-emit> --runtime $<TARGET_FILE:snx_arm_rt> --cc "${CMAKE_C_COMPILER}")
-        add_test(NAME arm7tdmi_witnesses COMMAND "${Python3_EXECUTABLE}" -X faulthandler
-            "${CMAKE_CURRENT_SOURCE_DIR}/arm7tdmi_test.py"
-            --arm-emitter $<TARGET_FILE:snx-test-arm-emit> --thumb-emitter $<TARGET_FILE:snx-test-thumb-emit>
-            --runtime $<TARGET_FILE:snx_arm_rt> --cc "${CMAKE_C_COMPILER}")
-        if(SNX_TEST_ARM_DIFF)
-            add_test(NAME arm_llvm_differential COMMAND "${Python3_EXECUTABLE}" -X faulthandler
-                "${CMAKE_CURRENT_SOURCE_DIR}/arm_test.py"
-                --emitter $<TARGET_FILE:snx-test-arm-emit> --runtime $<TARGET_FILE:snx_arm_rt> --cc "${CMAKE_C_COMPILER}" --unicorn)
-            set_tests_properties(arm_llvm_differential PROPERTIES TIMEOUT 900)
-            # VFP/NEON uses the same emitter plus the raw-bit FP and crypto runtime library.
-            get_filename_component(snx_llvm_bin "${SNX_LLVM_CONFIG}" DIRECTORY)
-            find_program(SNX_LLVM_MC llvm-mc HINTS "${snx_llvm_bin}" NO_DEFAULT_PATH)
-            if(SNX_LLVM_MC)
-                add_test(NAME arm_llvm_vector COMMAND "${Python3_EXECUTABLE}" -X faulthandler
-                    "${CMAKE_CURRENT_SOURCE_DIR}/arm_vector_test.py"
-                    --emitter $<TARGET_FILE:snx-test-arm-emit> --runtime $<TARGET_FILE:snx_arm_rt>
-                    --mc "${SNX_LLVM_MC}" --cc "${CMAKE_C_COMPILER}")
-                set_tests_properties(arm_llvm_vector PROPERTIES TIMEOUT 1800)
-                add_test(NAME thumb_llvm COMMAND "${Python3_EXECUTABLE}" -X faulthandler
-                    "${CMAKE_CURRENT_SOURCE_DIR}/thumb_test.py"
-                    --emitter $<TARGET_FILE:snx-test-thumb-emit> --runtime $<TARGET_FILE:snx_arm_rt> --mc "${SNX_LLVM_MC}"
-                    --cc "${CMAKE_C_COMPILER}")
-                set_tests_properties(thumb_llvm PROPERTIES TIMEOUT 900)
-                # random encodings of every class, llvm-objdump keeping the A57's, from random FP and flag state
-                find_program(SNX_LLVM_OBJDUMP llvm-objdump HINTS "${snx_llvm_bin}" NO_DEFAULT_PATH)
-                if(SNX_LLVM_OBJDUMP)
-                    add_test(NAME arm_llvm_fuzz COMMAND "${Python3_EXECUTABLE}" -X faulthandler
-                        "${CMAKE_CURRENT_SOURCE_DIR}/arm_fuzz.py"
-                        --arm-emitter $<TARGET_FILE:snx-test-arm-emit> --thumb-emitter $<TARGET_FILE:snx-test-thumb-emit>
-                        --runtime $<TARGET_FILE:snx_arm_rt> --mc "${SNX_LLVM_MC}" --objdump "${SNX_LLVM_OBJDUMP}"
-                        --cc "${CMAKE_C_COMPILER}" --count 1500)
-                    set_tests_properties(arm_llvm_fuzz PROPERTIES TIMEOUT 1800)
-                endif()
-            endif()
-        endif()
-    endif()
-endif()
+include(arm_blocks.cmake)
 
 # LLVM Internals: passes cut out of LLVM's pipelines (nx/runtime/driver/llvm_tuning.c), which LLVM still runs
 add_executable(snx-test-llvm-tuning llvm_tuning.c)
@@ -4327,15 +4302,25 @@ target_compile_options(snx-test-recompiler-library-cpp PRIVATE -Wall -Wextra -We
 target_link_libraries(snx-test-recompiler-library-cpp PRIVATE scarletnx-recompiler Threads::Threads)
 snx_test_sanitize(snx-test-recompiler-library-cpp) # this target is not made through snx_test_target
 add_test(NAME recompiler_library_cpp COMMAND snx-test-recompiler-library-cpp)
-# the x86-64 back end against LLVM, function by function (recompiler_backends.c)
+# the host's native back end (x86-64's, arm64's...) against LLVM, function by function (recompiler_backends.c). The
+# features of the host it goes without in plain runs (--without): x86-64's BMI, AVX, FMA, F16C, AES and SHA, arm64's all
+set(snx_plain_features 0xd07)
+set(snx_plain_ops_features 0x3d07)
+set(snx_plain_fma_features 0x800)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(snx_plain_features 0x7ffff)
+    set(snx_plain_ops_features 0x7ffff)
+    set(snx_plain_fma_features 0x7ffff)
+endif()
 add_executable(snx-test-recompiler-backends recompiler_backends.c llvm_qemu_words.c qemu_ref/qemu_ref.c)
 snx_test_target(snx-test-recompiler-backends gnu23)
 target_include_directories(snx-test-recompiler-backends PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(snx-test-recompiler-backends PRIVATE scarletnx-recompiler scarletnx-common)
 snx_decodetree_a64(snx-test-recompiler-backends)
 add_test(NAME recompiler_backends COMMAND snx-test-recompiler-backends)
-# x64_vec.c's Advanced SIMD, a family at a time: each word of these ops (the decoder's samples of them) made by the x86-64
-# back end, a function of its own, and its results LLVM's from states of the lanes' edge values
+# the back ends' Advanced SIMD (x64_vec.c, arm64_vec.c), a family at a time: each word of these ops (the decoder's samples
+# of them) made by the host's back end, a function of its own, and its results LLVM's from states of the lanes' edge
+# values
 foreach(family IN ITEMS
         "pairs;FADDP_v;FADDP_s;FMAXP_v;FMINP_v;FMAXNMP_v;FMINNMP_v;FMAXP_s;FMINP_s;FMAXNMP_s;FMINNMP_s;FMAXV_s;FMINV_s;FMAXNMV_s;FMINNMV_s"
         "elements;FMUL_si;FMLA_si;FMLS_si"
@@ -4347,6 +4332,12 @@ foreach(family IN ITEMS
         "differences;UABD_v;SABD_v;UABA_v;SABA_v;UABDL_v;SABDL_v;UABAL_v;SABAL_v"
         "doublewords;ADD_s;SUB_s;CMEQ_s;CMGT_s;CMGE_s;CMHI_s;CMHS_s;CMTST_s"
         "saturating;SQADD_s;UQADD_s;SQSUB_s;UQSUB_s;SQXTN_s;UQXTN_s;SQXTUN_s;SQSHRN_si;UQSHRN_si;SQSHRUN_si;SQRSHRN_v;UQRSHRN_v;SQRSHRUN_v;SQRSHRN_si;UQRSHRN_si;SQRSHRUN_si"
+        "saturating_sums;SQADD_v;UQADD_v;SQSUB_v;UQSUB_v;SUQADD_v;USQADD_v;SUQADD_s;USQADD_s;SQABS_v;SQNEG_v;SQABS_s;SQNEG_s"
+        "byte_shifts;SHL_v;USHR_v;SSHR_v;USRA_v;SSRA_v;SRSHR_v;URSHR_v;SRSRA_v;URSRA_v;SRI_v;SLI_v;RBIT_v"
+        "reversals;RBIT;REV16;REV32;REV64"
+        "shifts_by_register;SSHL_v;USHL_v;SRSHL_v;URSHL_v;SSHL_s;USHL_s;SRSHL_s;URSHL_s;SQSHL_v;UQSHL_v;SQRSHL_v;UQRSHL_v;SQSHL_s;UQSHL_s;SQRSHL_s;UQRSHL_s"
+        "saturating_shifts;SQSHL_vi;UQSHL_vi;SQSHLU_vi;SQSHL_si;UQSHL_si;SQSHLU_si"
+        "doubling;SQDMULH_v;SQRDMULH_v;SQDMULH_vi;SQRDMULH_vi;SQDMULH_s;SQRDMULH_s;SQDMULH_si;SQRDMULH_si;SQDMULL_v;SQDMLAL_v;SQDMLSL_v;SQDMULL_vi;SQDMLAL_vi;SQDMLSL_vi;SQDMULL_si;SQDMLAL_si;SQDMLSL_si;SRHADD_v;RADDHN;RSUBHN"
         "crypto;AESE;AESD;AESMC;AESIMC;SHA1C;SHA1P;SHA1M;SHA1SU0;SHA1H;SHA1SU1;SHA256H;SHA256H2;SHA256SU0;SHA256SU1;PMULL_p64")
     list(POP_FRONT family name)
     add_test(NAME recompiler_backends_${name} COMMAND snx-test-recompiler-backends --states 48 --ops ${family})
@@ -4361,11 +4352,17 @@ add_test(NAME recompiler_backends_half COMMAND snx-test-recompiler-backends --ta
          FMAXNMV_h FMINNMV_h FMUL_si FMLA_si FMLS_si FRECPE_v FRECPE_s FRSQRTE_v FRSQRTE_s FRECPS_v FRECPS_s FRSQRTS_v
          FRSQRTS_s FRINTN_v FRINTP_v FRINTM_v FRINTZ_v FRINTA_v)
 set_tests_properties(recompiler_backends_half PROPERTIES TIMEOUT 900)
-# the same without FMA, AES-NI and SHA-NI (0x800, 0x1000, 0x2000), where the helpers do their work
-add_test(NAME recompiler_backends_plain_ops COMMAND snx-test-recompiler-backends --without 0x3d07 --states 48 --ops
+# the same without the host's optional features (FMA, AES-NI and SHA-NI, or all of arm64's), where the helpers do their work
+add_test(NAME recompiler_backends_plain_ops COMMAND snx-test-recompiler-backends --without ${snx_plain_ops_features}
+         --states 48 --ops
          FRECPS_v FRECPS_s FRSQRTS_v FRSQRTS_s FMLA_si FMLS_si AESE AESD AESMC AESIMC SHA256H SHA256H2 SHA256SU0
          SHA256SU1)
 set_tests_properties(recompiler_backends_plain_ops PROPERTIES TIMEOUT 600)
+# the lanes' shifts and the saturating sums without GFNI (0x10000) and AVX2 (0x8000)
+add_test(NAME recompiler_backends_plain_lanes COMMAND snx-test-recompiler-backends --without 0x18000 --states 32 --ops
+         SHL_v USHR_v SSHR_v SRSHR_v URSRA_v SRI_v SLI_v RBIT_v RBIT SSHL_v USHL_v SRSHL_v URSHL_v SQSHL_v UQSHL_v
+         SQRSHL_v UQRSHL_v SQSHL_s UQRSHL_s)
+set_tests_properties(recompiler_backends_plain_lanes PROPERTIES TIMEOUT 600)
 # half-precision words (an Android phone's): x64_vec.c makes singles and doubles of no half's lanes
 set(snx_half_words 0e421420 4ec31462 6e441c83 2e453ca4 0e460cc5)
 add_test(NAME recompiler_backends_half_words COMMAND snx-test-recompiler-backends --target android --states 40 --words
@@ -4635,6 +4632,8 @@ foreach(family IN ITEMS
             if(m MATCHES "^ppc64") # an unpatched Unicorn has none: skipped, as it compares nothing
                 set_tests_properties(recompiler_${m}_past_${name} PROPERTIES SKIP_RETURN_CODE 77)
             endif()
+        elseif(m STREQUAL "backends") # no QEMU: the words' values are not compared
+            add_test(NAME recompiler_${m}_past_${name} COMMAND snx-test-recompiler-${m} --skip "${SNX_QEMU_REF_MISSING}")
         endif()
     endforeach()
 endforeach()
@@ -4695,12 +4694,15 @@ add_test(NAME recompiler_backends_fp_pins COMMAND snx-test-recompiler-backends -
 # SHA-NI: elsewhere a helper makes the word, and the path does not run)
 add_test(NAME recompiler_backends_sha_xmm0 COMMAND snx-test-recompiler-backends --made --states 40 --words 4ea684a5
          5e0640c5)
-# FMLA of a vector in a loop on a host with AVX and F16C but no FMA (0x800, FMA alone, taken away), where it is a cold
-# call always taken: its result stays in the destination's pin, past the pins' reload
-add_test(NAME recompiler_backends_cold_pin COMMAND snx-test-recompiler-backends --without 0x800 --states 40 --words
+# FMLA of a vector in a loop on an x86-64 host with AVX and F16C but no FMA (0x800, FMA alone, taken away), where it is a
+# cold call always taken (on arm64 the words run without its optional features): its result stays in the destination's
+# pin, past the pins' reload
+add_test(NAME recompiler_backends_cold_pin COMMAND snx-test-recompiler-backends --without ${snx_plain_fma_features}
+         --states 40 --words
          d2800030 4ee1d41f 4f821bff 9a8211c3 0f406000 f1000610 54ffff61)
-# random functions on a host of SSE4.2: no BMI1, BMI2, LZCNT, F16C, AVX or FMA
-add_test(NAME recompiler_backends_plain COMMAND snx-test-recompiler-backends --without 0xd07 --seed 209458
+# random functions on a host without optional features: SSE4.2 alone (no BMI1, BMI2, LZCNT, F16C, AVX or FMA) on x86-64,
+# the architecture's baseline on arm64
+add_test(NAME recompiler_backends_plain COMMAND snx-test-recompiler-backends --without ${snx_plain_features} --seed 209458
          --functions 1200)
 # what the library's archive needs from outside it: LLVM and the system's libraries alone
 # (tests/recompiler_symbols.cmake). Its program links every object of the archive with those, named here rather than
@@ -4800,6 +4802,16 @@ add_executable(snx-test-x64-unit-facts x64_unit_facts.c)
 snx_test_target(snx-test-x64-unit-facts gnu23)
 target_link_libraries(snx-test-x64-unit-facts PRIVATE snx_llvm snx_driver ${CMAKE_DL_LIBS})
 add_test(NAME x64_unit_facts COMMAND snx-test-x64-unit-facts)
+# what it makes of Advanced SIMD, by the size of its code and its writes of FPSR (x64_vec_code.c): ELF objects, so not
+# on Windows
+if(NOT WIN32)
+    add_executable(snx-test-x64-vec-code x64_vec_code.c)
+    snx_test_target(snx-test-x64-vec-code gnu23)
+    target_link_libraries(snx-test-x64-vec-code PRIVATE snx_llvm snx_driver ${CMAKE_DL_LIBS})
+    snx_decodetree_a64(snx-test-x64-vec-code)
+    add_test(NAME x64_vec_code COMMAND snx-test-x64-vec-code)
+    set_tests_properties(x64_vec_code PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 
 # NCE's patcher (src/nx/runtime/nce/nce_patch.c) on a synthetic module: the words that Eden's patcher changes, found
 # in the code and kept where the code reads them as data, and the words of their stubs. Words only, on any host
@@ -5956,7 +5968,7 @@ foreach(snx_test native_recompiler llvm_module nro_modules plt_calls nx_runtime_
         set_property(TEST ${snx_test} APPEND PROPERTY ENVIRONMENT "XDG_CACHE_HOME=${CMAKE_CURRENT_BINARY_DIR}/xdg-cache")
     endif()
 endforeach()
-# recompiler_backends on a host that has no x86-64 back end, or for words that it leaves to LLVM: nothing to compare
+# recompiler_backends on a host that has no native back end, or for words that it leaves to LLVM: nothing to compare
 get_property(snx_tests DIRECTORY PROPERTY TESTS)
 foreach(snx_test IN LISTS snx_tests)
     if(snx_test MATCHES "^recompiler_backends(_|$)")
