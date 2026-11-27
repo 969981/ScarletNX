@@ -10,7 +10,7 @@
 #   snx_recompiler_jit    what makes the code a running program reaches (jit/, cpu/arm/exec.c), and the AArch32 blocks
 #                         of the AOT compilers (cpu/arm/aot.c)
 #   scarletnx-recompiler  the library (snx_recompiler.h, docs/dev/library.md): an archive of all their objects
-# A build without LLVM has the core, snx_fallback_none, the AArch32 executor and AOT blocks and the JIT cache's reader
+# A build without LLVM has the core, snx_fallback_none, the AArch32 executor and AOT blocks, the JIT and its cache
 # alone: the others still call it
 
 # The runtime library every module links (rtlib.c): the helpers, compiled here with this Clang and the flags toolchain.c
@@ -134,6 +134,10 @@ endif()
 # generates with the A64 Sail's encoders; built on every host (its code is arm64's, which the tests run under
 # Unicorn; not on Windows on another machine), the default code generator on arm64's ELF hosts and Windows
 target_sources(snx_recompiler_core PRIVATE arm64/arm64_codegen.c arm64/arm64_arm.c mach/native.c)
+# without LLVM a host below its back end's floor is refused (native.h's snx_native_refused): nothing else makes its code
+if(NOT SNX_WITH_LLVM)
+    target_compile_definitions(snx_recompiler_core PRIVATE SNX_NATIVE_ALONE=1)
+endif()
 snx_sailgen_a64_arm64(snx_recompiler_core)
 snx_sailgen_a32_arm64(snx_recompiler_core)
 # the riscv64 back end (src/common/cpu/recompiler/rv64): the same functions in RV64, from the emitters sailgen
@@ -161,6 +165,30 @@ target_sources(snx_recompiler_core PRIVATE la64/la64_codegen.c la64/la64_arm.c)
 snx_sailgen_a64_risc(snx_recompiler_core la64)
 snx_sailgen_a32_risc(snx_recompiler_core la64)
 
+# the version of the code the native back ends make (snx_native_code), a hash of every file that decides it: their
+# sources and the object writers', sailgen's headers and the SDM's selection, and what sailgen generated for them above.
+# The JIT cache's key names it, so a cache made before a change to that code is refused rather than run
+set(snx_native_code_globs "${PROJECT_SOURCE_DIR}/tools/sailgen/*.h" "${PROJECT_SOURCE_DIR}/tools/sailgen/sdm/*.inc")
+foreach(dir mach object x64 arm64 rv64 ppc64 mips64 s390x la64)
+    list(APPEND snx_native_code_globs "${CMAKE_CURRENT_SOURCE_DIR}/${dir}/*.c" "${CMAKE_CURRENT_SOURCE_DIR}/${dir}/*.h"
+         "${CMAKE_CURRENT_SOURCE_DIR}/${dir}/*.inc")
+endforeach()
+file(GLOB snx_native_code_files CONFIGURE_DEPENDS ${snx_native_code_globs})
+get_target_property(snx_native_generated snx_recompiler_core SOURCES)
+list(FILTER snx_native_generated INCLUDE REGEX "/sailgen/[^/]*\\.inc$")
+list(APPEND snx_native_code_files ${snx_native_generated})
+list(SORT snx_native_code_files)
+list(JOIN snx_native_code_files "\n" snx_native_code_list)
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/native_code_files.txt" CONTENT "${snx_native_code_list}\n")
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/native_code.c"
+    COMMAND "${CMAKE_COMMAND}" "-DLIST=${CMAKE_CURRENT_BINARY_DIR}/native_code_files.txt"
+            "-DSOURCE=${PROJECT_SOURCE_DIR}" "-DBINARY=${PROJECT_BINARY_DIR}"
+            "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/native_code.c" -P "${PROJECT_SOURCE_DIR}/cmake/native_code_hash.cmake"
+    DEPENDS ${snx_native_code_files} "${CMAKE_CURRENT_BINARY_DIR}/native_code_files.txt"
+            "${PROJECT_SOURCE_DIR}/cmake/native_code_hash.cmake"
+    COMMENT "Hashing the native back ends' code" VERBATIM)
+target_sources(snx_recompiler_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/native_code.c")
+
 # no fallback: each thing asked of it is an error that names it. The tests link it in every build
 add_library(snx_fallback_none STATIC EXCLUDE_FROM_ALL fallback_none.c)
 set_target_properties(snx_fallback_none PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
@@ -168,7 +196,8 @@ target_compile_options(snx_fallback_none PRIVATE -pedantic-errors -Wall -Wextra 
 target_link_libraries(snx_fallback_none PUBLIC snx_recompiler_core)
 
 add_library(snx_recompiler_jit STATIC "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/exec.c" jit/jit_cache.c
-                                      "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/aot.c")
+                                      jit/jit_cache_key.c "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/aot.c"
+                                      jit/jit_service.c)
 set_target_properties(snx_recompiler_jit PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON C_EXTENSIONS ON)
 target_compile_options(snx_recompiler_jit PRIVATE -Wall -Wextra -Werror=missing-prototypes)
 target_compile_definitions(snx_recompiler_jit PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -178,8 +207,6 @@ if(NOT SNX_WITH_LLVM)
     return()
 endif()
 add_subdirectory(llvm)
-# these call LLVM themselves
-target_sources(snx_recompiler_jit PRIVATE jit/jit_service.c jit/jit_cache_key.c)
 target_link_libraries(snx_recompiler_jit PUBLIC snx_llvm)
 
 # The recompiler as a library (snx_recompiler.h): the backends and the function discovery behind one C interface,

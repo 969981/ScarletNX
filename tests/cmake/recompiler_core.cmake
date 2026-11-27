@@ -24,20 +24,29 @@ add_test(NAME recompiler_core_symbols COMMAND "${CMAKE_COMMAND}" "-DBUILD=${PROJ
          "-DRULE=The recompiler's core builds and links without LLVM (src/common/cpu/recompiler/CMakeLists.txt)"
          -P "${PROJECT_SOURCE_DIR}/tests/recompiler_symbols.cmake")
 
+# the version of the native back ends' code that the JIT cache's key names (cmake/native_code_hash.cmake)
+add_test(NAME native_code_hash COMMAND "${CMAKE_COMMAND}" "-DSCRIPT=${PROJECT_SOURCE_DIR}/cmake/native_code_hash.cmake"
+         "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/native-code-hash"
+         -P "${PROJECT_SOURCE_DIR}/tests/native_code_hash_test.cmake")
+
 # SNX_WITH_LLVM (cmake/with_llvm.cmake): which builds it stops
 add_test(NAME with_llvm_option COMMAND "${CMAKE_COMMAND}" "-DSCRIPT=${PROJECT_SOURCE_DIR}/cmake/with_llvm.cmake"
          -P "${PROJECT_SOURCE_DIR}/tests/with_llvm_test.cmake")
 
 # what makes the code the native back end leaves (recompiler/fallback.h), and the AArch32 executor over it: none, in a
-# program that links no LLVM, and LLVM's where the build has it. exec.c is in the test, its loads counted and refused
+# program that links no LLVM, and LLVM's where the build has it. exec.c is in the test, its loads counted and refused,
+# and the JIT's sources beside it, which the native back end alone makes the code of
 set(snx_fallback_tests none)
 if(SNX_WITH_LLVM)
     list(APPEND snx_fallback_tests llvm)
 endif()
 foreach(fallback IN LISTS snx_fallback_tests)
     set(target snx-test-recompiler-fallback-${fallback})
-    add_executable(${target} "${PROJECT_SOURCE_DIR}/tests/recompiler_fallback.c")
+    set(jit "${PROJECT_SOURCE_DIR}/src/common/cpu/recompiler/jit")
+    add_executable(${target} "${PROJECT_SOURCE_DIR}/tests/recompiler_fallback.c" "${jit}/jit_service.c"
+                             "${jit}/jit_cache.c" "${jit}/jit_cache_key.c")
     snx_test_target(${target} gnu23)
+    target_link_libraries(${target} PRIVATE Threads::Threads)
     if(fallback STREQUAL none)
         target_link_libraries(${target} PRIVATE snx_fallback_none snx_arm_rt)
         if(NOT WIN32)
@@ -48,3 +57,17 @@ foreach(fallback IN LISTS snx_fallback_tests)
     endif()
     add_test(NAME recompiler_fallback_${fallback} COMMAND ${target} WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 endforeach()
+
+# the recompiler's library (library.c) with no LLVM: the same sources and fallback as recompiler_fallback_none's, the
+# AArch32 executor beside them (cpu/arm/exec.c), and the program that recompiles and runs through it
+set(target snx-test-recompiler-library-none)
+add_executable(${target} "${PROJECT_SOURCE_DIR}/tests/recompiler_library_none.c"
+                         "${PROJECT_SOURCE_DIR}/src/common/cpu/recompiler/library.c" "${jit}/jit_service.c"
+                         "${jit}/jit_cache.c" "${jit}/jit_cache_key.c"
+                         "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/exec.c")
+snx_test_target(${target} gnu23)
+target_link_libraries(${target} PRIVATE snx_fallback_none snx_arm_rt Threads::Threads ${CMAKE_DL_LIBS})
+if(NOT WIN32)
+    target_link_libraries(${target} PRIVATE m)
+endif()
+add_test(NAME recompiler_library_none COMMAND ${target})

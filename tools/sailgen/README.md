@@ -333,7 +333,7 @@ shader tests (`shader_sm86`, `shader_direct`, `shader_sm86_gpu`...) run the gene
 ## Encoders (`--encoders`)
 
 ```sh
-sailgen --encoders __DecodeA64 [--roots ROOTS] -o a64_enc.inc a64.sail
+sailgen --encoders __DecodeA64 [--roots ROOTS] --profile a64.profile -o a64_enc.inc a64.sail --overlay nx.sail
 ```
 
 A back end that writes an architecture's own code takes its encodings from that architecture's Sail, the same
@@ -353,6 +353,16 @@ alike get the shortest tail of the name that tells them apart: `ldr_imm_gen_post
 instructions the guest's emitters make by hand or not at all (B, MRS, SVC, the Advanced SIMD) have encoders too
 (`--extract`'s `encode NAME`: the clauses of a decode function, or of every scattered function NAME begins).
 `tests/sailgen_encoders.c` (`sailgen_encoders`) holds them to words the Arm ARM gives.
+
+Each clause's `fp` in the table says what its code reaches of the floating-point control and status registers, with
+the overlays and the profile as `--generate` takes them: 0 nothing, 1 FPCR read or FPSR written (a saturation's QC),
+2 FPCR given to a function the back end lowers, or one that reads it by itself (FPRecipStepFused), what its lowering
+reads being the back end's. The code is walked as the generator folds it: a field the pattern fixes whole known (SSHL's
+S, which leaves its saturation out), a feature the profile names in no feature line false (FEAT_AFP's FPCR.AH in
+FABS), an if or a match down its known side, FPCR_read's value followed to where something reads it; every guess is
+the one that reaches more. The arm64 back end runs an Advanced SIMD or floating-point word as the host's own
+instruction, under the guest's FPCR only where a clause with the word's bits has an `fp` (`arm64_vec.c`);
+`tests/arm64_fpenv_code.c` holds that to the Sail's own code of each clause the arm64 Sail makes.
 
 ## The x86-64 back end
 
@@ -482,7 +492,9 @@ times are folded when sailgen runs and when the emitter runs as for LLVM, and wh
 of the block's x86 instructions (`SgXIns`: a selected candidate, virtual registers for its operands, an immediate),
 the assembly itself. The emitter does what costs little as it appends: constants fold, an operand that is a constant
 picks the candidate whose immediate it fits (`imm8` sign extended before `imm32`), a candidate needing a feature the
-host lacks is passed over (SHLX for SHL CL; a primitive none can make leaves the word to another back end), an input a
+host lacks is passed over (SHLX for SHL CL; an SSE form of XMM registers alone that `x64.h`'s `sgx_vf_helped_forms`
+lists is a cold call of `x64_helpers.c`'s `snx_x64_sse`, the instruction in C, and CRC32C without SSE4.2 a table's, as
+CRC32's; a primitive none can make leaves the word to another back end), an input a
 form reads whole is zero extended only where its register isn't (each value knows the bits of its register above it
 that are 0: the selection said which forms leave their result so), NOT stays unmade until something reads it (a
 subtraction takes the operand it was of), and a chain of operations with constants folds into its first (`x AND k1 AND
@@ -548,10 +560,15 @@ around a C call, which keeps all of them.
 
 **The test** (`tests/sail_x64.c`, `sail_x64` with `SNX_SAIL_X64`): every word of the decoder's rows the roots take
 (again with Rd, Rn and Rm 31) is made into x86-64 code twice, on the host's BMI1, BMI2 and LZCNT and without them, and
-run beside the LLVM back end's step of it (`llvm_steps.c`) from random states: every register, the flags, the next pc and
-UNDEF must match (`sail_x64_spill` again with three host registers, `--pool 3`, so the values spill). Then random
-sequences of two to four of the words are made one block each and run beside their LLVM
-steps one after another (`--sequences N`), which is what holds the block's folds, dropped stores and reused flags. `--dump WORD` prints a word's code for a disassembler (`llvm-mc --disassemble -triple=x86_64`).
+run beside `qemu-aarch64 -cpu max` (`tests/qemu_ref`) from states of the word's own seed (`tests/sail_qemu.h`): every
+register, the flags, FPCR, FPSR, the vector registers, the memory it changed, the next pc and UNDEF must be QEMU's
+(`sail_x64_spill` again with three host registers, `--pool 3`, so the values spill). A store-exclusive runs after the
+load-exclusive that arms its monitor in half the states. Where QEMU can't run beside it (Windows), the words are held
+to a reference of QEMU's ends, a hash of each word's every state, which the qemu-reference job records (`--record`) and
+the Windows job reads (`SNX_SAIL_QEMU_REFERENCE`). Then random sequences of two to four of the words are made one
+block each and run beside the code of each word alone at its pc, one after another (`--sequences N`), which is what
+holds the block's folds, dropped stores and reused flags. `--dump WORD` prints a word's code for a disassembler
+(`llvm-mc --disassemble -triple=x86_64`).
 
 The code for Windows is run by an x86-64 Linux host too (`sail_win64`, and over whole functions and AArch32 blocks
 `recompiler_win64` and `arm_win64`): `tests/support/host_win64.c` enters it as Windows' C would, with RBX, RBP, RSI, RDI,
@@ -648,16 +665,19 @@ after it and a release store DMB ISH around it, and the ABI (AAPCS64: the state 
 X30, X19 and X20; X16 and X17 the assembler's). It builds on any host: the code it writes is arm64's.
 
 Windows on Arm's convention is AAPCS64 too, with X18 the system's (no value's here), so the code for it
-(`SNX_ARM64_F_WIN`) is the same words. What differs is around it: a COFF object (`x64_elf.c`), whose function table
+(`SNX_ARM64_F_WIN`) is the same words but for a guest function's frame (`arm64_codegen.c`): there its spill slots are
+below the saved registers, a SUB of SP after the prologue's last save, the form the unwinder reads; elsewhere above
+them, in STP X29, X30's pre-index and each LDP's post-index (past 408 bytes of them, a SUB of SP before the STP and an
+ADD after each LDP). What differs is around it: a COFF object (`x64_elf.c`), whose function table
 unwinds each frame by a record of 1 MiB of code at most (a longer function has several), its prologue's codes and its
 epilogues'; an epilogue's return or jump right after it, where the unwinder has it end; a frame of a page or more reading
 its pages first (`sga_stack_probe`, X16 and X17); an AArch32 block's code of no frame, the exit of a failed entry check,
 past the range its frame covers; and `snx_stale` past the 1 MiB COFF's ADRP holds read with an ADD more.
 
-**The test** (`tests/sail_arm64.c`, `sail_arm64` where Unicorn is installed): the words of `sail_x64`'s rows, and
-blocks of two to four of them, made into arm64 code and run under Unicorn (QEMU's AArch64, its "max" CPU) beside the
-LLVM back end's steps from the same random states; registers, flags, the SIMD&FP state, guest memory, the next pc and
-UNDEF must match. The test's memory is mapped into Unicorn at its own addresses, so the code and the test's C share
+**The test** (`tests/sail_mach.c`, `sail_arm64` where Unicorn is installed): the words of `sail_x64`'s rows, made into
+arm64 code and run under Unicorn (QEMU's AArch64, its "max" CPU) beside `qemu-aarch64 -cpu max` from the same states as
+`sail_x64`'s; registers, flags, the SIMD&FP state, guest memory, the next pc and UNDEF must be QEMU's. Blocks of two to
+four of them run beside the code of each word alone, one after another. The test's memory is mapped into Unicorn at its own addresses, so the code and the test's C share
 every pointer; a call out goes to a page of traps whose hook calls the native helper. `sail_arm64_spill` gives it
 three registers (`--pool 3`); `--dump WORD...` prints a block for a disassembler.
 

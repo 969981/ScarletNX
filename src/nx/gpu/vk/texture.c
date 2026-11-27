@@ -1179,6 +1179,9 @@ static void tex_info(const Surf* t, VkFormat fmt, VkImageCreateInfo* ii, VkViewF
     *storage = !t->msaa && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
     if (*storage) ii->usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     if (!is3d && t->layers >= 6 && t->w == t->h && !t->msaa) ii->flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    /* one its render targets can draw into (tex_create): each image made for it again keeps the usage */
+    if (t->att_capable && fmt == t->f.vk)
+        ii->usage |= t->f.depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     /* a multisampled one is loaded by drawing its samples from the guest's layout of them, through a view of their
        raw bytes (gpu/vk/msaa.c) */
     vk_view_formats(ii, vf, t->msaa ? vk_raw_format(t->f.bpp) : VK_FORMAT_UNDEFINED);
@@ -1308,7 +1311,15 @@ static void tex_drawn(Surf* t, int drawn) {
 }
 /* t's image as img (memory mem, bytes bytes) of format fmt, in UNDEFINED or (copied) TRANSFER_DST_OPTIMAL: the old one
    and its views go once the frames that sample them are done */
+int vk_tex_image_own(Surf* s, VkImage* img, DevMem* mem, u64* bytes) {
+    VkImageCreateInfo ii;
+    VkViewFormats vf;
+    int storage;
+    tex_info(s, s->f.vk, &ii, &vf, &storage);
+    return vk_cache_image_create(&ii, img, mem, VK_OWN_TEXTURE | VK_OWN_WRITTEN, bytes);
+}
 static void tex_image_swap(Surf* t, VkImage img, DevMem mem, u64 bytes, VkFormat fmt, int copied) {
+    vk_tex_unhost(t); /* its targets draw into its old image: images of their own first (docs/dev/one-image.md) */
     for (int i = 0; i < t->nsv; i++) vk_defer_image(VK_NULL_HANDLE, 0, t->sv[i].v, VK_NULL_HANDLE);
     t->nsv = 0;
     if (t->present) vk_defer_image(VK_NULL_HANDLE, 0, t->present, VK_NULL_HANDLE); /* the old image's */
@@ -2151,8 +2162,16 @@ void vk_tex_kind_frame(void) {
 
 /* 1 when every subresource was copied; 0 when memory or staging ran out, and upload_valid keeps it for a retry */
 static int tex_upload_(Surf* t);
+/* t's hosted targets that hold pixels memory lacks, published: a load of all of t from memory writes their texels in the
+   image they share, and the take that copied them again after it before is no more (docs/dev/one-image.md). A load of
+   pieces leaves out the pieces under them (take_cover) */
+static void tex_hosted_publish(Surf* t) {
+    for (Surf* s = t->hosted; s; s = s->host_next)
+        if (vk_surf_flush_size(s) && !vk_surf_publish(s)) vk_surf_flush(s, NULL);
+}
 /* a texture's upload as a profiler zone (SNX_TRACY builds) */
 static int tex_upload(Surf* t) {
+    tex_hosted_publish(t);
     SNX_ZONE_V(z, "texture upload", t->size);
     int r = tex_upload_(t);
     SNX_ZONE_END(z);
@@ -2430,7 +2449,7 @@ int vk_tex_dma_rows(u64 tex, u32 level, u32 layer, u64 gva, u64 lo, u64 span, u3
     VkCommandBuffer cb = VK_NULL_HANDLE;
     for (Surf* t = vk_surf_first(tex); t && n < max; t = vk_surf_next(t)) {
         const VkFmt* f = &t->f;
-        if (t->is_rt || t->gva != tex || level >= t->levels || layer >= t->layers || !t->upload_valid || !t->bl ||
+        if (t->is_rt || t->host || t->gva != tex || level >= t->levels || layer >= t->layers || !t->upload_valid || !t->bl ||
             t->bd || t->msaa || t->type == VK_IMAGE_VIEW_TYPE_3D || f->depth || f->conv || vk_tc_converts(f) ||
             !f->bpp || !f->bw || !f->bh || ox % f->bpp || line_bytes % f->bpp || rows_pitch % f->bpp ||
             (rows_at % f->bpp) || (rows_at & 3))
@@ -2705,6 +2724,15 @@ static Surf* tex_create(u64 gva, u32 w, u32 h, u32 layers, u32 d3, u32 levels, V
                       w, h, layers * d3, levels, (int)ii.format,
                       !sparse ? "no sparse residency for it here, or it is not block linear, or it is multisampled"
                               : "the device makes no such image with sparse residency, or it is under 4 MiB");
+        /* the attachment usage of a texture its level's or layer's render targets can draw into
+           (docs/dev/one-image.md): block linear, 2D or cube, of one sample, its format as memory holds it */
+        if (g_vk.has_unified_layouts && bl && !msaa && f.conv == VKC_NONE &&
+            (type == VK_IMAGE_VIEW_TYPE_2D || type == VK_IMAGE_VIEW_TYPE_2D_ARRAY || type == VK_IMAGE_VIEW_TYPE_CUBE ||
+             type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) &&
+            vk_format_attachable(t->f.vk, f.depth)) {
+            ii.usage |= f.depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            t->att_capable = 1;
+        }
         if (!vk_cache_image_create(&ii, &t->img, &t->mem, VK_OWN_TEXTURE | (written ? VK_OWN_WRITTEN : VK_OWN_MOVES),
                                    &t->bytes)) {
             SNX_MEM_FREE_D(t, "texture objects");
@@ -2735,6 +2763,8 @@ static int can_blit(VkFormat f) {
    memory (scale_blit: integers nearest): blitted straight where c has rt's format, else into an image of rt's format
    at the guest's size, whose bits a copy then takes as c's format. 0 when that image can't be made */
 static int rt_copy_guest(Surf* rt, Surf* c, u32 sw, u32 sh) {
+    /* a hosted target, read as level 0 of its own image here: given one first (docs/dev/one-image.md) */
+    if (rt->host && !vk_rt_own(rt)) return 0;
     VkImageSubresourceLayers all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, rt->layers};
     VkFilter filter = rt->f.is_int ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
     VkImageBlit b = {.srcSubresource = all,
@@ -2854,6 +2884,8 @@ static u64 copy_bytes(const Surf* c) { return (u64)c->sw * c->sh * c->layers * c
    only asks its size. With reuse, a copy made since the last point that makes draws' writes visible to texture reads
    (g_vk_texture_epoch) is returned as it is though the target was drawn to since (vk_rt_snapshot) */
 static Surf* rt_copy(Surf* rt, u32 w, u32 h, const VkFmt* as, int why, int pixels, int reuse) {
+    /* a hosted target, read as level 0 of its own image here: given one first (docs/dev/one-image.md) */
+    if (rt->host && !vk_rt_own(rt)) return NULL;
     const int guest = why == VK_RT_COPY_GUEST;
     Surf* c = NULL;
     VkFmt f = as ? *as : rt->f;
@@ -3845,7 +3877,7 @@ static Surf* tex_check_memory(Surf* t, u64 gva) {
            submission or the end of a stream wait reaches the next sample, as with write tracking. The frame's schedule
            below alone misses that (the write and the sample come between two presents, and a headless run presents
            nothing). Expiring every texture at the cache invalidation methods did it before, and isn't enough either:
-           edenprobe rewrites texels with only the sampler and header caches invalidated after, never the texture data
+           Amberlith rewrites texels with only the sampler and header caches invalidated after, never the texture data
            cache. A settled texture is left to the schedule: epochs start at every submission, and hashing every
            texture in each took half the GPU thread (FreeBSD) */
         if (epoch && !tex_settled(t)) {
@@ -3950,6 +3982,13 @@ static int quiet_own(Surf* t, u64 gva, int* why) {
 }
 /* a texture found for a header checked against its memory: whole without a full check where it is quiet (quiet_own) */
 static Surf* tex_check(Surf* t, u64 gva) {
+    /* a storage surface its texture hosts (docs/dev/one-image.md): its image and memory are the host's, which the
+       host's check loads. One that lost its host meanwhile has an image of its own again, with the host's pixels */
+    if (t->host) {
+        Surf* h = t->host;
+        tex_check(h, h->gva);
+        return t;
+    }
     /* frequent, so a small code: bits 0..2 are why the full check ran (0 quiet hit, 1 a present, 2 an epoch, 3 a
        GPU write, 4 no quiet baseline), bit 3 is set when it found the texture gone or had to load it again */
     SNX_ZONE(z, "vk mem texture check");
@@ -4178,6 +4217,8 @@ static Surf* tex_from_tic(const u32* tic, int raw, int use) {
                up), else a surface with the descriptor's own guest layout. A scaled target's pixels aren't where the
                program's coordinates write */
             if (storage) {
+                /* a hosted target: an image of its own where its host's has no storage usage (docs/dev/one-image.md) */
+                if (rt->host && !rt->host->storage_capable && !vk_rt_own(rt)) goto texture_from_memory;
                 if (!vk_rt_same_layout(rt, w, h, bl, bh, pitch) || rt->sw != rt->w || rt->sh != rt->h ||
                     rt->layers != layers || rt->depth3d != d3 || rt->f.vk != f.vk || !rt->storage_capable)
                     goto texture_from_memory;
@@ -4196,6 +4237,9 @@ static Surf* tex_from_tic(const u32* tic, int raw, int use) {
                 if (guest) return guest;
             }
             if (as) return rt_crop(rt, w, h, as);
+            /* a hosted target padded past its level: its view is the level's, not the size the header samples */
+            if (rt->w == w && rt->h == h && rt->host && vk_surf_view_w(rt) != rt->w && !vk_rt_own(rt))
+                goto texture_from_memory;
             return rt->w == w && rt->h == h ? rt : rt_crop(rt, w, h, NULL);
         }
         LOG_LIMIT(1,
@@ -4394,7 +4438,7 @@ static VkImageView tex_view(Surf* s, VkImageViewType type, int srgb, const VkCom
                                 .subresourceRange = {stencil      ? VK_IMAGE_ASPECT_STENCIL_BIT
                                                      : s->f.depth ? VK_IMAGE_ASPECT_DEPTH_BIT
                                                                   : VK_IMAGE_ASPECT_COLOR_BIT,
-                                                     0, levels, 0, layers}};
+                                                     vk_surf_level0(s), levels, vk_surf_layer0(s), layers}};
     /* Explicit usage keeps a sampled sRGB view from inheriting the image's linear storage usage. */
     VkImageViewUsageCreateInfo vu = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
                                      .usage = storage ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT};
@@ -4419,6 +4463,8 @@ VkImageView vk_tex_view(Surf* s, VkImageViewType type, int srgb, const VkCompone
 
 VkImageView vk_tex_storage_view(Surf* s, VkImageViewType type) {
     const VkComponentMapping identity = {0};
+    /* a hosted surface writes its host's image in place where that has storage usage, else an image of its own */
+    if (s->host && !s->host->storage_capable && !vk_rt_own(s)) return VK_NULL_HANDLE;
     /* A storage descriptor exposes the first level selected by its TIC, not
        the entire sampled mip chain. Both views share the existing image. */
     return tex_view(s, type, 0, &identity, 0, 1, 1);
@@ -4817,8 +4863,8 @@ static VkCommandBuffer copy_begin(Surf* s, Surf* t) {
    a copy then takes. 0 when that image can't be made */
 static int copy_layers(VkCommandBuffer cb, Surf* s, Surf* t, u32 l, u32 dst, u32 count, u32 w, u32 h, int z) {
     /* a region takes one aspect: a depth target's depth, and its stencil in a second region when it has one */
-    VkImageSubresourceLayers from = {t->f.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
-                                     z ? 1 : count};
+    VkImageSubresourceLayers from = {t->f.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT,
+                                     vk_surf_level0(s), vk_surf_layer0(s), z ? 1 : count};
     VkImageSubresourceLayers to = {from.aspectMask, l, z ? 0 : dst, z ? 1 : count};
     u32 regions = t->f.depth && t->f.stencil ? 2 : 1;
     i32 dz = z ? (i32)dst : 0;
@@ -4913,6 +4959,23 @@ static int take_place(const Surf* s, const Surf* t, TakePlace* at) {
     }
     return 0;
 }
+/* texture a joins t (vk_tex_join) where a is one level of t's layers, of t's format and layer stride: the same bytes,
+   which one image holds. Not a texture of its own pieces (sparse, bricks, holes), nor one t's image can't give its
+   views (a cube's where t's image isn't cube compatible, a target's where t has no attachment usage) */
+static void tex_join(Surf* a, Surf* t) {
+    TakePlace at;
+    if (a == t || a->host || t->host || a->is_rt || t->is_rt || !t->img || a->levels != 1 || a->msaa || t->msaa ||
+        a->f.vk != t->f.vk || a->f.conv || t->f.conv || !a->bl || !t->bl || a->sparse || t->sparse || a->bricks ||
+        t->bricks || a->piecewise || t->piecewise || a->type == VK_IMAGE_VIEW_TYPE_3D ||
+        t->type == VK_IMAGE_VIEW_TYPE_3D || a->bc7_later || t->bc7_later)
+        return;
+    if (!take_place(a, t, &at) || a->w != at.lw || a->h != at.lh || at.count != a->layers ||
+        (a->layers > 1 && a->layer_size != t->layer_size))
+        return;
+    const int cube = a->type == VK_IMAGE_VIEW_TYPE_CUBE || a->type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+    if ((cube && !(t->layers >= 6 && t->w == t->h)) || (a->hosted && !t->att_capable)) return;
+    vk_tex_join(a, t, at.l, at.layer);
+}
 /* no newer guest memory over what s gives t at `at` (vk_rt_drawn_fresh): only the level's own bytes in each layer
    are asked: a target of a taller block height than the level's spans the face's other levels
    after it, which a dispatch writes as storage images after the faces' draws (one game's reflection cubes refused
@@ -4964,7 +5027,9 @@ static void take_cover(Surf* t, TexPieces* p) {
     }
     for (int i = 0; i < n; i++) {
         Surf* s = d[i];
-        if (s == t || s->img == t->img) continue; /* its own image, written in place */
+        /* its own image, written in place. A target t hosts draws into t's image too, and its fresh pixels are there:
+           memory's bytes under it are not loaded over them (docs/dev/one-image.md) */
+        if (s == t || (s->img == t->img && s->host != t)) continue;
         TakePlace at;
         if (s->f.depth != t->f.depth || s->f.stencil != t->f.stencil || s->f.bpp != t->f.bpp ||
             (t->f.depth && s->f.vk != t->f.vk) || s->msaa || ((s->sw != s->w || s->sh != s->h) && !can_blit(s->f.vk)) ||
@@ -4995,6 +5060,15 @@ void vk_tex_take_log(void) {
         (unsigned long long)g_takes.format, (unsigned long long)g_takes.scaled, (unsigned long long)g_takes.no_place,
         (unsigned long long)g_takes.stale);
     g_takes = (TakeCounts){0};
+    if (g_vk.has_unified_layouts) {
+        static u64 was[2];
+        u64 hosted, unhosted;
+        vk_rt_host_counts(&hosted, &unhosted);
+        LOG("vulkan: render targets made views of a texture's image over the last 600 presents: %llu, given images of "
+            "their own again %llu\n",
+            (unsigned long long)(hosted - was[0]), (unsigned long long)(unhosted - was[1]));
+        was[0] = hosted, was[1] = unhosted;
+    }
 }
 /* a texture whose layers, levels or 3D slices were drawn as render targets of their own is copied from those targets
    on the GPU: they are never written back to its memory. Only a target matching one subresource (or, layered, the
@@ -5003,6 +5077,11 @@ void vk_tex_take_log(void) {
    texels are as many bytes as its blocks, a texel for a block: a game compressing on the GPU draws the blocks so (one
    game's text labels, BC5 drawn as RGBA32UI) */
 static void tex_take_drawn(Surf* t) {
+    /* a storage surface its texture hosts: what it takes is its host's to take, into the host's image */
+    if (t && t->host) {
+        tex_take_drawn(t->host);
+        return;
+    }
     /* a converted format's texels differ from its host image's, but a depth texture takes its targets' host images
        as they are (the same format, below): D24S8's guest packing is converted only when it is loaded from memory */
     if (!t || t->is_rt || (t->f.conv && !t->f.depth)) {
@@ -5061,6 +5140,10 @@ static void tex_take_drawn(Surf* t) {
             continue;
         }
         /* the texture's own image, which a storage view of a level of it wrote in place: nothing to take */
+        /* a target hosted in another texture a that is one level of layers of t (one game samples each cube of its
+           reflections alone and in an array of the cubes): a joins t as a view of its image, with its targets, and
+           neither copies them again each frame (docs/dev/one-image.md) */
+        if (s->host && s->host != t && !s->host->is_rt) tex_join(s->host, t);
         if (copied_into(s, t) || s == t || s->img == t->img) continue;
         if (s->f.depth != t->f.depth || s->f.stencil != t->f.stencil || s->f.bpp != t->f.bpp ||
             (t->f.depth && s->f.vk != t->f.vk) || s->msaa || t->msaa) {
@@ -5077,6 +5160,8 @@ static void tex_take_drawn(Surf* t) {
         u64 off = s->gva - t->gva;
         if (t->type == VK_IMAGE_VIEW_TYPE_3D) {
             if (t->f.depth) continue;
+            /* a hosted target, read as level 0 of its own image here: given one first (docs/dev/one-image.md) */
+            if (s->host && !vk_rt_own(s)) continue;
             /* A layered color target can be sampled as a 3D texture at the same address. Its slices only exist in
                the host image: guest memory is not updated by draws. Each array layer goes to the matching Z slice */
             /* Its layers are the texture's slices when they are GOB slices (a volume) or lie inside the texture. A
@@ -5171,6 +5256,19 @@ static void tex_take_drawn(Surf* t) {
         }
         if (copy_layers(copy_begin(s, t), s, t, at.l, at.layer, at.count, at.lw, at.lh, 0)) {
             mark_copied(s, t);
+            /* the last take of it: from now on it draws into t's image (docs/dev/one-image.md). Its format, its
+               scale, the level's size and the layers it covers whole; t whole in memory, not sparse */
+            /* not a texture with holes in its mapping (piecewise, sparse or not): its loads clear the image first */
+            /* A storage surface too (a dispatch's image over a level or layer of t): its writes go into t's image, where
+               t has storage usage, and its loads and takes are t's */
+            const int fits = !t->sparse && !t->bricks && !t->piecewise && !s->host && !s->hosted && !s->msaa &&
+                             !(s->gva >> 63) && s->sw == s->w && s->sh == s->h && !s->volume && s->bl &&
+                             s->f.vk == t->f.vk && s->w >= at.lw &&
+                             s->w * s->f.bpp <= ((at.lw * s->f.bpp + 63) & ~63u) && s->h == at.lh &&
+                             at.count == s->layers && t->img;
+            const int storage = !s->is_rt && t->storage_capable && s->levels == 1 && !s->sparse && !s->bricks &&
+                                !s->piecewise && !s->f.conv && s->type != VK_IMAGE_VIEW_TYPE_3D;
+            if (fits && ((s->is_rt && t->att_capable) || storage)) vk_rt_host(s, t, at.l, at.layer);
             if (s->is_rt)
                 g_takes.targets++;
             else

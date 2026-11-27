@@ -113,14 +113,18 @@ snx_recompiled_free(m);
 snx_recompiler_free(r);
 ```
 
-`snx_recompiler_new` takes the backend: `SNX_RECOMPILER_FLAG_LLVM`, the only one.
-`snx_recompiler_has` tells whether LLVM can target this host.
-The recompiler also takes the `-O` level (`snx_recompiler_set_optimization`, `2` by
-default), how many code units compile at once (`snx_recompiler_set_jobs`, on
-threads),
-progress lines (`snx_recompiler_set_verbose`), a callback with how far a recompile is,
-for a progress bar (`snx_recompiler_set_progress`), and a folder to save the generated
-code's text in (`snx_recompiler_set_keep_ir`). `snx_recompiler_set_hook_direct_calls`
+`snx_recompiler_new` takes the backend: `SNX_RECOMPILER_FLAG_LLVM`, the only one, which
+names the host's native back end (x86-64's, arm64's or another machine's,
+`src/common/cpu/recompiler/mach/native.h`): it makes all of the A64 code.
+`snx_recompiler_has` tells whether this host has one. The recompiler also takes the `-O`
+level (`snx_recompiler_set_optimization`, `2` by default: the native back end's code is
+the same at every one, and the caches keep it), how many code units compile at once
+(`snx_recompiler_set_jobs`, on threads),
+progress lines (`snx_recompiler_set_verbose`) and a callback with how far a recompile is,
+for a progress bar (`snx_recompiler_set_progress`). `snx_recompiler_set_keep_ir` asked for
+LLVM's IR, and is refused with the folder named. `snx_recompiler_set_backend(r, 0)` is LLVM
+alone, the reference the tests compare the native back end with while the build has LLVM;
+its modules are not kept in the cache folder. `snx_recompiler_set_hook_direct_calls`
 routes calls between discovered functions through the CPU's dispatch table. Enable it
 when the runtime can invalidate guest code, so callers do not retain direct pointers to
 retired functions.
@@ -130,13 +134,13 @@ decide what the decoder (`tools/decodetree`, from QEMU's `a64.decode`) accepts: 
 encoding needing a feature the target lacks is an undefined instruction, as on that
 CPU. `SNX_RECOMPILER_A64_SWITCH`, the default, is the Switch's Cortex-A57 (Armv8.0
 with CRC32 and the Cryptographic Extension). `SNX_RECOMPILER_A64_MAX` takes every
-feature the decoder knows; `llvm_qemu_differential` checks the emitters against QEMU
-for it, and the native back ends' tests check theirs (FEAT_FP8's as FPMR zero has them,
-which is all code can do here: an `MSR` or `MRS` of FPMR is undefined). An instruction a
-native back end has no code for is said at the recompile, once a function: its address,
-the instruction, its word and address, the feature and the target, and how many functions
-there were; LLVM makes them, and where there is no LLVM the instruction is an undefined
-one where it runs.
+feature the decoder knows; `llvm_qemu_differential` and `native_qemu_differential` check
+the LLVM emitters and the host's native code against QEMU for it, and the native back
+ends' tests check theirs (FEAT_FP8's as FPMR zero has them, which is all code can do
+here: an `MSR` or `MRS` of FPMR is undefined). An instruction a native back end has no
+code for is said at the recompile, once a function: its address, the instruction, its
+word and address, the feature and the target, and how many functions there were; the
+function is made, the instruction undefined where it runs.
 `SNX_RECOMPILER_A64_ANDROID` is an Android phone's CPU, as the Android
 driver's native bridge runs it: Armv8.2 with the atomics, RDM, half precision, the
 dot product and LRCPC, without pointer authentication, so that the `PACIASP` and
@@ -192,8 +196,8 @@ its own table also gives `RtAPI.miss` its own handler, which compiles the code a
 address and runs it, as the Linux runtime (`src/gnuabi/runtime/jit.c`) does. A caller that
 keeps `snx_runtime_defaults`' miss can instead name that handler with
 `snx_recompiled_set_fallback`, which the module's misses then run instead of its own JIT. `snx_recompiler_set_cache` names a
-folder that keeps linked modules (LLVM) by a hash of everything they are made from, and
-the compiled runtime library: a module found there is loaded instead of compiled. The
+folder that keeps linked modules by a hash of everything they are made from (the native
+back end, the host's features it uses and its code's version among them): a module found there is loaded instead of compiled. The
 units its lazy JIT compiles on a miss are kept in `library-jit.cache` in the same folder,
 and a later miss loads a unit instead of compiling it when its code is the same, byte for
 byte, and the file was made with the same settings, LLVM and host CPU. The modules of one

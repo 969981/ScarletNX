@@ -28,11 +28,14 @@ typedef struct {
    A piece moved into the small store has seg NVN_SPILL_SMALL plus its class, and at its block */
 typedef struct {
     u64 anchor, canchor, mark, at;
+    u64 csig; /* NVN_PIECE_NO_COMMAND: the 8 bytes at canchor as the recording ended (spill_sweep's test) */
     u32 seg, serial, next, cnext, flags, ctl;
 } NvnSpillPiece;
 /* its recording counted no bytes of command memory: the driver keeps it all in control memory, so only a look at the
    control memory gives it back */
 #define NVN_PIECE_NO_COMMAND 1u
+/* a piece spill_sweep gives back in bulk: out of both chains in one pass over them, then freed (nvn_cmd.c) */
+#define NVN_PIECE_DYING 2u
 /* A command buffer's control memory as the game's driver counts it: the memory last added [start, limit + 0x10), the
    cursor, the cursor at the last look, where the open recording's entries start, the serial at the last look, whether
    a block of command ranges is open, whether commands were counted since the last range entry, and whether the game

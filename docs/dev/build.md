@@ -405,6 +405,9 @@ file in `hash`; CPMUtil's [documentation](https://git.crueter.xyz/CMake/CPMUtil/
 gives the other fields. The file is in CPMUtil's form, which `jq --indent 4 -S . cpmfile.json` or
 `python3 -m json.tool --indent 4 --sort-keys cpmfile.json` writes.
 
+The tests' reference values are the package test-references (scarletnx/test-references, fetched only with the tests);
+`-DCPM_test-references_SOURCE=<a clone>` reads a local copy instead, where the recording scripts write.
+
 To update a package:
 
 1. Change its `version`, and its `artifact` or `url` where they name it (`%VERSION%` in an artifact, or
@@ -499,7 +502,10 @@ cmake --preset default -B build -DSNX_FFMPEG_ASM=OFF && cmake --build build
 - `-DSNX_SAIL_X64=OFF`: build without the x86-64 back end, and LLVM makes every function. The default is ON on x86-64,
   Android's included; a tree keeps the value it was first configured with, which the configure's log says. Its
   instruction selection is in the tree (`tools/sailgen/sdm/x64_isel.inc`,
-  [sailgen](../../tools/sailgen/README.md#the-x86-64-back-end)).
+  [sailgen](../../tools/sailgen/README.md#the-x86-64-back-end)). Its code needs SSE2 alone, which every x86-64
+  processor has. Without SSSE3, SSE4.1, SSE4.2 or PCLMULQDQ (a processor from before 2008, or an Android x86_64 device
+  without PCLMULQDQ: its ABI promises the others) the back end does their instructions by SSE2's or calls helpers of its
+  own, and the recompile and the run's log say so (`cpu: this host has no PCLMULQDQ, done by the fallback`).
 - `-DBUILD_TESTING=ON`: build the tests, which the `default` and `tracy` presets leave out.
 - `-DSNX_BUILD_TESTING=OFF`: leave the tests out whatever `BUILD_TESTING` says. ON by default when ScarletNX is the
   top-level project, OFF when another project adds it with CPM or `add_subdirectory` ([Library](library.md)).
@@ -516,8 +522,9 @@ it:
 - `-DSNX_TEST_ONLINE_LIVE=ON`: add `online_presets_live`, which asks each WFC service's DNS server over the
   internet (labels `external` and `network`): how a service that stopped answering is found
   ([src/common/online](../../src/common/online/README.md)).
-- `-DSNX_TEST_EDENPROBE=/path/to/edenprobe.nro`: add `edenprobe_vk_memory_1` and `edenprobe_vk_memory_2`, which run
-  edenprobe as CI does against its baseline, with guest buffers copied and read in place (docs/dev/edenprobe.md).
+- `-DSNX_TEST_AMBERLITH=/path/to/amberlith.nro` (`SNX_TEST_EDENPROBE` before 1.0.0, still read as it, and said):
+  add `amberlith_vk_memory_1` and `amberlith_vk_memory_2`, which run Amberlith as CI does against its baseline, with
+  guest buffers copied and read in place (docs/dev/amberlith.md).
 - `-DSNX_TEST_SDM=ON`: download the Intel SDM into `CPM_SOURCE_CACHE` once and have `sailgen_sdm_isel` make the x86-64
   back end's instruction selection again from it, which must be the tree's (needs `pdftotext`, poppler's). The test is
   skipped without the PDF, which `-DSNX_SDM_PDF=` also names. CI's Linux x86-64 job runs it on a run by hand, a
@@ -541,6 +548,13 @@ machine).
 CI's job `Linux (x86_64, other machines under Unicorn)` runs them in every pull request, run by hand and version's tag,
 as all of its tests, and fails where a machine ran none (`scripts/unicorn-tests.py`). PowerPC64's are
 skipped: Unicorn 2.1.4 as it is released does not hold the MSR of a 64-bit PowerPC.
+
+The random A32 and Thumb blocks of the profiles and memories no Unicorn test draws (the Cortex-A9's, the ARM11's, the
+ARM946E-S's and the ARM7TDMI's, hosted and checked memory, the ARM7TDMI's trace), `arm_<machine>_<mode>`, are held to
+LLVM -O0's results as test-references' `arm/` keeps them: a hash a block over its states (`arm_x64.c`'s `--frozen`,
+the file's first blocks on the machines under Unicorn). `python3 tests/arm_frozen.py record
+build/tests/snx-test-arm-x64 --out <a clone>/arm` records them with a build that has LLVM and says what each file covers; a change to how `arm_x64.c` draws its blocks
+bumps its `FROZEN_GENERATOR`, and the files are recorded again.
 
 The tests labelled `census` (`ctest -L census -V`) recompile five whole programs that they make: a Switch game of a word of
 each A64 instruction, the same with a Switch 2's NPDM, an NRO of it, a 32-bit Switch game of each A32 and Thumb
@@ -623,7 +637,7 @@ documentation:
 ```sh
 scripts/linux-llvm.sh "$(uname -m)" ~/linux-llvm &&
 cmake --preset default -B build/appimage -DSNX_DEPLOY=OFF -DCMAKE_INSTALL_PREFIX=/usr \
-  -DLLVM_DIR="$HOME/linux-llvm/lib/cmake/llvm" -DSNX_A64_DISASM=OFF &&
+  -DLLVM_DIR="$HOME/linux-llvm/lib/cmake/llvm" &&
 cmake --build build/appimage &&
 cmake --install build/appimage &&
 GITHUB_REPOSITORY=scarletnx/ScarletNX scripts/make-appimage.sh
@@ -636,8 +650,7 @@ takes the version in `LLVM_VERSION` (CI gives it the container's, whose `opt` pr
 and with `SNX_SYSROOT` set it cross-builds for another architecture. `scripts/llvm-source.sh` downloads that version's
 source for it, as for the Android and Apple LLVM scripts, and checks it against the SHA-256 `scripts/llvm-source.sha256`
 pins: a version without a line there is refused, so a new LLVM in CI's image needs its line first, the hash taken from
-the digest on the release's page. `SNX_A64_DISASM=OFF` leaves out `scarletnx --mcp`'s A64 disassembler, which is for
-working on the runtime.
+the digest on the release's page.
 
 `scarletnx` is every driver the build has (`src/multicall`): each driver is a library with no `main` of its own,
 and the program, whichever drivers are on (`SNX_BUILD_NX` among them), runs the one its name says, so LLVM, SDL and

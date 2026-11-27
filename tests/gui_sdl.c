@@ -6266,6 +6266,22 @@ static void wait_played(App* app, int line) {
 /* a game opened that no game of the library was made from: its first compile in the queue, the Compile tab showing it.
    It plays once it ended while the tab still shows it; sent away from the tab first, the tips say it is ready instead
    (DraVee's pick, 2026-10-24) */
+/* text drawn in color in the letters half a step under the text's, on the line as it slides: one too long for its row
+   rests 8 steps at each end (common/utilities/slide.h), so a look every 8 steps meets both */
+static void slid_half(App* app, const char* text, SDL_Color color) {
+    int x, y, found = 0;
+    for (int step = 0; !found && step < 2 * (200 + 8); step += 8) {
+        app->clock = SDL_GetTicks() + 60000 + (Uint64)step * app->theme.scroll_ms; /* every line typed */
+        render(app);
+        int half = text_half(app);
+        found = find_text(app, text, color, 1, &x, &y);
+        app->half = half;
+    }
+    if (!found)
+        fprintf(stderr, "gui_sdl: \"%s\" is not drawn in %02x%02x%02x by the %s theme at %d columns\n", text, color.r,
+                color.g, color.b, app->theme.id, app->cols);
+    assert(found);
+}
 static void compile_first(App* app, const char* dir) {
     char *dump = snx_path_join(dir, "first compile.nsp"), *got = snx_path_join(dir, "driver argv"), *made, *argv_got;
     Uint64 until;
@@ -6286,6 +6302,50 @@ static void compile_first(App* app, const char* dir) {
     queue_drop(app, 0);
     assert(!snx_remove_tree(made));
     free(made);
+    { /* refused, the host below its back end's floor: a test's, without SSE2
+         (recompiler/x64/x64_codegen.c). What the host lacks follows how the recompile ended, and the panel shows the
+         driver's line: YoRHa's as the failed step's, the classic theme's in its output */
+        static const char lacks[] = "cpu: needs SSE2, this host has none";
+        char *say = snx_format("Recompiling first compile (1 modules)\nscarletnx: %s", lacks),
+             *said = snx_format("Compile failed (status 1). %s", lacks), *line = snx_format("first compile: %s", said);
+        GuiTheme theme = app->theme;
+        bool due = app->log_due;
+        driver_will(got, 1, say);
+        launch(app, snx_strdup(dump), false);
+        for (until = SDL_GetTicks() + 10000; app->queue.job[0].state < GUI_JOB_OK && SDL_GetTicks() < until;
+             SDL_Delay(2))
+            pump(app);
+        assert(app->queue.job[0].state == GUI_JOB_FAILED && !app->menu.running && app->log_due);
+        assert(!strcmp(app->queue.job[0].said, said) && !strcmp(app->message, line));
+        {
+            /* YoRHa, the look of every platform's first start, at 80 columns and 50; the classic theme, which cuts a
+               line and slides none, at 80 */
+            static const struct {
+                const char* id;
+                int w, h;
+            } looks[] = {{"yorha", 1280, 800}, {"yorha", 800, 512}, {"default", 1280, 800}};
+            int w, h;
+            assert(app->menu.view == GUI_LOAD_RECOMPILE && SDL_GetWindowSize(app->window, &w, &h));
+            for (size_t k = 0; k < SDL_arraysize(looks); ++k) {
+                app->theme = *gui_theme_builtin(looks[k].id);
+                assert(SDL_SetWindowSize(app->window, looks[k].w, looks[k].h));
+                const SDL_Color color =
+                    rgb(app->theme.run == GUI_RUN_STEPS ? app->theme.run_colors.failure : app->theme.ink);
+                slid_half(app, "cpu: needs SSE2", color);
+                slid_half(app, "this host has none", color);
+            }
+            app->clock = 0;
+            assert(SDL_SetWindowSize(app->window, w, h));
+        }
+        app->theme = theme;
+        remove(got);
+        queue_drop(app, 0);
+        app->log_due = due;
+        driver_will(got, 0, "Recompiling first compile");
+        go_tab(app, GUI_TAB_MENU);
+        app->menu.selected = GUI_SWITCH;
+        free(say), free(said), free(line);
+    }
     /* away from the tab before it ended: nothing plays, the tips say it is ready, Enter then plays it */
     launch(app, snx_strdup(dump), false);
     assert(app->queue.job[0].kind == GUI_JOB_COMPILE && app->menu.view == GUI_LOAD_RECOMPILE);
@@ -6955,6 +7015,26 @@ static void missing_file(App* app, const char* dir) {
     assert(!app->picks_shown && app->menu.running);
     argv_got = ran(app, 0); /* back on the menu */
     free(argv_got);
+    { /* a run refused, the host below its back end's floor: what it lacks follows how it ended */
+        char* go = snx_format("%s.go", got);
+        bool due = app->log_due;
+        driver_will(got, 1, "scarletnx: cpu: needs SSE4.1, this host has SSE3");
+        go_tab(app, GUI_TAB_GAMES);
+        focus_game(app, "extracted game");
+        key(app, SDLK_RETURN);
+        assert(app->menu.running && !snx_write_file(go, "", 0));
+        for (Uint64 until = SDL_GetTicks() + 10000; app->menu.running && SDL_GetTicks() < until; SDL_Delay(5))
+            pump(app);
+        assert(!app->menu.running && app->finished && app->abnormal_exit);
+        assert(!strcmp(app->message, "Program ended abnormally (status 1). cpu: needs SSE4.1, this host has SSE3"));
+        key(app, SDLK_ESCAPE);
+        assert(!app->finished && !app->message[0]);
+        app->log_due = due;
+        driver_will(got, 0, "ScarletNX - extracted game");
+        remove(got);
+        remove(go);
+        free(go);
+    }
     /* Locate...: a file of another kind refused, the dump it keeps said; a dump taken, its row saying nothing more */
     go_tab(app, GUI_TAB_GAMES);
     focus_game(app, "lost game");
@@ -7191,7 +7271,12 @@ static char* ctr_settings(void) {
                       "3DS\tctr_model\tauto\ttext\t\t\tThe console the game runs on\tConsole\t"
                       "auto=Auto|old=Old 3DS|new=New 3DS\t\n"
                       "3DS/Debug\tctr_hooks\t1\tint\t0\t1\tStubs\tIPC hooks\t0=Off|1=On\n"
-                      "Vita/Debug\tvita_hle_trace\t0\tint\t0\t2\tImports\tImport trace\t0=Off|1=Missing|2=All\n");
+                      "Vita/Debug\tvita_hle_trace\t0\tint\t0\t2\tImports\tImport trace\t0=Off|1=Missing|2=All\n"
+                      "On-screen controls\tcontrols\t2\tint\t0\t2\tShown\tShow controls\t0=Off|1=On|2=Auto\n"
+                      "On-screen controls\ttouch\t2\tint\t0\t2\tTouch\tTouch screen\t"
+                      "0=Off|1=Fingers|2=Fingers and mouse\n"
+                      "On-screen controls/Buttons\tcontrols_zl_shown\t1\tint\t0\t1\tDrawn\tZL\t0=Hidden|1=Shown\n"
+                      "On-screen controls/Buttons\tcontrols_plus_shown\t1\tint\t0\t1\tDrawn\t+\t0=Hidden|1=Shown\n");
 }
 /* the file at path holding text */
 static void fixture_text(const char* path, const char* text) { assert(!snx_write_file(path, text, strlen(text))); }
@@ -7208,7 +7293,8 @@ static int game_settings_row(App* app) {
    kept in its picks beside its .ini at once, and Reset to Global; nothing of the Switch's nor another console's, as a
    Switch game's has none of the 3DS's. M (L3, the foot's Settings on a phone) opens it on a listed and a recent game,
    and so does its box's Settings, after Recompile; Back goes to Games, its row and the side panel saying its own. A
-   3DS dump and a Vita game have none, said; the launcher's Console goes to a run of the game under its own. Clean Old
+   Vita, a GBA and a DS game's own are its on-screen controls. A 3DS dump and a file have none, said; the launcher's
+   Console goes to a run of the game under its own. Clean Old
    Settings takes out of a 3DS game's picks what its rows do not take, and keeps its console */
 static void ctr_own_console(App* app, const char* dir) {
     static const char* const name = "0004000000040000";
@@ -7316,37 +7402,122 @@ static void ctr_own_console(App* app, const char* dir) {
         char *switch_folder = made_game(app, "unused", "a switch game"),
              *played = program_in(switch_folder, "a switch game");
         open_game_settings(app, played, "a switch game", false);
-        assert(app->editing && app->own_picks && app->groups == 3 && !strcmp(app->group_keys[0].key, "Display") &&
-               !strcmp(app->group_keys[1].key, "Vita") && !strcmp(app->group_keys[2].key, "Reset to Global"));
+        assert(app->editing && app->own_picks && app->groups == 4 && !strcmp(app->group_keys[0].key, "Display") &&
+               !strcmp(app->group_keys[1].key, "Vita") && !strcmp(app->group_keys[2].key, "Overlay") &&
+               !strcmp(app->group_keys[3].key, "Reset to Global"));
         key(app, SDLK_ESCAPE);
         assert(!app->editing);
         made_gone(app, switch_folder);
         free(played);
     }
-    /* a Vita game and a file that is no game have none: said with what does */
+    /* a Vita, a GBA and a DS game's own, by M on it and by its box: its on-screen controls alone, the touch screen
+       where it has one, each control by its name there, kept in its picks; and the launcher's for its run, marked as
+       such: Show controls' always, as the Switch's runs have it */
     {
-        char *vita_folder, *played;
-        played = console_game(app, "PCSE00099", "[Game]\nsystem=vita\n", &vita_folder);
-        for (i = 0; i < 2; ++i) {
-            open_game_settings(app, i ? cia : played, i ? "a file" : "a vita game", false);
-            snprintf(value, sizeof value,
-                     "%s is no recompiled Switch or 3DS game: only they have settings of their own",
-                     i ? "a file" : "a vita game");
-            assert(!app->editing && !app->own_picks && !strcmp(app->message, value) && app->confirm.shown &&
-                   app->confirm.ask == GUI_ASK_ERROR);
+        static const struct {
+            int item;
+            const char *name, *ini;
+            int touch;
+        } consoles[] = {{GUI_VITA, "PCSE00099", "[Game]\nsystem=vita\n", 1},
+                        {GUI_GBA, "a gba game", "[Game]\nsystem=gba\nsource=/nonexistent/a gba game.gba\n", 0},
+                        {GUI_NDS, "a ds game", "[Game]\nsystem=nds\nsource=/nonexistent/a ds game.nds\n", 1}};
+        for (size_t c = 0; c < sizeof consoles / sizeof *consoles; ++c) {
+            char *made, *played = console_game(app, consoles[c].name, consoles[c].ini, &made), *beside, *own;
+            go_tab(app, GUI_TAB_GAMES);
+            list_games(app);
+            layout(app);
+            focus_game(app, consoles[c].name);
+            assert(strstr(screen_said(app, true, said, sizeof said), "M: settings."));
+            row = game_settings_row(app);
+            assert(row > 0);
             key(app, SDLK_ESCAPE);
-            assert(!app->confirm.shown);
+            assert(!app->picks_shown);
+            beside = game_ini_of(played);
+            own = snx_game_picks(beside);
+            key(app, SDLK_M);
+            assert(app->editing && app->own_picks && same_path(app->own_picks, own));
+            assert(app->groups == 2 && !strcmp(app->group_keys[0].key, "Overlay") &&
+                   !strcmp(app->group_keys[1].key, "Reset to Global"));
+            assert(gui_settings_value(&app->game_settings, "controls") == NULL);
+            key(app, SDLK_RETURN); /* Overlay */
+            assert(app->form == GUI_FORM_GROUP);
+            snprintf(said, sizeof said, "%s own controls", consoles[c].name);
+            foot_shot(app, said);
+            key(app, SDLK_ESCAPE);
+            assert(app->editing && app->form == GUI_FORM_SETTINGS);
+            assert(!gui_settings_set(&app->game_settings, "fullscreen", "1") &&
+                   !gui_settings_set(&app->game_settings, "controls_zl_shown", "0"));
+            assert(gui_settings_set(&app->game_settings, "touch", "1") == consoles[c].touch);
+            assert(gui_settings_set(&app->game_settings, "controls_plus_shown", "0") &&
+                   gui_settings_set(&app->game_settings, "controls", "1"));
+            for (i = 0; i < app->game_settings.count; ++i)
+                if (app->game_settings.values[i].key &&
+                    !strcmp(app->game_settings.values[i].key, "controls_plus_shown"))
+                    assert(!strcmp(app->game_settings.keys[i].key, "Start"));
+            write_settings(app);
+            assert((text = (char*)snx_read_file(own, &size)) && strstr(text, "[On-screen controls]\ncontrols=1\n") &&
+                   strstr(text, "controls_plus_shown=0\n") && (strstr(text, "touch=1\n") != NULL) == consoles[c].touch);
+            free(text);
+            key(app, SDLK_ESCAPE);
+            assert(!app->editing && game_own(played, value, sizeof value) == 2 + consoles[c].touch);
+            assert(!remove(own));
+            driver_will(argv_file, 0, "own controls");
+            assert(gui_settings_set(&app->settings, "fullscreen", "1")); /* as finish() reads a run's */
+            for (way = 0; way < 2; ++way) {
+                char* argv_got;
+                assert(gui_settings_set(&app->settings, "controls", way ? "1" : "2") &&
+                       gui_settings_set(&app->settings, "touch", way ? "1" : "2"));
+                app->menu.selected = consoles[c].item;
+                launch(app, snx_strdup(played), true);
+                argv_got = ran(app, 0);
+                assert(has_arg(argv_got, way ? "--controls=1" : "--controls=2", NULL) &&
+                       has_arg(argv_got, "--launcher-picks=1", NULL));
+                assert(has_arg(argv_got, "--touch=1", NULL) == way);
+                free(argv_got);
+                leave_run(app);
+            }
+            driver_will(NULL, 0, NULL);
+            assert(gui_settings_set(&app->settings, "controls", "2") && gui_settings_set(&app->settings, "touch", "2"));
+            /* a GBA or DS game's save states: S lists them from its folder, as a Switch game's, and Enter plays it from
+               one through its driver, --state-load= naming the file */
+            if (consoles[c].item != GUI_VITA) {
+                char *dir = snx_path_join(made, "states"), *leaf = snx_format("%s.1.snxstate", consoles[c].name);
+                char *file = snx_path_join(dir, leaf), *option = snx_format("--state-load=0:%s", file);
+                uint8_t bytes[SNX_STATE_HEADER] = {0};
+                SnxStateHeader h = {.format = SNX_STATE_FORMAT, .abi = 1, .title_id = 0x1234, .created = 1000};
+                snx_state_header_write(bytes, &h, 0, 0);
+                assert(dir && !snx_mkdirs(dir) && file && !snx_write_file(file, bytes, sizeof bytes));
+                go_tab(app, GUI_TAB_GAMES);
+                list_games(app);
+                layout(app);
+                focus_game(app, consoles[c].name);
+                key(app, SDLK_S);
+                assert(app->states_shown && app->states_count == 1 && strstr(app->states[0].label, "Slot 1 ") &&
+                       !app->states[0].why[0]);
+                driver_will(argv_file, 0, "from a state");
+                key(app, SDLK_RETURN);
+                char* argv_got = ran(app, 0);
+                assert(!app->states_shown && has_arg(argv_got, option, NULL));
+                free(argv_got);
+                leave_run(app);
+                driver_will(NULL, 0, NULL);
+                assert(!remove(file));
+                free(option), free(file), free(leaf), free(dir);
+            }
+            free(own);
+            free(beside);
+            made_gone(app, made);
+            free(played);
         }
-        focus_game(app, "PCSE00099");
-        row = game_settings_row(app);
-        assert(row < 0);
-        key(app, SDLK_ESCAPE);
-        assert(!app->picks_shown);
-        app->message[0] = 0;
-        assert(!strstr(screen_said(app, true, said, sizeof said), "M: settings."));
-        made_gone(app, vita_folder);
-        free(played);
         list_games(app);
+        /* a file that is no game has none: said with what does */
+        open_game_settings(app, cia, "a file", false);
+        assert(!app->editing && !app->own_picks && app->confirm.shown && app->confirm.ask == GUI_ASK_ERROR &&
+               !strcmp(app->message, "a file is no recompiled Switch, 3DS, Vita, GBA or DS game: only they have "
+                                     "settings of their own"));
+        key(app, SDLK_ESCAPE);
+        assert(!app->confirm.shown);
+        app->message[0] = 0;
     }
     /* a 3DS dump in focus on Games: M says whose box it opens */
     {
@@ -7592,6 +7763,22 @@ static void check_play_args(App* app, const char* root) {
         assert(!gba);
         play_args_free(&own);
         (void)gui_settings_set(settings_of(app), "vsync", "1");
+    }
+    /* the on-screen controls' go to the consoles whose windows have them, the launcher's picks under the game's own */
+    if (gui_settings_set(settings_of(app), "controls", "1")) {
+        static const int items[] = {GUI_VITA, GUI_GBA, GUI_NDS, GUI_3DS};
+        for (size_t k = 0; k < sizeof items / sizeof *items; ++k) {
+            int shown = 0, picks = 0;
+            app->menu.selected = items[k];
+            (void)play_args(app, items[k], dir, argv, 512, &own);
+            for (size_t i = 0; argv[i]; i++) {
+                shown += !strcmp(argv[i], "--controls=1");
+                picks += !strcmp(argv[i], "--launcher-picks=1");
+            }
+            assert(shown == (items[k] != GUI_3DS) && picks == shown);
+            play_args_free(&own);
+        }
+        (void)gui_settings_set(settings_of(app), "controls", "2");
     }
     free(argv);
     free(prog);
@@ -8053,7 +8240,22 @@ int main(int argc, char** argv) {
         said = whole;
         assert(app.confirm.shown && app.confirm.ask == GUI_ASK_ERROR && !strcmp(app.error_line, said));
         render(&app);
-        shows(&app, said, rgb(app.theme.warning));
+        { /* row by row as the box breaks it at its width (wrap_in's wrap_at): one row or more, as long as the
+             temporary folder this host gives makes it */
+            GuiChoices c;
+            const char* s = said;
+            char row[1100];
+            int width;
+            ask_place(&app, &c);
+            width = (c.box.w - cell_w(&app)) / cell_w(&app);
+            assert(width > 0);
+            while (*s) {
+                size_t n = wrap_at(s, width, 0);
+                snprintf(row, sizeof row, "%.*s", (int)n, s);
+                shows(&app, row, rgb(app.theme.warning));
+                for (s += n + (s[n] == '\n'); *s == ' ';) ++s;
+            }
+        }
         free(app.data_dir), free(app.games_dir), free(app.themes_dirs[0]), free(app.work_dir), free(app.keys_path);
         free(app.home_dir);
         app.data_dir = data, app.games_dir = games, app.themes_dirs[0] = themes, app.work_dir = work;
@@ -9137,6 +9339,26 @@ int main(int argc, char** argv) {
             app.work_dir = work;
             app_values(&app);
         }
+        { /* folders longer than the note's row, as a Windows profile's or a runner's temporary folder makes them: a row
+             each, cut around "...", and every row of App's still on the screen, its last ones too */
+            char *data = app.data_dir, *work = app.work_dir;
+            app.data_dir = snx_path_join(temporary, "a folder named as long as the ones a Windows runner's temporary "
+                                                    "folder and a deep profile make, and longer still");
+            app.work_dir = snx_path_join(app.data_dir, "extractions");
+            app_values(&app);
+            render(&app);
+            assert(strchr(app.places_shown, '\n') && strstr(app.places_shown, "...") &&
+                   !strncmp(app.places_shown, "Data: ", 6));
+            shows(&app, "- " ICON_PAINTBRUSH " Theme Editor", normal);
+            shows(&app, "- " ICON_ERASER " Clean Old Settings", rgb(app.theme.soft));
+            shows(&app, "- " ICON_FOLDER_INPUT " Move Old Files", rgb(app.theme.soft));
+            free(app.data_dir);
+            free(app.work_dir);
+            app.data_dir = data;
+            app.work_dir = work;
+            app_values(&app);
+            render(&app);
+        }
         /* nothing to clean here: greyed (#614) */
         shows(&app, "- " ICON_ERASER " Clean Old Settings", rgb(app.theme.soft));
         hides(&app, "- Layout", normal);
@@ -9460,7 +9682,7 @@ int main(int argc, char** argv) {
     /* the App's picks kept at once in app.ini, which the next start reads back */
     {
         size_t size = 0;
-        char *kept, expected[512], id[64], first_id[64];
+        char *kept, expected[sizeof app.message], id[64], first_id[64]; /* a message whole, long folders in it */
         const char* broken = "[app]\ntheme = gone\ntext_size = 9\nlayout = boxes\ncolour = red\ntext_size = 2x\n"
                              "[other]\nlayout = panels\n";
         char* blocker = snx_path_join(temporary, "not a folder");
@@ -10536,8 +10758,19 @@ int main(int argc, char** argv) {
             SDL_Color dim = rgb(app.theme.dim);
             assert(!app.theme.grid && !same_colour(dim, rgb(app.theme.page)));
             assert(same_colour(pixel(&app, (float)(r.x - 4 * app.scale), (float)(r.y + r.h / 2)), dim));
-            r = ui_form_side_row(f.right, app.scale, UI_FORM_SIDE_ROWS, 9 + GUI_FOLDER_GROUPS + 2);
-            assert(same_colour(pixel(&app, (float)(r.x - 4 * app.scale), (float)(r.y + r.h / 2)), dim));
+            { /* Reset to Defaults, the last row, in focus as a person brings it there: the rows scroll to it where the
+                 note of a long folder leaves room for fewer of them */
+                const int last = 9 + GUI_FOLDER_GROUPS + 2, was = app.editor.row;
+                app.editor.row = last;
+                render(&app);
+                form_boxes(&app, &f);
+                assert((size_t)last >= form_first(&f, true));
+                r = ui_form_side_row(f.right, app.scale, UI_FORM_SIDE_ROWS, (size_t)last - form_first(&f, true));
+                assert(same_colour(pixel(&app, (float)(r.x - 4 * app.scale), (float)(r.y + r.h / 2)), dim));
+                app.editor.row = was;
+                render(&app);
+                form_boxes(&app, &f);
+            }
         }
         { /* a title on a band of ink in a theme of filled boxes, its text in the page's colour; over a rule in dim in
              one of outlined boxes, in ink */
@@ -10946,8 +11179,13 @@ int main(int argc, char** argv) {
             /* folders.txt as an older version wrote it, a path a line: each folder in the library of what it holds,
                both for both, none or gone the dumps'; written again with them, said once naming each */
             {
-                char *ready = snx_path_join(temporary, "old ready"), *dumped = snx_path_join(temporary, "old dumps"),
-                     *both = snx_path_join(temporary, "old both"), *empty = snx_path_join(temporary, "old empty");
+                /* folders named long, as a deep profile's are: the message says each whole, past 512 bytes */
+#define LONG_NAME ", a folder named as long as a deep profile's are, and as a runner's temporary folder makes them"
+                char *ready = snx_path_join(temporary, "old ready" LONG_NAME),
+                     *dumped = snx_path_join(temporary, "old dumps" LONG_NAME),
+                     *both = snx_path_join(temporary, "old both" LONG_NAME),
+                     *empty = snx_path_join(temporary, "old empty" LONG_NAME);
+#undef LONG_NAME
                 char *game = snx_path_join(ready, GAME("Ready")), *nsp = snx_path_join(dumped, "a.nsp"),
                      *both_game = snx_path_join(both, GAME("Ready")), *both_nsp = snx_path_join(both, "b.xci");
                 char *old_text, *want, *read;
@@ -11050,7 +11288,7 @@ int main(int argc, char** argv) {
         char* games_default = snx_recompiled_dir(data); /* the test's own games/ is elsewhere, set by hand */
         char *keys = snx_strdup(app.keys_path), *themes = snx_strdup(app.themes_dirs[0]); /* so are these */
         char *picked = snx_path_join(temporary, "picked games"), *file = snx_path_join(temporary, "not a folder.txt");
-        char *kept, line[512];
+        char *kept, line[sizeof app.message];
         size_t size;
         assert(app.editor.row == GUI_APP_PLACES && !strcmp(app.app_form.places, "Defaults, 1 Extra(s)"));
         key(&app, SDLK_RETURN);
@@ -11072,12 +11310,27 @@ int main(int argc, char** argv) {
             snprintf(line, sizeof line, "%s%s", app.theme.marker, drawn.label);
             shows(&app, line, yellow);
         }
-        /* under the rows, the folder in use: its start, as a long one wraps (Windows' %APPDATA% does) */
-        snprintf(line, sizeof line, "%.24s", data);
-        shows_half(&app, line, rgb(app.theme.soft));
+        { /* under the rows, the folder in use: its start, as a long one wraps (Windows' %APPDATA% does): the first row
+             as the note breaks it at its width, which a long first folder ends early */
+            GuiFormBoxes note;
+            GuiRect text;
+            size_t n;
+            form_boxes(&app, &note);
+            text = inner(&app, note.info);
+            n = wrap_at(data, text.w / cell_w(&app), 0);
+            snprintf(line, sizeof line, "%.*s", (int)SDL_min(n, 24), data);
+            shows_half(&app, line, rgb(app.theme.soft));
+        }
         shows(&app, "- Extractions", normal);
-        /* every folder its default: greyed (#614) */
-        shows(&app, "- " ICON_ROTATE_CCW " Reset to Defaults", rgb(app.theme.soft));
+        { /* every folder its default: greyed (#614); in focus as a person brings it, the rows scrolling to it where the
+             note of a long folder leaves room for fewer of them, still greyed there */
+            const int was = app.editor.row;
+            app.editor.row = 9 + GUI_FOLDER_GROUPS + 2;
+            render(&app);
+            shows(&app, "- " ICON_ROTATE_CCW " Reset to Defaults", rgb(app.theme.soft));
+            app.editor.row = was;
+            render(&app);
+        }
         assert(!strcmp(app.place_line[GUI_PLACE_GAMES], app.games_dir) &&
                !strcmp(app.app_form.folder[FOLDER_ROW(GUI_ROW_PLACE, GUI_PLACE_GAMES)], "default"));
         assert(strstr(app.place_about[GUI_PLACE_GAMES], "The recompiled games, ") &&

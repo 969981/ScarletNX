@@ -252,12 +252,12 @@ static VkExtent2D target_extent(Surf* const* rt, const Surf* zt, u32 n) {
     VkExtent2D ext = {~0u, ~0u};
     for (u32 i = 0; i < n; i++)
         if (rt[i]) {
-            if (rt[i]->sw < ext.width) ext.width = rt[i]->sw;
-            if (rt[i]->sh < ext.height) ext.height = rt[i]->sh;
+            if (vk_surf_view_w(rt[i]) < ext.width) ext.width = vk_surf_view_w(rt[i]);
+            if (vk_surf_view_h(rt[i]) < ext.height) ext.height = vk_surf_view_h(rt[i]);
         }
     if (zt) {
-        if (zt->sw < ext.width) ext.width = zt->sw;
-        if (zt->sh < ext.height) ext.height = zt->sh;
+        if (vk_surf_view_w(zt) < ext.width) ext.width = vk_surf_view_w(zt);
+        if (vk_surf_view_h(zt) < ext.height) ext.height = vk_surf_view_h(zt);
     }
     return ext;
 }
@@ -361,8 +361,8 @@ static int render_begin(Surf** rt, Surf* zt, u32 n, int zt_ro, int srgb_write, u
         ca[i].imageLayout = layout;
         ca[i].loadOp = load_op(rt[i], undefined);
         if (loop) loops |= 1u << i;
-        if (rt[i]->sw < ext.width) ext.width = rt[i]->sw;
-        if (rt[i]->sh < ext.height) ext.height = rt[i]->sh;
+        if (vk_surf_view_w(rt[i]) < ext.width) ext.width = vk_surf_view_w(rt[i]);
+        if (vk_surf_view_h(rt[i]) < ext.height) ext.height = vk_surf_view_h(rt[i]);
     }
     VkRenderingAttachmentInfo za = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
                                     .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
@@ -386,8 +386,8 @@ static int render_begin(Surf** rt, Surf* zt, u32 n, int zt_ro, int srgb_write, u
         za.imageView = zt->att;
         za.imageLayout = zl;
         za.loadOp = load_op(zt, undefined);
-        if (zt->sw < ext.width) ext.width = zt->sw;
-        if (zt->sh < ext.height) ext.height = zt->sh;
+        if (vk_surf_view_w(zt) < ext.width) ext.width = vk_surf_view_w(zt);
+        if (vk_surf_view_h(zt) < ext.height) ext.height = vk_surf_view_h(zt);
     }
     vk_surf_batch_end();
     if (ext.width == ~0u) ext = area; /* nothing bound with a surface: the bound targets' size */
@@ -1021,7 +1021,7 @@ static void clear_targets(const DsState* ds, const DrawClear* c, const DrawOwner
         vk_surf_wrote(zt);
         int all_aspects = (v & 1) && (!zt->f.stencil || ((v & 2) && stencil_mask == 0xff));
         if (!o->pred && all_aspects && zt->layers == 1 && rect.rect.offset.x == 0 && rect.rect.offset.y == 0 &&
-            rect.rect.extent.width == zt->sw && rect.rect.extent.height == zt->sh)
+            rect.rect.extent.width == vk_surf_view_w(zt) && rect.rect.extent.height == vk_surf_view_h(zt))
             vk_rt_drawn_full(zt);
         else
             vk_rt_drawn(zt);
@@ -2365,6 +2365,8 @@ int vk_image_key(const ShaderInfo* si, int i, const u32* tic) {
 }
 
 VkImageView vk_storage_image_view(Surf* t, const ShaderInfo* si, int i, u64* bytes) {
+    /* a hosted surface: vk_tex_storage_view writes its host's image where that has storage usage, else gives it an
+       image of its own (docs/dev/one-image.md) */
     int volume = si->img[i].type == 5;
     int kind = si->img[i].kind;
     *bytes = vk_surf_guest_size(t);
@@ -3577,7 +3579,7 @@ static int tex_tables_set(const DsState* ds, int stage, const VkSh* s, const int
     u16 handle_slots[2 * SNX_TEX_ARRAY] = {0};
     u32 funcs[SNX_TEX_ARRAY] = {0};
     /* each element's entry: the null texture is given an entry only when an element needs it, so a table of
-       SNX_TEX_ARRAY real handles fits (edenprobe's bindless suite samples 256) */
+       SNX_TEX_ARRAY real handles fits (Amberlith's bindless suite samples 256) */
     u32 map[SH_INDEXED_TABLES * SNX_TEX_ARRAY]; /* every active table entry is assigned below */
     u32 used = 0;
     for (int table = 0; table < count; table++) {
@@ -3595,7 +3597,7 @@ static int tex_tables_set(const DsState* ds, int stage, const VkSh* s, const int
         for (u32 k = 0; k < elements; k++) {
             u32 at = st->cbuf_off * 4 + k * stride;
             /* past the constant buffer: the null texture. A handle of 0 is header 0 with sampler 0, a texture like any
-               other (edenprobe's bindless case samples it) */
+               other (Amberlith's bindless case samples it) */
             if ((!cba && !in.bytes) || at + 4 > size) {
                 if (tk->id == TEX_NO_ENTRY) {
                     if (used == g_spirv_translate.tex_array) {

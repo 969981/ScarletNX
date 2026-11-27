@@ -934,7 +934,7 @@ which ends the game, in the failure colour and asked first. The game waits while
 **Record input** and **Play input**, record player 1's buttons into a slot and play them back: Left and Right choose
 the slot, shown as a list's value (`< Slot 3 >`), and Enter takes it, a recording over another asked first. Before a load the game is saved to the auto slot,
 listed first, so a load can be undone (`state_auto_backup`). The game's own save files are never part of a state,
-and loading one leaves them as they are. A state loads only into the game, update and mods it was saved with. A newer
+and loading one leaves them as they are: a GBA cartridge's or a DS card's save memory too, the game's `<name>.sav`. A state loads only into the game, update and mods it was saved with. A newer
 ScarletNX loads it too, unless it changed the recompiled code (`SNX_ABI`) or the layout of what a state holds, and
 then it says so. A save is refused, saying why, while the game holds what a state can't keep yet: a network
 connection, local play with others, code modules it loaded, or NVN work waiting on the GPU.
@@ -999,6 +999,29 @@ game's own picks keep them: `controls`, `controls_scale`,
 `controls_snap`, `controls_rel_center`, `controls_dpad_slide`, `controls_haptics`, and whether a control is shown once
 that changed (`controls_a_shown=0`); its `.ini` keeps a control's place once it was moved (`controls_a=0.930 0.470 100`:
 its middle across the screen and its size in percent). The launcher's Settings have the same, but the layout.
+
+A GBA, DS or Vita game has the controls of its console over its picture, by its names for them: Start where Plus is and
+Select where Minus is, the Vita's Circle, Cross, Triangle and Square where A, B, X and Y are, and sticks on the Vita
+alone. They start where the window leaves them room, wider than tall or taller than wide, and each stays whole in it. A
+finger off them is the DS's pen on the lower screen, one at a time, or touches the Vita's front panel, six at most, and
+so does the mouse's left button, as `touch` lets each; the GBA has no touch screen. These windows have no menu: F2, or
+Back on Android, edits the layout (drag a control; tap one and size it with the bar on top; *Done*, Esc, F2 or Back ends
+it), and Back twice within 3 seconds closes the game. The settings are the Switch's keys: `controls`, `controls_scale`
+and the others of the game's own Settings (M on it in Games) or the launcher's, in the game's `.ini` (`[On-screen
+controls]`, where a moved control's place is kept) or on the command line (`--controls=0`). A key the console has nothing
+for changes nothing, and the run says it with its value: `touch=1` for a GBA game, `controls_zl_shown=0` for any of the
+three, `controls_rel_center=0` for a GBA or a DS game.
+
+Their windows take the runtime's keys too, the Shortcuts' settings of a Switch game (`hotkey_quit`, `hotkey_fullscreen`
+and the others, in the game's `.ini`, its own picks or on the command line, as `--hotkey-quit=Q`): Esc twice within 3
+seconds closes the game, F11 or Alt+Return switches fullscreen, F2 edits the layout, Pause holds the game and lets it
+go (*Pause: on*, the picture and the keys going on), F4 turns the FPS limit off and back (`fps_limit`, read as a
+Switch game reads it: `game`, `0` or 10 to 1000 frames a second; SDL's renderer then draws without vsync), F3 saves the picture as it shows in `captures/` of the game's
+folder, as a Switch game's (`screenshot_YYYYMMDD_HHMMSS.ppm`, both screens of a DS game), F12 the stats and F6 the
+showcase over the game for the run (*Stats: on*; the GPU's numbers show as `?`, the showcase draws the console's own
+buttons as the game gets them). A key the console has nothing
+for says so over the picture with why: `Ctrl+D (TV mode) does nothing in a GBA game: the TV mode is the Switch's console
+docked`.
 Beside the executable: `Game.log`, `threads.txt` (15 s refresh), `captures/` (screenshots); an installed copy on Linux
 keeps the first two in its state folder ([Folders](#folders)). `Game.log` is this run's: the 4 runs before keep theirs
 in `logs/` beside it, named by when each was last written (`2026-10-28_14-05-33.log`). Past `log_max` (MiB, 1 to

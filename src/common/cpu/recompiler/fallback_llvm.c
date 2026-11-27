@@ -178,6 +178,8 @@ int snx_fallback_rtlib(char opt, unsigned char** object, size_t* size, char* err
     return snx_ir_init(error, error_size) || snx_ir_rtlib_object(opt, object, size, error, error_size) ? -1 : 0;
 }
 
+int snx_fallback_start(char* error, size_t error_size) { return snx_ir_init(error, error_size); }
+
 /* ---- AArch32 blocks ---- */
 
 struct SnxFallbackArm {

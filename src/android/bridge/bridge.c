@@ -7,6 +7,7 @@
 #include "android/bridge/hle_signal.h"
 #include "android/bridge/host.h"
 #include "common/cpu/aarch64/a64_decoder.h"
+#include "common/cpu/recompiler/mach/native.h"
 #include "common/cpu/recompiler/snx_recompiler.h"
 #include "common/utilities/common.h"
 #include "gnuabi/kernel/kernel.h"
@@ -276,7 +277,9 @@ bool bridge_init(const char* cache, char* error, size_t error_size) {
     /* before anything of the bridge is kept: b.window says it started, and a start that failed is tried whole again */
     struct snx_recompiler* recompiler = snx_recompiler_new(SNX_RECOMPILER_FLAG_LLVM);
     if (!recompiler) {
-        snprintf(error, error_size, "the LLVM backend cannot target this host");
+        if (!snx_native_refused(error, error_size))
+            snprintf(error, error_size, "no recompiler for this host: its native back end (%s) makes none",
+                     snx_native_name());
         return false;
     }
     /* the window at the same address on every run: the compiled code's cache is keyed by the code's addresses */
@@ -311,7 +314,7 @@ bool bridge_init(const char* cache, char* error, size_t error_size) {
     snx_recompiler_set_a64_target(b.recompiler, SNX_RECOMPILER_A64_ANDROID);
     if (b.optimization) snx_recompiler_set_optimization(b.recompiler, b.optimization);
     if (b.keep_ir && snx_recompiler_set_keep_ir(b.recompiler, b.keep_ir))
-        fprintf(stderr, "scarletnx-android: cannot keep the JIT's IR in %s\n", b.keep_ir);
+        fprintf(stderr, "scarletnx-android: %s\n", snx_recompiler_error(b.recompiler));
     if (cache && snx_recompiler_set_cache(b.recompiler, cache))
         fprintf(stderr, "scarletnx-android: %s; compiling without a cache\n", snx_recompiler_error(b.recompiler));
     snx_runtime_defaults(&b.rt);

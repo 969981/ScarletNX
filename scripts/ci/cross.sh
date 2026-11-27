@@ -41,12 +41,10 @@ sysroot() {
 
 # The pinned Anylinux-AppImages tools and the target's libraries the runtime links and bundles: binutils and
 # patchelf are what quick-sharun needs on PATH. get-debloated-pkgs then replaces the full Mesa (its libgallium
-# links libLLVM), ICU and Opus, so it runs last. Each pacman is tried 3 times, as in the appimage job. The token
-# is get-debloated-pkgs' api.github.com rate limit, the one the appimage job's copy is given
-# env: GITHUB_TOKEN
+# links libLLVM), ICU and Opus, so it runs last. Each pacman is tried 3 times, as in the appimage job
 target_tools() {
   docker exec -i -e QUICK_SHARUN -e QUICK_SHARUN_SHA -e DEBLOATED_PACKAGES -e DEBLOATED_PACKAGES_SHA \
-    -e GITHUB_TOKEN target sh -s <<'EOF'
+    target sh -s <<'EOF'
 set -eu
 libraries="patchelf binutils sdl3 libx11 mesa vulkan-icd-loader vulkan-radeon vulkan-swrast libxext libxcursor
   libxfixes libxi libxinerama libxrandr libxrender libxss libxtst libxkbcommon wayland wayland-protocols libdecor
@@ -112,8 +110,8 @@ EOF
 
 # Through ccache, without debug information, which no one reads in these builds and the AppImage would carry.
 # LLVM is the one built above (-DSNX_LLVM_CONFIG= drops the preset's, the system root's), SDL3 the system root's
-# package (SNX_SYSTEM_SDL3: a root without it, or with one too old, stops the configure), and a release leaves
-# out scarletnx --mcp's A64 disassembler (SNX_A64_DISASM). The container gets a nightly's name (SNX_BUILD_NAME)
+# package (SNX_SYSTEM_SDL3: a root without it, or with one too old, stops the configure). The container gets a
+# nightly's name (SNX_BUILD_NAME)
 # env: ARCH PRESET
 build() {
   docker exec -i -e PRESET -e ARCH -e CCACHE_DIR=/src/.cache/ccache -e CCACHE_BASEDIR=/src -e CCACHE_NOHASHDIR=true \
@@ -123,7 +121,7 @@ git config --global --add safe.directory '*'
 export SNX_SYSROOT=/src/sysroot
 cmake --preset ${PRESET} -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_TESTING=OFF \
   -DSNX_OPT_FLAGS="-O2 -g0" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-  -DLLVM_DIR=/src/.cache/llvm/${ARCH}/lib/cmake/llvm -DSNX_LLVM_CONFIG= -DSNX_A64_DISASM=OFF \
+  -DLLVM_DIR=/src/.cache/llvm/${ARCH}/lib/cmake/llvm -DSNX_LLVM_CONFIG= \
   -DSNX_SYSTEM_SDL3=ON
 cmake --build --preset ${PRESET} --parallel "$(getconf _NPROCESSORS_ONLN)"
 DESTDIR=/src/stage cmake --install build/${PRESET}
@@ -132,8 +130,9 @@ chown -R "$(stat -c %u:%g /src)" /src/.cache/ccache /src/.cache/deps
 EOF
 }
 
-# The A64 differential against the qemu-reference job's recording: the cross build's tests are off, so the
-# one test is configured and built alone, then run here through qemu-user, with and without the generic path
+# The A64 differential against the qemu-reference job's recording, of the target's native back end and of the LLVM
+# one: the cross build's tests are off, so the tests are configured and built alone, then run here through qemu-user,
+# the LLVM one with and without the generic path
 # env: ARCH PRESET QEMU
 differential() {
   docker exec -i -e PRESET -e ARCH -e QEMU -e CCACHE_DIR=/src/.cache/ccache -e CCACHE_BASEDIR=/src -e CCACHE_NOHASHDIR=true \
@@ -143,28 +142,30 @@ git config --global --add safe.directory '*'
 export SNX_SYSROOT=/src/sysroot
 cmake --preset ${PRESET} -DBUILD_TESTING=ON \
   -DSNX_OPT_FLAGS="-O2 -g0" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-  -DLLVM_DIR=/src/.cache/llvm/${ARCH}/lib/cmake/llvm -DSNX_LLVM_CONFIG= -DSNX_A64_DISASM=OFF \
+  -DLLVM_DIR=/src/.cache/llvm/${ARCH}/lib/cmake/llvm -DSNX_LLVM_CONFIG= \
   -DSNX_SYSTEM_SDL3=ON
 cmake --build --preset ${PRESET} --parallel "$(getconf _NPROCESSORS_ONLN)" \
-  --target snx-test-llvm-qemu-differential
-# both forms run, and a failing one's examples go to the log: the container's /tmp goes with the job. A form
-# takes minutes; at 20 its SIGBUS makes the test name the case it was in, where a hang would hold the job 3 hours
-# the two forms at once, each with one thread and its own folder
-for form in host generic; do
-  flag=; [ "$form" = generic ] && flag=--generic
+  --target snx-test-llvm-qemu-differential snx-test-llvm-qemu-differential-native
+# the target's native back end, then the LLVM one's two forms, and a failing one's examples go to the log: the
+# container's /tmp goes with the job. A form takes minutes; at 20 its SIGBUS makes the test name the case it was
+# in, where a hang would hold the job 3 hours. All at once, each with one thread and its own folder
+for form in native host generic; do
+  test=snx-test-llvm-qemu-differential flag= expected=llvm
+  [ "$form" = generic ] && flag=--generic
+  [ "$form" = native ] && test=$test-native expected=native
   ( timeout -s BUS -k 30 1200 \
-    qemu-${QEMU} -L /src/sysroot build/${PRESET}/tests/snx-test-llvm-qemu-differential \
-    /tmp/llvm_qemu_reference_$form /src/tests/llvm_qemu_expected.txt \
+    qemu-${QEMU} -L /src/sysroot build/${PRESET}/tests/$test \
+    /tmp/llvm_qemu_reference_$form /src/tests/${expected}_qemu_expected.txt \
     --reference /src/reference/llvm_qemu_reference.bin --quiet $flag > /tmp/differential_$form.log 2>&1 \
     && echo 0 > /tmp/differential_$form.status || echo $? > /tmp/differential_$form.status ) &
 done
 wait
 failed=0
-for form in host generic; do
+for form in native host generic; do
   cat /tmp/differential_$form.log
   if [ "$(cat /tmp/differential_$form.status)" != 0 ]; then
     failed=1
-    cat /tmp/llvm_qemu_reference_$form/llvm_qemu_mismatches.txt || true
+    cat /tmp/llvm_qemu_reference_$form/*_qemu_mismatches.txt || true
   fi
 done
 exit $failed
@@ -184,7 +185,7 @@ git config --global --add safe.directory '*'
 export SNX_SYSROOT=/src/sysroot
 cmake --preset ${PRESET} -DBUILD_TESTING=ON \
   -DSNX_OPT_FLAGS="-O2 -g0" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-  -DLLVM_DIR=/src/.cache/llvm/${ARCH}/lib/cmake/llvm -DSNX_LLVM_CONFIG= -DSNX_A64_DISASM=OFF \
+  -DLLVM_DIR=/src/.cache/llvm/${ARCH}/lib/cmake/llvm -DSNX_LLVM_CONFIG= \
   -DSNX_SYSTEM_SDL3=ON
 cmake --build --preset ${PRESET} --parallel "$(getconf _NPROCESSORS_ONLN)" --target snx_gui_tests
 ctest --preset ${PRESET} -R '^gui_' -E '^gui_sdl_events$' -j"$(getconf _NPROCESSORS_ONLN)"

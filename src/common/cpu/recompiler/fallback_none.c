@@ -51,6 +51,12 @@ int snx_fallback_rtlib(char opt, unsigned char** object, size_t* size, char* err
     return -1;
 }
 
+int snx_fallback_start(char* error, size_t error_size) {
+    if (snx_native_available()) return 0;
+    snprintf(error, error_size, "this host has no native back end, and " NO_LLVM);
+    return -1;
+}
+
 SnxFallbackArm* snx_fallback_arm_new(const char* name, char opt, int jit) {
     SnxFallbackArm* f = (SnxFallbackArm*)calloc(1, sizeof *f);
     (void)opt;

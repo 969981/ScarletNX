@@ -48,6 +48,9 @@ int snx_fallback_object(SnxCodegen* codegen, size_t first, size_t last, const Sn
 /* The runtime library (rtlib.c) made for this host's processor at opt, as a module whose code the fallback made links
    it: 0 with the object (malloc'd), or -1 with the reason in error */
 int snx_fallback_rtlib(char opt, unsigned char** object, size_t* size, char* error, size_t error_size);
+/* Whether the fallback can make this host's code, started where it must be (LLVM's targets, once a process): 0, or -1
+   with why not in error. None's 0 where the host has a native back end, which then makes all of it */
+int snx_fallback_start(char* error, size_t error_size);
 
 /* AArch32 and Thumb blocks: a maker of them for one thread, for an AOT module or (jit) for code the JIT's loader loads
    into this process, at opt's -O level. NULL out of memory */

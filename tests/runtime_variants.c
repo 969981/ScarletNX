@@ -5,6 +5,7 @@
    invalidation clears the slot. A miss falls through to the JIT: the fake service
    here proves the runtime asks it only when no variant matches. */
 #include "common/cpu/recompiler/jit/jit_service.h"
+#include "common/cpu/recompiler/mach/native.h"
 #include "common/cpu/recompiler/variants.h"
 #include "nx/loader/module_abi.h"
 #include "nx/memory/mem.h"
@@ -108,6 +109,20 @@ SnxJitService* snx_jit_service_new(const SnxJitConfig* config, char* error, size
     return (SnxJitService*)(void*)&sentinel;
 }
 
+/* native.h's: whether the host is below its back end's floor (--below), or lacks what its fallback does (--done),
+   and its line */
+static int g_below, g_done;
+#define BELOW "cpu: needs SSE2, this host has none"
+#define DONE  "cpu: this host has no PCLMULQDQ, done by the fallback"
+int snx_native_floor(char* why, size_t size) {
+    snprintf(why, size, "%s", g_below ? BELOW : "");
+    return g_below;
+}
+int snx_native_fallback(char* why, size_t size) {
+    snprintf(why, size, "%s", g_done && !g_below ? DONE : "");
+    return g_done && !g_below;
+}
+
 GuestFn snx_jit_resolve(SnxJitService* service, SnxU64 pc) {
     (void)service;
     return jit_can_code(pc) ? test_jit_fn : NULL;
@@ -205,10 +220,14 @@ static void (*g_invalidate)(u64, u64);
 void mem_set_code_invalidate(void (*fn)(u64, u64)) { g_invalidate = fn; }
 
 static char g_logged[512]; /* the last LOG line */
+static char g_logs[2048];  /* every LOG line */
 void logf_(int lvl, const char* fmt, ...) {
-    size_t at = strlen(g_warned);
-    va_list ap;
+    size_t at = strlen(g_warned), logs = strlen(g_logs);
+    va_list ap, again;
     va_start(ap, fmt);
+    va_copy(again, ap);
+    if (lvl == 1) vsnprintf(g_logs + logs, sizeof g_logs - logs, fmt, again);
+    va_end(again);
     if (lvl == 1) vsnprintf(g_logged, sizeof g_logged, fmt, ap);
     if (lvl == 0) vsnprintf(g_warned + at, sizeof g_warned - at, fmt, ap); /* WARN's level */
     va_end(ap);
@@ -466,8 +485,11 @@ int main(int argc, char** argv) {
     const char* jit_opt = "3";
     const char default_level = g_settings.jit_optimization[0]; /* settings.txt's, before any .ini */
     GuestFn fn;
-    for (int i = 1; i < argc; i++)
+    for (int i = 1; i < argc; i++) {
         if (!strncmp(argv[i], "--jit-opt=", 10)) jit_opt = argv[i] + 10;
+        if (!strcmp(argv[i], "--below")) g_below = 1;
+        if (!strcmp(argv[i], "--done")) g_done = 1;
+    }
     memcpy(g_memory + START, words, sizeof(words));
     memcpy(g_memory + OUT, words2, sizeof(words2));
     memset(&g_block, 0, sizeof(g_block));
@@ -520,6 +542,11 @@ int main(int argc, char** argv) {
     jit_init();
     CHECK(g_jit_started == 1);
     check_jit_opt(jit_opt, default_level);
+    /* the host below its back end's floor: LLVM makes the JIT's code, said with what the host lacks; none otherwise */
+    CHECK(!g_below == !strstr(g_warned, "jit: " BELOW ": LLVM makes the code\n"));
+    CHECK(g_below || !strstr(g_warned, "LLVM makes the code"));
+    /* one that lacks what the back end does by its fallback: logged, not warned, and nothing of it otherwise */
+    CHECK(!g_done == !strstr(g_logs, "jit: " DONE "\n") && !strstr(g_warned, "fallback"));
     if (argc == 2 && !strcmp(argv[1], "--bench-no-pack")) {
         g_variants = NULL;
         for (u64 i = 0; i < 20000000; i++)

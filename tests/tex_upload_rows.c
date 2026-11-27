@@ -262,6 +262,13 @@ static struct {
     u64 content[2];
 } g_astc_key;
 u64 vk_bc7_strip_blocks(void) { abort(); }
+/* a format's attachment support (format.c): no device features here, so no texture takes the attachment usage and
+   the uploads go to the images as before */
+int vk_format_attachable(VkFormat f, int depth) {
+    (void)f;
+    (void)depth;
+    return 0;
+}
 /* the ASTC stream on the compute queue (astc.c): no texture here goes to it, so its images take the graphics queue
    alone and nothing else of it runs */
 int vk_astc_stream_fits(const Surf* t) {
@@ -618,6 +625,34 @@ int vk_rt_drawn_fresh_in(Surf* s, u64 at, u64 size) {
     (void)at;
     (void)size;
     return vk_rt_drawn_fresh(s);
+}
+/* no target is hosted by a texture here (docs/dev/one-image.md) */
+void vk_tex_join(Surf* a, Surf* t, u32 level, u32 layer) {
+    (void)a, (void)t, (void)level, (void)layer;
+}
+void vk_tex_unhost(Surf* t) {
+    (void)t;
+}
+void vk_rt_host_counts(u64* hosted, u64* unhosted) {
+    *hosted = *unhosted = 0;
+}
+u64 vk_surf_flush_size(const Surf* s) {
+    (void)s;
+    return 0;
+}
+int vk_surf_publish(Surf* s) {
+    (void)s;
+    return 1;
+}
+void vk_surf_flush(Surf* s, const u8* original) {
+    (void)s, (void)original;
+}
+int vk_rt_own_(Surf* s, const char* why) {
+    (void)s, (void)why;
+    return 1;
+}
+void vk_rt_host(Surf* s, Surf* t, u32 level, u32 layer) {
+    (void)s, (void)t, (void)level, (void)layer;
 }
 int vk_rt_drawn_in(u64 lo, u64 hi, Surf** out, int max) {
     (void)lo, (void)hi;

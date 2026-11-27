@@ -256,6 +256,7 @@ static int load_armlib(SnxArmExec* e, char* error, size_t error_size) {
 static int define_helpers(SnxArmExec* e) {
     return snx_code_define(e->loader, "snx_arm_fp", (SnxU64)(uintptr_t)snx_arm_fp) ||
            snx_code_define(e->loader, "snx_arm_fp_x64", (SnxU64)(uintptr_t)snx_arm_fp_x64) ||
+           snx_code_define(e->loader, "snx_arm_fp_env", (SnxU64)(uintptr_t)snx_arm_fp_env) ||
            snx_code_define(e->loader, "snx_arm_io_read", (SnxU64)(uintptr_t)snx_arm_io_read) ||
            snx_code_define(e->loader, "snx_arm_io_write", (SnxU64)(uintptr_t)snx_arm_io_write) ||
            snx_code_define(e->loader, "snx_arm_checked_fetch", (SnxU64)(uintptr_t)snx_arm_checked_fetch) ||
@@ -280,7 +281,8 @@ SnxArmExec* snx_arm_exec_new(char* error, size_t error_size) {
         snx_arm_exec_free(e);
         return NULL;
     }
-    snprintf(e->why, sizeof e->why, "no native back end on this host");
+    if (!e->native && !snx_native_floor(e->why, sizeof e->why))
+        snprintf(e->why, sizeof e->why, "no native back end on this host");
     if (!(e->fallback = snx_fallback_arm_new("a32exec", BLOCK_OPT, 1))) {
         snprintf(error, error_size, "out of memory");
         snx_arm_exec_free(e);

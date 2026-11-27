@@ -522,9 +522,12 @@ static inline void sgx_assemble_cold(SgXAsm* a, int at) {
         a->b = &a->cold;
         c = a->b;
         if ((i->zacc || i->cfpcr) && x->base != 3) sg_fail("a cold call's state field off RBX", x->base, 3);
-        if (i->vflags == 2 && (i->zacc & 0x80))
-            sgx_cold_vwarm(a, at, i, outreg, back);
-        else if (i->zacc & 0x80) {
+        if (i->vflags == 2 && (i->zacc & 0x80)) {
+            /* its tests are SSE4.1's (PTEST, PCMPEQQ) and of doubles SSE4.2's (PCMPGTQ): without them, the call */
+            const unsigned f = a->x->features;
+            if ((f & SGX_F_SSE41) && ((i->imm >> 4 & 15) != 8 || (f & SGX_F_SSE42)))
+                sgx_cold_vwarm(a, at, i, outreg, back);
+        } else if (i->zacc & 0x80) {
             /* a zero result that is exact: back to the hot code without the call */
             size_t to_call[8];
             int ncall = 0, nok = 0, j;
@@ -635,6 +638,7 @@ static inline void sgx_assemble_cold(SgXAsm* a, int at) {
             SgXV* vv = &x->v[v];
             argslot[k] = -1;
             if (dst >= SGX_NREG) stack = dst - SGX_NREG, dst = 0; /* through RAX, whose value was saved, to its slot */
+            sgx_fixed_writes(a, at, 1u << dst, 0);
             if (k + 1 == i->cfpcr) {
                 /* mov dst32, [rbx + disp] */
                 if (dst >= 8) sgx_byte(c, 0x44);
@@ -811,6 +815,54 @@ static inline int sgx_xdown(SgX* x, int v, unsigned lo) {
 }
 /* PUNPCKLQDQ: the low's high bits the high's low ones */
 static inline int sgx_xconcat(SgX* x, int lo, int hi) { return sgx_v2(x, &sgx_v_punpcklqdq, lo, hi, 0); }
+/* SSE4.1's lane moves of general-purpose registers on a host without it (mach.h's sgx_vins), SSE2's forms in their
+   place: PEXTRB, D and Q the lane brought down (PSRLDQ, PSHUFD) and moved out (MOVD, MOVQ), a byte's register holding
+   the bytes above it too (no SSE form's result is known to be 0 above its bits: sgx_vreg's zab 64); PINSRB, D and Q the
+   value moved in, its byte alone of a PINSRB's, put at its lane (PSLLDQ, PSHUFD, PUNPCKLQDQ) and merged under a mask;
+   PBLENDW the words imm's bits choose of the second, the first's the others, under their mask. Their result, 0 for
+   another form */
+static inline int sgx_vlower(SgX* x, const SgXVForm* f, const int* in, long long imm) {
+    const unsigned k = (unsigned)imm;
+    int t, in2[4] = {0, 0, 0, 0};
+    if (f == &sgx_v_pblendw) {
+        SnxU64 half[2] = {0, 0};
+        for (unsigned w = 0; w < 8; ++w)
+            if (k >> w & 1) half[w / 4] |= 0xFFFFull << (16 * (w % 4));
+        t = sgx_xconst(x, half[0], half[1]);
+        return sgx_v2(x, &sgx_v_por, sgx_v2(x, &sgx_v_pandn, t, in[0], 0), sgx_v2(x, &sgx_v_pand, in[1], t, 0), 0);
+    }
+    if (f == &sgx_v_pextrq) return sgx_v1(x, &sgx_v_movq_rx, k & 1 ? sgx_v1(x, &sgx_v_pshufd, in[1], 0xEE) : in[1], 0);
+    if (f == &sgx_v_pextrd) return sgx_v1(x, &sgx_v_movd_rx, k & 3 ? sgx_v1(x, &sgx_v_pshufd, in[1], k & 3) : in[1], 0);
+    if (f == &sgx_v_pextrb) {
+        t = in[1];
+        if (k & 15) {
+            in2[0] = t;
+            t = sgx_vins(x, &sgx_v_psrldq, 0, 1, in2, k & 15, 0, SGX_VM_NONE, 0, 0, 0, 0, 0);
+        }
+        return sgx_v1(x, &sgx_v_movd_rx, t, 0);
+    }
+    if (f == &sgx_v_pinsrq) { /* (low, the value) or (the value, high) */
+        t = sgx_v1(x, &sgx_v_movq_xr, in[1], 0);
+        return k & 1 ? sgx_v2(x, &sgx_v_punpcklqdq, in[0], t, 0)
+                     : sgx_v2(x, &sgx_v_punpcklqdq, t, sgx_v1(x, &sgx_v_pshufd, in[0], 0xEE), 0);
+    }
+    if (f == &sgx_v_pinsrd || f == &sgx_v_pinsrb) {
+        const unsigned bits = f == &sgx_v_pinsrd ? 32 : 8, at = (k & (128 / bits - 1)) * bits;
+        const SnxU64 ones = (1ull << bits) - 1;
+        t = sgx_v1(x, &sgx_v_movd_xr, in[1], 0);
+        if (bits == 8) t = sgx_v2(x, &sgx_v_pand, t, sgx_xconst(x, ones, 0), 0);
+        if (at) { /* PSHUFD: word 0 at its lane, word 1 (0) at the others; PSLLDQ: the byte up */
+            in2[0] = t;
+            t = bits == 32 ? sgx_v1(x, &sgx_v_pshufd, t, 0x55 & ~(3u << (at / 16)))
+                           : sgx_vins(x, &sgx_v_pslldq, 0, 1, in2, at / 8, 0, SGX_VM_NONE, 0, 0, 0, 0, 0);
+        }
+        return sgx_v2(
+            x, &sgx_v_por,
+            sgx_v2(x, &sgx_v_pandn, sgx_xconst(x, at < 64 ? ones << at : 0, at < 64 ? 0 : ones << (at - 64)), in[0], 0),
+            t, 0);
+    }
+    return 0;
+}
 /* an XMM value's bits w and up, to 128, made 0: MOVQ for a doubleword, INSERTPS for a word, byte shifts below */
 static inline int sgx_xclear(SgX* x, int v, unsigned w) {
     if (w >= 128) return v;

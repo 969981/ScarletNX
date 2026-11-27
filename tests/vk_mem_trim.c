@@ -196,6 +196,10 @@ u64 vk_tex_demote(Surf* t) { stub_hit("vk_tex_demote"); }
 u32 vk_mem_owner_prio(u32 owner) { stub_hit("vk_mem_owner_prio"); }
 static u32 g_tex_evictions; /* textures the cache let go (tex_superseded_takes) */
 void vk_tex_evicted(const Surf* t) { g_tex_evictions++; }
+int vk_tex_image_own(Surf* s, VkImage* img, DevMem* mem, u64* bytes) {
+    (void)s, (void)img, (void)mem, (void)bytes;
+    return 0;
+}
 int vk_tex_finer(Surf* t) { stub_hit("vk_tex_finer"); }
 void vk_tex_note_writeback(Surf* s) { stub_hit("vk_tex_note_writeback"); }
 int vk_tex_promote(Surf* t) { stub_hit("vk_tex_promote"); }
@@ -503,3 +507,5 @@ int main(void) {
         "target's storage result landed nothing\n");
     return 0;
 }
+/* the pool map's views of a texture whose image changed (vk_rt_host): this test makes no pool map */
+void vk_pool_map_swapped(const Surf* t) { (void)t; }
