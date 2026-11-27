@@ -2,7 +2,7 @@
    Copyright 2026 the ScarletNX contributors */
 /* sail_qemu.h's: the states, the window, the cases, the comparison with QEMU's end and the reference of it */
 #include "sail_qemu.h"
-#include "llvm_qemu_words.h"
+#include "native_qemu_words.h"
 #include "support/frozen.h"
 #include "common/cpu/aarch64/a64_decoder.h"
 #include "common/utilities/endian.h"
@@ -798,7 +798,7 @@ size_t sail_frozen(SailHold* h, const char* path, const u32* words, size_t n, si
         if (f.parts != SAIL_FROZEN_PARTS || f.inputs != inputs || f.items[0] != counts[0] || f.items[1] != counts[1]) {
             fprintf(stderr,
                     "FAIL: %s holds %zu parts of %zu and %zu words, its inputs %016llx; this test draws 2 of %zu and "
-                    "%zu, inputs %016llx: record it again (snx-test-sail-frozen --record, where LLVM is built)\n",
+                    "%zu, inputs %016llx: these words need another reference\n",
                     path, f.parts, f.items[0], f.parts > 1 ? f.items[1] : 0, (unsigned long long)f.inputs, counts[0],
                     counts[1], (unsigned long long)inputs);
             snx_frozen_free(&f);

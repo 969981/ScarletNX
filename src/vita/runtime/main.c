@@ -64,12 +64,10 @@ static void usage(FILE* out) {
         "                         KEY is the key with a - for each _; the key as written, the older spelling, is still\n"
         "                         read, and said once\n"
         "\n"
-        "On the Vita, -O is the level of the blocks LLVM compiles: those this computer's native back end does not make,\n"
-        "and every one with --keep-ir. --chunk N puts N instructions in a chunk of LLVM's, whole blocks (default: 512\n"
-        "blocks a chunk). --jit-cache FILE is the list of the blocks a run compiled at run time that discovery starts\n"
-        "from, another game folder's <title ID>.hints (default: the game's own). --jit-only makes a module of no blocks,\n"
-        "the run-time compiler compiling every one, and --keep-ir has LLVM compile them all and keeps each chunk's IR in\n"
-        "<title ID>_build of the game's folder.\n"
+        "On the Vita, --chunk N puts N instructions in a chunk, whole blocks (default: 512 blocks a chunk).\n"
+        "--jit-cache FILE is the list of the blocks a run compiled at run time that discovery starts from, another\n"
+        "game folder's <title ID>.hints (default: the game's own). --jit-only makes a module of no blocks, the\n"
+        "run-time compiler compiling every one. -O and --keep-ir, LLVM's, went with it: said, and nothing done.\n"
         "\n"
         "F2, or Android's Back, edits the on-screen controls' layout: a control dragged moves, and one tapped is\n"
         "sized from the bar; Done, Esc, F2 or Back ends it, and <title ID>.ini keeps it. Back twice quits.\n"
@@ -357,7 +355,6 @@ int snx_vita_main(int argc, char** argv) {
         }
         if (common == SNX_CLI_SCRIPT) ini_read(ini_find(g_vita_run_ini, "vita_script"), cli.value[SNX_CLI_SCRIPT]);
         /* the Switch's settings, as --aot-threads= is: the last given counts */
-        if (common == SNX_CLI_OPT) ini_read(ini_find(g_recompile_ini, "opt"), cli.value[SNX_CLI_OPT]);
         if (common == SNX_CLI_JOBS) g_settings.aot_threads = cli.jobs;
         if (common) continue;
         /* the on-screen controls' and the front panel's settings, read with the game's own once its folder is known */

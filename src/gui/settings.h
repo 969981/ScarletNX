@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 /* The menu's Settings: the launcher's own rows and the recompiler's (settings.txt's launcher sections: gdbstub, Extract
-   to tmpfs, Extract dump, the optimization level, the AOT threads and the LLVM Internals page), then every setting of
+   to tmpfs, Extract dump and the AOT threads), then every setting of
    the game's .ini as the runtime lists them (scarletnx --settings, its tables), each a row of the form (editor.h),
    named and its values worded as the game's menu shows them. A setting is the .ini's, passed to no run, while it is at
    its default: a word row's value is one of its words, the default's marked [default]; one whose default has no word
@@ -190,10 +190,10 @@ const char* gui_settings_tmpfs(const GuiSettings* settings);
 /* Extract dump: --extract-container while it is on, else NULL (a dump read in place, nothing extracted).
    Both drivers take it */
 const char* gui_settings_extract(const GuiSettings* settings);
-/* argv's --key=value for each of the recompiler's settings picked (the optimization level, the AOT threads, LLVM
-   Internals), which the Switch driver takes for a run (which recompiles when it must) and for R's recompile; with
+/* argv's --key=value for each of the recompiler's settings picked (the AOT threads
+   and the like), which the Switch driver takes for a run (which recompiles when it must) and for R's recompile; with
    make, a run that makes the game and plays nothing (-r), each of the game's settings the recompile takes too
-   (settings.txt's recompile: NCE, Debug's SLP vectorizer) picked, which a run gets with the game's options: the game's
+   (settings.txt's recompile: NCE among them) picked, which a run gets with the game's options: the game's
    own pick where its picks beside game_ini (NULL: none) have one, else the launcher's. Their count */
 size_t gui_settings_recompile(GuiSettings* settings, int make, const char* game_ini, const char** argv);
 /* argv's --key=value for each of the recompile's settings every driver that recompiles takes picked: the optimization

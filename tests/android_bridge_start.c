@@ -3,7 +3,7 @@
 /* The native bridge's start (android/bridge/bridge.c) on a host its native back end cannot make code for, which the linker's
    wrap of snx_recompiler_new stands in for: the start says so and keeps nothing, so the next one, with the backend
    there, is a whole start and not the answer of a bridge that started with no recompiler. On a host below its native
-   back end's floor, in a build without LLVM (recompiler/mach/native.h), it says what the host lacks */
+   back end's floor (recompiler/mach/native.h), it says what the host lacks */
 #include "android/bridge/bridge.h"
 #include "common/cpu/recompiler/mach/native.h"
 #include "common/cpu/recompiler/snx_recompiler.h"
@@ -30,10 +30,8 @@ int main(void) {
     if (snx_native_available()) {
         char lacks[256];
         snx_x64_without(SNX_X64_SSE2);
-        snx_native_set_alone(1);
         assert(snx_native_floor(lacks, sizeof lacks) && !bridge_init(NULL, error, sizeof error));
         assert(!strcmp(error, lacks) && !strncmp(error, "cpu: needs SSE2, this host has ", 31));
-        snx_native_set_alone(0);
         snx_x64_without(0);
     }
 #endif

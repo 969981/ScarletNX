@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 /* sailgen's x86-64 back end, A64's part of its own (after mach_a64.h, which keeps the guest's registers, its memory
-   and its branches): the floating point (the SSE instruction behind the LLVM back end's guards, the exact helper on
+   and its branches): the floating point (the SSE instruction behind guards, the exact helper on
    a cold path), the exclusives' stores, the LSE atomics and CRC32 inline with their inputs in fixed registers, the
    barriers as x86's ordering asks, and the ABI's bytes. The state's address is in RBX.
 
@@ -9,9 +9,14 @@
    address from RDI into RBX, kept as RBX is the callee's), the runtime's UNDEF (cpu.h's RtAPI.undef(state, pc, word))
    and the return (the next pc in RAX) */
 
+/* mach_codegen.inc's struct_ldst_fast deinterleaves 16-byte structures with PSHUFB on this back end */
+#define MG_X64_STRUCT_FAST 1
+/* INS of an element is x64_vec.c's (PINSR, a blend), not mach_codegen.inc's simd_copy's through a doubleword */
+#define MG_X64_VEC_INS     1
+
 /* ---- the hot paths ----
    Each operation is the SSE instruction's, and the exact helper's (snx_x64_fp_*) on a cold path where the result
-   may not be the console's: the guards are the LLVM back end's (llvm.h's sg_fp_fast_*). FPCR rounds to nearest
+   may not be the console's. The guards: FPCR rounds to nearest
    (DN matters to NaNs only, which go cold), under FZ no operand is a denormal (sgx_fp_flushed: many games run with FZ
    set, and a guard of FZ clear sent all of their arithmetic to the helpers), FPSR's IXC is set already where the
    operation may be inexact (the inline code doesn't raise it), and the result is a normal number above the smallest
@@ -79,7 +84,7 @@ static inline int sgx_fp_bound(SgCtx* g, SgD fpcr, unsigned w) {
     return g->fp_bound[w == 64] = b.v;
 }
 /* and of the test for a denormal operand (w 32 or 64) that FPCR.FZ flushes, raising IDC (SGX_T_DENORMAL): the helpers'
-   case (llvm.h's sg_fp_unflushed). The doubled smallest normal less 2 where FZ is set, 0 where it is clear (never), a
+   case. The doubled smallest normal less 2 where FZ is set, 0 where it is clear (never), a
    register made once a region, so the test costs a MOVD, LEA, CMP and Jcc */
 static inline int sgx_fp_dbound(SgCtx* g, SgD fpcr, unsigned w) {
     SnxU64 normal = w == 32 ? 0x00800000u : 0x0010000000000000ull;
@@ -107,7 +112,7 @@ static inline int sgx_fp_tests(SgCtx* g, SgXTest* t, SgD fpcr, unsigned w, int n
     return n;
 }
 /* the cold path of an operation sgx_fp_tests tests: the helper's call where a test holds, but a zero result the hot
-   path's where FPCR rounds to nearest, under FZ no operand is a denormal (llvm.h's sg_fp_unflushed: many games run with
+   path's where FPCR rounds to nearest, under FZ no operand is a denormal (many games run with
    FZ set and compute zeros), and (zargs, a mask of ops) one of those operands is a zero (none: any zero is exact, as a
    sum's is) */
 static inline SgD sgx_fp_cold_z(SgCtx* g, const SgXTest* t, int nt, SgD fast, const char* sym, SgD* ops, int nops,
@@ -520,15 +525,17 @@ static inline SgD sg_crc32(SgCtx* g, SgD acc_bits, SgD value_bits, long long siz
     in[0] = sg_d_zext(g, acc_bits, 64);
     in[1] = sg_d_zext(g, value_bits, 64);
     const int c = poly.v == 0x1EDC6F41u, sse42 = (sgx(g)->features & SGX_F_SSE42) != 0, slices = !c && size >= 16;
+    const int loop = !slices && !(c && sse42) && size >= 16; /* the byte loop counts in R8D */
     return sg_d_slice(
         g,
         sgx_mach(g, SGX_M_CRC, in, fix, 2, size / 8 | (c && sse42) << 4 | (c && !sse42) << 5 | slices << 6,
-                 1u << SGX_RCX | 1u << SGX_RDX | 1u << SGX_R11 | (slices && size == 64 ? 1u << SGX_R8 : 0u), 1, 64),
+                 1u << SGX_RCX | 1u << SGX_RDX | 1u << SGX_R11 | ((slices && size == 64) || loop ? 1u << SGX_R8 : 0u),
+                 1, 64),
         31, 0);
 }
 
 /* an x86 load is an acquire one (Vol. 3A, 10.2.2: loads are not reordered with other loads, nor stores with older
-   loads); a release store is MFENCE after it, as the sequentially consistent store the LLVM back end makes (Arm's
+   loads); a release store is MFENCE after it, a sequentially consistent store (Arm's
    store-release orders it with a later load-acquire, which x86's store buffer alone would not) */
 static inline void sgx_acquire(SgCtx* g) { (void)g; }
 static inline void sgx_release(SgCtx* g, int after) {
@@ -552,17 +559,13 @@ static inline void sgx_prologue(SgXAsm* a) {
     sgx_byte(b, 0x48); /* mov rbx, rdi, or rcx */
     sgx_byte(b, 0x89);
     sgx_byte(b, SGX_WIN64(a->x) ? 0xCB : 0xFB);
-    sgx_byte(b, 0x48); /* sub rsp, imm32: the frame, patched */
-    sgx_byte(b, 0x81);
-    sgx_byte(b, 0xEC);
+    sgx_frame(b, 0, 1); /* sub rsp, imm32: a block's frame, patched */
     if (a->nframe < 256) a->frame_at[a->nframe++] = b->n;
     sgx_imm(b, 0, 4);
 }
 static inline void sgx_epilogue(SgXAsm* a) {
     SgXBuf* b = a->b;
-    sgx_byte(b, 0x48); /* add rsp, imm32 */
-    sgx_byte(b, 0x81);
-    sgx_byte(b, 0xC4);
+    sgx_frame(b, 1, 1); /* add rsp, imm32 */
     if (a->nframe < 256) a->frame_at[a->nframe++] = b->n;
     else
         sg_fail("a function of more than 255 epilogues", 0, 0);
@@ -761,9 +764,21 @@ static inline void sgx_machine_inline(SgXAsm* a, SgXIns* i) {
             sgx_bytes(b, "C1 EA 10 0F B6 CA 41 33 84 8B 00 04 00 00 0F B6 CE 41 33 04 8B");
             return;
         }
-        for (k = 0; k < bytes; ++k)
-            /* mov ecx, eax; xor cl, dl; movzx ecx, cl; shr eax, 8; xor eax, [r11 + rcx*4]; shr rdx, 8 */
-            sgx_bytes(b, "89 C1 30 D1 0F B6 C9 C1 E8 08 41 33 04 8B 48 C1 EA 08");
+        /* movzx ecx, dl; xor cl, al; shr eax, 8; xor eax, [r11 + rcx*4]; shr rdx, 8 */
+        (void)k;
+        if (bytes == 1) {
+            /* the value's shift is dead: one lookup in EAX is the whole CRC32B update */
+            sgx_bytes(b, "0F B6 CA 30 C1 C1 E8 08 41 33 04 8B");
+            return;
+        }
+        /* one loop for every wider width, not a byte's code each time: mov r8d, bytes; the body; dec r8d; jnz */
+        sgx_bytes(b, "41 B8"); /* mov r8d, imm32 */
+        sgx_imm(b, bytes, 4);
+        {
+            size_t loop = b->n;
+            sgx_bytes(b, "0F B6 CA 30 C1 C1 E8 08 41 33 04 8B 48 C1 EA 08 41 FF C8 0F 85");
+            sgx_imm(b, (long long)loop - (long long)(b->n + 4), 4);
+        }
         return;
     }
     default: return;

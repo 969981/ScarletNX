@@ -1,11 +1,12 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* The AdvSIMD instructions of the x86-64 back end (x64_codegen.c includes this after sailgen's emitters): what the
-   LLVM back end's ir_vec.c does, on the region's SSA in XMM registers. The SIMD&FP registers are the block's XMM
+/* The AdvSIMD instructions of the x86-64 back end (x64_codegen.c includes this after sailgen's emitters), on the
+   region's SSA in XMM registers. The SIMD&FP registers are the block's XMM
    values (x64_a64.h's sg__V_read_bits, sg__V_write); each operation is SSE forms of x64.ops' enc lines, a byte
    shuffle (PSHUFB, its masks in the function's constant pool) where the lanes move, general-purpose code lane by lane
-   where x86 has no form (a shift of each lane by its own amount). Every one is held against the LLVM back end by
-   recompiler_backends. vec() returns 1 made, 0 not one of these (the function goes to LLVM), -1 UNDEF */
+   where x86 has no form (a shift of each lane by its own amount). Every one is held to its recorded results by
+   recompiler_backends. vec() returns 1 made, 0 not one of these (another emitter's, or no code: undefined where it
+   runs), -1 UNDEF */
 
 #define X sgx(g)
 
@@ -400,7 +401,7 @@ static int shift_imm(SnxU32 word, unsigned* size, unsigned* left, unsigned* righ
 static int vabs(SgCtx* g, unsigned size, int a);
 
 /* ---- floating point by lanes ----
-   The host's lanes where the LLVM back end's guards (ir_vec_fp.c's fast paths) hold for every lane that is the
+   The host's lanes where the guards (fwarm) hold for every lane that is the
    instruction's; else all of them on the cold path through the exact helpers (x64_helpers.c's snx_x64_fp_vec, desc
    as it reads it). sz: 0 singles, 1 doubles; n the lanes */
 
@@ -432,18 +433,18 @@ static int fnot_roomy(SgCtx* g, unsigned sz, int r) {
     return vgt(g, size, vxor(g, t, vsplat(g, size, flip)), vsplat(g, size, (((inf - normal - 1) << 1) - 1) ^ flip), 0);
 }
 static int fzero(SgCtx* g, unsigned sz, int a) { return veq(g, sz + 2, vadd(g, sz + 2, a, a), vzero(g)); }
-/* the denormal lanes (the doubled magnitude less 2 below the doubled smallest normal less 2, unsigned: a signed
-   compare with their tops flipped) */
+/* the denormal lanes (the bits less one with the sign bit set, below the smallest normal's less one with it set,
+   signed: either zero's borrow puts it above) */
 static int fdenormal(SgCtx* g, unsigned sz, int a) {
     unsigned size = sz + 2;
     SnxU64 normal = sz ? 0x0010000000000000ull : 0x00800000u, flip = 1ull << ((8u << size) - 1);
-    int t = vsub(g, size, vadd(g, size, a, a), vsplat(g, size, 2));
-    return vgt(g, size, vsplat(g, size, ((normal << 1) - 2) ^ flip), vxor(g, t, vsplat(g, size, flip)), 0);
+    int t = vor(g, vsub(g, size, a, vsplat(g, size, 1)), vsplat(g, size, flip));
+    return vgt(g, size, vsplat(g, size, (normal - 1) | flip), t, 0);
 }
 static int fnan(SgCtx* g, unsigned sz, int a) { return sgx_v2(X, k_fcmp[sz], a, a, 3); /* CMPUNORD */ }
 static SgB fstate(SgCtx* g, SnxU32 mask, int ixc) { return sgx_fp_bad(g, sg_FPCR_read(g), mask, ixc); }
 /* FPCR.FZ set and a denormal in the first n lanes of a, b or c (0: none), which it flushes, raising IDC: the helpers'
-   case (ir_vec_fp.c's unflushed) */
+   case */
 static SgB fflushed(SgCtx* g, unsigned sz, int n, int a, int b, int c) {
     int m = fdenormal(g, sz, a);
     if (b) m = vor(g, m, fdenormal(g, sz, b));
@@ -454,7 +455,7 @@ static int fcold(SgCtx* g, SgB bad, int fast, int a, int b, int d, SnxU32 desc) 
     return sgx_vcold(X, bad, fast, "snx_x64_fp_vec", a, b, d, desc);
 }
 #define FDESC(kind, sz, n) ((SnxU32)(kind) | (SnxU32)(sz ? 8 : 4) << 4 | (SnxU32)(n) << 8)
-/* the LLVM back end's guards in two steps: the hot code tests FPCR's mode and FZ and FPSR's IXC (once a region) and
+/* the guards in two steps: the hot code tests FPCR's mode and FZ and FPSR's IXC (once a region) and
    that every lane of r is a normal number (nr: fnot_roomy's); the cold path tests the rest before its call
    (x64_asm.h's sgx_cold_vwarm: zacc's bits), back to r where it holds: exact zeros, FZ with no denormal argument */
 static int fwarm(SgCtx* g, int r, int nr, unsigned sz, int n, int a, int b, int d, SnxU32 desc, unsigned zacc) {
@@ -548,9 +549,8 @@ static int fto_int(SgCtx* g, unsigned sz, int n, int a, int uns, int fbits, int 
             int hi = vxor(g, sgx_v1(X, &sgx_v_cvttps2dq, op2(g, &sgx_v_subps, x, fsplat(g, 0, 0x4F000000u)), 0),
                           vsplat(g, 2, 0x80000000u));
             r = vsel(g, big, hi, lo);
-            bad = vor(g, sgx_v2(X, &sgx_v_cmpps, x, fsplat(g, 0, 0xBF800000u), 2),  /* x <= -1 */
-                      sgx_v2(X, &sgx_v_cmpps, fsplat(g, 0, 0x4F800000u), x, 2)); /* 2^32 <= x */
-            bad = vor(g, bad, fnan(g, 0, x));
+            bad = vor(g, sgx_v2(X, &sgx_v_cmpps, fsplat(g, 0, 0xBF800000u), x, 5), /* not -1 < x: x <= -1 or a NaN */
+                      sgx_v2(X, &sgx_v_cmpps, fsplat(g, 0, 0x4F800000u), x, 2));   /* 2^32 <= x */
         }
     } else {
         /* the two doubles one at a time (CVTTSD2SI), unsigned ones from 2^63 up cold */
@@ -619,7 +619,7 @@ static int fstep(SgCtx* g, unsigned sz, int n, int a, int b, int sqrt) {
     /* a zero only where a b is exactly 2 (3), so every one exact; a and b FZ may flush */
     return fwarm(g, r, fnot_roomy(g, sz, r), sz, n, a, b, 0, FDESC(0, sz, n) | (SnxU32)op << 12, 1 | 2u << 3);
 }
-/* FRECPE, FRSQRTE as ir_vec_fp.c's fast_estimate makes them, where every lane is normal with a normal estimate
+/* FRECPE, FRSQRTE inline, where every lane is normal with a normal estimate
    (FRSQRTE's positive): the exponent, and the low 8 bits of (2^19 / a' + 1) / 2 (FRSQRTE's: of the root of 2^28 / a'),
    which a single gives exactly for every a' it can take; another lane goes cold */
 static int festimate(SgCtx* g, unsigned sz, int n, int a, int sqrt) {
@@ -1023,8 +1023,8 @@ static int vqshl_reg(SgCtx* g, unsigned size, int q, int a, int m, int* sat) {
 
 /* ---- shifts by a register's lanes ----
    Left by the signed byte s at the bottom of each lane of m where it is positive, right by -s where it is negative
-   (uns: logical), rounded (round: the last bit shifted out added back) or saturated on the left (saturate), as
-   ir_vec.c's shl_helper. Left and right are made apart, each 0 where it is the other's lane, and ORed (a 0 amount is
+   (uns: logical), rounded (round: the last bit shifted out added back) or saturated on the left (saturate). Left and
+   right are made apart, each 0 where it is the other's lane, and ORed (a 0 amount is
    the value, in both). Words and doublewords by AVX2's shifts, 0 past the lane; bytes and halfwords by products with
    the power of two a table (PSHUFB) has for the amount: left a * 2^s, right the upper half of a * 2^(e + s), whose
    index -1 - s is the amount's complement */
@@ -1506,7 +1506,7 @@ static int vec_crypto(Unit* u, const SnxA64Insn* insn, SnxU32 word) {
 
 static int vec(Unit* u, const SnxA64Insn* insn, SnxU32 word) {
     SgCtx* g = u->g;
-    if (insn->feature & SNX_A64_FEAT_FP16) return 0; /* half-precision lanes: the LLVM back end's */
+    if (insn->feature & SNX_A64_FEAT_FP16) return 0; /* half-precision lanes: not made here */
     {
         int f = vec_fp(u, insn, word);
         if (!f) f = vec_fp_more(u, insn, word);
@@ -1551,6 +1551,33 @@ static int vec(Unit* u, const SnxA64Insn* insn, SnxU32 word) {
     case SNX_A64_OP_BIF_v: { /* d = d ^ ((d ^ n) & ~m) */
         int d = vread(g, rd);
         vwrite(g, rd, vxor(g, d, vandn(g, vread(g, rm), vxor(g, d, vread(g, rn)))), q);
+        return 1;
+    }
+    case SNX_A64_OP_INS_general: { /* an element from a general-purpose register: PINSR */
+        unsigned imm5 = word >> 16 & 31, k = 0;
+        SgD v;
+        if (!(imm5 & 15)) return -1;
+        while (!(imm5 >> k & 1)) ++k;
+        v = rn == 31 ? sgx_const(64, 0) : sg_GPR_read(g, rn);
+        if (k < 3) v = sg_d_slice(g, v, (8u << k) - 1, 0);
+        vwrite(g, rd, lane_put(g, k, vread(g, rd), (int)(imm5 >> (k + 1)), v), 1);
+        return 1;
+    }
+    case SNX_A64_OP_INS_element: { /* an element from another's: a blend or an unpack of the two registers (vshuf);
+                                      a byte, which those would take two shuffles by constants for, PEXTRB and PINSRB */
+        unsigned imm5 = word >> 16 & 31, k = 0, to, from;
+        int idx[16];
+        if (!(imm5 & 15)) return -1;
+        while (!(imm5 >> k & 1)) ++k;
+        to = imm5 >> (k + 1), from = (word >> 11 & 15) >> k;
+        a = vread(g, rd), b = vread(g, rn);
+        if (!k)
+            r = lane_put(g, 0, a, (int)to, lane_get(g, 0, b, (int)from));
+        else {
+            for (int i = 0; i < 16; ++i) idx[i] = (unsigned)i >> k == to ? 16 + (int)(from << k) + i % (1 << k) : i;
+            r = vperm(g, a, b, idx);
+        }
+        vwrite(g, rd, r, 1);
         return 1;
     }
     /* integer arithmetic, compares, minimum and maximum, lane by lane */
@@ -2271,6 +2298,30 @@ static int vec(Unit* u, const SnxA64Insn* insn, SnxU32 word) {
         if (scalar) vwrite_scalar(g, rd, sz, r);
         else
             vwrite_narrow(g, rd, r, q);
+        return 1;
+    }
+    case SNX_A64_OP_PMUL_v: { /* each byte's carryless product, its low byte: a << k where b's bit k is set, XORed */
+        int ak;
+        if (size) return -1;
+        a = ak = vread(g, rn), b = vread(g, rm), r = 0;
+        for (unsigned k = 0; k < 8; ++k) {
+            /* b's bit k at each byte's top (a word shift moves each byte's own bit there), spread over the byte */
+            int t = vand(g, op2(g, &sgx_v_pcmpgtb, vzero(g), k < 7 ? opi(g, &sgx_v_psllw_i, b, 7 - k) : b), ak);
+            r = k ? vxor(g, r, t) : t;
+            if (k < 7) ak = vadd(g, 0, ak, ak);
+        }
+        vwrite(g, rd, r, q);
+        return 1;
+    }
+    case SNX_A64_OP_PMULL_p8: { /* each byte's carryless product in a halfword, of the half q chooses: the words' product
+                                   with each of b's bits alone is a << k or 0, and those XORed carry nothing */
+        if (size) return 0;
+        a = vwiden(g, 0, vread(g, rn), (int)q, 0), b = vwiden(g, 0, vread(g, rm), (int)q, 0), r = 0;
+        for (unsigned k = 0; k < 8; ++k) {
+            int t = op2(g, &sgx_v_pmullw, a, vand(g, b, vsplat(g, 1, 1u << k)));
+            r = k ? vxor(g, r, t) : t;
+        }
+        vwrite(g, rd, r, 1);
         return 1;
     }
     case SNX_A64_OP_PMULL_p64: /* PMULL, PMULL2 of a doubleword (q: the upper ones): the 128-bit carryless product */

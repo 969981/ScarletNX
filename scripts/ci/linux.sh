@@ -33,7 +33,7 @@ release() {
   git config --global --add safe.directory '*'
   ccache --zero-stats
   cmake --preset default -DSNX_DEPLOY=OFF -DCMAKE_INSTALL_PREFIX=/usr \
-    -DLLVM_DIR="$PWD/.cache/llvm/${ARCH}/lib/cmake/llvm" -DBUILD_TESTING=OFF \
+    -DBUILD_TESTING=OFF \
     -DSNX_LTO=${LTO} \
     -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
   cmake --build --preset default --parallel "$(getconf _NPROCESSORS_ONLN)"
@@ -72,7 +72,7 @@ EOF
 }
 
 # The test options on the AppImage's tree, its tests on, and the headless tree, whose options change what every
-# target builds, in a folder of its own with this job's LLVM. x86-64's has the other machines' back ends under
+# target builds, in a folder of its own. x86-64's has the other machines' back ends under
 # Unicorn too, whose tests linux-unicorn runs. Built on every event, tested where SNX_TESTS
 # env: ARCH UNICORN
 test_trees() {
@@ -88,7 +88,6 @@ test_trees() {
   ccache --show-stats
   ccache --zero-stats
   cmake --preset default -B build/headless ${SNX_HEADLESS_OPTIONS} -DBUILD_TESTING=ON \
-    -DLLVM_DIR="$PWD/.cache/llvm/${ARCH}/lib/cmake/llvm" \
     -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
   cmake --build build/headless --parallel "$(getconf _NPROCESSORS_ONLN)"
   ccache --show-stats
@@ -249,16 +248,16 @@ unicorn_tests() {
 qemu_reference_build() {
   cmake --preset default -DBUILD_TESTING=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
   cmake --build --preset default --parallel "$(getconf _NPROCESSORS_ONLN)" \
-    --target snx-test-llvm-qemu-differential snx-test-sail-x64 snx_qemu_ref_runner
+    --target snx-test-native-qemu-differential snx-test-sail-x64 snx_qemu_ref_runner
   ccache --show-stats
 }
 
 # the differential's QEMU side, and QEMU's ends of every state of sail_x64's words (with no sequences: what Windows
 # holds its words to)
 qemu_reference_record() {
-  build/default/tests/snx-test-llvm-qemu-differential qemu-aarch64 build/default/qemu_ref_runner \
-    build/llvm_qemu_reference_dir tests/llvm_qemu_expected.txt --quiet \
-    --record build/llvm_qemu_reference.bin
+  build/default/tests/snx-test-native-qemu-differential qemu-aarch64 build/default/qemu_ref_runner \
+    build/native_qemu_reference_dir tests/native_qemu_expected.txt --quiet \
+    --record build/native_qemu_reference.bin
   build/default/tests/snx-test-sail-x64 --qemu qemu-aarch64 build/default/qemu_ref_runner build/sail_qemu_reference_dir \
     --record build/sail_qemu_reference.bin --sequences 0
 }

@@ -1,21 +1,20 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* The native back ends' guest functions, what any machine's shares: what ir_codegen.c's snx_ir_emit makes of a
-   function, without LLVM. Included by a machine's code generator (x64/x64_codegen.c, arm64/arm64_codegen.c) after
-   sailgen's emitters of that machine (a64_<machine>.inc), and followed by the machine's glue, which it declares
-   below: the bytes of the ABI and the flow (the prologue, the jumps and their fixups, the calls, the entry's checks,
-   the dispatch block, SVC, BRK and UNDEF, the pins' loads and stores) and the relocations of its objects. The
-   machine also gives its AdvSIMD instructions (vec() and the vector helpers the structures' loads and stores take:
-   vread, vwrite, vzero, lane_get, lane_put, vdup), and these constants: MG_EM (its ELF machine; MG_ELF_FLAGS, its
-   objects' e_flags, LLVM's for the host's ABI, 0 by default), MG_R_ABS64 (an
-   absolute doubleword's relocation), SGX_FN_TARGET (the register a call's target and a function's entry are in),
-   the pins' host registers (mg_pin_hosts, MG_NPINS, MG_NPINS_FIXED where an exclusive, an atomic or CRC32 takes the
-   last ones, MG_PIN_RESERVED(h) whether a pin's register is one values may be in), the vector pins' (MG_VPIN(k),
-   the k-th, MG_NVPINS) and the vector registers no value may take (MG_XRESERVED: the callee's). MG_FAR_JUMPS where its
-   jumps have a longer form (Unit.far), MG_POOL_REACH how far the code goes past the first LDR of a literal before the
-   literals are put in it (mg_pool_island), MG_DIRECT_ENTRY where a function's entry checks its target before the
-   frame, so that a call of its start comes in past the check (mg_direct): how far back a call reaches one so with no
-   relocation's help.
+/* The native back ends' guest functions, what any machine's shares: a guest function's code. Included by a machine's
+   code generator (x64/x64_codegen.c, arm64/arm64_codegen.c) after sailgen's emitters of that machine
+   (a64_<machine>.inc), and followed by the machine's glue, which it declares below: the bytes of the ABI and the flow
+   (the prologue, the jumps and their fixups, the calls, the entry's checks, the dispatch block, SVC, BRK and UNDEF, the
+   pins' loads and stores) and the relocations of its objects. The machine also gives its AdvSIMD instructions (vec()
+   and the vector helpers the structures' loads and stores take: vread, vwrite, vzero, lane_get, lane_put, vdup), and
+   these constants: MG_EM (its ELF machine; MG_ELF_FLAGS, its objects' e_flags, the host ABI's, 0 by default),
+   MG_R_ABS64 (an absolute doubleword's relocation), SGX_FN_TARGET (the register a call's target and a function's entry
+   are in), the pins' host registers (mg_pin_hosts, MG_NPINS, MG_NPINS_FIXED where an exclusive, an atomic or CRC32
+   takes the last ones, MG_PIN_RESERVED(h) whether a pin's register is one values may be in), the vector pins'
+   (MG_VPIN(k), the k-th, MG_NVPINS) and the vector registers no value may take (MG_XRESERVED: the callee's).
+   MG_FAR_JUMPS where its jumps have a longer form (Unit.far), MG_POOL_REACH how far the code goes past the first LDR of
+   a literal before the literals are put in it (mg_pool_island), MG_DIRECT_ENTRY where a function's entry checks its
+   target before the frame, so that a call of its start comes in past the check (mg_direct): how far back a call reaches
+   one so with no relocation's help.
 
    Each basic block's instructions are sailgen's emitters', appended to one SSA region (registers read once, flags
    reused, constants folded) and assembled when the block ends. The guest's registers are in the CPU structure at
@@ -98,7 +97,7 @@ typedef struct {
     size_t index; /* the function's in the codegen: its snx_stale byte */
     size_t at;    /* the index of the function's instruction being made, its count past them */
     int far;      /* the function's jumps are the machine's longest (MG_FAR_JUMPS): its short ones did not reach */
-    /* the addresses of the function's instructions there is no code for (options.alone), undefined where they run */
+    /* the addresses of the function's instructions there is no code for, undefined where they run */
     SnxU64* none;
     size_t nnone, cap_none;
     int again;    /* the machine's glue refused the function to make it again its way (mg_finish), once */
@@ -206,6 +205,11 @@ static int mg_direct(const Unit* u);
 static void mg_check(Unit* u, SnxU64 start, int label);
 /* after the prologue: if (snx_stale[index]) { c->pc = given ? e : start; return; }, where options->stale */
 static void mg_stale(Unit* u, size_t index, int given, SnxU64 start);
+#endif
+#ifdef MG_ENTRY_STALE
+static void mg_entry_stale(Unit* u, size_t index);
+/* the rest of mg_entry's before the compare (x86-64's host FP environment), for a function entered at its start alone */
+static void mg_entry_fp(Unit* u);
 #endif
 /* at u->mismatch_label: c->pc = e and the dispatch block (several leaders), else CALLDYN(e) */
 static void mg_dispatch(Unit* u, int lab0);
@@ -509,7 +513,7 @@ static void jump_if_back(Unit* u, SgB taken, int header, int slow, SnxU64 target
 }
 #endif
 
-/* ---- what the Sail roots don't have: ir_ldst.c's, ir_vec.c's and ir_int.c's, on the region's SSA ---- */
+/* ---- what the Sail roots don't have: loads and stores, vectors and system instructions, on the region's SSA ---- */
 
 /* Xn as an address: SP for 31 */
 static SgD base_of(SgCtx* g, unsigned rn) { return sg_GPR_read(g, rn); }
@@ -774,6 +778,9 @@ static int simd_copy(Unit* u, SnxU32 word) {
         sgx_vd_write(g, rd, 1, q ? r : sgx_const(64, 0));
         return 1;
     }
+#ifdef MG_X64_VEC_INS
+    if ((word & 0xFFE0FC00u) == 0x4E001C00u || (word & 0xFFE08400u) == 0x6E000400u) return 0; /* INS: vec()'s */
+#endif
     if ((word & 0xFFE0FC00u) == 0x4E001C00u) { /* INS (general) */
         elem_write(g, rd, idx, esize, rn == 31 ? sgx_const(64, 0) : sg_GPR_read(g, rn));
         return 1;
@@ -786,8 +793,8 @@ static int simd_copy(Unit* u, SnxU32 word) {
     return 0;
 }
 
-/* SYS, MRS and MSR as ir_int.c's sys(): what EL0 reads and writes on the Switch, the cache maintenance it does; 0
-   for the rest (UNDEF there, LLVM's) */
+/* SYS, MRS and MSR: what EL0 reads and writes on the Switch, the cache maintenance it does; 0 for the rest, which no
+   code is made for (undefined where it runs) */
 #define SYSREG(op1, crn, crm, op2) ((1u << 14) | ((op1) << 11) | ((crn) << 7) | ((crm) << 3) | (op2))
 static int sys(Unit* u, SnxU32 word) {
     SgCtx* g = u->g;
@@ -823,7 +830,7 @@ static int sys(Unit* u, SnxU32 word) {
                                              sg_d_concat(g, sg_PSTATE_read(g, SG_PSTATE_C), sg_PSTATE_read(g, SG_PSTATE_V))), 64);
                 v = sg_d_lsl(g, v, 28);
                 break;
-            /* the constants ir_int.c's read_sysreg gives: CTR_EL0 (SCTLR_EL1.UCT), DCZID_EL0, CNTFRQ_EL0 */
+            /* the constants EL0 reads: CTR_EL0 (SCTLR_EL1.UCT), DCZID_EL0, CNTFRQ_EL0 */
             case SYSREG(3, 0, 0, 1): v = sgx_const(64, 0x8444C004u); break;
             case SYSREG(3, 0, 0, 7): v = sgx_const(64, 4); break;
             case SYSREG(3, 14, 0, 0): v = sgx_const(64, 19200000u); break;
@@ -834,7 +841,7 @@ static int sys(Unit* u, SnxU32 word) {
                 v = sgx_call(g, "snx_mrs", 0, 1, &k, 1, 64);
                 break;
             }
-            default: return -1; /* UNDEF at EL0 on the Switch, as ir_int.c's read_sysreg leaves it */
+            default: return -1; /* UNDEF at EL0 on the Switch */
             }
             if (rt != 31) sg_GPR_write(g, rt, v);
             return 1;
@@ -868,7 +875,7 @@ static int sys(Unit* u, SnxU32 word) {
             sg_PSTATE_write(g, SG_PSTATE_N, 4, sg_d_slice(g, xzr_or(g, rt), 31, 28));
             g->origin = -1;
             return 1;
-        default: return -1; /* read-only at EL0, or EL1's: UNDEF, as ir_int.c's write_sysreg leaves it */
+        default: return -1; /* read-only at EL0, or EL1's: UNDEF */
         }
     }
     if (op0 == 1 && !l && op1 == 3 && crn == 7 && op2 == 1) {
@@ -893,7 +900,7 @@ static int sys(Unit* u, SnxU32 word) {
         default: return -1;
         }
     }
-    return -1; /* the rest of SYS and SYSL: UNDEF, as ir_int.c's sys() */
+    return -1; /* the rest of SYS and SYSL: UNDEF */
 }
 #undef SYSREG
 
@@ -915,6 +922,174 @@ static void vstore(SgCtx* g, SgD address, int r, int bytes) {
     in[(int)f->reg] = r;
     sgx_vins(x, f, f->rm, 0, in, 0, f->rm, SGX_VM_GUEST, base, index, disp, 0, 0);
 }
+
+#ifdef MG_X64_STRUCT_FAST
+/* Wide LD_mult and ST_mult through 16-byte chunks. PUNPCK handles two registers, PSHUFB the others.
+   Return 0 for shapes that are not whole chunks, so the Sail loop makes them. Chunks follow address order. */
+static int struct_ldst_fast(SgCtx* g, unsigned selem, unsigned size, int load, unsigned rt, SgD base, int q) {
+    SgX* x = sgx(g);
+    unsigned esize = 1u << size, c, s, j;
+    unsigned nchunks, bytes = selem * (q ? 16u : 8u), last;
+    int chunk[4];
+    static const SgXVForm* const lo[4] = {&sgx_v_punpcklbw, &sgx_v_punpcklwd, &sgx_v_punpckldq, &sgx_v_punpcklqdq};
+    static const SgXVForm* const hi[4] = {&sgx_v_punpckhbw, &sgx_v_punpckhwd, &sgx_v_punpckhdq, &sgx_v_punpckhqdq};
+    if (selem < 2 || selem > 4 || size > 3 || !(x->features & SGX_F_SSSE3)) return 0;
+    nchunks = (bytes + 15) / 16;
+    last = bytes - 16 * (nchunks - 1); /* the last chunk's bytes: 8 for three D registers' 24, else 16 */
+    if (load)
+        for (c = 0; c < nchunks; ++c)
+            chunk[c] = vload(g, sg_d_add(g, base, sgx_const(64, 16 * c)), c + 1 == nchunks ? (int)last : 16);
+    if (q && load && selem == 2) {
+        /* one mask gathers a register's elements from either chunk, so the two masks serve both loads */
+        if (size == 3) {
+            /* two quadwords per chunk: the halves of the chunks are the registers already */
+            vwrite(g, rt & 31, sgx_v2(x, &sgx_v_punpcklqdq, chunk[0], chunk[1], 0), 1);
+            vwrite(g, (rt + 1) & 31, sgx_v2(x, &sgx_v_punpckhqdq, chunk[0], chunk[1], 0), 1);
+            return 1;
+        }
+        for (s = 0; s < 2; ++s) {
+            SnxU64 lo = 0, hi = 0;
+            int mask, sh0, sh1;
+            for (j = 0; j < 16; ++j) {
+                SnxU64 b = j < 8 ? (SnxU64)((2 * (j / esize) + s) * esize + j % esize) : 0x80ull;
+                if (j < 8)
+                    lo |= b << (8 * j);
+                else
+                    hi |= b << (8 * (j - 8));
+            }
+            mask = sgx_xconst(x, lo, hi);
+            sh0 = sgx_v2(x, &sgx_v_pshufb, chunk[0], mask, 0);
+            sh1 = sgx_v2(x, &sgx_v_pshufb, chunk[1], mask, 0);
+            vwrite(g, (rt + s) & 31, sgx_v2(x, &sgx_v_punpcklqdq, sh0, sh1, 0), 1);
+        }
+        return 1;
+    }
+    if (q && !load && selem == 2) {
+        /* an unpack of the two registers makes each chunk: no PSHUFB mask, and each register is read once */
+        int v0 = vread(g, rt & 31), v1 = vread(g, (rt + 1) & 31);
+        vstore(g, base, sgx_v2(x, lo[size], v0, v1, 0), 16);
+        vstore(g, sg_d_add(g, base, sgx_const(64, 16)), sgx_v2(x, hi[size], v0, v1, 0), 16);
+        return 1;
+    }
+    if (q && !load && selem == 4) {
+        /* a butterfly of unpacks makes each chunk from the four registers, in address order, with no PSHUFB mask
+           and no OR layer: the first unpacks pair Vt with Vt+1 and Vt+2 with Vt+3, and the second interleave
+           puts one element of each of the four in each group of four bytes. A pair of quadwords (size 3) is
+           already a chunk: the second interleave would be of 16-byte halves, which no instruction makes */
+        int v[4], a01, a23, b01, b23, ci;
+        for (s = 0; s < 4; ++s) v[s] = vread(g, (rt + s) & 31);
+        if (size == 3) {
+            vstore(g, base, sgx_v2(x, &sgx_v_punpcklqdq, v[0], v[1], 0), 16);
+            vstore(g, sg_d_add(g, base, sgx_const(64, 16)), sgx_v2(x, &sgx_v_punpcklqdq, v[2], v[3], 0), 16);
+            vstore(g, sg_d_add(g, base, sgx_const(64, 32)), sgx_v2(x, &sgx_v_punpckhqdq, v[0], v[1], 0), 16);
+            vstore(g, sg_d_add(g, base, sgx_const(64, 48)), sgx_v2(x, &sgx_v_punpckhqdq, v[2], v[3], 0), 16);
+            return 1;
+        }
+        a01 = sgx_v2(x, lo[size], v[0], v[1], 0);
+        a23 = sgx_v2(x, lo[size], v[2], v[3], 0);
+        b01 = sgx_v2(x, hi[size], v[0], v[1], 0);
+        b23 = sgx_v2(x, hi[size], v[2], v[3], 0);
+        for (ci = 0; ci < 4; ++ci) {
+            int lo01 = ci & 2 ? b01 : a01, lo23 = ci & 2 ? b23 : a23;
+            int wide = sgx_v2(x, ci & 1 ? hi[size + 1] : lo[size + 1], lo01, lo23, 0);
+            vstore(g, sg_d_add(g, base, sgx_const(64, 16 * ci)), wide, 16);
+        }
+        return 1;
+    }
+    if (q && load && selem == 4) {
+        /* the inverse butterfly: unpacks at the element's width gather each register's elements in order, one
+           fewer round for each doubling of the element; the quadword unpacks then join the register's two halves.
+           No PSHUFB mask and no OR layer. q is 1 here, as the caller only takes this path for Q forms */
+        int t[4] = {chunk[0], chunk[1], chunk[2], chunk[3]}, a01, a23, b01, b23, round;
+        for (round = 0; round < 3 - (int)size; ++round) {
+            a01 = sgx_v2(x, lo[size], t[0], t[1], 0);
+            b01 = sgx_v2(x, hi[size], t[0], t[1], 0);
+            a23 = sgx_v2(x, lo[size], t[2], t[3], 0);
+            b23 = sgx_v2(x, hi[size], t[2], t[3], 0);
+            t[0] = a01, t[1] = b01, t[2] = a23, t[3] = b23;
+        }
+        vwrite(g, rt & 31, sgx_v2(x, &sgx_v_punpcklqdq, t[0], t[2], 0), 1);
+        vwrite(g, (rt + 1) & 31, sgx_v2(x, &sgx_v_punpckhqdq, t[0], t[2], 0), 1);
+        vwrite(g, (rt + 2) & 31, sgx_v2(x, &sgx_v_punpcklqdq, t[1], t[3], 0), 1);
+        vwrite(g, (rt + 3) & 31, sgx_v2(x, &sgx_v_punpckhqdq, t[1], t[3], 0), 1);
+        return 1;
+    }
+    if (!q && load && selem == 2 && size == 2) {
+        /* one chunk: two quadwords per register. PSHUFD gathers either register's pair of elements. */
+        int c0 = chunk[0];
+        vwrite(g, rt & 31, sgx_v1(x, &sgx_v_pshufd, c0, 0x08), 0);
+        vwrite(g, (rt + 1) & 31, sgx_v1(x, &sgx_v_pshufd, c0, 0x8D), 0);
+        return 1;
+    }
+    if (!q && load && selem == 4 && size >= 1) {
+        /* two chunks hold the four D registers' halves: pair the chunks at the element's width, then unpack the
+           pairs into one register each. The high quadwords hold the next register; vwrite clears the other half. */
+        int a, b, u0, u1;
+        a = size == 2 ? chunk[0] : sgx_v2(x, lo[1], chunk[0], chunk[1], 0);
+        b = size == 2 ? chunk[1] : sgx_v2(x, hi[1], chunk[0], chunk[1], 0);
+        u0 = sgx_v2(x, size == 2 ? lo[2] : lo[1], a, b, 0);
+        u1 = sgx_v2(x, size == 2 ? hi[2] : hi[1], a, b, 0);
+        vwrite(g, rt & 31, u0, 0);
+        vwrite(g, (rt + 1) & 31, sgx_v2(x, &sgx_v_punpckhqdq, u0, u0, 0), 0);
+        vwrite(g, (rt + 2) & 31, u1, 0);
+        vwrite(g, (rt + 3) & 31, sgx_v2(x, &sgx_v_punpckhqdq, u1, u1, 0), 0);
+        return 1;
+    }
+    if (!q && !load && selem == 2) { /* the two D registers' elements in turn: one unpack, one chunk */
+        vstore(g, base, sgx_v2(x, lo[size], vread(g, rt & 31), vread(g, (rt + 1) & 31), 0), 16);
+        return 1;
+    }
+    if (!q && !load && selem == 4) { /* the butterfly's low halves: two chunks */
+        int v[4], a01, a23;
+        for (s = 0; s < 4; ++s) v[s] = vread(g, (rt + s) & 31);
+        a01 = sgx_v2(x, lo[size], v[0], v[1], 0);
+        a23 = sgx_v2(x, lo[size], v[2], v[3], 0);
+        vstore(g, base, sgx_v2(x, lo[size + 1], a01, a23, 0), 16);
+        vstore(g, sg_d_add(g, base, sgx_const(64, 16)), sgx_v2(x, hi[size + 1], a01, a23, 0), 16);
+        return 1;
+    }
+    if (load) {
+        for (s = 0; s < selem; ++s) {
+            int reg = 0;
+            for (c = 0; c < nchunks; ++c) {
+                SnxU64 lo = 0, hi = 0;
+                int sh;
+                for (j = 0; j < 16; ++j) {
+                    unsigned off = (j / esize) * selem * esize + s * esize + j % esize;
+                    SnxU64 b = off >= 16 * c && off < 16 * (c + 1) ? (SnxU64)(off - 16 * c) : 0x80ull;
+                    if (j < 8)
+                        lo |= b << (8 * j);
+                    else
+                        hi |= b << (8 * (j - 8));
+                }
+                sh = sgx_v2(x, &sgx_v_pshufb, chunk[c], sgx_xconst(x, lo, hi), 0);
+                reg = c ? sgx_v2(x, &sgx_v_por, reg, sh, 0) : sh;
+            }
+            vwrite(g, (rt + s) & 31, reg, q);
+        }
+    } else {
+        for (c = 0; c < nchunks; ++c) {
+            int wide = 0;
+            for (s = 0; s < selem; ++s) {
+                SnxU64 lo = 0, hi = 0;
+                int sh, src = vread(g, (rt + s) & 31);
+                for (j = 0; j < 16; ++j) {
+                    unsigned off = 16 * c + j, k = off / esize;
+                    SnxU64 b = k % selem == s ? (SnxU64)(k / selem * esize + off % esize) : 0x80ull;
+                    if (j < 8)
+                        lo |= b << (8 * j);
+                    else
+                        hi |= b << (8 * (j - 8));
+                }
+                sh = sgx_v2(x, &sgx_v_pshufb, src, sgx_xconst(x, lo, hi), 0);
+                wide = s ? sgx_v2(x, &sgx_v_por, wide, sh, 0) : sh;
+            }
+            vstore(g, sg_d_add(g, base, sgx_const(64, 16 * c)), wide, c + 1 == nchunks ? (int)last : 16);
+        }
+    }
+    return 1;
+}
+#endif
 
 /* 1 made, 0 not one of these, -1 UNDEF */
 static int struct_ldst(Unit* u, SnxU32 word) {
@@ -949,18 +1124,26 @@ static int struct_ldst(Unit* u, SnxU32 word) {
                     vstore(g, a, vread(g, (rt + r) & 31), (int)len);
             }
         } else {
-            /* interleaved: structure e's element s is V[t + s]'s element e, one at a time */
-            int regs[4];
-            for (s = 0; s < selem; ++s) regs[s] = l ? vzero(g) : vread(g, (rt + s) & 31);
-            for (e = 0; e < ne; ++e)
-                for (s = 0; s < selem; ++s) {
-                    a = sg_d_add(g, base, sgx_const(64, (e * selem + s) * eb));
-                    if (l) regs[s] = lane_put(g, size, regs[s], (int)e, sg_GuestMemRead(g, a, eb, 0));
-                    else
-                        sg_GuestMemWrite(g, a, eb, 0, lane_get(g, size, regs[s], (int)e));
-                }
-            if (l)
-                for (s = 0; s < selem; ++s) vwrite(g, (rt + s) & 31, regs[s], (int)q);
+#ifdef MG_X64_STRUCT_FAST
+            if (struct_ldst_fast(g, selem, size, l, rt, base, (int)q)) {
+                /* made in 16-byte chunks */
+            } else
+#endif
+            {
+                /* interleaved: structure e's element s is V[t + s]'s element e, one at a time */
+                int regs[4];
+                for (s = 0; s < selem; ++s) regs[s] = l ? vzero(g) : vread(g, (rt + s) & 31);
+                for (e = 0; e < ne; ++e)
+                    for (s = 0; s < selem; ++s) {
+                        a = sg_d_add(g, base, sgx_const(64, (e * selem + s) * eb));
+                        if (l)
+                            regs[s] = lane_put(g, size, regs[s], (int)e, sg_GuestMemRead(g, a, eb, 0));
+                        else
+                            sg_GuestMemWrite(g, a, eb, 0, lane_get(g, size, regs[s], (int)e));
+                    }
+                if (l)
+                    for (s = 0; s < selem; ++s) vwrite(g, (rt + s) & 31, regs[s], (int)q);
+            }
         }
     } else if ((word & 0xBF9F0000u) == 0x0D000000u || (word & 0xBF800000u) == 0x0D800000u) {
         /* single structure: one element of selem registers (or each register's every element: LDnR) */
@@ -1012,7 +1195,7 @@ static int struct_ldst(Unit* u, SnxU32 word) {
     return 1;
 }
 
-/* the instruction at address, word; 0 where the function goes to LLVM */
+/* the instruction at address, word; 0 where the back end has no code for it (undefined where it runs) */
 /* SBFM and UBFM (LSL, LSR, ASR, SBFX, UBFX, SBFIZ, UBFIZ, SXTB to SXTW, UXTB, UXTH): one or two shifts, a MOVSX or
    a mask, not the Sail's rotation, masks and Replicate of the sign. BFM, and reserved fields (the Sail's UNDEF), are
    the Sail's */
@@ -1061,7 +1244,7 @@ static int reverse(Unit* u, SnxU32 word) {
     return 1;
 }
 
-/* ---- PLT stubs the program's linker binds (SnxBoundBranch), as ir_codegen.c lowers them ----
+/* ---- PLT stubs the program's linker binds (SnxBoundBranch) ----
    On a machine without MG_BOUND every call of a stub runs the stub */
 
 #ifdef MG_BOUND
@@ -1098,7 +1281,7 @@ static SnxU64 stub_function(Unit* u, SnxU64 target, SnxU32* w, int* guard) {
    F_bound. With guard, the stub's ADRP, LDR and ADD as at their own addresses, then if (x17 == bound) F_bound, else
    F_stub, whose own code takes whatever else the slot holds. A stub whose code the guest changed is stale: none of
    its instructions run here, and its function's entry leaves for the code there now. tail: each way returns.
-   0 where the back end can't make the stub's load (the function is LLVM's then) */
+   0 where the back end can't make the stub's load (no code for it then: undefined where it runs) */
 static int call_stub(Unit* u, SnxU64 stub, const SnxU32* w, SnxU64 bound, int guard, int tail) {
     SgCtx* g = u->g;
     const SnxCodegen* c = u->codegen;
@@ -1410,7 +1593,7 @@ static int memory_op(Unit* u, const SnxA64Insn* insn, SnxU32 word) {
 
 /* instructions past the guests' CPUs that are others', or nothing, where EL0 runs: 1 made, -1 UNDEF, 0 the Sail's (of
    g->word). No allocation tag is kept (FEAT_MTE): STG and ST2G only move their base, the zeroing forms clear their
-   16-byte granules too, LDG gives a tag of 0 and STGP stores its pair, as ir_ldst.c's; the forms of many tags are
+   16-byte granules too, LDG gives a tag of 0 and STGP stores its pair; the forms of many tags are
    EL1's */
 static int past_guests(Unit* u, const SnxA64Insn* insn, SnxU32 word, SnxU64 address_of) {
     SgCtx* g = u->g;
@@ -1464,15 +1647,14 @@ static int past_guests(Unit* u, const SnxA64Insn* insn, SnxU32 word, SnxU64 addr
    NULL): said, once a function, with what it becomes */
 static void no_code(Unit* u, const char* why) {
     const SnxFunction* f = u->f;
-    const char* becomes =
-        u->options->alone ? "it raises an undefined instruction where it runs" : "LLVM makes the function";
+    const char* becomes = "it raises an undefined instruction where it runs";
     SnxU64 address;
     SnxU32 word = 0;
     SnxA64Insn insn;
     if (u->options->refused) ++*u->options->refused;
     if (u->at >= f->count) {
-        snx_error("native back end: the function at 0x%llx: %s%s", (unsigned long long)f->start,
-                  why ? why : "longer than its branches reach", u->options->alone ? "" : ": LLVM makes the function");
+        snx_error("native back end: the function at 0x%llx: %s", (unsigned long long)f->start,
+                  why ? why : "longer than its branches reach");
         return;
     }
     address = snx_function_address(f, u->at);
@@ -2396,7 +2578,7 @@ static void choose_pins(Unit* u, const SnxFunction* f) {
 /* the function's code, or 0 (the unit as it was) where an instruction isn't this back end's */
 static int function(Unit* u, const SnxFunction* f, size_t index) {
     size_t i, at0 = u->b.n, fix0 = u->nfixups, rel0 = u->nrelocs, sym0 = u->nsyms;
-    int lab0 = u->nlabels, ok = 1;
+    int lab0 = u->nlabels, ok = 1, single_entry = 0;
     SnxU64 pin_rest = 0;
     SnxU32 vpin_rest = 0;
 #ifdef MG_DIRECT_ENTRY
@@ -2473,13 +2655,28 @@ static int function(Unit* u, const SnxFunction* f, size_t index) {
     prologue(u);
     pin_rest = ~u->pin_sel, vpin_rest = ~u->vpin_sel;
     u->pin_sel = ~(SnxU64)0, u->vpin_sel = ~0u; /* every other load of the pins: all of them */
-    /* if (snx_stale[index]) { c->pc = e; return; } if (e != start) goto mismatch */
+    /* a function of one leader, its start, is entered there alone (the table's entries and the direct calls are the
+       leaders'): no compare of the entry with it and no mismatch block. Its stale check stays, where the machine has
+       it apart from the compare (MG_ENTRY_STALE: mg_entry_stale); on the others such a function keeps both */
+    single_entry = f->leader_count == 1 && f->count && snx_function_address(f, 0) == f->start;
 #ifdef MG_DIRECT_ENTRY
-    if (other >= 0)
-        mg_stale(u, index, 0, f->start);
-    else
+    if (other >= 0) single_entry = 0; /* its compare came before the frame: the other target's way stays */
 #endif
-        mg_entry(u, index, f->start);
+#ifdef MG_ENTRY_STALE
+    if (single_entry && u->options->stale) mg_entry_stale(u, index);
+    if (single_entry) mg_entry_fp(u); /* what mg_entry makes after the stale check, for the others */
+#else
+    if (u->options->stale) single_entry = 0;
+#endif
+    /* if (snx_stale[index]) { c->pc = e; return; } if (e != start) goto mismatch */
+    if (!single_entry) {
+#ifdef MG_DIRECT_ENTRY
+        if (other >= 0)
+            mg_stale(u, index, 0, f->start);
+        else
+#endif
+            mg_entry(u, index, f->start);
+    }
     if (f->count && snx_function_address(f, 0) != f->start) jmp(u, (int)index_of(f, f->start));
     {
         volatile size_t vi = 0;
@@ -2503,11 +2700,16 @@ static int function(Unit* u, const SnxFunction* f, size_t index) {
                 goto out;
             }
         }
+        u->g->x.src = -1; /* what follows is no word's */
+        /* every word made: a failure from here on is of the function's finish, a jump's reach (MG_FAR_JUMPS) */
+        u->at = f->count;
+        /* the last word left the function (a return, a branch, the tail call off its end): only a function of no
+           word returns here */
+        if (!f->count) {
+            flush(u);
+            leave(u);
+        }
     }
-    u->g->x.src = -1; /* what follows is no word's */
-    flush(u);
-    u->at = f->count;
-    leave(u); /* off the end */
 #ifdef MG_DIRECT_ENTRY
     if (other >= 0) {
         /* the entry of another target: the start's frame and pins, its stale check, then the mismatch's way */
@@ -2519,16 +2721,18 @@ static int function(Unit* u, const SnxFunction* f, size_t index) {
         mg_stale(u, index, 1, f->start);
     }
 #endif
-    /* mismatch: { c->pc = e; goto D; } or { CALLDYN(e); return; }; D: the poll, then switch (c->pc) over the
-       leaders, else CALLDYN(c->pc) */
-    bind(u, u->mismatch_label);
-    u->cur_dirty = ~(SnxU64)0, u->vcur_dirty = ~0u; /* the dispatch block's: a BR's way in too */
-    if (pin_rest || vpin_rest) {
-        u->pin_sel = pin_rest, u->vpin_sel = vpin_rest;
-        pins(u, 0);
-        u->pin_sel = ~(SnxU64)0, u->vpin_sel = ~0u;
+    if (!single_entry) {
+        /* mismatch: { c->pc = e; goto D; } or { CALLDYN(e); return; }; D: the poll, then switch (c->pc) over the
+           leaders, else CALLDYN(c->pc) */
+        bind(u, u->mismatch_label);
+        u->cur_dirty = ~(SnxU64)0, u->vcur_dirty = ~0u; /* the dispatch block's: a BR's way in too */
+        if (pin_rest || vpin_rest) {
+            u->pin_sel = pin_rest, u->vpin_sel = vpin_rest;
+            pins(u, 0);
+            u->pin_sel = ~(SnxU64)0, u->vpin_sel = ~0u;
+        }
+        mg_dispatch(u, lab0);
     }
-    mg_dispatch(u, lab0);
     for (i = 0; i < (size_t)u->nstubs; ++i) {
         struct Stub s = u->stubs[i];
         bind(u, s.label);
@@ -2765,7 +2969,7 @@ static int write_object(Unit* u, unsigned char** object, size_t* size) {
             sym.st_name = str_add(&strtab, undef[i]);
             sym.st_info = ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE);
             sym.st_shndx = SHN_UNDEF;
-            if (!strcmp(undef[i], "snx_stale")) sym.st_other = STV_HIDDEN; /* the module's own, as LLVM declares it */
+            if (!strcmp(undef[i], "snx_stale")) sym.st_other = STV_HIDDEN; /* the module's own */
             put(&symtab, &sym, sizeof sym);
         }
         for (i = 0; i < u->nrelocs; ++i) {
@@ -2882,10 +3086,6 @@ static int mach_object(SnxCodegen* codegen, size_t first, size_t last, const Snx
     u.g->x.nb = 1;
     for (i = first; i < last; ++i) {
         size_t before = u.b.n, relocs = u.nrelocs, syms = u.nsyms;
-        if (options->llvm_at && codegen->functions[i].start == options->llvm_at) {
-            if (options->jit) break; /* made[] stays 0: LLVM's, for the IR it prints */
-            continue;
-        }
         if (u.b.cap - u.b.n < codegen->functions[i].count * 400 + 4096) {
             u.b.cap = u.b.cap * 2 + codegen->functions[i].count * 400 + 4096;
             u.b.p = (unsigned char*)realloc(u.b.p, u.b.cap);
@@ -2915,7 +3115,7 @@ static int mach_object(SnxCodegen* codegen, size_t first, size_t last, const Snx
 #endif
         if (!made[i - first]) {
             if (!u.nnone) no_code(&u, g_why);
-            if (options->alone && u.at < codegen->functions[i].count) {
+            if (u.at < codegen->functions[i].count) {
                 SnxU64 address = snx_function_address(&codegen->functions[i], u.at);
                 if (!u.nnone || u.none[u.nnone - 1] != address) {
                     /* made again, that instruction undefined */

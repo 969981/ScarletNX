@@ -22,18 +22,12 @@ typedef struct {
        on the machines that compare the slot (MG_BOUND: x86-64 and arm64) */
     SnxU64 (*bound)(void* user, SnxU64 address, int* guard);
     void* bound_user;
-    /* a function left to LLVM, 0 for none: the one whose IR the setting ir_dump_pc prints */
-    SnxU64 llvm_at;
-    /* no other back end makes what this one can't: an instruction it has no code for raises an undefined instruction
-       where it runs, and its function is made. 0: the function is left to LLVM */
-    int alone;
     /* where not NULL, how many functions it could not make whole, added to it; each is said once (snx_error) */
     size_t* refused;
     /* words taken as ones there is no code for, how many: what a test of that asks for */
     const SnxU32* without;
     size_t without_count;
-    /* the AOT module's stale checks (ir_codegen.c's snx_ir_stale_checks): snx_stale[the function's index] read at the
-       entry and after each call's return */
+    /* the AOT module's stale checks: snx_stale[the function's index] read at the entry and after each call's return */
     int stale;
     /* arm64: every SIMD&FP word by the A64 Sail's own code, none run as the host's own instruction (arm64_vec.c's
        vec): what a test holds that one to */
@@ -57,20 +51,17 @@ const char* snx_native_code(void);
 unsigned snx_native_features(void);
 
 /* What this host lacks of what its architecture's back end takes of every host past the program's own baseline: on
-   x86-64 SSE3, SSSE3, SSE4.1, SSE4.2, PCLMULQDQ and POPCNT, on a big-endian PowerPC64 ISA 2.06's LDBRX and STDBRX and
-   the ELFv2 ABI. 1 with the line of it in why, what is needed and what the host has ("cpu: needs SSE4.2, this host has
-   SSE3, SSSE3, SSE4.1, PCLMULQDQ and POPCNT"); 0 and "" where there is a back end, or none of the architecture is
-   built */
+   x86-64 SSE2 (every x86-64 has it: a test's snx_x64_without alone takes it away), on a big-endian PowerPC64 the ELFv2
+   ABI (its LDBRX and STDBRX are taken where the host has them, two word accesses elsewhere). 1 with the line of it in
+   why, what is needed and what the host has ("abi: needs ELFv2, this build has ELFv1"); 0 and "" where there is a back
+   end, or none of the architecture is built */
 int snx_native_floor(char* why, size_t size);
-/* 1 where nothing makes this host's code, snx_native_floor's line in error: a host below the floor, in a build without
-   LLVM (SNX_WITH_LLVM=OFF). 0 with LLVM, which makes the code there, and the line is said beside it; error is as it
-   was then */
+/* 1 where nothing makes this host's code, snx_native_floor's line in error: a host below the floor. 0, error as it was,
+   elsewhere */
 int snx_native_refused(char* error, size_t size);
 /* What this host lacks that its back end does without, through its fallback (x86-64's PCLMULQDQ): 1 with the line of
    it in why ("cpu: this host has no PCLMULQDQ, done by the fallback"); 0 and "" for a host that has it all */
 int snx_native_fallback(char* why, size_t size);
-/* for a test: from here on as a build without LLVM (1) or as this one (0) */
-void snx_native_set_alone(int on);
 /* a feature a back end takes of every host: its name, and its bit of the host's */
 typedef struct {
     const char* name;
@@ -90,7 +81,7 @@ int snx_native_cached_object(SnxCodegen* codegen, size_t first, size_t last, con
                              unsigned char* made, unsigned char** object, size_t* size, int* reused, char* error,
                              size_t error_size);
 
-/* 1 where this host's build makes the module of another machine's triple (module_llvm.h's: the pack of objects a JIT
+/* 1 where this host's build makes the module of another machine's triple (module_a64.h's: the pack of objects a JIT
    loader takes) with a native back end: arm64's, for arm64-apple-ios<version>-elf, whose objects are the ELF that
    loader reads, with Darwin's calling convention. 0 for another triple, on a Windows host, whose objects are COFF
    alone, and on a big-endian one, whose descriptors are its own numbers. Its code takes the features of the host it is

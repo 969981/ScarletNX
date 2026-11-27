@@ -99,18 +99,8 @@ chmod -R u+rwX /src/sysroot
 EOF
 }
 
-# env: ARCH LLVM_VERSION
-llvm() {
-  docker exec -i -e LLVM_VERSION -e ARCH build sh -s <<'EOF'
-set -eu
-SNX_SYSROOT=/src/sysroot scripts/linux-llvm.sh ${ARCH} /src/.cache/llvm/${ARCH}
-chown -R "$(stat -c %u:%g /src)" /src/.cache/llvm
-EOF
-}
-
-# Through ccache, without debug information, which no one reads in these builds and the AppImage would carry.
-# LLVM is the one built above (-DSNX_LLVM_CONFIG= drops the preset's, the system root's), SDL3 the system root's
-# package (SNX_SYSTEM_SDL3: a root without it, or with one too old, stops the configure). The container gets a
+# Through ccache, without debug information, which no one reads in these builds and the AppImage would carry. SDL3
+# is the system root's package (SNX_SYSTEM_SDL3: a root without it, or with one too old, stops the configure). The container gets a
 # nightly's name (SNX_BUILD_NAME)
 # env: ARCH PRESET
 build() {
@@ -121,7 +111,6 @@ git config --global --add safe.directory '*'
 export SNX_SYSROOT=/src/sysroot
 cmake --preset ${PRESET} -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_TESTING=OFF \
   -DSNX_OPT_FLAGS="-O2 -g0" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-  -DLLVM_DIR=/src/.cache/llvm/${ARCH}/lib/cmake/llvm -DSNX_LLVM_CONFIG= \
   -DSNX_SYSTEM_SDL3=ON
 cmake --build --preset ${PRESET} --parallel "$(getconf _NPROCESSORS_ONLN)"
 DESTDIR=/src/stage cmake --install build/${PRESET}
@@ -130,9 +119,8 @@ chown -R "$(stat -c %u:%g /src)" /src/.cache/ccache /src/.cache/deps
 EOF
 }
 
-# The A64 differential against the qemu-reference job's recording, of the target's native back end and of the LLVM
-# one: the cross build's tests are off, so the tests are configured and built alone, then run here through qemu-user,
-# the LLVM one with and without the generic path
+# The A64 differential against the qemu-reference job's recording, of the target's native back end: the cross build's
+# tests are off, so the test is configured and built alone, then run here through qemu-user
 # env: ARCH PRESET QEMU
 differential() {
   docker exec -i -e PRESET -e ARCH -e QEMU -e CCACHE_DIR=/src/.cache/ccache -e CCACHE_BASEDIR=/src -e CCACHE_NOHASHDIR=true \
@@ -142,33 +130,17 @@ git config --global --add safe.directory '*'
 export SNX_SYSROOT=/src/sysroot
 cmake --preset ${PRESET} -DBUILD_TESTING=ON \
   -DSNX_OPT_FLAGS="-O2 -g0" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-  -DLLVM_DIR=/src/.cache/llvm/${ARCH}/lib/cmake/llvm -DSNX_LLVM_CONFIG= \
   -DSNX_SYSTEM_SDL3=ON
 cmake --build --preset ${PRESET} --parallel "$(getconf _NPROCESSORS_ONLN)" \
-  --target snx-test-llvm-qemu-differential snx-test-llvm-qemu-differential-native
-# the target's native back end, then the LLVM one's two forms, and a failing one's examples go to the log: the
-# container's /tmp goes with the job. A form takes minutes; at 20 its SIGBUS makes the test name the case it was
-# in, where a hang would hold the job 3 hours. All at once, each with one thread and its own folder
-for form in native host generic; do
-  test=snx-test-llvm-qemu-differential flag= expected=llvm
-  [ "$form" = generic ] && flag=--generic
-  [ "$form" = native ] && test=$test-native expected=native
-  ( timeout -s BUS -k 30 1200 \
-    qemu-${QEMU} -L /src/sysroot build/${PRESET}/tests/$test \
-    /tmp/llvm_qemu_reference_$form /src/tests/${expected}_qemu_expected.txt \
-    --reference /src/reference/llvm_qemu_reference.bin --quiet $flag > /tmp/differential_$form.log 2>&1 \
-    && echo 0 > /tmp/differential_$form.status || echo $? > /tmp/differential_$form.status ) &
-done
-wait
-failed=0
-for form in native host generic; do
-  cat /tmp/differential_$form.log
-  if [ "$(cat /tmp/differential_$form.status)" != 0 ]; then
-    failed=1
-    cat /tmp/llvm_qemu_reference_$form/*_qemu_mismatches.txt || true
-  fi
-done
-exit $failed
+  --target snx-test-native-qemu-differential
+# a failing run's examples go to the log: the container's /tmp goes with the job. A run takes minutes; at 20 its SIGBUS
+# makes the test name the case it was in, where a hang would hold the job 3 hours
+status=0
+timeout -s BUS -k 30 1200 qemu-${QEMU} -L /src/sysroot build/${PRESET}/tests/snx-test-native-qemu-differential \
+  /tmp/native_qemu_reference /src/tests/native_qemu_expected.txt --reference /src/reference/native_qemu_reference.bin \
+  --quiet || status=$?
+[ "$status" = 0 ] || cat /tmp/native_qemu_reference/*_qemu_mismatches.txt || true
+exit $status
 EOF
 }
 
@@ -185,7 +157,6 @@ git config --global --add safe.directory '*'
 export SNX_SYSROOT=/src/sysroot
 cmake --preset ${PRESET} -DBUILD_TESTING=ON \
   -DSNX_OPT_FLAGS="-O2 -g0" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-  -DLLVM_DIR=/src/.cache/llvm/${ARCH}/lib/cmake/llvm -DSNX_LLVM_CONFIG= \
   -DSNX_SYSTEM_SDL3=ON
 cmake --build --preset ${PRESET} --parallel "$(getconf _NPROCESSORS_ONLN)" --target snx_gui_tests
 ctest --preset ${PRESET} -R '^gui_' -E '^gui_sdl_events$' -j"$(getconf _NPROCESSORS_ONLN)"
