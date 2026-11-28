@@ -32,13 +32,20 @@
 #include <pthread.h>
 #endif
 
+/* The object bytes a guest instruction comes to at most, averaged over a unit (the back ends make 36 to 49 of code):
+   what bounds the instructions a unit takes before any is made. A unit whose object is still over the ceiling is made
+   again as two (split_units) */
+#define UNIT_BYTES_AN_INSTRUCTION 96u
+
 typedef struct {
     size_t first, last; /* functions */
+    int made;           /* compiled already: a unit split after the others were made is not */
     /* the native back end's object of the unit (x64_codegen.h) */
     unsigned char* x64;
     size_t x64_size, x64_made;
     size_t x64_refused; /* of the others, those with an instruction it has no code for */
     int reused; /* the x86-64 back end's object came from memory (x64_cache.h) */
+    SnxSsaCount ssa; /* its SSA, as the back end that made the object counted it (none of a reused one) */
 } Unit;
 
 typedef struct {
@@ -56,6 +63,7 @@ typedef struct {
        ones keep in memory */
     unsigned active;
     SnxU64 held;
+    double unit_seconds; /* what the threads spent in the units, summed */
     int failed;
     char error[1024];
 #ifdef _WIN32
@@ -138,6 +146,8 @@ static int compile_unit(Queue* q, size_t index, char* error, size_t error_size) 
     SnxNativeOptions options = {0};
     options.stale = 1;
     options.refused = &u->x64_refused;
+    u->ssa = (SnxSsaCount){0};
+    options.ssa = &u->ssa;
     if (q->bound_count) {
         options.bound = bound_at;
         options.bound_user = q;
@@ -183,6 +193,7 @@ static void worker(Queue* q) {
             snprintf(q->error, sizeof(q->error), "aborted by the player, %zu of %zu code units compiled", q->done,
                      q->count);
         }
+        while (!q->failed && q->next < q->count && q->units[q->next].made) ++q->next;
         if (q->failed || q->next == q->count) {
             unlock(q);
             return;
@@ -198,6 +209,8 @@ static void worker(Queue* q) {
         lock(q);
         ++q->done;
         --q->active;
+        q->units[i].made = 1;
+        q->unit_seconds += seconds;
         if (q->units[i].x64) q->held += q->units[i].x64_size;
         if (rc && !q->failed) {
             q->failed = 1;
@@ -292,6 +305,59 @@ static void run(Queue* q, unsigned jobs, int open) {
     free(threads);
 }
 
+/* A unit's object is at most half of what the machine's calls reach: all of its code then reaches the island its
+   veneers are in, and a call of an earlier function of the unit that function's entry (the back ends'
+   MG_DIRECT_ENTRY) */
+static SnxU64 unit_ceiling(const SnxModuleBuild* build) {
+    return build->unit_bytes ? build->unit_bytes : snx_native_reach(build->triple) / 2;
+}
+
+/* The units whose object came out over ceiling, each put back as two of about half its instructions, to be made by
+   the next run of the queue; the others keep their objects and their place. 1 when any was, 0 for none, or -1 with
+   the reason in q->error: a function that alone makes more than a unit holds */
+static int split_units(Queue* q, SnxU64 ceiling) {
+    size_t over = 0, n = 0;
+    for (size_t i = 0; i < q->count; ++i) over += q->units[i].x64_size > ceiling;
+    if (!over) return 0;
+    Unit* units = (Unit*)snx_alloc((q->count + over) * sizeof(*units));
+    for (size_t i = 0; i < q->count; ++i) {
+        Unit* u = &q->units[i];
+        if (u->x64_size <= ceiling) {
+            units[n++] = *u;
+            continue;
+        }
+        if (u->last - u->first < 2) {
+            snprintf(q->error, sizeof(q->error),
+                     "the function at 0x%llx alone makes an object of %.1f MiB, more than the %.1f MiB a unit holds",
+                     (unsigned long long)q->codegen->functions[u->first].start, (double)u->x64_size / 1048576.0,
+                     (double)ceiling / 1048576.0);
+            free(units);
+            return -1;
+        }
+        size_t count = 0, half = 0, mid = u->first;
+        for (size_t k = u->first; k < u->last; ++k) count += q->codegen->functions[k].count;
+        for (; mid + 1 < u->last && 2 * half < count; ++mid) half += q->codegen->functions[mid].count;
+        if (mid == u->first) mid = u->first + 1;
+        snx_error("a code unit of %zu instructions came to %.1f MiB, more than the %.1f MiB a unit holds on this "
+                  "machine: made again as two, of %zu and %zu functions",
+                  count, (double)u->x64_size / 1048576.0, (double)ceiling / 1048576.0, mid - u->first, u->last - mid);
+        q->held -= u->x64_size;
+        --q->done;
+        free(u->x64);
+        units[n] = (Unit){0};
+        units[n].first = u->first;
+        units[n++].last = mid;
+        units[n] = (Unit){0};
+        units[n].first = mid;
+        units[n++].last = u->last;
+    }
+    free(q->units);
+    q->units = units;
+    q->count = n;
+    q->next = 0;
+    return 1;
+}
+
 unsigned snx_module_abi(void) { return SNX_ABI; }
 static const char* base_name(const char* path) {
     const char *name = path, *p;
@@ -308,10 +374,11 @@ int snx_build_module_a64(SnxProgram* loaded, const SnxCodegenOptions* options, c
     SnxLinkOutput linked;
     unsigned char* module_object = NULL;
     size_t module_size = 0, first, last, count, limit, i, entry_count = 0, n = 0;
-    size_t cache_count = 0, variant_count = 0, export_count = 1;
+    size_t cache_count = 0, variant_count = 0, export_count = 1, units_at = 0, units_end = 0;
     const char* exports[5];
-    char error[1024], *tmp = NULL;
+    char error[1024], unit_name[48] = "code unit", *tmp = NULL; /* unit_name: a unit's object in the linker's errors */
     double start;
+    SnxRecompilePhases phases = {0};
     int rc = -1;
     memset(&codegen, 0, sizeof(codegen));
     memset(&q, 0, sizeof(q));
@@ -341,15 +408,29 @@ int snx_build_module_a64(SnxProgram* loaded, const SnxCodegenOptions* options, c
         }
         cache_count = snx_jit_cache_count(cache);
     }
+    start = snx_seconds();
     if (!options->interp_only &&
         snx_nx_codegen_analyze(&codegen, loaded, options->hints, options->hint_count, options->quiet, features))
         goto done;
+    phases.discovery = snx_seconds() - start;
+    const SnxU64 guest = codegen.instruction_count;
     if (build->found) *build->found = codegen.instruction_count;
     codegen.features = features;
     codegen.direct_svc = 1; /* the runtime's RtAPI.svcs (svc.c's g_svc64) */
     codegen.hook_direct_calls = options->hook_direct_calls;
     /* chunks of whole functions, as module.c splits the C */
     limit = options->chunk_instrs ? options->chunk_instrs : (size_t)g_settings.unit_size;
+    {
+        /* no more instructions to a unit than its ceiling takes */
+        const SnxU64 ceiling = unit_ceiling(build);
+        const SnxU64 most = ceiling / UNIT_BYTES_AN_INSTRUCTION ? ceiling / UNIT_BYTES_AN_INSTRUCTION : 1;
+        if (limit > most) {
+            snx_error("unit_instructions=%zu would make units of more than the %.1f MiB one holds on this machine: "
+                      "%llu in effect",
+                      limit, (double)ceiling / 1048576.0, (unsigned long long)most);
+            limit = (size_t)most;
+        }
+    }
     q.units = (Unit*)snx_alloc((codegen.function_count + 1) * sizeof(*q.units));
     memset(q.units, 0, (codegen.function_count + 1) * sizeof(*q.units));
     for (first = 0; first < codegen.function_count; first = last) {
@@ -365,6 +446,7 @@ int snx_build_module_a64(SnxProgram* loaded, const SnxCodegenOptions* options, c
        objects (snx_native_target: iOS's). With every call through the table (hook_direct_calls) its calls go through
        CPU.disp too */
     const char* native = build->triple ? "arm64" : snx_native_name();
+    snprintf(unit_name, sizeof unit_name, "%s code unit", native);
     if (build->triple ? !snx_native_target(build->triple) : !snx_native_available()) {
         char floor[256];
         if (build->triple)
@@ -399,7 +481,18 @@ int snx_build_module_a64(SnxProgram* loaded, const SnxCodegenOptions* options, c
         if (n > q.count) n = (unsigned)q.count;
         printf("aot_threads=0 (Auto): %u thread%s at once, the x86-64 back end's units\n", n, n == 1 ? "" : "s");
     }
-    if (q.count) run(&q, build->jobs, 0);
+    start = snx_seconds();
+    for (;;) {
+        if (q.count) run(&q, build->jobs, 0);
+        if (q.failed) break;
+        const int split = split_units(&q, unit_ceiling(build));
+        if (split < 0) q.failed = 1;
+        if (split <= 0) break;
+    }
+    phases.compile = snx_seconds() - start;
+    phases.units = q.unit_seconds;
+    phases.threads = build->jobs < 1 ? 1 : build->jobs;
+    if (phases.threads > q.count) phases.threads = q.count ? (unsigned)q.count : 1;
     if (q.failed) {
         snx_error("%s back end: %s", native, q.error);
         goto done;
@@ -444,6 +537,7 @@ int snx_build_module_a64(SnxProgram* loaded, const SnxCodegenOptions* options, c
         snx_report_unit(q.count + 1, q.count + 1, "module", label, 0, snx_seconds() - start);
         free(label);
     }
+    phases.descriptor = snx_seconds() - start;
     /* link: runtime library (the one the recompiler's build compiled, rtlib_object.h, as the JIT links), descriptor,
        chunks, the profile cache's units. A module for another machine has no runtime library of its own (this host has
        none for that machine): the app that loads it brings its own */
@@ -456,12 +550,14 @@ int snx_build_module_a64(SnxProgram* loaded, const SnxCodegenOptions* options, c
     inputs[n].data = module_object;
     inputs[n].size = module_size;
     inputs[n++].name = "module";
+    units_at = n;
     for (i = 0; i < q.count; ++i)
         if (q.units[i].x64) {
             inputs[n].data = q.units[i].x64;
             inputs[n].size = q.units[i].x64_size;
-            inputs[n++].name = "code chunk";
+            inputs[n++].name = unit_name;
         }
+    units_end = n;
     for (i = 0; i < cache_count; ++i) {
         const SnxJitCacheRecord* record = snx_jit_cache_record(cache, i);
         inputs[n].data = record->object;
@@ -483,6 +579,8 @@ int snx_build_module_a64(SnxProgram* loaded, const SnxCodegenOptions* options, c
         pack.inputs = inputs;
         pack.count = q.count;
         snx_codegen_free(&codegen);
+        phases.pack = 1;
+        start = snx_seconds();
         if (snx_objects_pack_write(inputs, n, tmp, &linked.size, NULL, written_unit, &pack, error, sizeof(error))) {
             snx_error("packing failed: %s", error);
             if (snx_is_file(tmp)) snx_remove_tree(tmp);
@@ -494,21 +592,57 @@ int snx_build_module_a64(SnxProgram* loaded, const SnxCodegenOptions* options, c
             snx_remove_tree(tmp);
             goto done;
         }
+        phases.link = snx_seconds() - start;
     } else {
-        if (snx_link(inputs, n, exports, export_count, base_name(build->output), &linked, error, sizeof(error))) {
+        /* the module to its file as it is linked, each unit's object given back once its code is there: a game's
+           code is in memory once, not as the units' objects and as the module too. The code generator's tables go
+           first, as for a pack */
+        PackUnits pack = {q.units, inputs, q.count};
+        unsigned char* owned = (unsigned char*)snx_alloc(n ? n : 1);
+        memset(owned, 0, n ? n : 1);
+        for (i = units_at; i < units_end; ++i) owned[i] = 1;
+        snx_codegen_free(&codegen);
+        phases.streamed = 1;
+        start = snx_seconds();
+        const int failed = snx_link_to_file(inputs, n, exports, export_count, base_name(build->output), tmp, owned,
+                                            written_unit, &pack, &linked.size, error, sizeof(error));
+        free(owned);
+        if (failed) {
             snx_error("linking failed: %s", error);
-            goto done;
-        }
-        /* a module Android can map: its text is loaded executable, which its file must allow there */
-        if (snx_write_file(tmp, linked.data, linked.size) || snx_make_executable(tmp) ||
-            plat_replace_file(tmp, build->output)) {
-            snx_error("linking failed: cannot write %s or make it executable", build->output);
             if (snx_is_file(tmp)) snx_remove_tree(tmp);
             goto done;
         }
+        phases.link = snx_seconds() - start;
+        start = snx_seconds();
+        /* a module Android can map: its text is loaded executable, which its file must allow there */
+        if (snx_make_executable(tmp) || plat_replace_file(tmp, build->output)) {
+            snx_error("linking failed: cannot make %s executable or put it at %s", tmp, build->output);
+            if (snx_is_file(tmp)) snx_remove_tree(tmp);
+            goto done;
+        }
+        phases.write = snx_seconds() - start;
     }
+    SnxSsaCount ssa = {0};
+    size_t uncounted = 0; /* the units whose object came from memory: no back end ran to count their SSA */
+    for (i = 0; i < q.count; ++i) {
+        uncounted += q.units[i].reused != 0;
+        ssa.instructions += q.units[i].ssa.instructions;
+        ssa.bytes += q.units[i].ssa.bytes;
+        ssa.packed += q.units[i].ssa.packed;
+    }
+    if (build->ssa) *build->ssa = ssa;
     if (!options->quiet) {
+        char line[512];
         printf("%s module: %.1f MB, %lu entries\n", native, (double)linked.size / 1000000.0, (unsigned long)entry_count);
+        phases.peak = snx_footprint_peak();
+        snx_phases_line(line, sizeof line, &phases);
+        puts(line);
+        if (ssa.instructions) {
+            snx_ssa_line(line, sizeof line, &ssa, guest);
+            puts(line);
+            if (uncounted)
+                printf("ssa: %zu of the %zu units came from memory, their SSA not in it\n", uncounted, q.count);
+        }
     }
     rc = 0;
 done:

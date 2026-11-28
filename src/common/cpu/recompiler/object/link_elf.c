@@ -34,6 +34,9 @@ int snx_link_elf(const SnxLinkInput* inputs, size_t count, const char* const* ex
     return -1;
 }
 #else
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "common/cpu/recompiler/object/elf_object.h"
 #ifndef DT_RELACOUNT
 #define DT_RELACOUNT 0x6ffffff9
@@ -293,9 +296,79 @@ static const char* const section_names[S_COUNT] = {"",        ".hash",   ".dynsy
                                                    ".bss",    ".symtab", ".strtab", ".shstrtab"};
 static const int kind_section[SNX_ELF_KINDS] = {S_RODATA, S_TEXT, S_DATA, S_BSS};
 
-int snx_link_elf(const SnxLinkInput* inputs, size_t count, const char* const* exports, size_t export_count,
-                 const char* soname, SnxLinkOutput* output, char* error, size_t error_size) {
+/* Where a module goes when it is not made in memory (snx_link_elf_to_file): its file, the inputs whose bytes are the
+   linker's to write into, and what is told of each one it is done with */
+typedef struct {
+    int fd;
+    const unsigned char* owned;
+    void (*release)(void* arg, size_t index);
+    void* arg;
+} Sink;
+
+/* size bytes at offset of the sink's file: 0, or -1 with why in error */
+static int sink_put(const Sink* sink, const void* data, uint64_t size, uint64_t offset, char* error,
+                    size_t error_size) {
+    const unsigned char* p = (const unsigned char*)data;
+    while (size) {
+        ssize_t n = pwrite(sink->fd, p, size, (off_t)offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            snprintf(error, error_size, "cannot write %llu bytes of the module at %llu: %s", (unsigned long long)size,
+                     (unsigned long long)offset, n ? strerror(errno) : "nothing was written");
+            return -1;
+        }
+        p += n, size -= (uint64_t)n, offset += (uint64_t)n;
+    }
+    return 0;
+}
+
+/* The module's byte at offset, from the GOT on: in the module, or for a file in the part of it that is kept apart
+   (mid, which starts at got_off) */
+static unsigned char* got_at(const SnxLinkBuffer* out, const SnxLinkBuffer* mid, uint64_t got_off, uint64_t offset) {
+    return mid->data ? mid->data + (offset - got_off) : out->data + offset;
+}
+
+/* object i's named functions and objects into the module's .symtab, as local symbols */
+static void object_symbols(Link* l, size_t i, SnxLinkBuffer* symtab, SnxLinkBuffer* strtab) {
+    const SnxElfObject* o = &l->objs[i];
+    for (size_t j = 1; j < o->nsyms; ++j) {
+        const Elf64_Sym* src = &o->syms[j];
+        int type = ELF64_ST_TYPE(src->st_info);
+        Elf64_Sym s;
+        size_t found;
+        if ((type != STT_FUNC && type != STT_OBJECT) || src->st_shndx == SHN_UNDEF || src->st_shndx >= SHN_LORESERVE ||
+            o->kind[src->st_shndx] < 0 || !o->strtab[src->st_name])
+            continue;
+        if (ELF64_ST_BIND(src->st_info) != STB_LOCAL &&
+            snx_link_find(&l->globals, snx_elf_symbol_name(o, src), &found) && found != ((i << 32) | j))
+            continue; /* an overridden weak definition */
+        memset(&s, 0, sizeof(s));
+        s.st_name =
+            (uint32_t)snx_link_append(strtab, snx_elf_symbol_name(o, src), strlen(snx_elf_symbol_name(o, src)) + 1);
+        s.st_info = ELF64_ST_INFO(STB_LOCAL, type);
+        s.st_other = STV_DEFAULT;
+        s.st_shndx = (uint16_t)kind_section[o->kind[src->st_shndx]];
+        s.st_value = o->address[src->st_shndx] + src->st_value;
+        s.st_size = src->st_size;
+        snx_link_append(symtab, &s, sizeof(s));
+    }
+}
+
+/* The link, into memory (sink NULL: output's data and size) or into the sink's file (output's size alone): there each
+   object's sections are relocated where they are, in the input where it is the linker's, written at their place in
+   the file and the input given back, so the module is never in memory beside its objects */
+static int link_elf(const SnxLinkInput* inputs, size_t count, const char* const* exports, size_t export_count,
+                    const char* soname, SnxLinkOutput* output, const Sink* sink, char* error, size_t error_size) {
     Link l = {0};
+    /* a file's parts that are made in memory: out its head, up to the read-only data; mid the GOT and .dynamic; trail
+       what follows the data. The objects' sections, between them, are never here */
+    SnxLinkBuffer mid = {0}, trail = {0};
+    /* the object being relocated: where each of its sections' bytes are, which of them are copies made here, and
+       its island's */
+    unsigned char **base = NULL, *island = NULL;
+    unsigned char* copied = NULL;
+    size_t nbase = 0;
+    Elf64_Sym** kept = NULL; /* the symbols of the objects given back already, which later ones still name */
     SnxLinkBuffer out = {0}, dynstr = {0}, strtab = {0}, symtab = {0}, rela = {0};
     Elf64_Shdr shdr[S_COUNT];
     Elf64_Phdr ph[5];
@@ -354,9 +427,18 @@ int snx_link_elf(const SnxLinkInput* inputs, size_t count, const char* const* ex
         for (size_t j = 0; j < l.objs[i].eh->e_shnum; ++j)
             if (l.objs[i].kind[j] >= 0)
                 l.objs[i].address[j] = l.kind_address[l.objs[i].kind[j]] + l.objs[i].position[j];
-    snx_link_reserve(&out, end_data);
+    if (sink) {
+        kept = (Elf64_Sym**)calloc(count ? count : 1, sizeof *kept);
+        if (!kept) {
+            snprintf(error, error_size, "out of memory");
+            goto done;
+        }
+        snx_link_reserve(&out, rodata_off);
+        snx_link_reserve(&mid, end_data - got_off);
+    } else
+        snx_link_reserve(&out, end_data);
     /* section contents */
-    for (size_t i = 0; i < count; ++i) {
+    for (size_t i = 0; !sink && i < count; ++i) {
         SnxElfObject* o = &l.objs[i];
         for (size_t j = 0; j < o->eh->e_shnum; ++j)
             if (o->kind[j] >= 0 && o->kind[j] != SNX_ELF_BSS && o->sh[j].sh_size)
@@ -373,10 +455,10 @@ int snx_link_elf(const SnxLinkInput* inputs, size_t count, const char* const* ex
             sscanf(l.got.keys[i], "%lu:%lu", &object, &index);
             uint64_t value = symbol_address(&l, object, index, &absolute);
             if (l.machine == EM_MIPS) {
-                memcpy(out.data + slot, &value, 8);
+                memcpy(got_at(&out, &mid, got_off, slot), &value, 8);
                 continue;
             }
-            snx_st_le64(out.data + slot, value);
+            snx_st_le64(got_at(&out, &mid, got_off, slot), value);
             r.r_offset = slot;
             r.r_info = ELF64_R_INFO((Elf64_Xword)0, l.relative);
             r.r_addend = (int64_t)value;
@@ -384,12 +466,44 @@ int snx_link_elf(const SnxLinkInput* inputs, size_t count, const char* const* ex
         }
     if (l.machine == EM_MIPS) {
         uint64_t gnu = SNX_MIPS_GNU_GOT1;
-        memcpy(out.data + got_off + 8, &gnu, 8);
+        memcpy(got_at(&out, &mid, got_off, got_off + 8), &gnu, 8);
     }
     /* relocations, through elf_object.c as the JIT loader writes them; the module's own parts are the RELATIVE
        entries for absolute addresses, the veneers of branches out of reach and PowerPC64's TOC */
+    snx_link_append(&strtab, "", 1);
+    {
+        Elf64_Sym s;
+        memset(&s, 0, sizeof(s));
+        snx_link_append(&symtab, &s, sizeof(s));
+    }
     for (size_t i = 0; i < count; ++i) {
         SnxElfObject* o = &l.objs[i];
+        const size_t veneer_size = l.machine == EM_PPC64 ? SNX_ELF_PPC_VENEER_SIZE : SNX_ELF_VENEER_SIZE;
+        const int given = sink && sink->owned && sink->owned[i];
+        nbase = o->eh->e_shnum;
+        base = (unsigned char**)calloc(nbase ? nbase : 1, sizeof *base);
+        copied = (unsigned char*)calloc(nbase ? nbase : 1, 1);
+        if (sink && o->veneers) island = (unsigned char*)calloc(o->veneers, veneer_size);
+        if (!base || !copied || (sink && o->veneers && !island)) {
+            snprintf(error, error_size, "out of memory");
+            goto done;
+        }
+        for (size_t j = 0; j < nbase; ++j) {
+            if (o->kind[j] < 0 || o->kind[j] == SNX_ELF_BSS) continue;
+            if (!sink)
+                base[j] = out.data + o->address[j];
+            else if (o->sh[j].sh_size) {
+                if (given)
+                    base[j] = (unsigned char*)(uintptr_t)(o->input->data + o->sh[j].sh_offset);
+                else if ((base[j] = (unsigned char*)malloc(o->sh[j].sh_size)) != NULL) {
+                    memcpy(base[j], o->input->data + o->sh[j].sh_offset, o->sh[j].sh_size);
+                    copied[j] = 1;
+                } else {
+                    snprintf(error, error_size, "out of memory");
+                    goto done;
+                }
+            }
+        }
         for (size_t j = 0; j < o->eh->e_shnum; ++j) {
             const Elf64_Shdr* s = &o->sh[j];
             size_t def_object = 0, def_index = 0;
@@ -438,13 +552,16 @@ int snx_link_elf(const SnxLinkInput* inputs, size_t count, const char* const* ex
                     if (!snx_link_find(&l.pages, key, &found)) {
                         found = SNX_MIPS_GOT_RESERVED + l.page_count++;
                         snx_link_insert(&l.pages, key, found);
-                        memcpy(out.data + got_off + 8 * (uint64_t)found, &page, 8);
+                        memcpy(got_at(&out, &mid, got_off, got_off + 8 * (uint64_t)found), &page, 8);
                     }
                     slot = got_off + 8 * (uint64_t)found;
                 }
                 if (snx_elf_riscv_lo12(l.machine, type) && riscv_hi20_value(&l, i, s, r, n, &r[k], &S)) goto done;
-                if (r[k].r_offset <= o->sh[s->sh_info].sh_size) {
-                    unsigned char* p = out.data + P;
+                if (r[k].r_offset <= o->sh[s->sh_info].sh_size && base[s->sh_info]) {
+                    unsigned char* p = base[s->sh_info] + r[k].r_offset;
+                    /* the object's island: in the module, or for a file a buffer of its own */
+                    const uint64_t isle_at = l.kind_address[SNX_ELF_TEXT] + o->island;
+                    unsigned char* const isle = sink ? island : out.data + isle_at;
                     written = snx_elf_relocate(l.machine, p, o->sh[s->sh_info].sh_size - r[k].r_offset, type, S, A, P,
                                                got, slot);
                     if (written == SNX_LINK_RANGE && snx_elf_call_relocation(l.machine, type) && !weak) {
@@ -455,11 +572,11 @@ int snx_link_elf(const SnxLinkInput* inputs, size_t count, const char* const* ex
                             if (l.machine == EM_PPC64) {
                                 uint64_t at = l.kind_address[SNX_ELF_TEXT] + o->island +
                                      SNX_ELF_PPC_VENEER_SIZE * (uint64_t)found;
-                                written = snx_elf_ppc_branch_veneer(p, P, out.data + at, at, entry, l.toc);
+                                written = snx_elf_ppc_branch_veneer(p, P, isle + (at - isle_at), at, entry, l.toc);
                             } else {
                                 uint64_t at = l.kind_address[SNX_ELF_TEXT] + o->island
                                     + SNX_ELF_VENEER_SIZE * (uint64_t)found;
-                                written = snx_elf_branch_veneer(p, P, out.data + at, at, S + (uint64_t)A, 0);
+                                written = snx_elf_branch_veneer(p, P, isle + (at - isle_at), at, S + (uint64_t)A, 0);
                             }
                         }
                     }
@@ -471,7 +588,24 @@ int snx_link_elf(const SnxLinkInput* inputs, size_t count, const char* const* ex
                     d.r_addend = (int64_t)(toc_relocation(&l, type) ? l.toc : S + (uint64_t)A);
                     snx_link_append(&rela, &d, sizeof(d));
                 }
-                if (written == SNX_LINK_RANGE)
+                if (written == SNX_LINK_RANGE && snx_elf_call_relocation(l.machine, type) &&
+                    (l.machine == EM_AARCH64 || l.machine == EM_PPC64)) {
+                    /* a call with no veneer in its reach either: how far it is from its target, what it reaches
+                       and how much code its object is, whose island comes after it */
+                    const uint64_t target = l.machine == EM_PPC64 ? entry : S + (uint64_t)A;
+                    const uint64_t away = target > P ? target - P : P - target;
+                    uint64_t code = 0;
+                    for (size_t t = 0; t < o->eh->e_shnum; ++t)
+                        if (o->kind[t] == SNX_ELF_TEXT) code += o->sh[t].sh_size;
+                    snprintf(error, error_size,
+                             "%s: relocation %u (%s) out of range: the call is %.1f MiB from its target and reaches "
+                             "%u MiB; the object's code is %.1f MiB",
+                             o->input->name, type,
+                             type == SNX_A64_CALL26   ? "R_AARCH64_CALL26"
+                             : type == SNX_A64_JUMP26 ? "R_AARCH64_JUMP26"
+                                                      : "R_PPC64_REL24",
+                             (double)away / 1048576.0, l.machine == EM_AARCH64 ? 128u : 32u, (double)code / 1048576.0);
+                } else if (written == SNX_LINK_RANGE)
                     snprintf(error, error_size, "%s: relocation %u out of range (the module is too large)",
                              o->input->name, type);
                 else if (written == SNX_LINK_MISALIGNED)
@@ -483,6 +617,39 @@ int snx_link_elf(const SnxLinkInput* inputs, size_t count, const char* const* ex
                 if (written) goto done;
             }
         }
+        object_symbols(&l, i, &symtab, &strtab);
+        if (sink) {
+            /* the object's sections and its island to their place in the file */
+            for (size_t j = 0; j < nbase; ++j)
+                if (base[j] && sink_put(sink, base[j], o->sh[j].sh_size, o->address[j], error, error_size)) goto done;
+            if (island && sink_put(sink, island, o->veneers * veneer_size, l.kind_address[SNX_ELF_TEXT] + o->island,
+                                   error, error_size))
+                goto done;
+            /* x86-64's and AArch64's objects are named by later ones through their symbols alone, kept here: the
+               input goes back now. Another machine's linker reads their sections too (PowerPC64's descriptors) */
+            if (given && sink->release && (l.machine == EM_X86_64 || l.machine == EM_AARCH64)) {
+                kept[i] = (Elf64_Sym*)malloc((o->nsyms ? o->nsyms : 1) * sizeof(Elf64_Sym));
+                if (!kept[i]) {
+                    snprintf(error, error_size, "out of memory");
+                    goto done;
+                }
+                if (o->nsyms) memcpy(kept[i], o->syms, o->nsyms * sizeof(Elf64_Sym));
+                o->syms = kept[i];
+                o->strtab = NULL;
+                o->eh = NULL;
+                o->sh = NULL;
+                for (size_t j = 0; j < nbase; ++j) /* the copies first: the input's bytes are not this link's */
+                    if (copied[j]) free(base[j]);
+                free(base), free(copied), free(island);
+                base = NULL, copied = NULL, island = NULL;
+                sink->release(sink->arg, i);
+                continue;
+            }
+        }
+        for (size_t j = 0; copied && j < nbase; ++j)
+            if (copied[j]) free(base[j]);
+        free(base), free(copied), free(island);
+        base = NULL, copied = NULL, island = NULL;
     }
     /* exports */
     for (size_t i = 0; i < export_count; ++i) {
@@ -549,7 +716,7 @@ int snx_link_elf(const SnxLinkInput* inputs, size_t count, const char* const* ex
     }
     while (ndyn < sizeof(dyn) / sizeof(dyn[0])) DYN(DT_NULL, 0);
 #undef DYN
-    memcpy(out.data + dynamic_off, dyn, sizeof(dyn));
+    memcpy(got_at(&out, &mid, got_off, dynamic_off), dyn, sizeof(dyn));
     /* program headers */
     memset(ph, 0, sizeof(ph));
     ph[0].p_type = PT_LOAD;
@@ -576,37 +743,8 @@ int snx_link_elf(const SnxLinkInput* inputs, size_t count, const char* const* ex
     ph[4].p_flags = PF_R | PF_W;
     ph[4].p_align = 16;
     memcpy(out.data + sizeof(Elf64_Ehdr), ph, sizeof(ph));
-    /* .symtab: every named function and object, for debuggers and crash reports; the exports last, global */
-    snx_link_append(&strtab, "", 1);
-    {
-        Elf64_Sym s;
-        memset(&s, 0, sizeof(s));
-        snx_link_append(&symtab, &s, sizeof(s));
-    }
-    for (size_t i = 0; i < count; ++i) {
-        SnxElfObject* o = &l.objs[i];
-        for (size_t j = 1; j < o->nsyms; ++j) {
-            const Elf64_Sym* src = &o->syms[j];
-            int type = ELF64_ST_TYPE(src->st_info);
-            Elf64_Sym s;
-            size_t found;
-            if ((type != STT_FUNC && type != STT_OBJECT) || src->st_shndx == SHN_UNDEF ||
-                src->st_shndx >= SHN_LORESERVE || o->kind[src->st_shndx] < 0 || !o->strtab[src->st_name])
-                continue;
-            if (ELF64_ST_BIND(src->st_info) != STB_LOCAL &&
-                snx_link_find(&l.globals, snx_elf_symbol_name(o, src), &found) && found != ((i << 32) | j))
-                continue; /* an overridden weak definition */
-            memset(&s, 0, sizeof(s));
-            s.st_name = (uint32_t)snx_link_append(&strtab, snx_elf_symbol_name(o, src),
-                                                  strlen(snx_elf_symbol_name(o, src)) + 1);
-            s.st_info = ELF64_ST_INFO(STB_LOCAL, type);
-            s.st_other = STV_DEFAULT;
-            s.st_shndx = (uint16_t)kind_section[o->kind[src->st_shndx]];
-            s.st_value = o->address[src->st_shndx] + src->st_value;
-            s.st_size = src->st_size;
-            snx_link_append(&symtab, &s, sizeof(s));
-        }
-    }
+    /* .symtab: every named function and object, for debuggers and crash reports (object_symbols); the exports last,
+       global */
     size_t symbol_count = symtab.size / sizeof(Elf64_Sym);
     for (size_t i = 0; i < export_count; ++i) {
         Elf64_Sym s;
@@ -619,14 +757,17 @@ int snx_link_elf(const SnxLinkInput* inputs, size_t count, const char* const* ex
     }
     /* trailing, unloaded: symbol table, strings, section names, section headers */
     memset(shdr, 0, sizeof(shdr));
-    snx_link_align(&out, 8);
-    shdr[S_SYMTAB].sh_offset = snx_link_append(&out, symtab.data, symtab.size);
-    shdr[S_STRTAB].sh_offset = snx_link_append(&out, strtab.data, strtab.size);
+    /* into the module itself, or for a file into a part of its own, which starts at the next multiple of 8 */
+    SnxLinkBuffer* const tail = sink ? &trail : &out;
+    const uint64_t tail_at = sink ? snx_align_up(end_data, 8) : 0;
+    snx_link_align(tail, 8);
+    shdr[S_SYMTAB].sh_offset = tail_at + snx_link_append(tail, symtab.data, symtab.size);
+    shdr[S_STRTAB].sh_offset = tail_at + snx_link_append(tail, strtab.data, strtab.size);
     {
         SnxLinkBuffer names = {0};
         for (size_t i = 0; i < S_COUNT; ++i)
             shdr[i].sh_name = (uint32_t)snx_link_append(&names, section_names[i], strlen(section_names[i]) + 1);
-        shdr[S_SHSTRTAB].sh_offset = snx_link_append(&out, names.data, names.size);
+        shdr[S_SHSTRTAB].sh_offset = tail_at + snx_link_append(tail, names.data, names.size);
         shdr[S_SHSTRTAB].sh_size = names.size;
         free(names.data);
     }
@@ -663,7 +804,7 @@ int snx_link_elf(const SnxLinkInput* inputs, size_t count, const char* const* ex
     shdr[S_SHSTRTAB].sh_type = SHT_STRTAB;
     shdr[S_SHSTRTAB].sh_addralign = 1;
 #undef SECTION
-    snx_link_align(&out, 8);
+    snx_link_align(tail, 8);
     /* ELF header */
     memset(&eh, 0, sizeof(eh));
     memcpy(eh.e_ident, ELFMAG, SELFMAG);
@@ -686,13 +827,32 @@ int snx_link_elf(const SnxLinkInput* inputs, size_t count, const char* const* ex
     eh.e_shentsize = sizeof(Elf64_Shdr);
     eh.e_shnum = S_COUNT;
     eh.e_shstrndx = S_SHSTRTAB;
-    eh.e_shoff = snx_link_append(&out, shdr, sizeof(shdr));
+    eh.e_shoff = tail_at + snx_link_append(tail, shdr, sizeof(shdr));
     memcpy(out.data, &eh, sizeof(eh));
-    output->data = out.data;
-    output->size = out.size;
-    out.data = NULL;
+    if (sink) {
+        /* what the objects' sections lie between: the head up to the read-only data, the GOT and .dynamic, the tail */
+        if (sink_put(sink, out.data, rodata_off, 0, error, error_size) ||
+            sink_put(sink, mid.data, end_data - got_off, got_off, error, error_size) ||
+            sink_put(sink, trail.data, trail.size, tail_at, error, error_size))
+            goto done;
+        output->size = tail_at + trail.size;
+        /* the inputs no object's end gave back */
+        for (size_t i = 0; sink->release && i < count; ++i)
+            if (sink->owned && sink->owned[i] && !kept[i]) sink->release(sink->arg, i);
+    } else {
+        output->data = out.data;
+        output->size = out.size;
+        out.data = NULL;
+    }
     rc = 0;
 done:
+    for (size_t j = 0; copied && j < nbase; ++j)
+        if (copied[j]) free(base[j]);
+    free(base), free(copied), free(island);
+    for (size_t i = 0; kept && i < count; ++i) free(kept[i]);
+    free(kept);
+    free(mid.data);
+    free(trail.data);
     for (size_t i = 0; l.objs && i < count; ++i) snx_elf_free(&l.objs[i]);
     free(l.objs);
     free(text);
@@ -707,6 +867,31 @@ done:
     free(strtab.data);
     free(symtab.data);
     free(rela.data);
+    return rc;
+}
+
+int snx_link_elf(const SnxLinkInput* inputs, size_t count, const char* const* exports, size_t export_count,
+                 const char* soname, SnxLinkOutput* output, char* error, size_t error_size) {
+    return link_elf(inputs, count, exports, export_count, soname, output, NULL, error, error_size);
+}
+
+int snx_link_elf_to_file(const SnxLinkInput* inputs, size_t count, const char* const* exports, size_t export_count,
+                         const char* soname, const char* path, const unsigned char* owned,
+                         void (*release)(void* arg, size_t index), void* arg, size_t* size, char* error,
+                         size_t error_size) {
+    Sink sink = {open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644), owned, release, arg};
+    SnxLinkOutput written = {0};
+    *size = 0;
+    if (sink.fd < 0) {
+        snprintf(error, error_size, "cannot create %s: %s", path, strerror(errno));
+        return -1;
+    }
+    int rc = link_elf(inputs, count, exports, export_count, soname, &written, &sink, error, error_size);
+    if (close(sink.fd) && !rc) {
+        snprintf(error, error_size, "cannot close %s: %s", path, strerror(errno));
+        rc = -1;
+    }
+    *size = written.size;
     return rc;
 }
 #endif

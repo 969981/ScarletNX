@@ -20,11 +20,16 @@ typedef struct {
        units themselves (the setting aot_threads left at 0, Auto; common.h's SnxAotGovernor) */
     int jobs_open;
     int quiet;
+    /* the most bytes a unit's object may be, 0 for half of what the back end's calls reach (snx_native_reach): a
+       test's smaller one */
+    SnxU64 unit_bytes;
     /* when set, the snx_aot_ wrappers the descriptor got: one per entry when the profile cache's units link (they call
        them), else none */
     size_t* wrappers;
     /* when set, the instructions the analysis found and the module makes ahead of time (0 with --jit-only) */
     size_t* found;
+    /* when set, the SSA of the units the native back end made for the module, as it counted it */
+    SnxSsaCount* ssa;
     /* --layout: the guest addresses of functions in the order their code takes at the start of the module, each in a
        code section of its own (link.h's SNX_LINK_HOT_TEXT). A profile's hot functions, the others after them in
        address order. Addresses that start no function are skipped. An ELF module for this host only */

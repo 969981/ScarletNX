@@ -312,6 +312,96 @@ final class AndroidFramework {
         return (Integer) start.invoke(font, glyph + 1) - (Integer) start.invoke(font, glyph);
     }
 
+    /**
+     * A double's and a float's digits as ART prints them, OpenJDK's before JDK 19, where the JDK's are the shortest
+     * since (Amberlith's case on Android 16 gives these): what the translator sends Double.toString,
+     * StringBuilder.append and the others to, and what the framework's JSON prints
+     */
+    private static void digits() throws Exception {
+        check("Double.toString of 2.0E-3, 2.82879384806159E17, 1.0E23 and 0.1 + 0.2, Float.toString of 1.0E10f",
+              "0.002 2.82879384806159008E17 9.999999999999999E22 0.30000000000000004 1.0E10",
+              snx.dalvik.Digits.toString(2.0E-3) + " " + snx.dalvik.Digits.toString(2.82879384806159E17) + " "
+                  + snx.dalvik.Digits.toString(1.0E23) + " " + snx.dalvik.Digits.toString(0.1 + 0.2) + " "
+                  + snx.dalvik.Digits.toString(1.0E10f));
+        check("StringBuilder.append(double), a box's toString", "x9.999999999999999E22 1.0E10",
+              snx.dalvik.Digits.append(new StringBuilder("x"), 1.0E23) + " "
+                  + snx.dalvik.Digits.toString(Float.valueOf(1.0E10f)));
+        check("JSONObject's number and a JsonWriter's", "{\"a\":9.999999999999999E22} [9.999999999999999E22]",
+              new org.json.JSONObject().put("a", 1.0E23).toString() + " " + jsonWriter(1.0E23));
+        Throwable got = null;
+        try {
+            snx.dalvik.Digits.toString((Double) null);
+        } catch (NullPointerException e) {
+            got = e;
+        }
+        check("Double.toString() of null", "java.lang.NullPointerException: Attempt to invoke virtual method "
+              + "'java.lang.String java.lang.Double.toString()' on a null object reference", thrown(got));
+    }
+    private static String jsonWriter(double value) throws Exception {
+        java.io.StringWriter out = new java.io.StringWriter();
+        android.util.JsonWriter w = new android.util.JsonWriter(out);
+        w.beginArray().value(value).endArray().close();
+        return out.toString();
+    }
+
+    /**
+     * A PopupWindow is a window of its own, over its anchor's: its content attached at its size, placed where it was
+     * shown, and gone after dismiss (Amberlith's case on Android 16 gives the same). On a virtual display, whose
+     * windows nothing composes, so that no native draws
+     */
+    private static void popupWindow() throws InterruptedException {
+        AtomicReference<String> got = new AtomicReference<>("no answer in 10 s");
+        Thread ui = new Thread(() -> {
+            Looper.prepare();
+            /* a context of the virtual display with no resources, which need the driver's natives: the windows
+               and views here read none */
+            android.content.Context c = new snx.android.app.ContextImpl(null, false);
+            android.hardware.display.VirtualDisplay screen = new android.hardware.display.DisplayManager()
+                .createVirtualDisplay("popup", 600, 1066, 240, null, 0);
+            try {
+                java.lang.reflect.Field display = snx.android.app.ContextImpl.class.getDeclaredField("display");
+                display.setAccessible(true);
+                display.set(c, screen.getDisplay());
+            } catch (ReflectiveOperationException e) {
+                got.set("the context's display is not set: " + e);
+                return;
+            }
+            android.view.WindowManager wm =
+                (android.view.WindowManager) c.getSystemService(android.content.Context.WINDOW_SERVICE);
+            android.widget.FrameLayout activity = new android.widget.FrameLayout(c);
+            wm.addView(activity, new android.view.WindowManager.LayoutParams());
+            android.view.View content = new android.view.View(c);
+            android.widget.PopupWindow popup = new android.widget.PopupWindow(content, 120, 60);
+            Handler h = new Handler(Looper.myLooper());
+            StringBuilder said = new StringBuilder();
+            h.postDelayed(() -> {
+                said.append("token ").append(activity.getWindowToken() != null);
+                popup.showAtLocation(activity, android.view.Gravity.TOP | android.view.Gravity.START, 30, 40);
+            }, 100);
+            h.postDelayed(() -> {
+                int[] at = new int[2];
+                content.getLocationOnScreen(at);
+                said.append(", showing ").append(popup.isShowing()).append(", attached ")
+                    .append(content.isAttachedToWindow()).append(", size ").append(content.getWidth()).append('x').append(content.getHeight())
+                    .append(" at ").append(at[0]).append(',').append(at[1]);
+                popup.dismiss();
+            }, 300);
+            h.postDelayed(() -> {
+                said.append(", after dismiss showing ").append(popup.isShowing()).append(", attached ")
+                    .append(content.isAttachedToWindow());
+                got.set(said.toString());
+                Looper.myLooper().quit();
+            }, 500);
+            Looper.loop();
+        }, "popup ui");
+        ui.start();
+        ui.join(10000);
+        check("a PopupWindow shown at (30, 40) of 120x60, then dismissed",
+              "token true, showing true, attached true, size 120x60 at 30,40, after dismiss showing false, "
+                  + "attached false",
+              got.get());
+    }
+
     public static void main(String[] args) throws Exception {
         mainLoopEnds();
         logIsLoggable();
@@ -320,6 +410,8 @@ final class AndroidFramework {
         plurals();
         pdfDraws();
         pdfFontSubset();
+        digits();
+        popupWindow();
         if (failures != 0) System.exit(1);
         System.out.println("android_framework: ok");
     }

@@ -1,15 +1,17 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 /* GLES 2 and 3 over Vulkan (src/android/bridge/gles2*.c), drawn on the host's Vulkan (lavapipe) into a pbuffer and
-   framebuffer objects, and read back with glReadPixels: a triangle, textures (RGBA, RGB, luminance), blending,
+   framebuffer objects, and read back with glReadPixels: a triangle, textures (RGBA, RGB, luminance), clears through
+   the color and stencil masks, blending,
    the depth test, a framebuffer object sampled as a texture, instanced draws with gl_InstanceID and a divisor, a
    uniform block, client arrays and indices, a line loop, glBlitFramebuffer and glCopyTexSubImage2D, gl_FragCoord
    and gl_PointCoord, GLES 3.1's compute shaders, images, indirect draws, vertex bindings and program pipelines,
-   and GLES 3.2's base vertex draws and glCopyImageSubData. The calls go
-   through the HLE's handlers with the arguments in a CPU state, as a guest's do. Exits 77 without a Vulkan 1.3
-   device */
+   and GLES 3.2's base vertex draws and glCopyImageSubData; and GLES 1.1 (hle_gles.c) on a pbuffer of its own, cleared,
+   drawn and read back. The calls go through the HLE's handlers with the arguments in a CPU state, as a guest's do.
+   Exits 77 without a Vulkan 1.3 device */
 #include "android/bridge/gles2.h"
 #include "android/bridge/hle.h"
+#include "android/bridge/hle_gles.h"
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -181,6 +183,45 @@ static const char* const textured_vs =
 static const char* const textured_fs = "precision mediump float;\nvarying vec2 uv;\nuniform sampler2D tex;\n"
                                        "void main() { gl_FragColor = texture2D(tex, uv); }\n";
 static const float quad[] = {-1, -1, 1, -1, -1, 1, 1, 1};
+/* glClear writes only the channels of the color mask (Amberlith's case: blue cleared to yellow through red and alpha
+   alone is magenta), inside the scissor, and only the stencil bits of its write mask: a clear of 0xff through 0x0f
+   over 0 leaves 0x0f, which a stencil test of 0x0f lets a draw through */
+static void masked_clears(void) {
+    g_t.test = "masked clears";
+    clear(0, 0, 1, 1);
+    GL("glColorMask", 1, 0, 0, 1);
+    GLF0("glClearColor", 1, 1, 0, 1);
+    GL("glClear", GL_COLOR_BUFFER_BIT);
+    GL("glColorMask", 1, 1, 1, 1);
+    no_error("a clear through red and alpha");
+    expect(8, 8, 255, 0, 255, 255, "red and alpha written, green and blue kept");
+    GL("glEnable", 0x0c11); /* GL_SCISSOR_TEST */
+    GL("glScissor", 0, 0, 8, 8);
+    GL("glColorMask", 0, 1, 0, 0);
+    GLF0("glClearColor", 0, 1, 0, 0);
+    GL("glClear", GL_COLOR_BUFFER_BIT);
+    GL("glColorMask", 1, 1, 1, 1);
+    GL("glDisable", 0x0c11);
+    expect(2, 2, 255, 255, 255, 255, "green written inside the scissor");
+    expect(20, 2, 255, 0, 255, 255, "and nothing outside it");
+    GL("glClearStencil", 0);
+    GL("glClear", 0x400); /* GL_STENCIL_BUFFER_BIT, through every bit */
+    GL("glStencilMask", 0x0f);
+    GL("glClearStencil", 0xff);
+    GL("glClear", 0x400);
+    GL("glStencilMask", 0xff);
+    unsigned p = program(plain_vs, uniform_fs);
+    buffer(GL_ARRAY_BUFFER, quad, sizeof quad);
+    GL("glVertexAttribPointer", 0, 2, GL_FLOAT, 0, 0, 0);
+    GL("glEnableVertexAttribArray", 0);
+    GLF("glUniform4f", GL("glGetUniformLocation", p, P("color")), 1, 0, 0, 1);
+    GL("glEnable", 0x0b90);                  /* GL_STENCIL_TEST */
+    GL("glStencilFunc", 0x0202, 0x0f, 0xff); /* GL_EQUAL */
+    GL("glDrawArrays", GL_TRIANGLE_STRIP, 0, 4);
+    GL("glDisable", 0x0b90);
+    no_error("a draw where the stencil is 0x0f");
+    expect(W / 2, H / 2, 255, 0, 0, 255, "the stencil's low bits written, its high ones kept");
+}
 
 /* a 2x2 texture over the window: its row 0 at the bottom, as GL has it; then RGB and luminance texels */
 static void textures(void) {
@@ -703,6 +744,73 @@ static void queries(void) {
     no_error("queries");
 }
 
+/* a GLES 1.1 call: hle_gles's handler, integers x and floats f */
+static uint64_t gl1(const char* name, const uint64_t* x, size_t nx, const float* f, size_t nf) {
+    const HleSymbol* s = hle_gles;
+    while (s->name[0] && strcmp(s->name, name)) ++s;
+    if (!s->name[0]) {
+        fprintf(stderr, "android_gles2: GLES 1.1 has no function %s\n", name);
+        exit(1);
+    }
+    g_t.cpu = (CPU){0};
+    for (size_t i = 0; i < nx; ++i) g_t.cpu.x[i] = x[i];
+    for (size_t i = 0; i < nf; ++i) memcpy(&g_t.cpu.v[i].f[0], &f[i], 4);
+    s->handler(&g_t.cpu, s->data);
+    return g_t.cpu.x[0];
+}
+#define GL1(name, ...)  gl1(name, (uint64_t[]){__VA_ARGS__}, sizeof((uint64_t[]){__VA_ARGS__}) / 8, NULL, 0)
+#define GL1F(name, ...) gl1(name, NULL, 0, (float[]){__VA_ARGS__}, sizeof((float[]){__VA_ARGS__}) / 4)
+static void expect1(int x, int y, unsigned want, const char* what) {
+    unsigned char p[4] = {0};
+    GL1("glReadPixels", (uint64_t)x, (uint64_t)y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, P(p));
+    unsigned got = (unsigned)p[0] << 24 | (unsigned)p[1] << 16 | (unsigned)p[2] << 8 | p[3];
+    if (got != want) {
+        fprintf(stderr, "android_gles2: %s: %s: pixel %d,%d is %08x, want %08x\n", g_t.test, what, x, y, got, want);
+        g_t.failures++;
+    }
+}
+/* GLES 1.1 on a pbuffer of its own (Amberlith's case: its clear read back zeros, as GLES 1.1 drew nothing on a
+   pbuffer and glReadPixels read none): a clear, a triangle over the bottom left half, GL's rows from the bottom, and
+   a format GLES 1.1 does not read refused */
+static void gles1_pbuffer(void) {
+    g_t.test = "GLES 1.1 on a pbuffer";
+    GlesSurface* s = gles_pbuffer_surface(16, 16);
+    GlesContext* c = gles_context_new();
+    gles_make_current(c, s);
+    GL1F("glClearColor", 0, 1, 0, 1);
+    GL1("glClear", GL_COLOR_BUFFER_BIT);
+    expect1(8, 8, 0x00ff00ffu, "the clear");
+    static const float tri[] = {-1, -1, 1, -1, -1, 1};
+    GL1("glEnableClientState", 0x8074); /* GL_VERTEX_ARRAY */
+    GL1("glVertexPointer", 2, GL_FLOAT, 0, P(tri));
+    GL1F("glColor4f", 1, 0, 0, 1);
+    GL1("glDrawArrays", GL_TRIANGLES, 0, 3);
+    expect1(2, 2, 0xff0000ffu, "inside the triangle, at the bottom left");
+    expect1(13, 13, 0x00ff00ffu, "outside it, at the top right");
+    /* the whole surface: its row 0 is GL's bottom one. Pixel (1, 0) is inside the triangle and (1, 15) outside;
+       rows read upside down would swap them */
+    unsigned char rows[16 * 16 * 4] = {0};
+    GL1("glReadPixels", 0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, P(rows));
+    const unsigned char* bottom = rows + 1 * 4;
+    const unsigned char* top = rows + (15 * 16 + 1) * 4;
+    if (bottom[0] != 255 || bottom[1] != 0 || top[0] != 0 || top[1] != 255) {
+        fprintf(stderr,
+                "android_gles2: %s: pixel (1, 0) is %u %u and (1, 15) %u %u in red and green, want 255 0 and 0 "
+                "255\n",
+                g_t.test, bottom[0], bottom[1], top[0], top[1]);
+        g_t.failures++;
+    }
+    unsigned char rgb[3];
+    GL1("glReadPixels", 0, 0, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, P(rgb));
+    if (GL1("glGetError", 0) != 0x0502) { /* GL_INVALID_OPERATION */
+        fprintf(stderr, "android_gles2: %s: glReadPixels of GL_RGB bytes is not GL_INVALID_OPERATION\n", g_t.test);
+        g_t.failures++;
+    }
+    gles_make_current(NULL, NULL);
+    gles_context_free(c);
+    gles_surface_free(s);
+}
+
 int main(void) {
     Gles2Context* gl = gles2_context_new(3);
     GlesSurface* s = gles_pbuffer_surface(W, H);
@@ -715,6 +823,7 @@ int main(void) {
     GL("glViewport", 0, 0, W, H);
     triangle();
     textures();
+    masked_clears();
     blend();
     depth();
     fbo();
@@ -728,6 +837,7 @@ int main(void) {
     gles32();
     queries();
     gles2_make_current(NULL, NULL, NULL);
+    gles1_pbuffer();
     gles2_context_free(gl);
     gles_surface_free(s);
     gles2_shutdown(); /* every Vulkan object gone before the device, which the validation layer checks */
@@ -735,9 +845,9 @@ int main(void) {
         fprintf(stderr, "android_gles2: %d checks failed\n", g_t.failures);
         return 1;
     }
-    printf("android_gles2: a triangle, textures, blending, depth, a framebuffer object, instanced draws, a uniform "
-           "block, client arrays, a line loop, the window's coordinates, compute, vertex bindings, a program pipeline "
-           "and GLES 3.2's base vertex and image copy drawn on %s\n",
+    printf("android_gles2: a triangle, textures, masked clears, blending, depth, a framebuffer object, instanced "
+           "draws, a uniform block, client arrays, a line loop, the window's coordinates, compute, vertex bindings, a "
+           "program pipeline and GLES 3.2's base vertex and image copy, and GLES 1.1 on a pbuffer drawn on %s\n",
            g_gles_vk.props.deviceName);
     return 0;
 }

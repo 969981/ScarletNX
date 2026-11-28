@@ -181,7 +181,8 @@ object that a frame may still use goes when its serial completed. A call that mu
 goes on in the same command buffer. Between passes an acquired image is in `PRESENT_SRC_KHR`, so GLES 1.1's render
 passes and GLES 2's dynamic rendering can share a frame.
 
-**GLES 1.1** (`hle_gles.c`) is the fixed function. A draw goes into a render pass on the swapchain image. A texture
+**GLES 1.1** (`hle_gles.c`) is the fixed function. A draw goes into a render pass on the swapchain image, or on a
+pbuffer's image, which rests in `COLOR_ATTACHMENT_OPTIMAL` between passes as GLES 2 keeps it. A texture
 upload ends the pass, copies from a staging buffer and starts the pass again (loading what it drew), so each draw
 reads the texture as it was at its call. The client arrays of a draw are converted into one vertex format (position,
 texture coordinate and color as floats) in a buffer of the frame, as triangle, line or point lists. GL's window
@@ -189,8 +190,9 @@ origin is the bottom left: the viewport has a negative height, so GL's viewport,
 coordinates are used as they are. A texture of 3-byte texels on a device that cannot sample that format is an RGBA8
 image, which a compute shader (`gles_rgb.comp`) writes from the packed rows. It does 2D textures (the base level) in
 GLES 1.1's formats, the texture environment of unit 0, the matrix stacks, `glDrawArrays`, `glDrawElements`,
-`glDrawTexOES`, blending, the scissor and `glClear`. It does not do yet: depth and stencil tests, lighting, fog, the
-alpha test, mipmaps, the second texture unit, and `glReadPixels`, which reads zeros.
+`glDrawTexOES`, blending, the scissor, `glClear` and `glReadPixels` of RGBA bytes (the frame's image copied into its
+staging buffer, the frame submitted and waited for). It does not do yet: depth and stencil tests, lighting, fog, the
+alpha test, mipmaps and the second texture unit.
 
 **GLES 2, 3.0 and 3.1** (`gles2.c`, `gles2_object.c`, `gles2_program.c`, `gles2_draw.c`) are done as Mesa's zink does them:
 
@@ -250,9 +252,12 @@ alpha test, mipmaps, the second texture unit, and `glReadPixels`, which reads ze
 
 What GLES 2 and 3 do not do yet: transform feedback, GLES 3.1's atomic counters and its buffer variables in the
 interface queries, `glFramebufferParameteri`, GLES 3.2's geometry and tessellation, its indexed blending and color masks, texture buffers, sample shading and
-border colors, a divisor past 1, `glClear` with a partial color mask (it clears every
+border colors, a divisor past 1, `glClear` of an integer color buffer with a partial color mask (it clears every
 channel), client depth and stencil texels for a 24-bit depth texture, ETC2 and ASTC on a device that has neither
 (the decode on the GPU), `glReadPixels` of a format other than RGBA or BGRA bytes, program binaries, and a pbuffer bound as a texture.
+`glClear` with a partial color mask, or a stencil write mask of part of the bits, draws what Vulkan's clears cannot
+(they write every channel and bit): a triangle over the target with the clear color and the masks in its pipeline
+(`gles2_clear.vert`, `gles2_clear.frag`), no test and no blend, in the scissor's rectangle.
 
 `libz.so` is the build's own zlib (`hle_zlib.c`): z_stream has the guest's layout on an LP64 host, and a stream's
 allocator, when the guest gives one, is called through the bridge. Windows' `uLong` is 32 bits, so Windows has no
@@ -294,6 +299,18 @@ builds for FreeBSD, macOS and Windows x64, where they differ:
 - **errno**: on Linux the guest's errno is the host's. Elsewhere it is the guest's own, and each HLE call sets it
   from the host's in Linux's numbers (`gnu_host_errno`, `gnuabi/kernel/errno.c`). `strerror`, `strerror_r`, `perror`
   and `%m` give bionic's texts (`hle_error_text`): the host C library's are other words, in the user's language.
+  libm's functions (`hle_libm.c`) leave it as it was, as bionic's do (its `math_errhandling` is `MATH_ERREXCEPT`),
+  where the host's may set it (glibc's `log(0)` sets `ERANGE`).
+- **libm** (`hle_libm.c`) has every function of double and float, and of their complex numbers, that bionic's has:
+  the host's, and bionic's own where they differ or the host lacks one. `ilogb` gives bionic's `FP_ILOGB0` and
+  `FP_ILOGBNAN` (-INT_MAX and INT_MAX, where glibc's on x86 are INT_MIN), `remquo` 31 bits of the quotient (glibc's
+  3), `nan` the tag's digits as msun reads them, `lgamma` its sign in bionic's `signgam`; `rint`, `nearbyint`,
+  `lrint` and `llrint` round as the guest's FPCR
+  says, and a conversion out of range saturates as `FCVTZS` does, with FPSR's flags. `lround`, `fmax` and `fmin` are
+  AArch64's `FCVTAS`, `FMAXNM` and `FMINNM` (+0 above -0), and a NaN made from numbers (`sqrt(-1)`) is AArch64's
+  default NaN, whose sign is clear where x86's is set. `fenv.h`'s functions read and write the guest's FPCR and FPSR
+  in bionic's numbers (`FE_INEXACT` is 0x10, `FE_UPWARD` 1), and traps are refused, as Android's kernel enables none.
+  bionic's functions of long double, IEEE's quadruple precision on AArch64, are not there: no host type holds one.
 - **The locale**: bionic's C library has the C locale alone, its multibyte characters UTF-8 whatever the name.
   `setlocale`, `newlocale` and `uselocale` are bionic's (`hle_libc.c`): a name only sets `MB_CUR_MAX`, 4 or 1, a
   `locale_t` is bionic's struct of it, and the host's locale is never set. The host's is the user's, which the JVM
@@ -422,7 +439,7 @@ a level.
 
 All 24 libraries of the Unity game load and run their constructors. From Java, `System.loadLibrary` loads them and
 runs their `JNI_OnLoad`: the game's crash reporter initializes its native side. An import without an HLE yet is an export that
-says so once when called and returns 0.
+says so once when called and returns 0, in `x0` and in `v0`.
 
 The recompiler's `android` target (`a64.profile`) is a phone's Armv8.2 CPU without pointer authentication, and
 `getauxval(AT_HWCAP)` reports the same features.
