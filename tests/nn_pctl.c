@@ -5,6 +5,7 @@
    rest zero, which a game reads as no timer and not as TimesUp */
 #include "nx/nn/pctl.c"
 #include "nn/hooks.hook.inc" /* pctl.hook's table, and its adapters for a 32-bit game */
+#include "support/hook32_read.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -35,13 +36,14 @@ int main(void) {
     for (int i = 1; i < 0x18; i++) CHECK(mem[0x40 + i] == 0);
     CHECK(mem[0x3f] == 0xee && mem[0x58] == 0xee);
     /* a 32-bit game: every hook but the one that fills a struct is in its table (pctl.hook's a32), and Initialize's
-       answers success in r0 and goes back to lr; the play timer's 64-bit answer is r0 and r1 */
+       answers success in r0 and goes back to lr; the play timer's TimeSpan goes through the pointer in r0, as the
+       SDK's own GetPlayTimerRemainingTime stores it, and r1 is left */
     {
         static SnxArmCPU a;
-        CHECK(HOOK_COUNT == 20 && HOOK32_COUNT == 19);
-        /* each for the one 32-bit SDK read, 0.12.16, alone: a 32-bit game of another SDK has no hook here */
+        /* each for the 32-bit SDKs read, 0.12.16 and 4.4.0, a group each: a 32-bit game of another has no hook here */
+        CHECK(HOOK_COUNT == 20 && HOOK32_COUNT == 38 && hook32_read_count(1) == 19 && hook32_read_count(2) == 19);
         for (int i = 0; i < HOOK32_COUNT; i++)
-            CHECK(hook32_key[i] == HOOK_SDK && hook32_lo[i] == 0 && hook32_hi[i] == 0x10000);
+            CHECK(hook32_read_entry(hook32_symbol[i], 1) >= 0 && hook32_read_entry(hook32_symbol[i], 2) >= 0);
         for (int i = 0; i < HOOK32_COUNT; i++) {
             CHECK(!strstr(hook32_symbol[i], "DisplayInfo"));
             if (!strcmp(hook32_symbol[i], "_ZN2nn4pctl10InitializeEv")) {
@@ -50,9 +52,11 @@ int main(void) {
                 CHECK(a.r[0] == 0 && a.r[15] == 0x2000 && (a.cpsr & SNX_ARM_T));
             }
             if (!strcmp(hook32_symbol[i], "_ZN2nn4pctl25GetPlayTimerRemainingTimeEv")) {
-                a.r[0] = a.r[1] = 0xdead, a.r[14] = 0x3000;
+                memset(mem, 0xee, sizeof mem);
+                a.r[0] = 0x80, a.r[1] = 0xdead, a.r[14] = 0x3000;
                 hook32_fn[i](&a);
-                CHECK(a.r[0] == 0 && a.r[1] == 0 && a.r[15] == 0x3000);
+                for (int k = 0; k < 8; k++) CHECK(mem[0x80 + k] == 0);
+                CHECK(mem[0x7f] == 0xee && mem[0x88] == 0xee && a.r[1] == 0xdead && a.r[15] == 0x3000);
             }
         }
     }
